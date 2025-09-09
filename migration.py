@@ -203,6 +203,10 @@ class ExperimentMigrator:
     
     def migrate_experiment_runs(self, experiment_ids: List[str], id_mappings: Dict[str, Dict[str, str]]):
         """Migrate all runs for experiments"""
+        if not experiment_ids:
+            return
+            
+        total_runs = 0
         payload = {
             "session": experiment_ids,
             "skip_pagination": False,
@@ -210,50 +214,61 @@ class ExperimentMigrator:
         
         while True:
             response = self.old_client.post("/runs/query", payload)
-            runs = response["runs"]
+            runs = response.get("runs", [])
             
-            self._create_runs_batch(runs, id_mappings)
+            if runs:
+                self._create_runs_batch(runs, id_mappings)
+                total_runs += len(runs)
             
             next_cursor = response.get("cursors", {}).get("next")
             if not next_cursor:
                 break
                 
             payload["cursor"] = next_cursor
+        
+        return total_runs
     
     def _create_runs_batch(self, runs: List[Dict[str, Any]], id_mappings: Dict[str, Dict[str, str]]):
         """Create a batch of runs"""
+        if not runs:
+            return
+            
         experiment_mapping = id_mappings["experiments"]
         example_mapping = id_mappings["examples"]
         
-        runs_payload = {
-            "post": [
-                {
-                    "name": run["name"],
-                    "inputs": run["inputs"],
-                    "run_type": run["run_type"],
-                    "start_time": run["start_time"],
-                    "end_time": run["end_time"],
-                    "extra": run["extra"],
-                    "error": run.get("error"),
-                    "serialized": run.get("serialized", {}),
-                    "outputs": run["outputs"],
-                    "parent_run_id": run.get("parent_run_id"),
-                    "events": run.get("events", []),
-                    "tags": run.get("tags", []),
-                    "trace_id": run["trace_id"],
-                    "id": run["id"],
-                    "dotted_order": run["dotted_order"],
-                    "session_id": experiment_mapping[run["session_id"]],
-                    "session_name": run.get("session_name"),
-                    "reference_example_id": example_mapping.get(run.get("reference_example_id")),
-                    "input_attachments": run.get("input_attachments", {}),
-                    "output_attachments": run.get("output_attachments", {})
-                }
-                for run in runs
-            ]
-        }
+        runs_to_create = []
+        for run in runs:
+            # Skip runs that don't have a mapped session_id
+            if run.get("session_id") not in experiment_mapping:
+                continue
+                
+            run_data = {
+                "name": run["name"],
+                "inputs": run["inputs"],
+                "run_type": run["run_type"],
+                "start_time": run["start_time"],
+                "end_time": run["end_time"],
+                "extra": run.get("extra"),
+                "error": run.get("error"),
+                "serialized": run.get("serialized", {}),
+                "outputs": run.get("outputs"),
+                "parent_run_id": run.get("parent_run_id"),
+                "events": run.get("events", []),
+                "tags": run.get("tags", []),
+                "trace_id": run["trace_id"],
+                "id": run["id"],
+                "dotted_order": run.get("dotted_order"),
+                "session_id": experiment_mapping[run["session_id"]],
+                "session_name": run.get("session_name"),
+                "reference_example_id": example_mapping.get(run.get("reference_example_id")),
+                "input_attachments": run.get("input_attachments", {}),
+                "output_attachments": run.get("output_attachments", {})
+            }
+            runs_to_create.append(run_data)
         
-        self.new_client.post("/runs/batch", runs_payload)
+        if runs_to_create:
+            runs_payload = {"post": runs_to_create}
+            self.new_client.post("/runs/batch", runs_payload)
 
 
 class AnnotationQueueMigrator:
@@ -266,11 +281,11 @@ class AnnotationQueueMigrator:
     
     def get_queue(self, queue_id: str) -> Dict[str, Any]:
         """Fetch annotation queue by ID"""
-        return self.old_client.get(f"/annotation-queues/{queue_id}")
+        return self.old_client.get(f"/annotation_queues/{queue_id}")
     
     def list_queues(self) -> List[Dict[str, Any]]:
         """List all annotation queues from old client"""
-        response = self.old_client.get("/annotation-queues")
+        response = self.old_client.get("/annotation_queues")
         if "detail" in response:
             return []
         return response
@@ -304,7 +319,7 @@ class AnnotationQueueMigrator:
             "session_ids": []
         }
         
-        response = self.new_client.post("/annotation-queues", payload)
+        response = self.new_client.post("/annotation_queues", payload)
         return response["id"]
 
 
@@ -381,6 +396,10 @@ class LangsmithMigrator:
         
         # Migrate experiments
         experiments = self.experiment_migrator.fetch_experiments(original_dataset_id)
+        
+        if not experiments:
+            return
+            
         experiment_mapping = {}
         
         for experiment in experiments:
@@ -394,7 +413,13 @@ class LangsmithMigrator:
         }
         
         old_experiment_ids = [exp["id"] for exp in experiments]
-        self.experiment_migrator.migrate_experiment_runs(old_experiment_ids, id_mappings)
+        runs_count = self.experiment_migrator.migrate_experiment_runs(old_experiment_ids, id_mappings)
+        
+        # Return info about what was migrated
+        return {
+            "experiments": len(experiments),
+            "runs": runs_count if runs_count else 0
+        }
     
     def migrate_annotation_queue(self,
                                 old_annotation_queue_id: str,
@@ -681,9 +706,23 @@ def select_queues(migrator: 'LangsmithMigrator') -> List[str]:
 
 def _migrate_single_dataset(migrator: 'LangsmithMigrator', dataset_id: str, migration_mode: str, console: Console) -> bool:
     """Migrate a single dataset and return success status"""
-    result_id = migrator.migrate_dataset(dataset_id, True, migration_mode)
-    console.print(f"[green]✓[/green] Dataset {dataset_id} migrated successfully. New ID: {result_id}")
-    return True
+    try:
+        result_id = migrator.migrate_dataset(dataset_id, True, migration_mode)
+        
+        # Get dataset name for better feedback
+        dataset_info = migrator.dataset_migrator.get_dataset(dataset_id)
+        dataset_name = dataset_info.get('name', dataset_id)
+        
+        if migration_mode == 'EXAMPLES_AND_EXPERIMENTS':
+            console.print(f"[green]✓[/green] Dataset '{dataset_name}' migrated with examples and experiments. New ID: {result_id}")
+        elif migration_mode == 'EXAMPLES':
+            console.print(f"[green]✓[/green] Dataset '{dataset_name}' migrated with examples. New ID: {result_id}")
+        else:
+            console.print(f"[green]✓[/green] Dataset '{dataset_name}' metadata migrated. New ID: {result_id}")
+        return True
+    except Exception as e:
+        console.print(f"[red]✗[/red] Failed to migrate dataset {dataset_id}: {str(e)}")
+        return False
 
 
 def migrate_datasets_interactive(migrator: 'LangsmithMigrator') -> None:
@@ -872,6 +911,125 @@ def migrate_prompts_interactive(migrator: 'LangsmithMigrator') -> None:
             progress.advance(task)
 
 
+def migrate_all_interactive(migrator: 'LangsmithMigrator') -> None:
+    """Migrate all available data from source to destination"""
+    console = Console()
+    
+    console.print("\n[bold yellow]⚠️  This will migrate ALL available data:[/bold yellow]")
+    console.print("  • All datasets (with examples and experiments)")
+    console.print("  • All annotation queues")
+    console.print("  • All prompts")
+    console.print("  • Project rules require manual selection\n")
+    
+    if not Confirm.ask("[bold]Are you sure you want to migrate ALL data?[/bold]"):
+        console.print("[yellow]Migration cancelled[/yellow]")
+        return
+    
+    # Track overall progress
+    total_items = 0
+    migrated_items = 0
+    
+    # Migrate all datasets
+    console.print("\n[bold cyan]📊 Migrating all datasets...[/bold cyan]")
+    try:
+        datasets = migrator.dataset_migrator.list_datasets()
+        if datasets:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Migrating datasets...", total=len(datasets))
+                
+                for dataset in datasets:
+                    dataset_id = dataset['id']
+                    progress.update(task, description=f"Migrating dataset: {dataset['name']}...")
+                    try:
+                        result_id = migrator.migrate_dataset(dataset_id, True, 'EXAMPLES_AND_EXPERIMENTS')
+                        console.print(f"  [green]✓[/green] Dataset '{dataset['name']}' migrated successfully")
+                        migrated_items += 1
+                    except Exception as e:
+                        console.print(f"  [red]✗[/red] Failed to migrate dataset '{dataset['name']}': {str(e)}")
+                    progress.advance(task)
+                    total_items += 1
+        else:
+            console.print("  [yellow]No datasets found[/yellow]")
+    except Exception as e:
+        console.print(f"  [red]Error listing datasets: {str(e)}[/red]")
+    
+    # Migrate all annotation queues
+    console.print("\n[bold cyan]📝 Migrating all annotation queues...[/bold cyan]")
+    try:
+        queues = migrator.queue_migrator.list_queues()
+        if queues:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Migrating queues...", total=len(queues))
+                
+                for queue in queues:
+                    queue_id = queue['id']
+                    progress.update(task, description=f"Migrating queue: {queue['name']}...")
+                    try:
+                        result_id = migrator.migrate_annotation_queue(queue_id, True, 'QUEUE_AND_DATASET')
+                        console.print(f"  [green]✓[/green] Queue '{queue['name']}' migrated successfully")
+                        migrated_items += 1
+                    except Exception as e:
+                        console.print(f"  [red]✗[/red] Failed to migrate queue '{queue['name']}': {str(e)}")
+                    progress.advance(task)
+                    total_items += 1
+        else:
+            console.print("  [yellow]No annotation queues found[/yellow]")
+    except Exception as e:
+        console.print(f"  [red]Error listing queues: {str(e)}[/red]")
+    
+    # Migrate all prompts
+    console.print("\n[bold cyan]💬 Migrating all prompts...[/bold cyan]")
+    try:
+        prompts = migrator.list_prompts()
+        if prompts:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Migrating prompts...", total=len(prompts))
+                
+                for prompt in prompts:
+                    prompt_id = prompt['id']
+                    progress.update(task, description=f"Migrating prompt: {prompt['name']}...")
+                    try:
+                        new_prompt_id = migrator.migrate_prompt(prompt_id)
+                        console.print(f"  [green]✓[/green] Prompt '{prompt['name']}' migrated successfully")
+                        migrated_items += 1
+                    except Exception as e:
+                        console.print(f"  [red]✗[/red] Failed to migrate prompt '{prompt['name']}': {str(e)}")
+                    progress.advance(task)
+                    total_items += 1
+        else:
+            console.print("  [yellow]No prompts found[/yellow]")
+    except Exception as e:
+        console.print(f"  [red]Error listing prompts: {str(e)}[/red]")
+    
+    # Summary
+    console.print("\n" + "="*50)
+    console.print(f"[bold green]Migration Complete![/bold green]")
+    console.print(f"Successfully migrated {migrated_items} out of {total_items} items")
+    
+    if total_items > migrated_items:
+        console.print(f"[yellow]Note: {total_items - migrated_items} items failed or were skipped (may already exist)[/yellow]")
+    
+    console.print("\n[yellow]Note: Project rules require manual migration as they need project ID mapping[/yellow]")
+
+
 def _show_welcome_banner(console: Console) -> None:
     """Display welcome banner"""
     console.print(Panel.fit(
@@ -900,6 +1058,7 @@ def _run_main_loop(migrator: 'LangsmithMigrator', console: Console) -> None:
                 'action',
                 message="Select an option",
                 choices=[
+                    ('🚀 Migrate ALL (Datasets, Queues, Rules, Prompts)', 'all'),
                     ('📊 Datasets (with examples/experiments)', 'datasets'),
                     ('📝 Annotation Queues', 'queues'),
                     ('🔧 Project Rules', 'rules'),
@@ -919,6 +1078,7 @@ def _run_main_loop(migrator: 'LangsmithMigrator', console: Console) -> None:
             break
         
         action_handlers = {
+            'all': migrate_all_interactive,
             'datasets': migrate_datasets_interactive,
             'queues': migrate_queues_interactive,
             'rules': migrate_project_rules_interactive,

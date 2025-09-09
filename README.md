@@ -10,6 +10,20 @@ A comprehensive Python tool for migrating datasets, experiments, annotation queu
 - **Prompt Migration**: Migrate prompts and their versions
 - **Interactive CLI**: User-friendly command-line interface with progress bars
 
+## Limitations
+
+### Trace Data Not Supported
+This migration tool **does not support migrating trace data** between LangSmith instances. The tool is designed specifically for migrating:
+- Datasets and their examples
+- Experiments and evaluation runs
+- Annotation queues
+- Project rules
+- Prompts
+
+For migrating trace data, please use LangSmith's official **Bulk Export** functionality, which allows you to export traces to external storage systems like S3, BigQuery, or Snowflake. 
+
+📚 **Learn more about trace exports**: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
+
 ## Installation
 1. Clone or download this repository
 2. Install dependencies:
