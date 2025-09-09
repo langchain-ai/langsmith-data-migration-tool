@@ -201,74 +201,6 @@ class ExperimentMigrator:
         response = self.new_client.post("/sessions", payload)
         return response["id"]
     
-    def migrate_experiment_runs(self, experiment_ids: List[str], id_mappings: Dict[str, Dict[str, str]]):
-        """Migrate all runs for experiments"""
-        if not experiment_ids:
-            return
-            
-        total_runs = 0
-        payload = {
-            "session": experiment_ids,
-            "skip_pagination": False,
-        }
-        
-        while True:
-            response = self.old_client.post("/runs/query", payload)
-            runs = response.get("runs", [])
-            
-            if runs:
-                self._create_runs_batch(runs, id_mappings)
-                total_runs += len(runs)
-            
-            next_cursor = response.get("cursors", {}).get("next")
-            if not next_cursor:
-                break
-                
-            payload["cursor"] = next_cursor
-        
-        return total_runs
-    
-    def _create_runs_batch(self, runs: List[Dict[str, Any]], id_mappings: Dict[str, Dict[str, str]]):
-        """Create a batch of runs"""
-        if not runs:
-            return
-            
-        experiment_mapping = id_mappings["experiments"]
-        example_mapping = id_mappings["examples"]
-        
-        runs_to_create = []
-        for run in runs:
-            # Skip runs that don't have a mapped session_id
-            if run.get("session_id") not in experiment_mapping:
-                continue
-                
-            run_data = {
-                "name": run["name"],
-                "inputs": run["inputs"],
-                "run_type": run["run_type"],
-                "start_time": run["start_time"],
-                "end_time": run["end_time"],
-                "extra": run.get("extra"),
-                "error": run.get("error"),
-                "serialized": run.get("serialized", {}),
-                "outputs": run.get("outputs"),
-                "parent_run_id": run.get("parent_run_id"),
-                "events": run.get("events", []),
-                "tags": run.get("tags", []),
-                "trace_id": run["trace_id"],
-                "id": run["id"],
-                "dotted_order": run.get("dotted_order"),
-                "session_id": experiment_mapping[run["session_id"]],
-                "session_name": run.get("session_name"),
-                "reference_example_id": example_mapping.get(run.get("reference_example_id")),
-                "input_attachments": run.get("input_attachments", {}),
-                "output_attachments": run.get("output_attachments", {})
-            }
-            runs_to_create.append(run_data)
-        
-        if runs_to_create:
-            runs_payload = {"post": runs_to_create}
-            self.new_client.post("/runs/batch", runs_payload)
 
 
 class AnnotationQueueMigrator:
@@ -391,7 +323,7 @@ class LangsmithMigrator:
         self.dataset_migrator.migrate_examples(original_dataset_id, new_dataset_id)
     
     def _migrate_examples_and_experiments(self, original_dataset_id: str, new_dataset_id: str):
-        """Migrate examples and experiments"""
+        """Migrate examples and experiments (without runs)"""
         example_mapping = self.dataset_migrator.migrate_examples(original_dataset_id, new_dataset_id)
         
         # Migrate experiments
@@ -406,19 +338,10 @@ class LangsmithMigrator:
             new_exp_id = self.experiment_migrator.create_experiment(experiment, new_dataset_id)
             experiment_mapping[experiment["id"]] = new_exp_id
         
-        # Migrate runs
-        id_mappings = {
-            "experiments": experiment_mapping,
-            "examples": example_mapping
-        }
-        
-        old_experiment_ids = [exp["id"] for exp in experiments]
-        runs_count = self.experiment_migrator.migrate_experiment_runs(old_experiment_ids, id_mappings)
-        
-        # Return info about what was migrated
+        # Return info about what was migrated (no runs)
         return {
             "experiments": len(experiments),
-            "runs": runs_count if runs_count else 0
+            "runs": 0
         }
     
     def migrate_annotation_queue(self,
@@ -733,7 +656,7 @@ def _migrate_single_dataset(migrator: 'LangsmithMigrator', dataset_id: str, migr
         dataset_name = dataset_info.get('name', dataset_id)
         
         if migration_mode == 'EXAMPLES_AND_EXPERIMENTS':
-            console.print(f"[green]✓[/green] Dataset '{dataset_name}' migrated with examples and experiments. New ID: {result_id}")
+            console.print(f"[green]✓[/green] Dataset '{dataset_name}' migrated with examples and experiment metadata. New ID: {result_id}")
         elif migration_mode == 'EXAMPLES':
             console.print(f"[green]✓[/green] Dataset '{dataset_name}' migrated with examples. New ID: {result_id}")
         else:
@@ -760,7 +683,7 @@ def migrate_datasets_interactive(migrator: 'LangsmithMigrator') -> None:
             message="Select migration mode",
             choices=[
                 ('Examples only', 'EXAMPLES'),
-                ('Examples and experiments', 'EXAMPLES_AND_EXPERIMENTS'),
+                ('Examples and experiments (metadata only)', 'EXAMPLES_AND_EXPERIMENTS'),
                 ('Dataset metadata only', 'DATASET_ONLY'),
             ],
         ),
@@ -932,7 +855,7 @@ def migrate_all_interactive(migrator: 'LangsmithMigrator') -> None:
     console = Console()
     
     console.print("\n[bold yellow]⚠️  This will migrate ALL available data:[/bold yellow]")
-    console.print("  • All datasets (with examples and experiments)")
+    console.print("  • All datasets (with examples and experiment metadata)")
     console.print("  • All annotation queues")
     console.print("  • All prompts")
     console.print("  • Project rules require manual selection\n")

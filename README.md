@@ -40,17 +40,11 @@ Set up environment variables for your source and destination LangSmith instances
 ```bash
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
 export LANGSMITH_NEW_API_KEY="your_destination_api_key"
-```
 
-### Optional Environment Variables
-
-```bash
 # Base URLs (default: https://api.smith.langchain.com)
 export LANGSMITH_OLD_BASE_URL="https://your-source-instance.com"
 export LANGSMITH_NEW_BASE_URL="https://your-destination-instance.com"
 
-# SSL verification (default: true)
-export LANGSMITH_VERIFY_SSL="false"  # Set to false to disable SSL verification
 ```
 
 ### Using .env File
