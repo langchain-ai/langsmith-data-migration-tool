@@ -15,7 +15,7 @@ A comprehensive Python tool for migrating datasets, experiments, annotation queu
 ### Trace Data Not Supported
 This migration tool **does not support migrating trace data** between LangSmith instances. The tool is designed specifically for migrating:
 - Datasets and their examples
-- Experiments and evaluation runs
+- Experiments and evaluators
 - Annotation queues
 - Project rules
 - Prompts
@@ -79,7 +79,7 @@ The tool provides an interactive menu with the following options:
 
 Migrate datasets with three modes:
 - **Examples only**: Migrate dataset metadata and examples
-- **Examples and experiments**: Migrate dataset, examples, and associated experiments with runs
+- **Examples and experiments**: Migrate dataset, examples, and associated experiments
 - **Dataset metadata only**: Migrate only the dataset structure (no examples or experiments)
 
 ### 2. Annotation Queue Migration
@@ -104,7 +104,7 @@ Migrate prompts and their versions between instances.
 The tool is organized into several specialized classes:
 - **`LangsmithMigrator`**: Main orchestrator class
 - **`DatasetMigrator`**: Handles dataset and example migration
-- **`ExperimentMigrator`**: Manages experiment and run migration
+- **`ExperimentMigrator`**: Manages experiment migration
 - **`AnnotationQueueMigrator`**: Handles annotation queue migration
 - **`APIClient`**: Wrapper for HTTP requests with error handling
 
