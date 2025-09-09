@@ -281,18 +281,18 @@ class AnnotationQueueMigrator:
     
     def get_queue(self, queue_id: str) -> Dict[str, Any]:
         """Fetch annotation queue by ID"""
-        return self.old_client.get(f"/annotation_queues/{queue_id}")
+        return self.old_client.get(f"/annotation-queues/{queue_id}")
     
     def list_queues(self) -> List[Dict[str, Any]]:
         """List all annotation queues from old client"""
-        response = self.old_client.get("/annotation_queues")
+        response = self.old_client.get("/annotation-queues")
         if "detail" in response:
             return []
         return response
     
     def find_existing_queue(self, name: str) -> Optional[str]:
         """Find existing annotation queue by name"""
-        response = self.new_client.get("/annotation_queues", params={"name": name})
+        response = self.new_client.get("/annotation-queues", params={"name": name})
         
         if "detail" in response:
             return None
@@ -319,7 +319,7 @@ class AnnotationQueueMigrator:
             "session_ids": []
         }
         
-        response = self.new_client.post("/annotation_queues", payload)
+        response = self.new_client.post("/annotation-queues", payload)
         return response["id"]
 
 
@@ -520,10 +520,25 @@ class LangsmithMigrator:
     
     def list_prompts(self) -> List[Dict[str, Any]]:
         """List all prompts from old client"""
-        response = self.old_client.get("/prompts")
-        if "detail" in response:
+        try:
+            # Use the LangSmith SDK's list_prompts method
+            response = self.old_langsmith.list_prompts(limit=100)
+            prompts = []
+            if hasattr(response, 'prompts'):
+                for prompt in response.prompts:
+                    prompts.append({
+                        'id': prompt.id if hasattr(prompt, 'id') else prompt.get('id'),
+                        'name': prompt.repo_handle if hasattr(prompt, 'repo_handle') else prompt.get('repo_handle', 'Unknown'),
+                        'description': prompt.description if hasattr(prompt, 'description') else prompt.get('description', ''),
+                        'is_public': prompt.is_public if hasattr(prompt, 'is_public') else prompt.get('is_public', False),
+                        'num_commits': prompt.num_commits if hasattr(prompt, 'num_commits') else prompt.get('num_commits', 0),
+                        'updated_at': str(prompt.updated_at) if hasattr(prompt, 'updated_at') else prompt.get('updated_at', '')
+                    })
+            return prompts
+        except Exception as e:
+            # If list_prompts is not available or fails, return empty list
+            print(f"Note: Unable to list prompts: {str(e)}")
             return []
-        return response
     
     def migrate_prompt(self, original_prompt_id: str):
         """Migrate a prompt from original instance to new instance"""
@@ -621,13 +636,17 @@ def display_prompts(prompts: List[Dict[str, Any]], console: Console = None) -> N
     
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Name", style="cyan")
-    table.add_column("ID", style="dim")
+    table.add_column("Public", style="dim")
+    table.add_column("Commits", style="dim")
+    table.add_column("Updated", style="dim")
     
     for prompt in prompts:
         name = prompt.get('name', 'Unknown')
-        prompt_id = prompt.get('id', 'Unknown')
+        is_public = "Yes" if prompt.get('is_public', False) else "No"
+        num_commits = str(prompt.get('num_commits', 0))
+        updated_at = prompt.get('updated_at', 'Unknown')[:10] if prompt.get('updated_at') else 'Unknown'
         
-        table.add_row(name, prompt_id)
+        table.add_row(name, is_public, num_commits, updated_at)
     
     console.print(table)
 
@@ -871,7 +890,7 @@ def migrate_prompts_interactive(migrator: 'LangsmithMigrator') -> None:
     console.print("\n[bold]Available prompts:[/bold]")
     display_prompts(prompts, console)
     
-    choices = [f"{p['name']} ({p['id']})" for p in prompts]
+    choices = [f"{p['name']}" for p in prompts]
     questions = [
         inquirer.Checkbox(
             'prompts',
@@ -885,13 +904,10 @@ def migrate_prompts_interactive(migrator: 'LangsmithMigrator') -> None:
         console.print("[yellow]No prompts selected for migration[/yellow]")
         return
     
-    # Extract IDs from selected choices
-    selected_ids = []
-    for choice in answers['prompts']:
-        prompt_id = choice.split('(')[1].rstrip(')')
-        selected_ids.append(prompt_id)
+    # Extract prompt names (repo_handles) from selected choices
+    selected_names = answers['prompts']
     
-    if not Confirm.ask(f"Migrate {len(selected_ids)} prompt(s)?"):
+    if not Confirm.ask(f"Migrate {len(selected_names)} prompt(s)?"):
         console.print("[yellow]Migration cancelled[/yellow]")
         return
     
@@ -903,11 +919,11 @@ def migrate_prompts_interactive(migrator: 'LangsmithMigrator') -> None:
         TaskProgressColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Migrating prompts...", total=len(selected_ids))
+        task = progress.add_task("Migrating prompts...", total=len(selected_names))
         
-        for prompt_id in selected_ids:
-            progress.update(task, description=f"Migrating prompt {prompt_id}...")
-            _migrate_single_prompt(migrator, prompt_id, console)
+        for prompt_name in selected_names:
+            progress.update(task, description=f"Migrating prompt {prompt_name}...")
+            _migrate_single_prompt(migrator, prompt_name, console)
             progress.advance(task)
 
 
@@ -1004,10 +1020,10 @@ def migrate_all_interactive(migrator: 'LangsmithMigrator') -> None:
                 task = progress.add_task("Migrating prompts...", total=len(prompts))
                 
                 for prompt in prompts:
-                    prompt_id = prompt['id']
-                    progress.update(task, description=f"Migrating prompt: {prompt['name']}...")
+                    prompt_name = prompt['name']  # This is the repo_handle
+                    progress.update(task, description=f"Migrating prompt: {prompt_name}...")
                     try:
-                        new_prompt_id = migrator.migrate_prompt(prompt_id)
+                        new_prompt_id = migrator.migrate_prompt(prompt_name)
                         console.print(f"  [green]✓[/green] Prompt '{prompt['name']}' migrated successfully")
                         migrated_items += 1
                     except Exception as e:
