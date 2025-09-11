@@ -444,11 +444,12 @@ class LangsmithMigrator:
     def list_prompts(self) -> List[Dict[str, Any]]:
         """List all prompts from old client"""
         try:
-            # Use the LangSmith SDK's list_prompts method
-            response = self.old_langsmith.list_prompts(limit=100)
+            # Use the LangSmith SDK's list_prompts method - only get private prompts from your workspace
+            response = self.old_langsmith.list_prompts(limit=100, is_public=False)
             prompts = []
-            if hasattr(response, 'prompts'):
-                for prompt in response.prompts:
+            # The response has a 'repos' attribute containing the prompt objects
+            if hasattr(response, 'repos'):
+                for prompt in response.repos:
                     prompts.append({
                         'id': prompt.id if hasattr(prompt, 'id') else prompt.get('id'),
                         'name': prompt.repo_handle if hasattr(prompt, 'repo_handle') else prompt.get('repo_handle', 'Unknown'),
