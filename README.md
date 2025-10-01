@@ -2,6 +2,25 @@
 
 A comprehensive Python tool for migrating datasets, experiments, annotation queues, project rules, and prompts between LangSmith instances.
 
+## Quick Start
+
+```bash
+# Clone and install
+git clone https://github.com/langchain-ai/langsmith-data-migration-tool.git
+cd langsmith-data-migration-tool
+uv sync
+
+# Set up environment variables
+export LANGSMITH_OLD_API_KEY="your_source_api_key"
+export LANGSMITH_NEW_API_KEY="your_destination_api_key"
+
+# Test connections
+uv run langsmith-migrator test
+
+# Start migrating datasets
+uv run langsmith-migrator datasets
+```
+
 ## Features
 
 - **Dataset Migration**: Migrate datasets with examples, attachments, and associated experiments
@@ -23,25 +42,48 @@ This migration tool **does not support migrating trace data** between LangSmith 
 
 For migrating trace data, please use LangSmith's official **Bulk Export** functionality, which allows you to export traces to external storage systems like S3, BigQuery, or Snowflake.
 
-### Dataset Attachments
-The tool automatically handles examples with file attachments:
-- Downloads attachments from source using presigned URLs
-- Preserves original filenames and MIME types
-- Re-uploads attachments using the LangSmith SDK
-- Supports all file types (images, PDFs, documents, etc.) 
-
 📚 **Learn more about trace exports**: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
 
 ## Installation
 
+### Prerequisites
+- Python 3.12 or higher
+- [uv](https://docs.astral.sh/uv/) package manager (recommended) or pip
+
+### Using uv (Recommended)
+
 ```bash
-# Install with uv (recommended)
+# Clone the repository
+git clone https://github.com/langchain-ai/langsmith-data-migration-tool.git
+cd langsmith-data-migration-tool
+
+# Install dependencies and the package
 uv sync
+
+# Run the tool using uv
+uv run langsmith-migrator --help
+```
+
+### Using pip
+
+```bash
+# Clone the repository
+git clone https://github.com/langchain-ai/langsmith-data-migration-tool.git
+cd langsmith-data-migration-tool
+
+# Create a virtual environment
+python -m venv .venv
 
 # Activate the virtual environment
 source .venv/bin/activate  # On Unix/macOS
 # or
 .venv\Scripts\activate  # On Windows
+
+# Install the package in editable mode
+pip install -e .
+
+# Run the tool
+langsmith-migrator --help
 ```
 
 ## Configuration
@@ -74,7 +116,24 @@ LANGSMITH_VERIFY_SSL=true
 
 ## Usage
 
-The tool is invoked using the `langsmith-migrator` command (or `python -m langsmith_migrator`):
+### Running the Tool
+
+If installed with uv, use:
+```bash
+uv run langsmith-migrator [COMMAND] [OPTIONS]
+```
+
+If installed with pip and activated in virtual environment, use:
+```bash
+langsmith-migrator [COMMAND] [OPTIONS]
+```
+
+You can also run it as a Python module:
+```bash
+python -m langsmith_migrator [COMMAND] [OPTIONS]
+```
+
+### Available Commands
 
 ```bash
 # Test connections to both instances
@@ -165,4 +224,71 @@ The tool is organized into several specialized classes:
 |------|-------------|
 | `QUEUE_AND_DATASET` | Migrate queue and its associated default dataset |
 | `QUEUE_ONLY` | Migrate only the queue configuration |
+
+## Troubleshooting
+
+### Command Not Found
+
+If you get `command not found: langsmith-migrator`:
+
+**Using uv:**
+```bash
+# Always prefix with uv run
+uv run langsmith-migrator --help
+```
+
+**Using pip:**
+```bash
+# Make sure virtual environment is activated
+source .venv/bin/activate  # Unix/macOS
+.venv\Scripts\activate     # Windows
+
+# Or run as module
+python -m langsmith_migrator --help
+```
+
+### Module Not Found Error
+
+If you see `ModuleNotFoundError: No module named 'langsmith_migrator.__main__'`:
+
+```bash
+# Reinstall the package
+uv sync
+# or
+pip install -e .
+```
+
+### Missing Dependencies
+
+If you encounter import errors:
+
+```bash
+# Using uv - sync dependencies
+uv sync
+
+# Using pip - install from requirements
+pip install -r requirements.txt
+```
+
+### SSL Certificate Errors
+
+For self-hosted instances with SSL issues:
+
+```bash
+# Option 1: Use --no-ssl flag
+uv run langsmith-migrator --no-ssl test
+
+# Option 2: Set environment variable
+export LANGSMITH_VERIFY_SSL=false
+uv run langsmith-migrator test
+```
+
+### Connection Issues
+
+If connection tests fail:
+
+1. Verify API keys are correct
+2. Check base URLs (should include `https://`)
+3. Ensure network connectivity to both instances
+4. Try verbose mode for more details: `uv run langsmith-migrator -v test`
 

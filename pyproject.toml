@@ -1,7 +1,7 @@
 [project]
 name = "langsmith-data-migration-tool"
 version = "0.1.0"
-description = "Add your description here"
+description = "A tool for migrating datasets, experiments, and annotation queues between LangSmith instances"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,6 +11,7 @@ dependencies = [
     "requests>=2.31.0",
     "urllib3>=2.0.0",
     "langsmith>=0.1.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.scripts]

@@ -68,18 +68,22 @@ class Config:
             dry_run: Whether to run in dry-run mode
             verbose: Whether to enable verbose logging
         """
+        # Determine SSL verification setting
+        # Priority: CLI arg > env var > default (True)
+        ssl_verify = verify_ssl if verify_ssl is not None else (os.getenv('LANGSMITH_VERIFY_SSL', 'true').lower() != 'false')
+
         # Source connection
         self.source = ConnectionConfig(
             api_key=source_api_key or os.getenv('LANGSMITH_OLD_API_KEY', ''),
             base_url=source_url or os.getenv('LANGSMITH_OLD_BASE_URL', 'https://api.smith.langchain.com'),
-            verify_ssl=verify_ssl if verify_ssl is not None else os.getenv('LANGSMITH_VERIFY_SSL', 'true').lower() != 'false'
+            verify_ssl=ssl_verify
         )
-        
+
         # Destination connection
         self.destination = ConnectionConfig(
             api_key=dest_api_key or os.getenv('LANGSMITH_NEW_API_KEY', ''),
             base_url=dest_url or os.getenv('LANGSMITH_NEW_BASE_URL', 'https://api.smith.langchain.com'),
-            verify_ssl=verify_ssl if verify_ssl is not None else os.getenv('LANGSMITH_VERIFY_SSL', 'true').lower() != 'false'
+            verify_ssl=ssl_verify
         )
         
         # Migration settings
@@ -101,24 +105,36 @@ class Config:
     def validate(self) -> tuple[bool, list[str]]:
         """
         Validate the configuration.
-        
+
         Returns:
             Tuple of (is_valid, list_of_errors)
         """
         errors = []
-        
+
         if not self.source.api_key:
             errors.append("Source API key is required (LANGSMITH_OLD_API_KEY)")
-        
+
         if not self.destination.api_key:
             errors.append("Destination API key is required (LANGSMITH_NEW_API_KEY)")
-        
+
+        if not self.source.base_url:
+            errors.append("Source base URL is required")
+
+        if not self.destination.base_url:
+            errors.append("Destination base URL is required")
+
         if self.migration.batch_size <= 0:
             errors.append("Batch size must be positive")
-        
+
+        if self.migration.batch_size > 1000:
+            errors.append("Batch size should not exceed 1000 for optimal performance")
+
         if self.migration.concurrent_workers <= 0:
             errors.append("Concurrent workers must be positive")
-        
+
+        if self.migration.concurrent_workers > 10:
+            errors.append("Concurrent workers should not exceed 10 to avoid rate limiting")
+
         return len(errors) == 0, errors
     
     def prompt_for_credentials(self, console: Optional[Console] = None) -> None:

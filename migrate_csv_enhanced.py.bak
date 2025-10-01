@@ -21,6 +21,8 @@ import time
 import traceback
 from collections import defaultdict
 import uuid
+import urllib3
+import warnings
 
 load_dotenv()
 
@@ -28,22 +30,36 @@ console = Console()
 
 
 class EnhancedCSVMigrator:
-    def __init__(self, api_key: Optional[str] = None, api_url: Optional[str] = None, project_id: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, api_url: Optional[str] = None, project_id: Optional[str] = None, verify_ssl: bool = True):
         self.api_key = api_key or os.getenv("LANGSMITH_API_KEY")
         self.api_url = api_url or os.getenv("LANGSMITH_API_URL", "https://api.smith.langchain.com")
+        # Ensure /api/v1 is appended if not present
+        if not self.api_url.endswith('/api/v1'):
+            self.api_url = self.api_url.rstrip('/') + '/api/v1'
         self.project_id = project_id or os.getenv("LANGSMITH_PROJECT_ID")
+        self.verify_ssl = verify_ssl
+        
+        # Disable SSL warnings if verification is turned off
+        if not self.verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+            console.print("[yellow]Warning: SSL certificate verification is disabled[/yellow]")
         
         if not self.api_key:
             raise ValueError("LANGSMITH_API_KEY not provided or found in environment")
         
         # Initialize client with project if provided
+        # Note: The api_url should already have /api/v1 appended from __init__
+        # Remove /api/v1 for Client initialization as it adds it automatically
+        client_url = self.api_url.replace('/api/v1', '')
+        
         if self.project_id:
             os.environ["LANGCHAIN_PROJECT"] = self.project_id
-            self.client = Client(api_key=self.api_key, api_url=self.api_url)
-            console.print(f"[green]Connected to LangSmith project: {self.project_id}[/green]")
+            self.client = Client(api_key=self.api_key, api_url=client_url)
+            console.print(f"[green]Connected to LangSmith at {client_url} - project: {self.project_id}[/green]")
         else:
-            self.client = Client(api_key=self.api_key, api_url=self.api_url)
-            console.print(f"[green]Connected to LangSmith[/green]")
+            self.client = Client(api_key=self.api_key, api_url=client_url)
+            console.print(f"[green]Connected to LangSmith at {client_url}[/green]")
         
         self.dataset_mapping = {}  # old_id -> new_id
         self.evaluator_mapping = {}  # rule_id -> evaluator_id
@@ -321,6 +337,7 @@ class EnhancedCSVMigrator:
                         'inputs': inputs,
                         'outputs': outputs,
                         'metadata': metadata,
+                        'attachments': row.get('attachments', {}) if 'attachments' in row else {},
                         'source_run_id': row.get('source_run_id') if pd.notna(row.get('source_run_id')) else None,
                         'original_id': row.get('id')
                     }
@@ -366,6 +383,7 @@ class EnhancedCSVMigrator:
                                 outputs=example_data.get('outputs'),
                                 dataset_id=str(dataset_id) if not isinstance(dataset_id, str) else dataset_id,
                                 metadata=example_data.get('metadata', {}),
+                                attachments=example_data.get('attachments', {}),
                                 source_run_id=example_data.get('source_run_id')
                             )
                             self.stats['examples_created'] += 1
@@ -489,10 +507,12 @@ class EnhancedCSVMigrator:
                 'Content-Type': 'application/json'
             }
             
+            # The api_url already has /api/v1 appended, so just use the endpoint
             response = requests.post(
                 f"{self.api_url}/runs/rules",
                 headers=headers,
-                json=rule_data
+                json=rule_data,
+                verify=self.verify_ssl
             )
             
             if response.status_code == 200 or response.status_code == 201:
@@ -1133,6 +1153,7 @@ def main():
     parser.add_argument('--csv-dir', type=str, default='example_csv', help='Directory containing CSV files')
     parser.add_argument('--api-key', type=str, help='LangSmith API key')
     parser.add_argument('--api-url', type=str, default='https://api.smith.langchain.com', help='LangSmith API URL')
+    parser.add_argument('--no-verify-ssl', action='store_true', help='Disable SSL certificate verification (use for self-hosted with self-signed certs)')
     parser.add_argument('--project-id', type=str, help='Destination LangSmith project ID')
     parser.add_argument('--validate-only', action='store_true', help='Only validate CSV data without migrating')
     parser.add_argument('--batch-size', type=int, default=50, help='Batch size for example uploads')
@@ -1165,7 +1186,12 @@ def main():
         console.print("[red]API key is required (set LANGSMITH_API_KEY environment variable or use --api-key)[/red]")
         sys.exit(1)
     
-    migrator = EnhancedCSVMigrator(api_key=args.api_key, api_url=args.api_url, project_id=args.project_id)
+    migrator = EnhancedCSVMigrator(
+        api_key=args.api_key, 
+        api_url=args.api_url, 
+        project_id=args.project_id,
+        verify_ssl=not args.no_verify_ssl
+    )
     
     # Validate data
     is_valid, errors = migrator.validate_csv_data(csv_dir)
