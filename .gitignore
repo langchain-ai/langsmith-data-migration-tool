@@ -143,3 +143,20 @@ cython_debug/
 
 # macOS
 .DS_Store
+
+# Migration output files
+migration_report_*.json
+migration_mappings_*.json
+experiment_mappings_*.json
+enhanced_run_rules.json
+processed_run_rules.json
+evaluator_configs.json
+dataset_evaluator_configs.json
+dataset_test_configs.json
+annotation_queues_config.json
+run_dataset_tests.py
+
+# Test files
+test_*.py
+demo_*.py
+main.py
