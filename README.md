@@ -4,32 +4,45 @@ A comprehensive Python tool for migrating datasets, experiments, annotation queu
 
 ## Features
 
-- **Dataset Migration**: Migrate datasets with examples and associated experiments
+- **Dataset Migration**: Migrate datasets with examples, attachments, and associated experiments
+- **Attachment Support**: Automatically downloads and re-uploads file attachments (images, documents, etc.) with examples
 - **Annotation Queue Migration**: Transfer annotation queues with their configurations
 - **Project Rules Migration**: Copy tracing project rules between instances
 - **Prompt Migration**: Migrate prompts and their versions
-- **Interactive CLI**: User-friendly command-line interface with progress bars
+- **Interactive CLI**: User-friendly command-line interface with improved selection UX
 
 ## Limitations
 
 ### Trace Data Not Supported
 This migration tool **does not support migrating trace data** between LangSmith instances. The tool is designed specifically for migrating:
-- Datasets and their examples
+- Datasets and their examples (including file attachments)
 - Experiments and evaluators
 - Annotation queues
 - Project rules
 - Prompts
 
-For migrating trace data, please use LangSmith's official **Bulk Export** functionality, which allows you to export traces to external storage systems like S3, BigQuery, or Snowflake. 
+For migrating trace data, please use LangSmith's official **Bulk Export** functionality, which allows you to export traces to external storage systems like S3, BigQuery, or Snowflake.
+
+### Dataset Attachments
+The tool automatically handles examples with file attachments:
+- Downloads attachments from source using presigned URLs
+- Preserves original filenames and MIME types
+- Re-uploads attachments using the LangSmith SDK
+- Supports all file types (images, PDFs, documents, etc.) 
 
 📚 **Learn more about trace exports**: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
 
 ## Installation
-1. Clone or download this repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+
+```bash
+# Install with uv (recommended)
+uv sync
+
+# Activate the virtual environment
+source .venv/bin/activate  # On Unix/macOS
+# or
+.venv\Scripts\activate  # On Windows
+```
 
 ## Configuration
 
@@ -61,38 +74,72 @@ LANGSMITH_VERIFY_SSL=true
 
 ## Usage
 
-Run the migration tool:
+The tool is invoked using the `langsmith-migrator` command (or `python -m langsmith_migrator`):
 
 ```bash
-python migration.py
+# Test connections to both instances
+langsmith-migrator test
+
+# Interactive dataset selection
+langsmith-migrator datasets
+
+# Migrate all datasets (skip selection UI)
+langsmith-migrator datasets --all
+
+# Include related experiments
+langsmith-migrator datasets --include-experiments
+
+# Migrate annotation queues
+langsmith-migrator queues
+
+# Resume previous migration
+langsmith-migrator resume
+
+# Clean up old sessions
+langsmith-migrator clean
 ```
 
-The tool provides an interactive menu with the following options:
+### CLI Options
 
-### 1. Dataset Migration
+All commands support the following global options:
 
-Migrate datasets with three modes:
-- **Examples only**: Migrate dataset metadata and examples
-- **Examples and experiments**: Migrate dataset, examples, and associated experiments
-- **Dataset metadata only**: Migrate only the dataset structure (no examples or experiments)
+```bash
+--source-key TEXT       Source API key (or set LANGSMITH_OLD_API_KEY)
+--dest-key TEXT         Destination API key (or set LANGSMITH_NEW_API_KEY)
+--source-url TEXT       Source base URL (or set LANGSMITH_OLD_BASE_URL)
+--dest-url TEXT         Destination base URL (or set LANGSMITH_NEW_BASE_URL)
+--no-ssl                Disable SSL certificate verification
+--batch-size INTEGER    Batch size for operations (default: 100)
+--workers INTEGER       Number of concurrent workers (default: 4)
+--dry-run               Run without making changes
+--verbose, -v           Enable verbose output
+```
 
-### 2. Annotation Queue Migration
+### SSL Certificate Issues
 
-Migrate annotation queues with two modes:
-- **Queue and associated dataset**: Migrate the queue and its default dataset
-- **Queue only**: Migrate only the queue configuration
+If you encounter SSL certificate verification errors with self-hosted instances:
 
-### 3. Project Rules Migration
+```bash
+# Option 1: Use the --no-ssl flag
+langsmith-migrator --no-ssl datasets
 
-Migrate tracing project rules between projects. Requires:
-- Source project ID
-- Destination project ID
+# Option 2: Set the environment variable
+export LANGSMITH_VERIFY_SSL=false
+langsmith-migrator datasets
+```
 
-The tool will automatically migrate any datasets or annotation queues referenced by the rules.
+### Interactive Selection UI
 
-### 4. Prompt Migration
+When using `langsmith-migrator datasets` or `langsmith-migrator queues`, you'll see an interactive TUI with:
 
-Migrate prompts and their versions between instances.
+**Keyboard Shortcuts:**
+- `↑↓` - Navigate through items
+- `Space` - Toggle selection on current item
+- `a` - Select all visible items
+- `n` - Clear all selections
+- `/` - Focus search box
+- `Enter` - Confirm and proceed
+- `Esc` - Cancel and exit
 
 ## API Classes
 The tool is organized into several specialized classes:
