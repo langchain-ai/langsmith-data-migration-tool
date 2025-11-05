@@ -29,16 +29,11 @@ class MigrationConfig:
     skip_existing: bool = True
     resume_on_error: bool = True
     verbose: bool = False
-    
+
     # Performance settings
     stream_examples: bool = True  # Stream instead of loading all into memory
     chunk_size: int = 1000  # Process in chunks
     rate_limit_delay: float = 0.1  # Delay between API calls
-    
-    # Selection of what to migrate
-    include_experiments: bool = True
-    include_annotations: bool = True
-    include_rules: bool = False
 
 
 class Config:

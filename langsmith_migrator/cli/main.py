@@ -12,6 +12,8 @@ from ..core.migrators import (
     MigrationOrchestrator,
     DatasetMigrator,
     AnnotationQueueMigrator,
+    PromptMigrator,
+    RulesMigrator,
 )
 from .tui_selector import select_items
 
@@ -188,7 +190,8 @@ def datasets(ctx, include_experiments, select_all):
     try:
         id_mapping = orchestrator.migrate_datasets_parallel(
             dataset_ids,
-            include_examples=True
+            include_examples=True,
+            include_experiments=include_experiments
         )
 
         # Display results
@@ -201,6 +204,11 @@ def datasets(ctx, include_experiments, select_all):
                 console.print(f"  Migrated: {stats['completed']} dataset(s)")
             if stats['failed'] > 0:
                 console.print(f"  [red]Failed: {stats['failed']}[/red]")
+
+            # Show experiment stats if included
+            if include_experiments and 'by_type' in stats and 'experiment' in stats['by_type']:
+                exp_stats = stats['by_type']['experiment']
+                console.print(f"  Experiments: {exp_stats['completed']} completed, {exp_stats['failed']} failed")
 
     except Exception as e:
         console.print(f"\n[red]Migration failed: {e}[/red]")
@@ -306,12 +314,20 @@ def resume(ctx):
         if item.type == "dataset"
     ]
 
+    # Process experiment items separately
+    experiment_ids = [
+        item.source_id for item in items_to_process
+        if item.type == "experiment"
+    ]
+
     if dataset_ids:
         try:
             orchestrator.migrate_datasets_parallel(dataset_ids, include_examples=True)
             console.print("\n[green]✓ Migration resumed and completed[/green]")
         except Exception as e:
             console.print(f"\n[red]Resume failed: {e}[/red]")
+    elif experiment_ids:
+        console.print("[yellow]Note: Experiment-only resume not yet supported - please resume full dataset migration[/yellow]")
     else:
         console.print("[yellow]No datasets to process[/yellow]")
 
@@ -376,18 +392,510 @@ def queues(ctx):
 
 
 @cli.command()
+@click.option('--all', 'select_all', is_flag=True, help='Migrate all prompts')
+@click.option('--include-all-commits', is_flag=True, help='Include all commit history')
 @click.pass_context
-def prompts(ctx):
-    """Migrate prompts."""
+def prompts(ctx, select_all, include_all_commits):
+    """Migrate prompts with interactive selection."""
     config = ctx.obj['config']
+    state_manager = ctx.obj['state_manager']
 
     display_banner()
 
     if not ensure_config(config):
         return
 
-    console.print("[yellow]Prompt migration requires LangSmith client integration[/yellow]")
-    console.print("This feature will be available in a future update")
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        return
+    if not dest_ok:
+        console.print("[red]✗ Destination connection failed[/red]")
+        return
+    console.print("[green]✓[/green]")
+
+    # Create prompt migrator
+    prompt_migrator = PromptMigrator(
+        orchestrator.source_client,
+        orchestrator.dest_client,
+        None,
+        config
+    )
+
+    # Check if prompts API is available on destination
+    console.print("Checking prompts API availability... ", end="")
+    api_available, error_msg = prompt_migrator.check_prompts_api_available()
+    if not api_available:
+        console.print("[red]✗[/red]")
+        console.print(f"\n[red]Error:[/red] {error_msg}")
+        console.print("\n[yellow]Possible reasons:[/yellow]")
+        console.print("  • The destination instance may not have the prompts feature enabled")
+        console.print("  • The instance may be running an older version of LangSmith")
+        console.print("  • The nginx/proxy configuration may not route prompts endpoints")
+        console.print("\n[dim]Please check with your LangSmith administrator.[/dim]")
+        return
+    console.print("[green]✓[/green]")
+
+    console.print("Fetching prompts... ", end="")
+    prompts = prompt_migrator.list_prompts()
+
+    if not prompts:
+        console.print("[yellow]none found[/yellow]")
+        return
+
+    console.print(f"found {len(prompts)}\n")
+
+    # Warning about SDK-based prompt migration
+    console.print("[yellow]Note:[/yellow] Prompt migration uses the LangSmith SDK.")
+    console.print("[dim]Some prompts (especially those created via API) may not be accessible via the SDK.[/dim]")
+    console.print("[dim]If all prompts fail, they may need to be recreated manually in the destination.[/dim]\n")
+
+    if select_all:
+        selected_prompts = prompts
+    else:
+        selected_prompts = select_items(
+            items=prompts,
+            title="Select Prompts to Migrate",
+            columns=[
+                {"key": "repo_handle", "title": "Handle", "width": 40},
+                {"key": "description", "title": "Description", "width": 50},
+                {"key": "num_commits", "title": "Commits", "width": 10},
+                {"key": "is_public", "title": "Public", "width": 8}
+            ]
+        )
+
+    if not selected_prompts:
+        console.print("[yellow]No prompts selected[/yellow]")
+        return
+
+    console.print(f"\nSelected {len(selected_prompts)} prompt(s)")
+
+    if config.migration.dry_run:
+        console.print("[dim]Mode: Dry Run (no changes)[/dim]")
+
+    if include_all_commits:
+        console.print("[dim]Including all commit history[/dim]")
+
+    if not Confirm.ask("\nProceed?"):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+
+    success_count = 0
+    failed_count = 0
+    has_405_error = False
+
+    for prompt in selected_prompts:
+        try:
+            result = prompt_migrator.migrate_prompt(
+                prompt['repo_handle'],
+                include_all_commits=include_all_commits
+            )
+            if result:
+                console.print(f"[green]✓[/green] Migrated: {prompt['repo_handle']}")
+                success_count += 1
+            else:
+                console.print(f"[red]✗[/red] Failed: {prompt['repo_handle']}")
+                failed_count += 1
+        except Exception as e:
+            error_msg = str(e)
+            if "405" in error_msg or "Not Allowed" in error_msg:
+                has_405_error = True
+            console.print(f"[red]✗[/red] Failed {prompt['repo_handle']}: {e}")
+            failed_count += 1
+
+    console.print(f"\n[green]✓[/green] Migration completed")
+    console.print(f"  Migrated: {success_count} prompt(s)")
+    if failed_count > 0:
+        console.print(f"  [red]Failed: {failed_count}[/red]")
+        
+        if has_405_error:
+            console.print("\n[yellow]⚠ All failures were due to 405 Not Allowed errors[/yellow]")
+            console.print("[dim]This indicates the destination instance does not support prompt write operations.[/dim]")
+            console.print("[dim]Possible solutions:[/dim]")
+            console.print("[dim]  • Enable the prompts feature on your LangSmith instance[/dim]")
+            console.print("[dim]  • Check nginx/proxy configuration for /api/v1/repos/* endpoints[/dim]")
+            console.print("[dim]  • Contact your LangSmith administrator[/dim]")
+
+    orchestrator.cleanup()
+
+
+@cli.command()
+@click.option('--all', 'select_all', is_flag=True, help='Migrate all rules')
+@click.option('--strip-projects', is_flag=True, help='Strip project associations and create as global rules')
+@click.pass_context
+def rules(ctx, select_all, strip_projects):
+    """Migrate project rules (automation rules)."""
+    config = ctx.obj['config']
+    state_manager = ctx.obj['state_manager']
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        return
+    if not dest_ok:
+        console.print("[red]✗ Destination connection failed[/red]")
+        return
+    console.print("[green]✓[/green]")
+
+    rules_migrator = RulesMigrator(
+        orchestrator.source_client,
+        orchestrator.dest_client,
+        None,
+        config
+    )
+    
+    console.print("Fetching rules... ", end="")
+    rules = rules_migrator.list_rules()
+
+    if not rules:
+        console.print("[yellow]none found[/yellow]")
+        console.print("\n[yellow]No rules were found on the source instance.[/yellow]")
+        console.print("\n[dim]Possible reasons:[/dim]")
+        console.print("[dim]  • No rules have been created yet[/dim]")
+        console.print("[dim]  • Rules feature is not available on this instance[/dim]")
+        console.print("[dim]  • Rules are project-specific (try with a specific project)[/dim]")
+        console.print("[dim]  • Rules API uses a different endpoint than expected[/dim]")
+        console.print("\n[dim]Tip: Run with -v (verbose) flag to see which endpoints were checked[/dim]")
+        return
+
+    console.print(f"found {len(rules)}\n")
+
+    # Analyze rules for project/dataset associations
+    project_specific = [r for r in rules if r.get('session_id')]
+    dataset_specific = [r for r in rules if r.get('dataset_id')]
+    project_only = [r for r in rules if r.get('session_id') and not r.get('dataset_id')]
+
+    if project_specific and not strip_projects:
+        console.print(f"[yellow]Warning: {len(project_specific)} rule(s) are project-specific[/yellow]")
+        console.print("[dim]These rules reference projects that may not exist in the destination.[/dim]")
+        if project_only:
+            console.print(f"[dim]Note: {len(project_only)} rule(s) have no dataset_id and cannot be migrated without projects.[/dim]")
+        console.print("[dim]Options:[/dim]")
+        console.print("[dim]  • Migrate projects first, then migrate rules[/dim]")
+        console.print("[dim]  • Rules with dataset_id can be migrated without projects[/dim]\n")
+
+    if select_all:
+        selected_rules = rules
+    else:
+        # Enrich rules with association info for display
+        rules_for_display = []
+        for rule in rules:
+            rule_copy = rule.copy()
+            # Determine what the rule is associated with
+            if rule.get('session_id') and rule.get('dataset_id'):
+                rule_copy['association'] = 'Project+Dataset'
+            elif rule.get('session_id'):
+                rule_copy['association'] = 'Project'
+            elif rule.get('dataset_id'):
+                rule_copy['association'] = 'Dataset'
+            else:
+                rule_copy['association'] = 'None'
+            
+            # Use display_name if available, fallback to name
+            if not rule_copy.get('name') and rule_copy.get('display_name'):
+                rule_copy['name'] = rule_copy['display_name']
+                
+            rules_for_display.append(rule_copy)
+
+        selected_rules = select_items(
+            items=rules_for_display,
+            title="Select Rules to Migrate",
+            columns=[
+                {"key": "name", "title": "Name", "width": 30},
+                {"key": "rule_type", "title": "Type", "width": 25},
+                {"key": "association", "title": "Association", "width": 15},
+                {"key": "enabled", "title": "Enabled", "width": 10},
+            ]
+        )
+
+    if not selected_rules:
+        console.print("[yellow]No rules selected[/yellow]")
+        return
+
+    console.print(f"\nSelected {len(selected_rules)} rule(s)")
+
+    if config.migration.dry_run:
+        console.print("[dim]Mode: Dry Run (no changes)[/dim]")
+
+    if strip_projects:
+        console.print("[dim]Mode: Stripping project associations (creating as global rules)[/dim]")
+
+    if not Confirm.ask("\nProceed?"):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+
+    for rule in selected_rules:
+        try:
+            rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+            has_project = bool(rule.get('session_id'))
+            has_dataset = bool(rule.get('dataset_id'))
+
+            if has_project and not strip_projects:
+                console.print(f"[yellow]⊘[/yellow] Skipped: {rule_name} (project-specific)")
+                skipped_count += 1
+                continue
+
+            result = rules_migrator.create_rule(rule, strip_project_reference=strip_projects)
+            if result:
+                console.print(f"[green]✓[/green] Migrated: {rule_name}")
+                success_count += 1
+            else:
+                # Result is None - check if it was logged as skipped
+                console.print(f"[yellow]⊘[/yellow] Skipped: {rule_name} (cannot migrate without project or dataset)")
+                skipped_count += 1
+        except Exception as e:
+            rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+            console.print(f"[red]✗[/red] Failed {rule_name}: {e}")
+            failed_count += 1
+
+    console.print(f"\n[green]✓[/green] Migration completed")
+    console.print(f"  Migrated: {success_count} rule(s)")
+    if skipped_count > 0:
+        console.print(f"  [yellow]Skipped: {skipped_count}[/yellow]")
+    if failed_count > 0:
+        console.print(f"  [red]Failed: {failed_count}[/red]")
+
+    orchestrator.cleanup()
+
+
+@cli.command()
+@click.option('--skip-datasets', is_flag=True, help='Skip dataset migration')
+@click.option('--skip-experiments', is_flag=True, help='Skip experiment migration')
+@click.option('--skip-prompts', is_flag=True, help='Skip prompt migration')
+@click.option('--skip-queues', is_flag=True, help='Skip annotation queue migration')
+@click.option('--skip-rules', is_flag=True, help='Skip rules migration')
+@click.option('--include-all-commits', is_flag=True, help='Include all prompt commit history')
+@click.option('--strip-projects', is_flag=True, help='Strip project associations from rules')
+@click.pass_context
+def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, include_all_commits, strip_projects):
+    """Migrate all resources interactively."""
+    config = ctx.obj['config']
+    state_manager = ctx.obj['state_manager']
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    # Test connections first
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        return
+    if not dest_ok:
+        console.print("[red]✗ Destination connection failed[/red]")
+        return
+    console.print("[green]✓[/green]\n")
+
+    console.print("[bold cyan]LangSmith Data Migration Wizard[/bold cyan]\n")
+    console.print("This wizard will guide you through migrating all your data.\n")
+
+    # 1. Datasets and Experiments
+    if not skip_datasets:
+        console.print("[bold]Step 1: Datasets[/bold]")
+        console.print("Fetching datasets... ", end="")
+        from ..core.migrators import DatasetMigrator
+        dataset_migrator = DatasetMigrator(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            None,
+            config
+        )
+        datasets = dataset_migrator.list_datasets()
+
+        if datasets:
+            console.print(f"found {len(datasets)}")
+
+            if Confirm.ask(f"Migrate {len(datasets)} dataset(s)?"):
+                include_exp = False
+                if not skip_experiments:
+                    include_exp = Confirm.ask("Include experiments with datasets?")
+
+                try:
+                    dataset_ids = [d["id"] for d in datasets]
+                    orchestrator.migrate_datasets_parallel(dataset_ids, include_examples=True, include_experiments=include_exp)
+                    console.print("[green]✓ Datasets migrated successfully[/green]\n")
+                except Exception as e:
+                    console.print(f"[red]✗ Dataset migration failed: {e}[/red]\n")
+            else:
+                console.print("[yellow]Skipped datasets[/yellow]\n")
+        else:
+            console.print("[yellow]none found[/yellow]\n")
+    else:
+        console.print("[dim]Skipping datasets (--skip-datasets)[/dim]\n")
+
+    # 2. Prompts
+    if not skip_prompts:
+        console.print("[bold]Step 2: Prompts[/bold]")
+        console.print("Fetching prompts... ", end="")
+        from ..core.migrators import PromptMigrator
+        prompt_migrator = PromptMigrator(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            None,
+            config
+        )
+        prompts = prompt_migrator.list_prompts()
+
+        if prompts:
+            console.print(f"found {len(prompts)}")
+            console.print("[dim]Note: Prompt migration uses the SDK. API-created prompts may not be accessible.[/dim]")
+
+            if Confirm.ask(f"Migrate {len(prompts)} prompt(s)?"):
+                include_history = include_all_commits or Confirm.ask("Include full commit history?")
+
+                success_count = 0
+                failed_count = 0
+
+                for prompt in prompts:
+                    try:
+                        result = prompt_migrator.migrate_prompt(
+                            prompt['repo_handle'],
+                            include_all_commits=include_history
+                        )
+                        if result:
+                            console.print(f"[green]✓[/green] {prompt['repo_handle']}")
+                            success_count += 1
+                        else:
+                            console.print(f"[red]✗[/red] {prompt['repo_handle']}")
+                            failed_count += 1
+                    except Exception as e:
+                        console.print(f"[red]✗[/red] {prompt['repo_handle']}: {e}")
+                        failed_count += 1
+
+                console.print(f"[green]✓ Prompts migrated: {success_count} successful, {failed_count} failed[/green]\n")
+            else:
+                console.print("[yellow]Skipped prompts[/yellow]\n")
+        else:
+            console.print("[yellow]none found[/yellow]\n")
+    else:
+        console.print("[dim]Skipping prompts (--skip-prompts)[/dim]\n")
+
+    # 3. Annotation Queues
+    if not skip_queues:
+        console.print("[bold]Step 3: Annotation Queues[/bold]")
+        console.print("Fetching annotation queues... ", end="")
+        from ..core.migrators import AnnotationQueueMigrator
+        queue_migrator = AnnotationQueueMigrator(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            None,
+            config
+        )
+        queues = queue_migrator.list_queues()
+
+        if queues:
+            console.print(f"found {len(queues)}")
+
+            if Confirm.ask(f"Migrate {len(queues)} annotation queue(s)?"):
+                success_count = 0
+                failed_count = 0
+
+                for queue in queues:
+                    try:
+                        new_id = queue_migrator.create_queue(queue)
+                        console.print(f"[green]✓[/green] {queue['name']}")
+                        success_count += 1
+                    except Exception as e:
+                        console.print(f"[red]✗[/red] {queue['name']}: {e}")
+                        failed_count += 1
+
+                console.print(f"[green]✓ Queues migrated: {success_count} successful, {failed_count} failed[/green]\n")
+            else:
+                console.print("[yellow]Skipped queues[/yellow]\n")
+        else:
+            console.print("[yellow]none found[/yellow]\n")
+    else:
+        console.print("[dim]Skipping queues (--skip-queues)[/dim]\n")
+
+    # 4. Rules
+    if not skip_rules:
+        console.print("[bold]Step 4: Project Rules[/bold]")
+        console.print("Fetching rules... ", end="")
+        from ..core.migrators import RulesMigrator
+        rules_migrator = RulesMigrator(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            None,
+            config
+        )
+        rules = rules_migrator.list_rules()
+
+        if rules:
+            console.print(f"found {len(rules)}")
+
+            # Check for project-specific rules
+            project_specific = [r for r in rules if r.get('session_id')]
+            if project_specific:
+                console.print(f"[yellow]Note: {len(project_specific)} rule(s) are project-specific[/yellow]")
+
+            if Confirm.ask(f"Migrate {len(rules)} rule(s)?"):
+                strip = strip_projects
+                ensure_projects = False
+                
+                if project_specific and not strip:
+                    strip = Confirm.ask("Convert project-specific rules to global rules?")
+                    if not strip:
+                        ensure_projects = Confirm.ask("Create corresponding projects for project-specific rules?", default=True)
+
+                success_count = 0
+                failed_count = 0
+                skipped_count = 0
+
+                for rule in rules:
+                    try:
+                        has_project = bool(rule.get('session_id'))
+                        rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+
+                        if has_project and not strip and not ensure_projects:
+                            console.print(f"[yellow]⊘[/yellow] {rule_name} (project-specific, skipping)")
+                            skipped_count += 1
+                            continue
+
+                        result = rules_migrator.create_rule(
+                            rule, 
+                            strip_project_reference=strip,
+                            ensure_project=ensure_projects
+                        )
+                        if result:
+                            console.print(f"[green]✓[/green] {rule_name}")
+                            success_count += 1
+                        else:
+                            console.print(f"[red]✗[/red] {rule_name}")
+                            failed_count += 1
+                    except Exception as e:
+                        rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+                        console.print(f"[red]✗[/red] {rule_name}: {e}")
+                        failed_count += 1
+
+                console.print(f"[green]✓ Rules migrated: {success_count} successful, {skipped_count} skipped, {failed_count} failed[/green]\n")
+            else:
+                console.print("[yellow]Skipped rules[/yellow]\n")
+        else:
+            console.print("[yellow]none found[/yellow]\n")
+    else:
+        console.print("[dim]Skipping rules (--skip-rules)[/dim]\n")
+
+    console.print("[bold green]Migration wizard completed![/bold green]")
+    orchestrator.cleanup()
 
 
 @cli.command()

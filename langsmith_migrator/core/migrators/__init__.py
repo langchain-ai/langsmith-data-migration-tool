@@ -5,6 +5,7 @@ from .dataset import DatasetMigrator
 from .experiment import ExperimentMigrator
 from .annotation_queue import AnnotationQueueMigrator
 from .prompt import PromptMigrator
+from .rules import RulesMigrator
 from .orchestrator import MigrationOrchestrator
 
 __all__ = [
@@ -13,5 +14,6 @@ __all__ = [
     "ExperimentMigrator",
     "AnnotationQueueMigrator",
     "PromptMigrator",
+    "RulesMigrator",
     "MigrationOrchestrator",
 ]

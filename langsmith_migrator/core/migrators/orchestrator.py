@@ -73,7 +73,8 @@ class MigrationOrchestrator:
     def migrate_datasets_parallel(
         self,
         dataset_ids: List[str],
-        include_examples: bool = True
+        include_examples: bool = True,
+        include_experiments: bool = False
     ) -> Dict[str, str]:
         """Migrate multiple datasets in parallel."""
         # Create or load state
@@ -157,7 +158,95 @@ class MigrationOrchestrator:
                     progress.advance(task)
                     self.state_manager.save()
 
+        # Migrate experiments if requested
+        if include_experiments and id_mapping:
+            self.console.print("\n[bold]Migrating experiments...[/bold]")
+            self._migrate_experiments_for_datasets(dataset_ids, id_mapping)
+
         return id_mapping
+
+    def _migrate_experiments_for_datasets(
+        self,
+        dataset_ids: List[str],
+        dataset_id_mapping: Dict[str, str]
+    ):
+        """Migrate experiments for the given datasets."""
+        experiment_migrator = ExperimentMigrator(
+            self.source_client,
+            self.dest_client,
+            self.state,
+            self.config
+        )
+
+        all_experiments = []
+        experiment_to_dataset = {}
+
+        # Collect all experiments for these datasets
+        for dataset_id in dataset_ids:
+            experiments = experiment_migrator.list_experiments(dataset_id)
+            for exp in experiments:
+                all_experiments.append(exp)
+                experiment_to_dataset[exp['id']] = dataset_id
+
+        if not all_experiments:
+            self.console.print("[dim]No experiments found for selected datasets[/dim]")
+            return
+
+        self.console.print(f"Found {len(all_experiments)} experiment(s)")
+
+        # Create experiments in destination
+        experiment_id_mapping = {}
+        for experiment in all_experiments:
+            source_dataset_id = experiment_to_dataset[experiment['id']]
+            dest_dataset_id = dataset_id_mapping.get(source_dataset_id)
+
+            if not dest_dataset_id:
+                self.console.print(f"[yellow]Skipping experiment {experiment['name']} - dataset not migrated[/yellow]")
+                continue
+
+            try:
+                # Add to state
+                item = MigrationItem(
+                    id=f"experiment_{experiment['id']}",
+                    type="experiment",
+                    name=experiment['name'],
+                    source_id=experiment['id']
+                )
+                self.state.add_item(item)
+                self.state.update_item_status(item.id, MigrationStatus.IN_PROGRESS)
+
+                new_exp_id = experiment_migrator.create_experiment(experiment, dest_dataset_id)
+                experiment_id_mapping[experiment['id']] = new_exp_id
+
+                self.state.update_item_status(
+                    item.id,
+                    MigrationStatus.COMPLETED,
+                    destination_id=new_exp_id
+                )
+                self.console.print(f"[green]✓[/green] Migrated experiment: {experiment['name']}")
+
+            except Exception as e:
+                self.console.print(f"[red]✗[/red] Failed to migrate experiment {experiment['name']}: {e}")
+                self.state.update_item_status(
+                    item.id,
+                    MigrationStatus.FAILED,
+                    error=str(e)
+                )
+
+        # Migrate runs if experiments were created
+        if experiment_id_mapping:
+            self.console.print("\n[bold]Migrating experiment runs...[/bold]")
+            try:
+                total_runs = experiment_migrator.migrate_runs_streaming(
+                    list(experiment_id_mapping.keys()),
+                    {
+                        "experiments": experiment_id_mapping,
+                        "examples": self.state.id_mappings.get("examples", {})
+                    }
+                )
+                self.console.print(f"[green]✓[/green] Migrated {total_runs} run(s)")
+            except Exception as e:
+                self.console.print(f"[red]✗[/red] Failed to migrate runs: {e}")
 
     def cleanup(self):
         """Clean up resources."""

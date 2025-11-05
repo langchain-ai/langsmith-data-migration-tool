@@ -23,11 +23,13 @@ uv run langsmith-migrator datasets
 
 ## Features
 
-- **Dataset Migration**: Migrate datasets with examples, attachments, and associated experiments
+- **All-in-One Migration Wizard**: Interactive wizard that walks you through migrating all resources (`migrate-all`)
+- **Dataset Migration**: Migrate datasets with examples and attachments
+- **Experiment Migration**: Migrate experiments and their runs alongside datasets (use `--include-experiments`)
 - **Attachment Support**: Automatically downloads and re-uploads file attachments (images, documents, etc.) with examples
 - **Annotation Queue Migration**: Transfer annotation queues with their configurations
-- **Project Rules Migration**: Copy tracing project rules between instances
-- **Prompt Migration**: Migrate prompts and their versions
+- **Project Rules Migration**: Copy tracing project rules between instances (with `--strip-projects` to handle project mapping)
+- **Prompt Migration**: Migrate prompts and their versions with detailed progress tracking
 - **Interactive CLI**: User-friendly command-line interface with improved selection UX
 
 ## Limitations
@@ -43,6 +45,18 @@ This migration tool **does not support migrating trace data** between LangSmith 
 For migrating trace data, please use LangSmith's official **Bulk Export** functionality, which allows you to export traces to external storage systems like S3, BigQuery, or Snowflake.
 
 📚 **Learn more about trace exports**: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
+
+### Prompts and Rules Feature Availability
+**Prompts** and **Project Rules** migration require that these features are enabled on both source and destination LangSmith instances:
+
+- **Prompts**: If you encounter `405 Not Allowed` errors when migrating prompts, the destination instance may not have the prompts feature enabled. This can happen with:
+  - Self-hosted instances that haven't enabled the prompts feature
+  - Older versions of LangSmith
+  - Instances with restrictive nginx/proxy configurations
+  
+  **Solution**: Contact your LangSmith administrator to enable the prompts feature or configure the `/api/v1/repos/*` endpoints.
+
+- **Project Rules**: Rules (automation rules) may not be available on all LangSmith instances. The tool will gracefully handle missing endpoints and provide informative messages.
 
 ## Installation
 
@@ -139,17 +153,41 @@ python -m langsmith_migrator [COMMAND] [OPTIONS]
 # Test connections to both instances
 langsmith-migrator test
 
+# Migrate all resources with interactive wizard
+langsmith-migrator migrate-all
+
 # Interactive dataset selection
 langsmith-migrator datasets
 
 # Migrate all datasets (skip selection UI)
 langsmith-migrator datasets --all
 
-# Include related experiments
+# Include related experiments with datasets
 langsmith-migrator datasets --include-experiments
+
+# Migrate all datasets with experiments
+langsmith-migrator datasets --all --include-experiments
 
 # Migrate annotation queues
 langsmith-migrator queues
+
+# Migrate prompts
+langsmith-migrator prompts
+
+# Migrate all prompts with full commit history
+langsmith-migrator prompts --all --include-all-commits
+
+# Migrate project rules (automation rules)
+langsmith-migrator rules
+
+# Migrate rules, converting project-specific rules to global rules
+langsmith-migrator rules --strip-projects
+
+# Migrate everything interactively with wizard
+langsmith-migrator migrate-all
+
+# Skip specific resource types in wizard
+langsmith-migrator migrate-all --skip-prompts --skip-rules
 
 # Resume previous migration
 langsmith-migrator resume
@@ -212,11 +250,17 @@ The tool is organized into several specialized classes:
 
 ### Dataset Migration Modes
 
-| Mode | Description |
-|------|-------------|
-| `EXAMPLES` | Migrate dataset metadata and all examples |
-| `EXAMPLES_AND_EXPERIMENTS` | Migrate dataset, examples, experiments, and runs |
-| `DATASET_ONLY` | Migrate only dataset metadata |
+When using `langsmith-migrator datasets`:
+- **Default**: Migrate dataset metadata and all examples
+- **With `--include-experiments`**: Migrate dataset, examples, experiments, and their runs
+
+### Rules Migration Modes
+
+When using `langsmith-migrator rules`:
+- **Default**: Migrate only global rules (project-specific rules are skipped with warning)
+- **With `--strip-projects`**: Convert project-specific rules to global rules
+
+**Note on Project-Specific Rules**: Rules that reference specific projects (tracing projects/sessions) cannot be directly migrated because the project IDs differ between instances. Use the `--strip-projects` flag to migrate these rules as global rules with project references removed.
 
 ### Annotation Queue Migration Modes
 
@@ -291,4 +335,27 @@ If connection tests fail:
 2. Check base URLs (should include `https://`)
 3. Ensure network connectivity to both instances
 4. Try verbose mode for more details: `uv run langsmith-migrator -v test`
+
+### Rules Migration Issues
+
+If rules fail to migrate:
+
+1. **Check project/dataset associations:**
+   - Rules require either a `session_id` (project) or `dataset_id` (dataset)
+   - The tool automatically maps IDs by matching project/dataset names
+   - If a project or dataset doesn't exist in the destination, the rule will be skipped
+
+2. **Migrate projects and datasets first:**
+   ```bash
+   # First migrate datasets
+   langsmith-migrator datasets --all
+   
+   # Then migrate rules
+   langsmith-migrator rules
+   ```
+
+3. **Possible causes for skipped rules:**
+   - Project/dataset names don't match between source and destination
+   - Referenced projects/datasets haven't been migrated yet
+   - No rules have been created in the source instance
 
