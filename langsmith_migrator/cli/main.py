@@ -523,10 +523,63 @@ def prompts(ctx, select_all, include_all_commits):
 
 
 @cli.command()
+@click.option('--source', is_flag=True, help='List projects from source instance')
+@click.option('--dest', is_flag=True, help='List projects from destination instance')
+@click.pass_context
+def list_projects(ctx, source, dest):
+    """List projects with their IDs to help create project mappings."""
+    config = ctx.obj['config']
+    
+    if not source and not dest:
+        console.print("[yellow]Specify --source or --dest to list projects[/yellow]")
+        return
+    
+    if not ensure_config(config):
+        return
+    
+    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
+    
+    from rich.table import Table
+    
+    if source:
+        console.print("\n[bold]Source Projects:[/bold]")
+        try:
+            table = Table(show_header=True)
+            table.add_column("Name", style="cyan", width=50)
+            table.add_column("ID", style="dim", width=36)
+            
+            for project in orchestrator.source_client.get_paginated("/sessions", page_size=100):
+                if isinstance(project, dict):
+                    table.add_row(project.get('name', 'unnamed'), project.get('id', ''))
+            
+            console.print(table)
+        except Exception as e:
+            console.print(f"[red]Failed to list source projects: {e}[/red]")
+    
+    if dest:
+        console.print("\n[bold]Destination Projects:[/bold]")
+        try:
+            table = Table(show_header=True)
+            table.add_column("Name", style="cyan", width=50)
+            table.add_column("ID", style="dim", width=36)
+            
+            for project in orchestrator.dest_client.get_paginated("/sessions", page_size=100):
+                if isinstance(project, dict):
+                    table.add_row(project.get('name', 'unnamed'), project.get('id', ''))
+            
+            console.print(table)
+        except Exception as e:
+            console.print(f"[red]Failed to list destination projects: {e}[/red]")
+    
+    orchestrator.cleanup()
+
+
+@cli.command()
 @click.option('--all', 'select_all', is_flag=True, help='Migrate all rules')
 @click.option('--strip-projects', is_flag=True, help='Strip project associations and create as global rules')
+@click.option('--project-mapping', type=str, help='JSON string or file path with project ID mapping (e.g., \'{"old-id": "new-id"}\')')
 @click.pass_context
-def rules(ctx, select_all, strip_projects):
+def rules(ctx, select_all, strip_projects, project_mapping):
     """Migrate project rules (automation rules)."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -554,6 +607,37 @@ def rules(ctx, select_all, strip_projects):
         None,
         config
     )
+    
+    # Parse and apply custom project mapping if provided
+    if project_mapping:
+        import json
+        import os
+        
+        try:
+            # Check if it's a file path
+            if os.path.isfile(project_mapping):
+                with open(project_mapping, 'r') as f:
+                    custom_mapping = json.load(f)
+                console.print(f"Loaded project mapping from file: {project_mapping}")
+            else:
+                # Parse as JSON string
+                custom_mapping = json.loads(project_mapping)
+            
+            # Validate it's a dict
+            if not isinstance(custom_mapping, dict):
+                console.print("[red]Error: Project mapping must be a JSON object/dict[/red]")
+                return
+            
+            # Apply the custom mapping
+            rules_migrator._project_id_map = custom_mapping
+            console.print(f"Using custom project mapping with {len(custom_mapping)} project(s)")
+            
+        except json.JSONDecodeError as e:
+            console.print(f"[red]Error parsing project mapping JSON: {e}[/red]")
+            return
+        except Exception as e:
+            console.print(f"[red]Error loading project mapping: {e}[/red]")
+            return
     
     console.print("Fetching rules... ", end="")
     rules = rules_migrator.list_rules()

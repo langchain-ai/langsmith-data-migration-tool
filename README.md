@@ -180,8 +180,15 @@ langsmith-migrator prompts --all --include-all-commits
 # Migrate project rules (automation rules)
 langsmith-migrator rules
 
-# Migrate rules, converting project-specific rules to global rules
-langsmith-migrator rules --strip-projects
+# List projects to help create ID mappings
+langsmith-migrator list-projects --source
+langsmith-migrator list-projects --dest
+
+# Migrate rules with custom project ID mapping
+langsmith-migrator rules --project-mapping '{"source-proj-id": "dest-proj-id"}'
+
+# Or use a mapping file
+langsmith-migrator rules --project-mapping ./project-mapping.json
 
 # Migrate everything interactively with wizard
 langsmith-migrator migrate-all
