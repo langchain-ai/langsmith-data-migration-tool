@@ -3,6 +3,9 @@
 from typing import Dict, List, Any, Optional, Generator, Tuple
 import requests
 import uuid
+import tempfile
+import os
+import shutil
 
 from .base import BaseMigrator
 from ..api_client import APIError, NotFoundError
@@ -79,15 +82,15 @@ class DatasetMigrator(BaseMigrator):
         for example in self.source.get_paginated("/examples", params=params):
             yield example
 
-    def download_attachments(self, attachments: Dict[str, Any]) -> Dict[str, Tuple[str, bytes, str]]:
+    def download_attachments(self, attachments: Dict[str, Any]) -> Dict[str, Tuple[str, str, str]]:
         """
-        Download attachments from source.
+        Download attachments from source to temporary files.
 
         Args:
             attachments: Dictionary of attachment URLs from source example
 
         Returns:
-            Dictionary mapping attachment names to (mime_type, binary_data, original_filename) tuples
+            Dictionary mapping attachment names to (mime_type, temp_file_path, original_filename) tuples
         """
         if not attachments:
             return {}
@@ -98,18 +101,21 @@ class DatasetMigrator(BaseMigrator):
             try:
                 # Debug: log all available fields in attachment_info
                 self.log(f"Attachment '{key}' metadata fields: {list(attachment_info.keys())}", "info")
-                self.log(f"Full attachment info: {attachment_info}", "info")
-
+                
                 # Get the presigned URL from source
                 presigned_url = attachment_info.get("presigned_url")
                 if not presigned_url:
                     self.log(f"No presigned URL for attachment '{key}', skipping", "warning")
                     continue
 
-                # Download the attachment content
-                response = requests.get(presigned_url, verify=self.source.verify_ssl, timeout=30)
-                response.raise_for_status()
-                content = response.content
+                # Download the attachment content streaming to a temp file
+                with requests.get(presigned_url, verify=self.source.verify_ssl, timeout=60, stream=True) as response:
+                    response.raise_for_status()
+                    
+                    # Create a temp file
+                    fd, temp_path = tempfile.mkstemp()
+                    with os.fdopen(fd, 'wb') as f:
+                        shutil.copyfileobj(response.raw, f)
 
                 # Get attachment metadata - use mime_type from attachment_info
                 content_type = attachment_info.get("mime_type") or attachment_info.get("content_type", "application/octet-stream")
@@ -117,9 +123,10 @@ class DatasetMigrator(BaseMigrator):
                 # Extract filename from key by removing 'attachment.' prefix
                 original_filename = key.replace("attachment.", "", 1) if key.startswith("attachment.") else key
 
-                # Store as tuple of (mime_type, data, original_filename)
-                downloaded[key] = (content_type, content, original_filename)
-                self.log(f"Downloaded attachment '{key}' as '{original_filename}' ({len(content)} bytes)", "info")
+                # Store as tuple of (mime_type, temp_file_path, original_filename)
+                downloaded[key] = (content_type, temp_path, original_filename)
+                file_size = os.path.getsize(temp_path)
+                self.log(f"Downloaded attachment '{key}' to '{temp_path}' ({file_size} bytes)", "info")
 
             except Exception as e:
                 self.log(f"Failed to download attachment '{key}': {e}", "error")
@@ -130,7 +137,7 @@ class DatasetMigrator(BaseMigrator):
     def create_examples_with_attachments(
         self,
         dataset_id: str,
-        examples_with_attachments: List[Tuple[str, Dict[str, Any], Dict[str, Tuple[str, bytes, str]]]]
+        examples_with_attachments: List[Tuple[str, Dict[str, Any], Dict[str, Tuple[str, str, str]]]]
     ) -> Dict[str, str]:
         """
         Create examples with attachments using LangSmith SDK.
@@ -138,7 +145,7 @@ class DatasetMigrator(BaseMigrator):
         Args:
             dataset_id: Destination dataset ID
             examples_with_attachments: List of (original_id, example_data, attachments) tuples
-                where attachments is Dict[key, (mime_type, data, filename)]
+                where attachments is Dict[key, (mime_type, temp_file_path, filename)]
 
         Returns:
             Dictionary mapping original_id to new example ID
@@ -163,17 +170,26 @@ class DatasetMigrator(BaseMigrator):
 
         # Process examples one at a time due to SDK limitations
         for original_id, example_data, attachments in examples_with_attachments:
+            temp_files_to_cleanup = []
             try:
                 # Convert attachment tuples to SDK Attachment objects
                 # Use the original filename to preserve the file extension
                 sdk_attachments = {}
-                for att_name, (mime_type, data, original_filename) in attachments.items():
-                    # Use the original filename which should include the extension
-                    sdk_attachments[original_filename] = Attachment(
-                        mime_type=mime_type,
-                        data=data
-                    )
-                    self.log(f"Mapping attachment: {att_name} -> {original_filename} ({mime_type})", "info")
+                for att_name, (mime_type, temp_path, original_filename) in attachments.items():
+                    try:
+                        temp_files_to_cleanup.append(temp_path)
+                        with open(temp_path, "rb") as f:
+                            data = f.read()
+                        
+                        # Use the original filename which should include the extension
+                        sdk_attachments[original_filename] = Attachment(
+                            mime_type=mime_type,
+                            data=data
+                        )
+                        self.log(f"Mapping attachment: {att_name} -> {original_filename} ({mime_type})", "info")
+                    except Exception as e:
+                        self.log(f"Failed to read attachment file {temp_path}: {e}", "error")
+                        continue
 
                 # Create example with attachments using SDK
                 example_dict = {
@@ -215,6 +231,14 @@ class DatasetMigrator(BaseMigrator):
                 self.log(f"Failed to create example {original_id} with attachments: {e}", "error")
                 self.log(f"Traceback: {traceback.format_exc()}", "error")
                 continue
+            finally:
+                # Clean up temp files for this example
+                for path in temp_files_to_cleanup:
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except Exception as e:
+                        self.log(f"Failed to remove temp file {path}: {e}", "warning")
 
         return id_mapping
 

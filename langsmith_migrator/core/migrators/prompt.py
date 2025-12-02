@@ -69,49 +69,11 @@ class PromptMigrator(BaseMigrator):
             else:
                 return False, f"Prompts API read check failed: {error_msg}"
 
-        # Test 2: Check if we can push prompts (WRITE access)
-        # Try to POST to the commits endpoint with a test payload
-        try:
-            api_url = self.dest_ls_client._host_url
-            test_endpoint = f"{api_url}/api/v1/repos/__langsmith_migration_test_prompt__/commits"
-
-            # Send a test POST request with minimal payload
-            # We expect this to either succeed (unlikely without actual prompt data)
-            # or fail with 404 (prompt doesn't exist) or 400 (bad request)
-            # But NOT 405 (method not allowed)
-            test_payload = {
-                "manifest": {},
-                "parent_commit": None
-            }
-            
-            response = self.dest_ls_client.session.post(
-                test_endpoint,
-                json=test_payload,
-                headers=self.dest_ls_client._headers
-            )
-
-            # Check the response
-            if response.status_code == 405:
-                return False, (
-                    "Prompts API write operations returned 405 Not Allowed. "
-                    "The destination instance does not support creating/updating prompts via API. "
-                    "This typically means:\n"
-                    "  • The prompts feature is not enabled on this instance\n"
-                    "  • The nginx/proxy configuration blocks these endpoints\n"
-                    "  • The instance is running a version that doesn't support prompt push operations"
-                )
-            
-            # Any other response code (including 400, 404, 401, etc.) suggests the endpoint exists
-            # and write operations are allowed (even if this specific request failed for other reasons)
-            self.log(f"Prompts write API test returned {response.status_code} - endpoint appears accessible", "info")
-            return True, ""
-
-        except Exception as e:
-            # If the check itself fails, we'll report it but allow migration to proceed
-            # The actual push will reveal if there are real issues
-            self.log(f"Warning: Could not verify write access to prompts API: {e}", "warning")
-            # Return True to allow the migration attempt - better to try and fail with specific error
-            return True, ""
+        # Note: We're NOT testing write access here because:
+        # 1. Testing with fake prompts may give false negatives
+        # 2. The SDK's push_prompt has an existence check that may fail even if push works
+        # 3. Better to attempt actual migration and provide good error messages if it fails
+        return True, ""
 
     def _get_api_url(self, base_url: str) -> str:
         """
@@ -126,48 +88,65 @@ class PromptMigrator(BaseMigrator):
             clean_url = f"{clean_url}/api/v1"
         return clean_url
 
-    def _push_prompt_direct(self, prompt_identifier: str, prompt_obj: Any, parent_commit_hash: Optional[str] = None) -> str:
+    def _push_prompt_direct(self, prompt_identifier: str, prompt_obj: Any, parent_commit_hash: Optional[str] = None, prompt_metadata: Optional[Dict] = None) -> str:
         """
-        Push a prompt using direct API calls, bypassing SDK's broken _prompt_exists check.
+        Push a prompt by creating the repo first, then adding a commit.
+        This bypasses SDK's _prompt_exists check which fails with 405/JSONDecodeError.
 
-        This works around the issue where the SDK's get_prompt method fails with JSONDecodeError
-        when checking if a prompt exists in the destination.
+        Instead of checking if prompt exists, we:
+        1. Try to create the prompt repo (may fail if exists, that's OK)
+        2. Create a commit with the content
+
+        Args:
+            prompt_identifier: The prompt repo handle (e.g., "username/prompt-name")
+            prompt_obj: The prompt object to push
+            parent_commit_hash: Parent commit hash (optional, defaults to "latest")
+            prompt_metadata: Optional dict with description, readme, tags, is_public
+
+        Returns:
+            The commit hash of the created commit
         """
-        # Use the SDK's underlying session to make direct API calls
-        api_url = self.dest_ls_client._host_url
+        metadata = prompt_metadata or {}
 
-        # Build the request payload similar to what push_prompt does
-        manifest = prompt_obj.manifest if hasattr(prompt_obj, 'manifest') else prompt_obj
-
-        payload = {
-            "manifest": manifest if isinstance(manifest, dict) else manifest.dict() if hasattr(manifest, 'dict') else dict(manifest),
-            "parent_commit": parent_commit_hash
-        }
-
-        # Make direct POST request to create/update the prompt
-        endpoint = f"{api_url}/api/v1/repos/{prompt_identifier}/commits"
-
-        # Use the SDK's session which already has the correct headers configured
-        response = self.dest_ls_client.session.post(
-            endpoint,
-            json=payload,
-            headers=self.dest_ls_client._headers
-        )
-
-        # Check response
-        if response.status_code == 405:
-            raise ValueError(
-                "Prompts API returned 405 Not Allowed. "
-                "The destination instance may not have the prompts feature enabled, "
-                "or write operations may be restricted. "
-                "Please check with your LangSmith administrator."
+        # Step 1: Try to create the prompt repo
+        # This may fail with 409 if it already exists, which is fine
+        try:
+            self.log(f"Attempting to create prompt repo: {prompt_identifier}", "info")
+            self.dest_ls_client.create_prompt(
+                prompt_identifier,
+                description=metadata.get('description', ''),
+                readme=metadata.get('readme', ''),
+                tags=metadata.get('tags', []),
+                is_public=metadata.get('is_public', False)
             )
-        elif response.status_code not in (200, 201):
-            raise ValueError(f"Failed to push prompt: {response.status_code} - {response.text[:500]}")
+            self.log(f"✓ Created prompt repo: {prompt_identifier}", "success")
+        except Exception as e:
+            error_str = str(e).lower()
+            # These errors mean the repo already exists, which is fine
+            if "already exists" in error_str or "409" in error_str or "conflict" in error_str:
+                self.log(f"Prompt repo already exists (OK): {prompt_identifier}", "info")
+            else:
+                # Log warning but continue - maybe it exists and we just can't detect it
+                self.log(f"Could not create prompt repo (may already exist): {e}", "warning")
 
-        # Extract commit hash from response
-        result = response.json()
-        return result.get("commit_hash") or result.get("commit", {}).get("hash", "unknown")
+        # Step 2: Create a commit with the prompt content
+        try:
+            self.log(f"Creating commit for prompt: {prompt_identifier}", "info")
+            commit_url = self.dest_ls_client.create_commit(
+                prompt_identifier,
+                prompt_obj,
+                parent_commit_hash=parent_commit_hash or "latest"
+            )
+            self.log(f"✓ Created commit: {commit_url}", "success")
+
+            # Extract commit hash from URL (typically ends with /commits/{hash})
+            if "/" in str(commit_url):
+                commit_hash = str(commit_url).split("/")[-1]
+                return commit_hash
+            return str(commit_url)
+
+        except Exception as e:
+            raise ValueError(f"Failed to create commit for prompt {prompt_identifier}: {e}")
 
     def list_prompts(self, is_archived: bool = False) -> List[Dict[str, Any]]:
         """List all prompts from source instance."""

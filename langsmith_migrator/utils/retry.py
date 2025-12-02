@@ -18,6 +18,12 @@ class APIError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.request_info = request_info
+        
+    def __str__(self):
+        msg = super().__str__()
+        if self.request_info:
+            return f"{msg} | Request Info: {self.request_info}"
+        return msg
 
 
 def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):

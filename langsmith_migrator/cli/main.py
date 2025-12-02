@@ -14,6 +14,7 @@ from ..core.migrators import (
     AnnotationQueueMigrator,
     PromptMigrator,
     RulesMigrator,
+    ChartMigrator,
 )
 from .tui_selector import select_items
 
@@ -979,6 +980,140 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
         console.print("[dim]Skipping rules (--skip-rules)[/dim]\n")
 
     console.print("[bold green]Migration wizard completed![/bold green]")
+    orchestrator.cleanup()
+
+
+@cli.command()
+@click.option('--session', help='Migrate charts for a specific session/project (by name or ID)')
+@click.option('--same-instance', is_flag=True, help='Source and destination are the same instance (use same session IDs)')
+@click.pass_context
+def charts(ctx, session, same_instance):
+    """Migrate monitoring charts from sessions/projects."""
+    config = ctx.obj['config']
+    state_manager = ctx.obj['state_manager']
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        return
+    if not dest_ok:
+        console.print("[red]✗ Destination connection failed[/red]")
+        return
+    console.print("[green]✓[/green]")
+
+    # Auto-detect if same instance (same base URL)
+    if not same_instance:
+        source_url = config.source.base_url.rstrip('/').lower()
+        dest_url = config.destination.base_url.rstrip('/').lower()
+        if source_url == dest_url:
+            # Only consider it same instance if API keys are also identical
+            # Different keys usually imply different workspaces, so IDs won't match
+            if config.source.api_key == config.destination.api_key:
+                same_instance = True
+                console.print("[dim]Detected same source and destination instance (same URL and API key)[/dim]")
+            else:
+                console.print("[dim]Detected same instance URL but different API keys (likely different workspaces).[/dim]")
+                console.print("[dim]Will use project name matching instead of same session IDs.[/dim]")
+
+    chart_migrator = ChartMigrator(
+        orchestrator.source_client,
+        orchestrator.dest_client,
+        orchestrator.state,
+        config
+    )
+
+    if session:
+        # Migrate charts for a specific session
+        console.print(f"\n[bold]Migrating charts for session: {session}[/bold]\n")
+
+        # Try to find session by name or ID
+        console.print("Looking up session... ", end="")
+        sessions = chart_migrator.list_sessions()
+
+        if not sessions:
+            console.print("[red]✗[/red]")
+            console.print("[red]No sessions found in source[/red]")
+            return
+
+        target_session = None
+        for s in sessions:
+            if s.get('id') == session or s.get('name') == session:
+                target_session = s
+                break
+
+        if not target_session:
+            console.print("[red]✗[/red]")
+            console.print(f"[red]Session not found: {session}[/red]")
+            console.print(f"\n[yellow]Available sessions:[/yellow]")
+            for s in sessions[:10]:  # Show first 10
+                console.print(f"  - {s.get('name', 'unnamed')} ({s.get('id', 'no-id')})")
+            if len(sessions) > 10:
+                console.print(f"  ... and {len(sessions) - 10} more")
+            return
+
+        console.print(f"[green]✓[/green] Found: {target_session.get('name', 'unnamed')}")
+        source_session_id = target_session['id']
+
+        # Determine destination session ID
+        if same_instance:
+            dest_session_id = source_session_id
+            console.print("[dim]Using same session ID for destination[/dim]\n")
+        else:
+            dest_session_id = orchestrator.state.get_mapped_id('project', source_session_id)
+            if not dest_session_id:
+                console.print(f"[red]No destination mapping found for session {session}[/red]")
+                console.print("\n[yellow]This means the project/session hasn't been migrated yet.[/yellow]")
+                console.print("[yellow]Options:[/yellow]")
+                console.print("  1. Run 'langsmith-migrator datasets' first to migrate projects")
+                console.print("  2. Use --same-instance flag if source and dest are the same")
+                return
+            console.print(f"[dim]Mapped to destination session: {dest_session_id[:8]}...[/dim]\n")
+
+        # Migrate charts
+        chart_mappings = chart_migrator.migrate_session_charts(
+            source_session_id,
+            dest_session_id
+        )
+
+        console.print(f"\n[green]✓[/green] Migrated {len(chart_mappings)} chart(s)")
+
+    else:
+        # Migrate all charts from all sessions
+        console.print("\n[bold]Migrating charts from all sessions...[/bold]")
+
+        if same_instance:
+            console.print("[dim]Mode: Same instance (using same session IDs)[/dim]")
+        else:
+            console.print("[dim]Mode: Different instances (requires session ID mappings)[/dim]")
+
+        console.print()
+
+        if not Confirm.ask("Proceed with migration?"):
+            console.print("[yellow]Cancelled[/yellow]")
+            return
+
+        console.print()  # Blank line before migration output
+        all_mappings = chart_migrator.migrate_all_charts(same_instance=same_instance)
+
+        # Display summary (migrator already prints one, so just add final message)
+        if all_mappings:
+            console.print("\n[green]✓ Chart migration completed successfully[/green]")
+        else:
+            console.print("\n[yellow]No charts were migrated[/yellow]")
+
+        if config.migration.verbose and all_mappings:
+            console.print("\n[dim]Detailed chart mappings:[/dim]")
+            for session_id, chart_map in all_mappings.items():
+                console.print(f"  Session {session_id[:8]}...: {len(chart_map)} charts")
+
     orchestrator.cleanup()
 
 

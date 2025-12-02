@@ -18,44 +18,119 @@ class RulesMigrator(BaseMigrator):
         self._project_id_map = None  # Maps old_project_id -> new_project_id
         self._dataset_id_map = None  # Maps old_dataset_id -> new_dataset_id
 
-    def build_project_mapping(self) -> Dict[str, str]:
+    def _get_project_details(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get full project details from source.
+
+        Args:
+            project_id: The project ID to fetch
+
+        Returns:
+            Project details dict, or None if failed
+        """
+        try:
+            return self.source.get(f"/sessions/{project_id}")
+        except Exception as e:
+            self.log(f"Failed to get project {project_id}: {e}", "error")
+            return None
+
+    def _create_project(self, project: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Create a project in the destination.
+
+        Args:
+            project: Project details from source
+
+        Returns:
+            Created project details, or None if failed
+        """
+        if self.config.migration.dry_run:
+            self.log(f"[DRY RUN] Would create project: {project['name']}", "info")
+            return {"id": f"dry-run-{project['id']}", "name": project['name']}
+
+        try:
+            payload = {
+                "name": project["name"],
+                "description": project.get("description"),
+                "metadata": project.get("metadata"),
+                "start_time": project.get("start_time"),
+                "end_time": project.get("end_time"),
+                "extra": project.get("extra"),
+            }
+
+            response = self.dest.post("/sessions", payload)
+            self.log(f"Created project '{project['name']}' in destination", "success")
+            return response
+
+        except Exception as e:
+            self.log(f"Failed to create project '{project['name']}': {e}", "error")
+            return None
+
+    def build_project_mapping(self, create_missing: bool = True) -> Dict[str, str]:
         """
         Build a mapping of project IDs from source to destination by matching project names.
-        
+        Automatically creates missing projects in destination by default.
+
+        Args:
+            create_missing: If True (default), creates projects that exist in source but not in destination
+
         Returns:
             Dict mapping source_project_id -> dest_project_id
         """
         if self._project_id_map is not None:
             return self._project_id_map
-            
+
         self.log("Building project ID mapping...", "info")
         self._project_id_map = {}
-        
+
         try:
-            # Get all projects from source
-            source_projects = {}
+            # Get all projects from source (store full objects for potential creation)
+            source_projects = {}  # name -> full project dict
+            source_projects_by_id = {}  # id -> full project dict
             for project in self.source.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
-                    source_projects[project['name']] = project['id']
-            
+                    source_projects[project['name']] = project
+                    source_projects_by_id[project['id']] = project
+
             # Get all projects from destination
-            dest_projects = {}
+            dest_projects = {}  # name -> project id
             for project in self.dest.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
                     dest_projects[project['name']] = project['id']
-            
+
             # Build mapping by matching names
-            for name, source_id in source_projects.items():
+            existing_count = 0
+            created_count = 0
+
+            for name, source_project in source_projects.items():
+                source_id = source_project['id']
+
                 if name in dest_projects:
+                    # Project exists in both - create mapping
                     self._project_id_map[source_id] = dest_projects[name]
                     self.log(f"Mapped project '{name}': {source_id} -> {dest_projects[name]}", "info")
-            
-            self.log(f"Built project mapping: {len(self._project_id_map)} projects matched", "success")
-            
+                    existing_count += 1
+                elif create_missing:
+                    # Project missing in destination - create it
+                    self.log(f"Project '{name}' not found in destination, creating...", "info")
+                    new_project = self._create_project(source_project)
+                    if new_project:
+                        self._project_id_map[source_id] = new_project['id']
+                        self.log(f"Mapped project '{name}': {source_id} -> {new_project['id']}", "info")
+                        created_count += 1
+                    else:
+                        self.log(f"Failed to create project '{name}' in destination", "error")
+
+            total_mapped = len(self._project_id_map)
+            if created_count > 0:
+                self.log(f"Built project mapping: {existing_count} existing, {created_count} created, {total_mapped} total", "success")
+            else:
+                self.log(f"Built project mapping: {total_mapped} projects mapped", "success")
+
         except Exception as e:
             self.log(f"Failed to build project mapping: {e}", "error")
             self._project_id_map = {}
-        
+
         return self._project_id_map
     
     def build_dataset_mapping(self) -> Dict[str, str]:

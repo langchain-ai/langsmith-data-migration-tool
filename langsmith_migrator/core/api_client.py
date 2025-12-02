@@ -68,10 +68,22 @@ class EnhancedAPIClient:
         self.request_count += 1
 
         if response.status_code == 404:
+            error_detail = ""
+            try:
+                error_data = response.json()
+                error_detail = error_data.get("detail", error_data.get("message", ""))
+            except:
+                error_detail = response.text[:200]
+                
             raise NotFoundError(
-                f"Resource not found: {endpoint}",
+                f"Resource not found: {endpoint} - {error_detail}",
                 status_code=404,
-                request_info={"endpoint": endpoint}
+                request_info={
+                    "endpoint": endpoint,
+                    "url": response.request.url,
+                    "body": response.request.body[:1000] if response.request.body else "None",
+                    "headers": str(response.request.headers)
+                }
             )
 
         if response.status_code == 429:
@@ -187,7 +199,7 @@ class EnhancedAPIClient:
         batch_size: int = 100
     ) -> List[Dict[str, Any]]:
         """
-        Post items in batches to avoid overwhelming the API.
+        Post items in batches with smart retry logic (binary splitting).
 
         Args:
             endpoint: API endpoint
@@ -205,23 +217,48 @@ class EnhancedAPIClient:
             if self.verbose:
                 self.console.print(f"[dim]Posting batch {i//batch_size + 1} ({len(batch)} items)[/dim]")
 
-            try:
-                response = self.post(endpoint, batch)
-
-                # Handle different response formats
-                if isinstance(response, list):
-                    responses.extend(response)
-                else:
-                    responses.append(response)
-
-            except APIError as e:
-                # Log error but continue with next batch
-                if self.verbose:
-                    self.console.print(f"[red]Batch {i//batch_size + 1} failed: {e}[/red]")
-                # Add None for failed items to maintain index alignment
-                responses.extend([None] * len(batch))
+            # Use recursive smart batching
+            batch_responses = self._post_batch_recursive(endpoint, batch)
+            responses.extend(batch_responses)
 
         return responses
+
+    def _post_batch_recursive(self, endpoint: str, items: List[Dict[str, Any]]) -> List[Any]:
+        """
+        Recursively post batches, splitting them on failure to isolate bad records.
+        """
+        if not items:
+            return []
+            
+        try:
+            # Try to post the whole batch
+            response = self.post(endpoint, items)
+            
+            # Normalize response to list
+            if isinstance(response, list):
+                return response
+            # Fallback for endpoints that might return single object for batch (unlikely but safe)
+            return [response] * len(items)
+            
+        except APIError as e:
+            # Base case: if batch size is 1, it's a definitive failure for this item
+            if len(items) == 1:
+                if self.verbose:
+                    self.console.print(f"[red]Item failed permanently: {e}[/red]")
+                return [None]
+                
+            # Recursive step: Split and retry
+            mid = len(items) // 2
+            left = items[:mid]
+            right = items[mid:]
+            
+            if self.verbose:
+                self.console.print(f"[yellow]Batch failed, splitting into {len(left)} and {len(right)} items to isolate error[/yellow]")
+                
+            return (
+                self._post_batch_recursive(endpoint, left) + 
+                self._post_batch_recursive(endpoint, right)
+            )
 
     def test_connection(self) -> bool:
         """

@@ -30,6 +30,7 @@ uv run langsmith-migrator datasets
 - **Annotation Queue Migration**: Transfer annotation queues with their configurations
 - **Project Rules Migration**: Copy tracing project rules between instances (with `--strip-projects` to handle project mapping)
 - **Prompt Migration**: Migrate prompts and their versions with detailed progress tracking
+- **Chart Migration**: Migrate monitoring charts and dashboards with automatic creation of missing sections and filter preservation
 - **Interactive CLI**: User-friendly command-line interface with improved selection UX
 
 ## Limitations
@@ -180,6 +181,17 @@ langsmith-migrator prompts --all --include-all-commits
 # Migrate project rules (automation rules)
 langsmith-migrator rules
 
+# Migrate monitoring charts from all projects
+langsmith-migrator charts
+
+# Migrate charts for a specific project/session
+langsmith-migrator charts --session "my-project-name"
+langsmith-migrator charts --session "project-uuid"
+
+# If source and destination are the same instance (auto-detected)
+# Use --same-instance to force using same session IDs
+langsmith-migrator charts --same-instance
+
 # List projects to help create ID mappings
 langsmith-migrator list-projects --source
 langsmith-migrator list-projects --dest
@@ -264,10 +276,15 @@ When using `langsmith-migrator datasets`:
 ### Rules Migration Modes
 
 When using `langsmith-migrator rules`:
-- **Default**: Migrate only global rules (project-specific rules are skipped with warning)
-- **With `--strip-projects`**: Convert project-specific rules to global rules
+- **Default**: Migrate all rules, automatically creating any missing projects in the destination
+- **With `--strip-projects`**: Convert project-specific rules to global rules (removes project associations)
 
-**Note on Project-Specific Rules**: Rules that reference specific projects (tracing projects/sessions) cannot be directly migrated because the project IDs differ between instances. Use the `--strip-projects` flag to migrate these rules as global rules with project references removed.
+**Automatic Project Creation**: When migrating project-specific rules, the tool automatically:
+1. Matches projects between source and destination by name
+2. Creates any missing projects in the destination with the same name and metadata
+3. Maps rule references to the correct project IDs
+
+This ensures project-specific rules migrate successfully without manual project setup. Projects are only created if they're referenced by a rule being migrated.
 
 ### Annotation Queue Migration Modes
 
@@ -275,6 +292,16 @@ When using `langsmith-migrator rules`:
 |------|-------------|
 | `QUEUE_AND_DATASET` | Migrate queue and its associated default dataset |
 | `QUEUE_ONLY` | Migrate only the queue configuration |
+
+### Chart & Dashboard Migration
+
+The `charts` command (`langsmith-migrator charts`) handles the migration of monitoring charts and their organization.
+
+- **Automatic Dashboard Creation**: The tool automatically detects dashboard sections in the source project and creates them in the destination if they don't exist, maintaining the same structure.
+- **Common Filter Support**: Session (Project) filters are correctly preserved. When migrating to a different instance or project, project ID filters are updated to match the new destination project IDs.
+- **Same Instance Detection**: The tool smartly detects if you are migrating within the same workspace by checking both the API Key and Base URL.
+  - If identical: It preserves exact references.
+  - If different: It maps references to new IDs.
 
 ## Troubleshooting
 
@@ -350,19 +377,21 @@ If rules fail to migrate:
 1. **Check project/dataset associations:**
    - Rules require either a `session_id` (project) or `dataset_id` (dataset)
    - The tool automatically maps IDs by matching project/dataset names
-   - If a project or dataset doesn't exist in the destination, the rule will be skipped
+   - Missing projects are created automatically in the destination
+   - If a dataset doesn't exist in the destination, migrate datasets first
 
-2. **Migrate projects and datasets first:**
+2. **For dataset-specific rules, migrate datasets first:**
    ```bash
-   # First migrate datasets
+   # First migrate datasets if rules reference them
    langsmith-migrator datasets --all
-   
-   # Then migrate rules
+
+   # Then migrate rules (projects created automatically)
    langsmith-migrator rules
    ```
 
 3. **Possible causes for skipped rules:**
-   - Project/dataset names don't match between source and destination
-   - Referenced projects/datasets haven't been migrated yet
+   - Dataset names don't match between source and destination (for dataset-specific rules)
+   - Referenced datasets haven't been migrated yet
    - No rules have been created in the source instance
+   - Project creation failed due to API errors or permissions
 
