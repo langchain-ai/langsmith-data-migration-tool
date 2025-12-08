@@ -65,7 +65,22 @@ For migrating trace data, please use LangSmith's official **Bulk Export** functi
 - Python 3.12 or higher
 - [uv](https://docs.astral.sh/uv/) package manager (recommended) or pip
 
-### Using uv (Recommended)
+### Option 1: Install from GitHub Release (Recommended)
+
+Download and install the latest release directly:
+
+```bash
+# Install the latest release wheel file
+pip install https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.1-py3-none-any.whl
+
+# Or download manually from the releases page and install
+pip install langsmith_data_migration_tool-0.0.1-py3-none-any.whl
+
+# Run the tool
+langsmith-migrator --help
+```
+
+### Option 2: Install from Source with uv
 
 ```bash
 # Clone the repository
@@ -79,7 +94,7 @@ uv sync
 uv run langsmith-migrator --help
 ```
 
-### Using pip
+### Option 3: Install from Source with pip
 
 ```bash
 # Clone the repository
@@ -394,4 +409,118 @@ If rules fail to migrate:
    - Referenced datasets haven't been migrated yet
    - No rules have been created in the source instance
    - Project creation failed due to API errors or permissions
+
+## Development
+
+### Setting up Development Environment
+
+```bash
+# Clone the repository
+git clone https://github.com/langchain-ai/langsmith-data-migration-tool.git
+cd langsmith-data-migration-tool
+
+# Install dependencies using uv
+uv sync
+
+# Run tests
+uv run pytest
+
+# Run tests with coverage
+uv run pytest --cov=langsmith_migrator --cov-report=term-missing
+```
+
+### Running from Source
+
+```bash
+# Run the tool directly from source
+uv run langsmith-migrator --help
+
+# Or use as a Python module
+uv run python -m langsmith_migrator --help
+```
+
+### Building the Package
+
+```bash
+# Build distribution packages (wheel and source)
+uv build
+
+# The built packages will be in the dist/ directory
+ls -lh dist/
+```
+
+## Releasing
+
+### Creating a New Release
+
+This project uses automated GitHub releases. To create a new release:
+
+1. **Update the version** in `pyproject.toml`:
+   ```toml
+   version = "0.0.2"  # Update to your new version
+   ```
+
+2. **Update CHANGELOG.md**:
+   - Move items from `[Unreleased]` to a new version section
+   - Add the release date
+   - Create a new empty `[Unreleased]` section
+
+3. **Commit the changes**:
+   ```bash
+   git add pyproject.toml CHANGELOG.md
+   git commit -m "Prepare release v0.0.2"
+   git push origin main
+   ```
+
+4. **Create and push a git tag**:
+   ```bash
+   git tag -a v0.0.2 -m "Release version 0.0.2"
+   git push origin v0.0.2
+   ```
+
+5. **Automated workflow**: The GitHub Actions workflow will automatically:
+   - Build the package (wheel and source distribution)
+   - Create a GitHub release with the changelog notes
+   - Upload distribution files for easy download
+
+### Installing from GitHub Release
+
+Users can install directly from a GitHub release:
+
+```bash
+# Download the wheel file from the release page, then:
+pip install langsmith_data_migration_tool-0.0.1-py3-none-any.whl
+
+# Or install directly from the release URL:
+pip install https://github.com/langchain-ai/langsmith-data-migration-tool/releases/download/v0.0.1/langsmith_data_migration_tool-0.0.1-py3-none-any.whl
+```
+
+### Release Checklist
+
+Before creating a release, ensure:
+
+- [ ] All tests pass (`uv run pytest`)
+- [ ] Version number is updated in `pyproject.toml`
+- [ ] CHANGELOG.md is updated with all changes
+- [ ] README.md is up to date with new features
+- [ ] All changes are committed to main branch
+- [ ] Git tag matches the version in `pyproject.toml`
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## Support
+
+For issues, questions, or contributions, please visit the [GitHub repository](https://github.com/langchain-ai/langsmith-data-migration-tool).
 

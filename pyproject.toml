@@ -1,9 +1,22 @@
 [project]
 name = "langsmith-data-migration-tool"
-version = "0.1.0"
+version = "0.0.1"
 description = "A tool for migrating datasets, experiments, and annotation queues between LangSmith instances"
 readme = "README.md"
 requires-python = ">=3.12"
+license = {file = "LICENSE"}
+authors = [
+    {name = "LangChain", email = "support@langchain.dev"}
+]
+keywords = ["langsmith", "migration", "datasets", "langchain"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "textual>=6.2.0",
     "click>=8.0.0",
@@ -14,6 +27,12 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "langchain-core>=1.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/langchain-ai/langsmith-data-migration-tool"
+Repository = "https://github.com/langchain-ai/langsmith-data-migration-tool"
+"Bug Tracker" = "https://github.com/langchain-ai/langsmith-data-migration-tool/issues"
+Documentation = "https://github.com/langchain-ai/langsmith-data-migration-tool#readme"
 
 [project.scripts]
 langsmith-migrator = "langsmith_migrator.__main__:main"
