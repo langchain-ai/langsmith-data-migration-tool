@@ -208,18 +208,89 @@ class ChartMigrator(BaseMigrator):
         except Exception as e:
             self.log(f"Failed to build destination section map: {e}", "warning")
 
+    def find_existing_chart(self, title: str, section_id: Optional[str] = None) -> Optional[str]:
+        """
+        Check if a chart with the same title already exists in destination.
+
+        Args:
+            title: Chart title
+            section_id: Optional section ID to narrow the search
+
+        Returns:
+            The chart ID if found, None otherwise
+        """
+        try:
+            # List all charts from destination
+            charts = self.list_charts()
+
+            for chart in charts:
+                chart_title = chart.get("title") or chart.get("name")
+                chart_section = chart.get("section_id")
+
+                # Match by title, and optionally by section
+                if chart_title == title:
+                    if section_id is None or chart_section == section_id:
+                        return chart.get("id")
+
+            return None
+        except Exception as e:
+            self.log(f"Failed to check for existing chart: {e}", "warning")
+            return None
+
+    def update_chart(self, chart_id: str, chart_data: Dict[str, Any]) -> bool:
+        """
+        Update an existing chart in destination.
+
+        Args:
+            chart_id: The chart ID to update
+            chart_data: Chart configuration dict
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.config.migration.dry_run:
+            chart_title = chart_data.get("title") or chart_data.get("name") or "Untitled Chart"
+            self.log(f"[DRY RUN] Would update chart: {chart_title} ({chart_id})")
+            return True
+
+        # Build update payload
+        payload = {
+            "title": chart_data.get("title") or chart_data.get("name"),
+            "chart_type": chart_data.get("chart_type"),
+            "series": chart_data.get("series"),
+            "description": chart_data.get("description"),
+            "index": chart_data.get("index"),
+            "metadata": chart_data.get("metadata"),
+            "section_id": chart_data.get("section_id"),
+            "common_filters": chart_data.get("common_filters")
+        }
+
+        # Remove None values
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        try:
+            # Use PATCH to update the chart
+            self.dest.patch(f"/charts/{chart_id}", payload)
+            chart_title = chart_data.get("title") or chart_data.get("name") or "Untitled Chart"
+            self.log(f"Updated chart: {chart_title} ({chart_id})", "success")
+            return True
+        except Exception as e:
+            chart_title = chart_data.get("title") or chart_data.get("name") or "Untitled Chart"
+            self.log(f"Failed to update chart '{chart_title}': {e}", "error")
+            return False
+
     def create_chart(self, chart_data: Dict[str, Any]) -> Optional[str]:
         """
-        Create a chart in destination using POST /api/v1/charts/create.
-        
+        Create or update a chart in destination using POST /api/v1/charts/create or PATCH.
+
         Args:
             chart_data: Chart configuration dict
 
         Returns:
-            The created chart ID or None if failed
+            The created/updated chart ID or None if failed
         """
         chart_title = chart_data.get("title") or chart_data.get("name") or "Untitled Chart"
-        
+
         if self.config.migration.dry_run:
             self.log(f"[DRY RUN] Would create chart: {chart_title}", "info")
             return f"dry-run-{chart_data.get('id', 'chart-id')}"
@@ -238,11 +309,11 @@ class ChartMigrator(BaseMigrator):
 
         # Remove None values
         payload = {k: v for k, v in payload.items() if v is not None}
-        
+
         # If we have a source section title, ensure it exists in destination
         source_section_title = chart_data.get("_source_section_title")
         source_section_desc = chart_data.get("_source_section_description")
-        
+
         if source_section_title:
             dest_section_id = self._ensure_dest_section(source_section_title, source_section_desc)
             if dest_section_id:
@@ -255,6 +326,18 @@ class ChartMigrator(BaseMigrator):
         if not payload["series"]:
             self.log(f"Chart '{chart_title}' has no series, skipping", "warning")
             return None
+
+        # Check if chart already exists
+        existing_id = self.find_existing_chart(chart_title, payload.get("section_id"))
+
+        if existing_id:
+            if self.config.migration.skip_existing:
+                self.log(f"Chart '{chart_title}' already exists, skipping", "warning")
+                return existing_id
+            else:
+                self.log(f"Chart '{chart_title}' exists, updating...", "info")
+                success = self.update_chart(existing_id, chart_data)
+                return existing_id if success else None
 
         try:
             # Try to create

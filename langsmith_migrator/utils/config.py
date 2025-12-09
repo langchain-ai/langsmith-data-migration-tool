@@ -26,7 +26,7 @@ class MigrationConfig:
     batch_size: int = 100
     concurrent_workers: int = 4
     dry_run: bool = False
-    skip_existing: bool = True
+    skip_existing: bool = False
     resume_on_error: bool = True
     verbose: bool = False
 
@@ -39,7 +39,7 @@ class MigrationConfig:
 class Config:
     """Main configuration class that loads from environment variables."""
     
-    def __init__(self, 
+    def __init__(self,
                  source_api_key: Optional[str] = None,
                  dest_api_key: Optional[str] = None,
                  source_url: Optional[str] = None,
@@ -48,10 +48,11 @@ class Config:
                  batch_size: Optional[int] = None,
                  concurrent_workers: Optional[int] = None,
                  dry_run: bool = False,
+                 skip_existing: Optional[bool] = None,
                  verbose: bool = False):
         """
         Initialize configuration from CLI args, falling back to environment variables.
-        
+
         Args:
             source_api_key: Source instance API key (overrides env)
             dest_api_key: Destination instance API key (overrides env)
@@ -61,6 +62,7 @@ class Config:
             batch_size: Batch size for operations (overrides env)
             concurrent_workers: Number of concurrent workers (overrides env)
             dry_run: Whether to run in dry-run mode
+            skip_existing: If True, skip existing resources; if False, update them (overrides env)
             verbose: Whether to enable verbose logging
         """
         # Determine SSL verification setting
@@ -82,12 +84,15 @@ class Config:
         )
         
         # Migration settings
+        # Priority: CLI arg > env var > default (False, meaning update by default)
+        should_skip = skip_existing if skip_existing is not None else (os.getenv('MIGRATION_SKIP_EXISTING', 'false').lower() == 'true')
+
         self.migration = MigrationConfig(
             batch_size=batch_size or int(os.getenv('MIGRATION_BATCH_SIZE', '100')),
             concurrent_workers=concurrent_workers or int(os.getenv('MIGRATION_WORKERS', '4')),
             dry_run=dry_run or os.getenv('MIGRATION_DRY_RUN', 'false').lower() == 'true',
             verbose=verbose or os.getenv('MIGRATION_VERBOSE', 'false').lower() == 'true',
-            skip_existing=os.getenv('MIGRATION_SKIP_EXISTING', 'true').lower() != 'false',
+            skip_existing=should_skip,
             stream_examples=os.getenv('MIGRATION_STREAM_EXAMPLES', 'true').lower() != 'false',
             chunk_size=int(os.getenv('MIGRATION_CHUNK_SIZE', '1000')),
             rate_limit_delay=float(os.getenv('MIGRATION_RATE_LIMIT_DELAY', '0.1'))

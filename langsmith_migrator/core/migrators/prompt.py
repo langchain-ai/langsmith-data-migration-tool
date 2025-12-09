@@ -78,7 +78,7 @@ class PromptMigrator(BaseMigrator):
     def _get_api_url(self, base_url: str) -> str:
         """
         Prepare API URL for LangSmith Client.
-        
+
         The LangSmith Client expects the full API URL including /api/v1.
         The config.base_url already has /api/v1 appended by the orchestrator.
         """
@@ -87,6 +87,212 @@ class PromptMigrator(BaseMigrator):
         if not clean_url.endswith('/api/v1'):
             clean_url = f"{clean_url}/api/v1"
         return clean_url
+
+    def _parse_prompt_identifier(self, prompt_identifier: str) -> tuple[Optional[str], str, Optional[str]]:
+        """
+        Parse a prompt identifier into owner, repo, and commit.
+
+        Format: "owner/repo:commit" or "repo:commit" or "owner/repo" or "repo"
+
+        Returns:
+            Tuple of (owner, repo, commit)
+        """
+        commit = None
+        if ":" in prompt_identifier:
+            owner_repo, commit = prompt_identifier.split(":", 1)
+        else:
+            owner_repo = prompt_identifier
+
+        if "/" in owner_repo:
+            owner, repo = owner_repo.split("/", 1)
+            return owner, repo, commit
+        else:
+            return None, owner_repo, commit
+
+    def _pull_prompt_manifest(self, prompt_identifier: str, commit: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Pull a prompt manifest directly from the API without deserializing the model.
+
+        This uses the /commits/{owner}/{repo}/{commit} endpoint to get the raw manifest,
+        which includes the model configuration without trying to instantiate it.
+
+        Args:
+            prompt_identifier: Prompt repo handle (e.g., "owner/repo" or "repo")
+            commit: Specific commit hash or "latest" (default: "latest")
+
+        Returns:
+            Dict containing 'commit_hash' and 'manifest', or None if failed
+        """
+        owner, repo, id_commit = self._parse_prompt_identifier(prompt_identifier)
+        commit = commit or id_commit or "latest"
+
+        # Build the API URL - use "-" for owner if not specified (means current user's workspace)
+        owner_path = owner if owner else "-"
+        endpoint = f"/commits/{owner_path}/{repo}/{commit}"
+
+        # Add include_model=true to get the full manifest with model config
+        params = {"include_model": "true"}
+
+        try:
+            url = f"{self._get_api_url(self.config.source.base_url)}{endpoint}"
+            headers = {"x-api-key": self.config.source.api_key}
+
+            session = requests.Session()
+            if not self.config.source.verify_ssl:
+                session.verify = False
+
+            response = session.get(url, headers=headers, params=params, timeout=30)
+            response.raise_for_status()
+
+            data = response.json()
+            return {
+                "commit_hash": data.get("commit_hash"),
+                "manifest": data.get("manifest"),
+            }
+        except Exception as e:
+            self.log(f"Failed to pull prompt manifest for {prompt_identifier}: {e}", "error")
+            return None
+
+    def _get_latest_commit_hash(self, prompt_identifier: str) -> Optional[str]:
+        """
+        Get the latest commit hash for a prompt from destination.
+        
+        Args:
+            prompt_identifier: Prompt repo handle
+            
+        Returns:
+            The latest commit hash, or None if not found
+        """
+        owner, repo, _ = self._parse_prompt_identifier(prompt_identifier)
+        owner_path = owner if owner else "-"
+        
+        try:
+            url = f"{self._get_api_url(self.config.destination.base_url)}/commits/{owner_path}/{repo}/latest"
+            headers = {"x-api-key": self.config.destination.api_key}
+            
+            session = requests.Session()
+            if not self.config.destination.verify_ssl:
+                session.verify = False
+            
+            response = session.get(url, headers=headers, timeout=30)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            
+            data = response.json()
+            return data.get("commit_hash")
+        except Exception as e:
+            self.log(f"Could not get latest commit for {prompt_identifier}: {e}", "warning")
+            return None
+
+    def _push_prompt_manifest(
+        self,
+        prompt_identifier: str,
+        manifest: Dict[str, Any],
+        parent_commit: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        auto_parent: bool = True
+    ) -> Optional[str]:
+        """
+        Push a prompt manifest directly to the API.
+
+        This uses the /commits/{owner}/{repo} endpoint to create a commit with the raw manifest,
+        preserving the model configuration without trying to instantiate it.
+
+        Args:
+            prompt_identifier: Prompt repo handle (e.g., "owner/repo" or "repo")
+            manifest: The prompt manifest dict (includes model config)
+            parent_commit: Parent commit hash (optional)
+            metadata: Optional dict with description, readme, tags, is_public for repo creation
+            auto_parent: If True, automatically get latest commit as parent if not provided
+
+        Returns:
+            The commit hash of the created commit, or None if failed
+        """
+        owner, repo, _ = self._parse_prompt_identifier(prompt_identifier)
+        metadata = metadata or {}
+
+        # Step 1: Ensure the prompt repo exists
+        try:
+            self.log(f"Ensuring prompt repo exists: {prompt_identifier}", "info")
+            self.dest_ls_client.create_prompt(
+                prompt_identifier,
+                description=metadata.get('description', ''),
+                readme=metadata.get('readme', ''),
+                tags=metadata.get('tags', []),
+                is_public=metadata.get('is_public', False)
+            )
+            self.log(f"Created prompt repo: {prompt_identifier}", "success")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "already exists" in error_str or "409" in error_str or "conflict" in error_str:
+                self.log(f"Prompt repo already exists: {prompt_identifier}", "info")
+            else:
+                self.log(f"Could not create prompt repo (may already exist): {e}", "warning")
+
+        # Step 2: Get the latest commit hash from destination to use as parent
+        # This is required to create a new commit on an existing repo
+        if parent_commit is None and auto_parent:
+            parent_commit = self._get_latest_commit_hash(prompt_identifier)
+            if parent_commit:
+                self.log(f"Using destination's latest commit as parent: {parent_commit[:16]}...", "info")
+
+        # Step 3: Create a commit with the manifest
+        owner_path = owner if owner else "-"
+        endpoint = f"/commits/{owner_path}/{repo}"
+
+        payload = {
+            "manifest": manifest,
+        }
+        if parent_commit:
+            payload["parent_commit"] = parent_commit
+
+        try:
+            url = f"{self._get_api_url(self.config.destination.base_url)}{endpoint}"
+            headers = {
+                "x-api-key": self.config.destination.api_key,
+                "Content-Type": "application/json"
+            }
+
+            session = requests.Session()
+            if not self.config.destination.verify_ssl:
+                session.verify = False
+
+            response = session.post(url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+
+            data = response.json()
+            commit_hash = data.get("commit", {}).get("commit_hash")
+            self.log(f"Created commit: {commit_hash}", "success")
+            return commit_hash
+        except requests.exceptions.HTTPError as e:
+            error_detail = ""
+            error_dict = {}
+            try:
+                error_dict = e.response.json()
+                error_detail = error_dict.get("detail", error_dict.get("error", str(error_dict)))
+            except:
+                error_detail = e.response.text[:500] if e.response else ""
+
+            # Check for "nothing to commit" (already up to date) - various phrasings
+            if e.response and e.response.status_code == 409:
+                error_lower = str(error_detail).lower()
+                # Check for explicit "nothing to commit" messages
+                if any(phrase in error_lower for phrase in ["nothing to commit", "no changes", "already up to date", "identical"]):
+                    self.log(f"Prompt already up to date: {prompt_identifier}", "info")
+                    return "already_up_to_date"
+                # If we got a 409 with parent commit set and empty/minimal error detail,
+                # it likely means the manifest is identical (nothing to commit)
+                if parent_commit and (not error_detail or error_detail == "{}" or len(error_detail) < 10):
+                    self.log(f"Prompt already up to date (409 with matching parent): {prompt_identifier}", "info")
+                    return "already_up_to_date"
+
+            self.log(f"Failed to push prompt manifest: {e}", "error")
+            self.log(f"  Error detail: {error_detail}", "error")
+            return None
+        except Exception as e:
+            self.log(f"Failed to push prompt manifest: {e}", "error")
+            return None
 
     def _push_prompt_direct(self, prompt_identifier: str, prompt_obj: Any, parent_commit_hash: Optional[str] = None, prompt_metadata: Optional[Dict] = None) -> str:
         """
@@ -234,6 +440,29 @@ class PromptMigrator(BaseMigrator):
             self.log(f"Failed to get commits for prompt {prompt_identifier}: {e}", "error")
             return []
 
+    def find_existing_prompt(self, prompt_identifier: str) -> bool:
+        """
+        Check if a prompt already exists in the destination.
+
+        Args:
+            prompt_identifier: The prompt repo handle (e.g., "username/prompt-name")
+
+        Returns:
+            True if the prompt exists, False otherwise
+        """
+        try:
+            # Try to list prompts and find a match by repo_handle
+            response = self.dest_ls_client.list_prompts(limit=100)
+            if response and hasattr(response, 'repos'):
+                for prompt in response.repos:
+                    if prompt.repo_handle == prompt_identifier:
+                        return True
+            return False
+        except Exception as e:
+            # If we can't check, assume it doesn't exist and let push_prompt handle it
+            self.log(f"Could not check if prompt exists: {e}", "warning")
+            return False
+
     def migrate_prompt(
         self,
         prompt_identifier: str,
@@ -253,6 +482,16 @@ class PromptMigrator(BaseMigrator):
             self.log(f"[DRY RUN] Would migrate prompt: {prompt_identifier}")
             return prompt_identifier
 
+        # Check if prompt already exists
+        exists = self.find_existing_prompt(prompt_identifier)
+
+        if exists:
+            if self.config.migration.skip_existing:
+                self.log(f"Prompt '{prompt_identifier}' already exists, skipping", "warning")
+                return prompt_identifier
+            else:
+                self.log(f"Prompt '{prompt_identifier}' exists, updating with new commits...", "info")
+
         try:
             self.log(f"Migrating prompt: {prompt_identifier}", "info")
 
@@ -265,49 +504,30 @@ class PromptMigrator(BaseMigrator):
                 for i, commit in enumerate(commits):
                     try:
                         commit_hash = commit['commit_hash']
-                        self.log(f"Attempting to pull commit {commit_hash[:16]}...", "info")
+                        self.log(f"Pulling commit {commit_hash[:16]} manifest...", "info")
 
-                        # Try the prompt:commit format (common in LangSmith)
-                        prompt_obj = self.source_ls_client.pull_prompt(f"{prompt_identifier}:{commit_hash}")
+                        # Use direct API to get raw manifest (includes model config without instantiating it)
+                        manifest_data = self._pull_prompt_manifest(prompt_identifier, commit_hash)
 
-                        if not prompt_obj:
-                            self.log(f"Pull returned empty object for commit {commit_hash[:16]}", "warning")
+                        if not manifest_data or not manifest_data.get('manifest'):
+                            self.log(f"Pull returned empty manifest for commit {commit_hash[:16]}", "warning")
                             continue
 
                         parent_hash = commit['parent_commit_hash'] if i > 0 else None
 
-                        try:
-                            new_commit_hash = self.dest_ls_client.push_prompt(
-                                prompt_identifier,
-                                object=prompt_obj,
-                                parent_commit_hash=parent_hash
-                            )
+                        # Push manifest directly to destination
+                        new_commit_hash = self._push_prompt_manifest(
+                            prompt_identifier,
+                            manifest_data['manifest'],
+                            parent_commit=parent_hash
+                        )
 
-                            self.log(f"Migrated commit {commit_hash[:16]} -> {new_commit_hash[:16] if new_commit_hash else 'unknown'}", "success")
+                        if new_commit_hash:
+                            self.log(f"Migrated commit {commit_hash[:16]} -> {new_commit_hash[:16] if new_commit_hash != 'already_up_to_date' else 'already up to date'}", "success")
                             commits_migrated += 1
-                        except (json.JSONDecodeError, requests.exceptions.JSONDecodeError) as jde:
-                            # SDK's _prompt_exists check failed - try using direct API approach
-                            self.log(f"SDK existence check failed, trying alternative approach...", "warning")
-                            try:
-                                new_commit_hash = self._push_prompt_direct(
-                                    prompt_identifier,
-                                    prompt_obj,
-                                    parent_hash
-                                )
-                                self.log(f"Migrated commit {commit_hash[:16]} using direct API -> {new_commit_hash[:16] if new_commit_hash else 'unknown'}", "success")
-                                commits_migrated += 1
-                            except Exception as direct_error:
-                                self.log(f"Direct API push also failed for commit {commit['commit_hash'][:16]}: {direct_error}", "warning")
-                                continue
+                        else:
+                            self.log(f"Failed to push commit {commit_hash[:16]}", "warning")
 
-                    except (json.JSONDecodeError, requests.exceptions.JSONDecodeError) as e:
-                        self.log(f"JSON decode error for commit {commit['commit_hash'][:16]}: {e}", "warning")
-                        self.log(f"This may indicate the prompt format is incompatible or the SDK version mismatch", "warning")
-                        continue
-                    except AttributeError as e:
-                        self.log(f"SDK attribute error for commit {commit['commit_hash'][:16]}: {e}", "warning")
-                        self.log(f"SDK may not support this prompt format", "warning")
-                        continue
                     except Exception as e:
                         self.log(f"Failed to migrate commit {commit['commit_hash'][:16]}: {e}", "warning")
                         import traceback
@@ -318,71 +538,45 @@ class PromptMigrator(BaseMigrator):
                 # Fallback: if no commits were successfully migrated, try latest version
                 if commits_migrated == 0:
                     self.log(f"No commits migrated, falling back to latest version", "warning")
-                    try:
-                        prompt_obj = self.source_ls_client.pull_prompt(prompt_identifier)
+                    manifest_data = self._pull_prompt_manifest(prompt_identifier, "latest")
 
-                        if not prompt_obj:
-                            raise ValueError("pull_prompt returned empty object")
+                    if not manifest_data or not manifest_data.get('manifest'):
+                        raise ValueError("Failed to pull prompt manifest")
 
-                        try:
-                            new_commit_hash = self.dest_ls_client.push_prompt(
-                                prompt_identifier,
-                                object=prompt_obj
-                            )
-                        except (json.JSONDecodeError, requests.exceptions.JSONDecodeError) as jde:
-                            # SDK's _prompt_exists check failed - try using direct API approach
-                            self.log(f"SDK existence check failed, trying alternative approach...", "warning")
-                            new_commit_hash = self._push_prompt_direct(
-                                prompt_identifier,
-                                prompt_obj,
-                                None
-                            )
+                    new_commit_hash = self._push_prompt_manifest(
+                        prompt_identifier,
+                        manifest_data['manifest']
+                    )
 
-                        self.log(f"Migrated prompt (latest only): {prompt_identifier} (commit: {new_commit_hash[:16] if new_commit_hash else 'unknown'})", "success")
+                    if new_commit_hash:
+                        self.log(f"Migrated prompt (latest only): {prompt_identifier}", "success")
                         return prompt_identifier
-                    except (json.JSONDecodeError, requests.exceptions.JSONDecodeError) as jde:
-                        self.log(f"Fallback migration failed: JSON decode error during SDK operation", "error")
-                        self.log(f"This prompt may not be accessible via the SDK or may be in an incompatible format", "error")
-                        self.log(f"Hint: These prompts might be created via API and not accessible through the prompt hub", "warning")
-                        raise ValueError(f"Prompt not accessible via SDK: {jde}")
-                    except Exception as fallback_error:
-                        self.log(f"Fallback migration also failed: {fallback_error}", "error")
-                        raise
+                    else:
+                        raise ValueError("Failed to push prompt manifest")
                 else:
                     self.log(f"Successfully migrated {commits_migrated}/{len(commits)} commits", "success")
             else:
-                # Migrate only latest version
-                self.log(f"Pulling latest version of {prompt_identifier}", "info")
-                try:
-                    prompt_obj = self.source_ls_client.pull_prompt(prompt_identifier)
+                # Migrate only latest version using direct API (doesn't instantiate models)
+                self.log(f"Pulling latest version of {prompt_identifier} (manifest)...", "info")
 
-                    if not prompt_obj:
-                        raise ValueError("pull_prompt returned empty object")
+                manifest_data = self._pull_prompt_manifest(prompt_identifier, "latest")
 
-                    self.log(f"Pushing to destination...", "info")
-                    try:
-                        new_commit_hash = self.dest_ls_client.push_prompt(
-                            prompt_identifier,
-                            object=prompt_obj
-                        )
-                    except (json.JSONDecodeError, requests.exceptions.JSONDecodeError) as jde:
-                        # SDK's _prompt_exists check failed - try using direct API approach
-                        self.log(f"SDK existence check failed, trying alternative approach...", "warning")
-                        new_commit_hash = self._push_prompt_direct(
-                            prompt_identifier,
-                            prompt_obj,
-                            None
-                        )
+                if not manifest_data or not manifest_data.get('manifest'):
+                    raise ValueError("Failed to pull prompt manifest - prompt may not exist or be inaccessible")
 
-                    self.log(f"Migrated prompt: {prompt_identifier} (commit: {new_commit_hash[:16] if new_commit_hash else 'unknown'})", "success")
-                except (json.JSONDecodeError, requests.exceptions.JSONDecodeError) as e:
-                    self.log(f"JSON decode error: {e}", "error")
-                    self.log(f"This prompt may not be accessible via the SDK or may be in an incompatible format", "error")
-                    self.log(f"Hint: These prompts might be created via API and not accessible through the prompt hub", "warning")
-                    raise ValueError(f"Prompt not accessible via SDK: {e}")
-                except Exception as e:
-                    self.log(f"Error during pull/push: {e}", "error")
-                    raise
+                self.log(f"Pushing manifest to destination...", "info")
+                new_commit_hash = self._push_prompt_manifest(
+                    prompt_identifier,
+                    manifest_data['manifest']
+                )
+
+                if new_commit_hash:
+                    if new_commit_hash == "already_up_to_date":
+                        self.log(f"Prompt already up to date: {prompt_identifier}", "success")
+                    else:
+                        self.log(f"Migrated prompt: {prompt_identifier} (commit: {new_commit_hash[:16]})", "success")
+                else:
+                    raise ValueError("Failed to push prompt manifest")
 
             return prompt_identifier
 

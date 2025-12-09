@@ -52,6 +52,26 @@ class DatasetMigrator(BaseMigrator):
 
         return None
 
+    def update_dataset(self, dataset_id: str, dataset: Dict[str, Any]) -> None:
+        """Update existing dataset in destination."""
+        if self.config.migration.dry_run:
+            self.log(f"[DRY RUN] Would update dataset: {dataset['name']} ({dataset_id})")
+            return
+
+        payload = {
+            "name": dataset["name"],
+            "description": dataset.get("description") or "",
+            "inputs_schema_definition": dataset.get("inputs_schema_definition"),
+            "outputs_schema_definition": dataset.get("outputs_schema_definition"),
+            "transformations": dataset.get("transformations") or [],
+        }
+        
+        # Remove None values
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        self.dest.patch(f"/datasets/{dataset_id}", payload)
+        self.log(f"Updated dataset: {dataset['name']} ({dataset_id})", "success")
+
     def create_dataset(self, dataset: Dict[str, Any]) -> str:
         """Create dataset in destination."""
         if self.config.migration.dry_run:
@@ -109,6 +129,11 @@ class DatasetMigrator(BaseMigrator):
                     continue
 
                 # Download the attachment content streaming to a temp file
+                # Suppress SSL warnings if verification is disabled
+                if not self.source.verify_ssl:
+                    import urllib3
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
                 with requests.get(presigned_url, verify=self.source.verify_ssl, timeout=60, stream=True) as response:
                     response.raise_for_status()
                     
@@ -133,6 +158,88 @@ class DatasetMigrator(BaseMigrator):
                 continue
 
         return downloaded
+
+    def _create_example_individual_with_attachments(
+        self,
+        dataset_id: str,
+        example_data: Dict[str, Any],
+        attachments: Dict[str, tuple]
+    ) -> Optional[str]:
+        """
+        Create a single example with attachments using direct API (fallback method).
+
+        Args:
+            dataset_id: Destination dataset ID
+            example_data: Example data dict with inputs, outputs, metadata
+            attachments: Dict mapping attachment name to (mime_type, data) tuple
+
+        Returns:
+            Created example ID or None if failed
+        """
+        try:
+            # First, create the example without attachments using direct API
+            payload = {
+                "dataset_id": dataset_id,
+                "inputs": example_data.get("inputs", {}),
+                "outputs": example_data.get("outputs", {}),
+                "metadata": example_data.get("metadata", {}),
+            }
+
+            # Use POST /examples (singular) to create one example
+            response = self.dest.post("/examples", payload)
+            example_id = response.get("id")
+
+            if not example_id:
+                self.log("Failed to create example: no ID returned", "error")
+                return None
+
+            self.log(f"Created example {example_id}, now uploading {len(attachments)} attachment(s)", "info")
+
+            # Now upload attachments one by one
+            # This requires getting presigned URLs for upload
+            for att_name, (mime_type, data) in attachments.items():
+                try:
+                    # Get presigned URL for upload
+                    upload_url_response = self.dest.post(
+                        f"/examples/{example_id}/attachments",
+                        {
+                            "name": att_name,
+                            "content_type": mime_type,
+                        }
+                    )
+
+                    presigned_url = upload_url_response.get("presigned_url") or upload_url_response.get("upload_url")
+
+                    if not presigned_url:
+                        self.log(f"No presigned URL for attachment {att_name}", "warning")
+                        continue
+
+                    # Upload attachment data to presigned URL
+                    import requests
+                    # Suppress SSL warnings if verification is disabled
+                    if not self.dest.verify_ssl:
+                        import urllib3
+                        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+                    upload_response = requests.put(
+                        presigned_url,
+                        data=data,
+                        headers={"Content-Type": mime_type},
+                        verify=self.dest.verify_ssl
+                    )
+                    upload_response.raise_for_status()
+
+                    self.log(f"Uploaded attachment {att_name} for example {example_id}", "success")
+
+                except Exception as att_error:
+                    self.log(f"Failed to upload attachment {att_name}: {att_error}", "warning")
+                    # Continue with other attachments even if one fails
+
+            return example_id
+
+        except Exception as e:
+            self.log(f"Individual example creation failed: {e}", "error")
+            return None
 
     def create_examples_with_attachments(
         self,
@@ -161,10 +268,28 @@ class DatasetMigrator(BaseMigrator):
         # SDK expects base URL without /api/v1 suffix
         sdk_url = self.dest.base_url.replace("/api/v1", "")
         api_key = self.dest.headers.get("X-API-Key") or self.dest.headers.get("x-api-key", "")
-        client = Client(
-            api_url=sdk_url,
-            api_key=api_key,
-        )
+
+        # Create client kwargs
+        client_kwargs = {
+            "api_url": sdk_url,
+            "api_key": api_key,
+            "info": {}  # Skip automatic /info fetch to avoid compatibility issues
+        }
+
+        # Add custom session with SSL verification disabled if needed
+        if not self.config.destination.verify_ssl:
+            import requests
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+            # Create session with SSL verification disabled
+            session = requests.Session()
+            session.verify = False
+            client_kwargs["session"] = session
+
+            self.log("SSL verification disabled for LangSmith SDK client", "info")
+
+        client = Client(**client_kwargs)
 
         id_mapping = {}
 
@@ -228,9 +353,34 @@ class DatasetMigrator(BaseMigrator):
 
             except Exception as e:
                 import traceback
-                self.log(f"Failed to create example {original_id} with attachments: {e}", "error")
-                self.log(f"Traceback: {traceback.format_exc()}", "error")
-                continue
+                error_str = str(e)
+
+                # Check if it's a 405 error (endpoint not allowed)
+                if "405" in error_str or "Not Allowed" in error_str:
+                    self.log(f"Bulk endpoint not allowed, falling back to individual creation for {original_id}", "warning")
+
+                    # Fall back to individual example creation
+                    try:
+                        # Convert SDK Attachment objects to (mime_type, data) tuples
+                        attachment_tuples = {}
+                        for att_name, attachment_obj in sdk_attachments.items():
+                            attachment_tuples[att_name] = (attachment_obj.mime_type, attachment_obj.data)
+
+                        new_id = self._create_example_individual_with_attachments(
+                            dataset_id,
+                            example_data,
+                            attachment_tuples
+                        )
+                        if new_id:
+                            id_mapping[original_id] = str(new_id)
+                            self.log(f"Created example with attachments (fallback): {original_id} -> {new_id}", "success")
+                    except Exception as fallback_error:
+                        self.log(f"Fallback creation also failed for {original_id}: {fallback_error}", "error")
+                        continue
+                else:
+                    self.log(f"Failed to create example {original_id} with attachments: {e}", "error")
+                    self.log(f"Traceback: {traceback.format_exc()}", "error")
+                    continue
             finally:
                 # Clean up temp files for this example
                 for path in temp_files_to_cleanup:
@@ -376,15 +526,20 @@ class DatasetMigrator(BaseMigrator):
         dataset = self.get_dataset(dataset_id)
 
         # Check if already exists
-        if self.config.migration.skip_existing:
-            existing_id = self.find_existing_dataset(dataset["name"])
-            if existing_id:
+        existing_id = self.find_existing_dataset(dataset["name"])
+        
+        if existing_id:
+            if self.config.migration.skip_existing:
                 self.log(f"Dataset '{dataset['name']}' already exists, skipping", "warning")
                 return existing_id, {}
-
-        # Create dataset
-        new_dataset_id = self.create_dataset(dataset)
-        self.log(f"Created dataset: {dataset['name']} -> {new_dataset_id}", "success")
+            else:
+                self.log(f"Dataset '{dataset['name']}' exists, updating...", "info")
+                self.update_dataset(existing_id, dataset)
+                new_dataset_id = existing_id
+        else:
+            # Create dataset
+            new_dataset_id = self.create_dataset(dataset)
+            self.log(f"Created dataset: {dataset['name']} -> {new_dataset_id}", "success")
 
         # Migrate examples if requested
         example_mapping = {}

@@ -65,9 +65,10 @@ def ensure_config(config: Config) -> bool:
 @click.option('--batch-size', type=int, help='Batch size for operations')
 @click.option('--workers', type=int, help='Number of concurrent workers')
 @click.option('--dry-run', is_flag=True, help='Run in dry-run mode (no changes)')
+@click.option('--skip-existing', is_flag=True, help='Skip existing resources instead of updating them')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
 @click.pass_context
-def cli(ctx, source_key, dest_key, source_url, dest_url, no_ssl, batch_size, workers, dry_run, verbose):
+def cli(ctx, source_key, dest_key, source_url, dest_url, no_ssl, batch_size, workers, dry_run, skip_existing, verbose):
     """LangSmith Migration Tool - Migrate data between LangSmith instances."""
     ctx.ensure_object(dict)
 
@@ -81,6 +82,7 @@ def cli(ctx, source_key, dest_key, source_url, dest_url, no_ssl, batch_size, wor
         batch_size=batch_size,
         concurrent_workers=workers,
         dry_run=dry_run,
+        skip_existing=skip_existing if skip_existing else None,
         verbose=verbose
     )
 
@@ -579,8 +581,9 @@ def list_projects(ctx, source, dest):
 @click.option('--all', 'select_all', is_flag=True, help='Migrate all rules')
 @click.option('--strip-projects', is_flag=True, help='Strip project associations and create as global rules')
 @click.option('--project-mapping', type=str, help='JSON string or file path with project ID mapping (e.g., \'{"old-id": "new-id"}\')')
+@click.option('--create-enabled', is_flag=True, help='Create rules as enabled (default is disabled to bypass API key/secrets validation)')
 @click.pass_context
-def rules(ctx, select_all, strip_projects, project_mapping):
+def rules(ctx, select_all, strip_projects, project_mapping, create_enabled):
     """Migrate project rules (automation rules)."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -729,20 +732,33 @@ def rules(ctx, select_all, strip_projects, project_mapping):
             rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
             has_project = bool(rule.get('session_id'))
             has_dataset = bool(rule.get('dataset_id'))
+            has_evaluators = bool(rule.get('evaluators') or rule.get('evaluator_prompt_handle'))
 
-            if has_project and not strip_projects:
-                console.print(f"[yellow]⊘[/yellow] Skipped: {rule_name} (project-specific)")
-                skipped_count += 1
-                continue
-
-            result = rules_migrator.create_rule(rule, strip_project_reference=strip_projects)
+            # Let create_rule handle all mapping logic - it will:
+            # 1. Map source project IDs to destination (creating projects if ensure_project=True)
+            # 2. Map source dataset IDs to destination
+            # 3. Handle strip_project_reference if requested
+            # By default, create rules as disabled to bypass secrets validation
+            create_disabled = not create_enabled
+            result = rules_migrator.create_rule(rule, strip_project_reference=strip_projects, create_disabled=create_disabled)
             if result:
                 console.print(f"[green]✓[/green] Migrated: {rule_name}")
                 success_count += 1
             else:
-                # Result is None - check if it was logged as skipped
-                console.print(f"[yellow]⊘[/yellow] Skipped: {rule_name} (cannot migrate without project or dataset)")
-                skipped_count += 1
+                # Result is None - could be validation error, API error, or missing mapping
+                # Check common causes and provide helpful feedback
+                if not has_dataset and not has_project:
+                    console.print(f"[yellow]⊘[/yellow] Skipped: {rule_name} (no dataset or project)")
+                    skipped_count += 1
+                elif has_project and not has_dataset:
+                    console.print(f"[yellow]⊘[/yellow] Skipped: {rule_name} (project not found in destination)")
+                    skipped_count += 1
+                elif has_evaluators:
+                    console.print(f"[red]✗[/red] Failed: {rule_name} (check prompts exist on destination)")
+                    failed_count += 1
+                else:
+                    console.print(f"[red]✗[/red] Failed: {rule_name} (see verbose logs)")
+                    failed_count += 1
         except Exception as e:
             rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
             console.print(f"[red]✗[/red] Failed {rule_name}: {e}")
@@ -754,6 +770,13 @@ def rules(ctx, select_all, strip_projects, project_mapping):
         console.print(f"  [yellow]Skipped: {skipped_count}[/yellow]")
     if failed_count > 0:
         console.print(f"  [red]Failed: {failed_count}[/red]")
+    
+    # Show helpful message about disabled rules
+    if success_count > 0 and not create_enabled:
+        console.print(f"\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
+        console.print(f"  To enable rules:")
+        console.print(f"  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
+        console.print(f"  2. Enable each rule in the LangSmith UI or use --create-enabled flag")
 
     orchestrator.cleanup()
 
@@ -793,6 +816,9 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
     console.print("[bold cyan]LangSmith Data Migration Wizard[/bold cyan]\n")
     console.print("This wizard will guide you through migrating all your data.\n")
 
+    # Track dataset ID mappings for use in rules migration
+    dataset_id_mapping = {}
+
     # 1. Datasets and Experiments
     if not skip_datasets:
         console.print("[bold]Step 1: Datasets[/bold]")
@@ -816,7 +842,7 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 
                 try:
                     dataset_ids = [d["id"] for d in datasets]
-                    orchestrator.migrate_datasets_parallel(dataset_ids, include_examples=True, include_experiments=include_exp)
+                    dataset_id_mapping = orchestrator.migrate_datasets_parallel(dataset_ids, include_examples=True, include_experiments=include_exp)
                     console.print("[green]✓ Datasets migrated successfully[/green]\n")
                 except Exception as e:
                     console.print(f"[red]✗ Dataset migration failed: {e}[/red]\n")
@@ -911,9 +937,10 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
     else:
         console.print("[dim]Skipping queues (--skip-queues)[/dim]\n")
 
-    # 4. Rules
+    # 4. Rules (evaluators)
     if not skip_rules:
-        console.print("[bold]Step 4: Project Rules[/bold]")
+        console.print("[bold]Step 4: Rules (Evaluators)[/bold]")
+        console.print("[dim]Note: LLM evaluators reference prompts via hub_ref. Prompts were migrated in Step 2.[/dim]")
         console.print("Fetching rules... ", end="")
         from ..core.migrators import RulesMigrator
         rules_migrator = RulesMigrator(
@@ -922,10 +949,24 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
             None,
             config
         )
+
+        # Pass dataset ID mapping from Step 1 so rules can reference correct destination datasets
+        if dataset_id_mapping:
+            rules_migrator._dataset_id_map = dataset_id_mapping
+            console.print(f"[dim]Using dataset mapping from Step 1 ({len(dataset_id_mapping)} dataset(s))[/dim]")
+
         rules = rules_migrator.list_rules()
 
         if rules:
             console.print(f"found {len(rules)}")
+
+            # Check for rules with LLM evaluators
+            rules_with_evaluators = [r for r in rules if r.get('evaluators') or r.get('evaluator_prompt_handle')]
+            rules_with_code_evaluators = [r for r in rules if r.get('code_evaluators')]
+            if rules_with_evaluators:
+                console.print(f"[dim]  - {len(rules_with_evaluators)} rule(s) have LLM evaluators[/dim]")
+            if rules_with_code_evaluators:
+                console.print(f"[dim]  - {len(rules_with_code_evaluators)} rule(s) have code evaluators[/dim]")
 
             # Check for project-specific rules
             project_specific = [r for r in rules if r.get('session_id')]
@@ -948,15 +989,13 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
                 for rule in rules:
                     try:
                         has_project = bool(rule.get('session_id'))
+                        has_dataset = bool(rule.get('dataset_id'))
+                        has_evaluators = bool(rule.get('evaluators') or rule.get('evaluator_prompt_handle'))
                         rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
 
-                        if has_project and not strip and not ensure_projects:
-                            console.print(f"[yellow]⊘[/yellow] {rule_name} (project-specific, skipping)")
-                            skipped_count += 1
-                            continue
-
+                        # Let create_rule handle all mapping - it auto-creates missing projects if ensure_projects=True
                         result = rules_migrator.create_rule(
-                            rule, 
+                            rule,
                             strip_project_reference=strip,
                             ensure_project=ensure_projects
                         )
@@ -964,8 +1003,19 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
                             console.print(f"[green]✓[/green] {rule_name}")
                             success_count += 1
                         else:
-                            console.print(f"[red]✗[/red] {rule_name}")
-                            failed_count += 1
+                            # Result is None - provide helpful error context
+                            if not has_dataset and not has_project:
+                                console.print(f"[yellow]⊘[/yellow] {rule_name} (no dataset or project)")
+                                skipped_count += 1
+                            elif has_project and not has_dataset and not ensure_projects:
+                                console.print(f"[yellow]⊘[/yellow] {rule_name} (project not found in destination)")
+                                skipped_count += 1
+                            elif has_evaluators:
+                                console.print(f"[red]✗[/red] {rule_name} (check prompts exist on destination)")
+                                failed_count += 1
+                            else:
+                                console.print(f"[red]✗[/red] {rule_name} (see verbose logs)")
+                                failed_count += 1
                     except Exception as e:
                         rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
                         console.print(f"[red]✗[/red] {rule_name}: {e}")

@@ -1,7 +1,7 @@
 [project]
 name = "langsmith-data-migration-tool"
-version = "0.0.1"
-description = "A tool for migrating datasets, experiments, and annotation queues between LangSmith instances"
+version = "0.0.2"
+description = "A tool for migrating datasets, experiments, prompts, rules, and annotation queues between LangSmith instances"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {file = "LICENSE"}
@@ -26,6 +26,9 @@ dependencies = [
     "langsmith>=0.1.0",
     "python-dotenv>=1.0.0",
     "langchain-core>=1.1.0",
+    # Model packages required for pulling prompts with include_model=True
+    "langchain-openai>=0.1.0",
+    "langchain-anthropic>=0.1.0",
 ]
 
 [project.urls]
@@ -44,6 +47,24 @@ test = [
     "pytest-cov>=4.0.0",
     "httpx>=0.24.0",
     "respx>=0.20.0",
+]
+# Additional model providers for pulling prompts with include_model=True
+models = [
+    "langchain-google-genai>=1.0.0",
+    "langchain-mistralai>=0.1.0",
+    "langchain-aws>=0.1.0",
+    "langchain-fireworks>=0.1.0",
+    "langchain-groq>=0.1.0",
+    "langchain-cohere>=0.1.0",
+]
+# All model providers
+all = [
+    "langchain-google-genai>=1.0.0",
+    "langchain-mistralai>=0.1.0",
+    "langchain-aws>=0.1.0",
+    "langchain-fireworks>=0.1.0",
+    "langchain-groq>=0.1.0",
+    "langchain-cohere>=0.1.0",
 ]
 
 [tool.pytest.ini_options]

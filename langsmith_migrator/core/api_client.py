@@ -168,6 +168,31 @@ class EnhancedAPIClient:
         response = self.session.post(url, json=data, timeout=self.timeout)
         return self._handle_response(response, endpoint)
 
+    @retry_on_failure(max_retries=1)  # Reduce retries for PATCH - if it fails once, likely to keep failing
+    def patch(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Make a PATCH request.
+
+        Args:
+            endpoint: API endpoint
+            data: JSON data to send
+
+        Returns:
+            JSON response as dictionary
+        """
+        url = self._prepare_url(endpoint)
+
+        if self.verbose:
+            self.console.print(f"[dim]PATCH {url}[/dim]")
+
+        # Add rate limiting delay
+        if self.rate_limit_delay > 0:
+            time.sleep(self.rate_limit_delay)
+
+        # Use shorter timeout for PATCH - if it's slow, server is likely overloaded
+        response = self.session.patch(url, json=data, timeout=15)
+        return self._handle_response(response, endpoint)
+
     def get_paginated(
         self,
         endpoint: str,

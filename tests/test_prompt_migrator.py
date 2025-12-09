@@ -55,7 +55,7 @@ class TestPromptMigrator:
         mock_prompt_obj.num_commits = 3
         mock_prompt_obj.updated_at = '2024-01-01T00:00:00Z'
         
-        mock_response.prompts = [mock_prompt_obj]
+        mock_response.repos = [mock_prompt_obj]
         prompt_migrator.source_ls_client.list_prompts.return_value = mock_response
 
         result = prompt_migrator.list_prompts()
@@ -67,7 +67,7 @@ class TestPromptMigrator:
     def test_list_prompts_empty(self, prompt_migrator):
         """Test listing prompts when none exist."""
         mock_response = Mock()
-        mock_response.prompts = []
+        mock_response.repos = []
         prompt_migrator.source_ls_client.list_prompts.return_value = mock_response
 
         result = prompt_migrator.list_prompts()
@@ -84,51 +84,66 @@ class TestPromptMigrator:
         prompt_migrator.dest_ls_client.push_prompt.assert_not_called()
 
     def test_migrate_prompt_success(self, prompt_migrator, sample_config):
-        """Test successful prompt migration."""
+        """Test successful prompt migration using direct API (manifest-based)."""
         sample_config.migration.dry_run = False
-        
-        mock_prompt_obj = Mock()
-        prompt_migrator.source_ls_client.pull_prompt.return_value = mock_prompt_obj
-        prompt_migrator.dest_ls_client.push_prompt.return_value = 'commit-hash-123'
+
+        # Mock the direct API methods that use raw manifests (no model instantiation)
+        mock_manifest = {"id": ["langchain", "schema", "runnable", "RunnableSequence"], "kwargs": {}}
+        prompt_migrator._pull_prompt_manifest = Mock(return_value={
+            "commit_hash": "abc123",
+            "manifest": mock_manifest
+        })
+        prompt_migrator._push_prompt_manifest = Mock(return_value="new-commit-hash-123")
 
         result = prompt_migrator.migrate_prompt('user/test-prompt')
 
         assert result == 'user/test-prompt'
-        prompt_migrator.source_ls_client.pull_prompt.assert_called_once_with('user/test-prompt')
-        prompt_migrator.dest_ls_client.push_prompt.assert_called_once()
+        # Verify we used the manifest-based approach (not SDK's pull_prompt)
+        prompt_migrator._pull_prompt_manifest.assert_called_once_with('user/test-prompt', 'latest')
+        prompt_migrator._push_prompt_manifest.assert_called_once_with(
+            'user/test-prompt',
+            mock_manifest
+        )
 
     def test_migrate_prompt_with_all_commits(self, prompt_migrator, sample_config):
-        """Test migrating prompt with all commit history."""
+        """Test migrating prompt with all commit history using manifest-based approach."""
         sample_config.migration.dry_run = False
-        
+
         mock_commit1 = Mock()
         mock_commit1.commit_hash = 'hash1'
         mock_commit1.parent_commit_hash = None
-        
+
         mock_commit2 = Mock()
         mock_commit2.commit_hash = 'hash2'
         mock_commit2.parent_commit_hash = 'hash1'
-        
+
         prompt_migrator.source_ls_client.list_prompt_commits.return_value = [
             mock_commit1,
             mock_commit2
         ]
-        
-        mock_prompt_obj = Mock()
-        prompt_migrator.source_ls_client.pull_prompt_commit.return_value = mock_prompt_obj
-        prompt_migrator.dest_ls_client.push_prompt.return_value = 'new-hash'
+
+        # Mock the manifest-based methods
+        mock_manifest = {"id": ["langchain", "schema", "runnable", "RunnableSequence"], "kwargs": {}}
+        prompt_migrator._pull_prompt_manifest = Mock(return_value={
+            "commit_hash": "abc123",
+            "manifest": mock_manifest
+        })
+        prompt_migrator._push_prompt_manifest = Mock(return_value="new-commit-hash")
 
         result = prompt_migrator.migrate_prompt('user/test-prompt', include_all_commits=True)
 
         assert result == 'user/test-prompt'
-        assert prompt_migrator.source_ls_client.pull_prompt_commit.call_count == 2
-        assert prompt_migrator.dest_ls_client.push_prompt.call_count == 2
+        # Should call _pull_prompt_manifest 2 times (once per commit)
+        assert prompt_migrator._pull_prompt_manifest.call_count == 2
+        # And _push_prompt_manifest 2 times
+        assert prompt_migrator._push_prompt_manifest.call_count == 2
 
     def test_migrate_prompt_error_handling(self, prompt_migrator, sample_config):
         """Test error handling in prompt migration."""
         sample_config.migration.dry_run = False
-        
-        prompt_migrator.source_ls_client.pull_prompt.side_effect = Exception("API Error")
+
+        # Mock manifest pull to return None (failure)
+        prompt_migrator._pull_prompt_manifest = Mock(return_value=None)
 
         result = prompt_migrator.migrate_prompt('user/test-prompt')
 
@@ -147,4 +162,4 @@ class TestPromptMigrator:
 
         assert len(result) == 1
         assert result[0]['commit_hash'] == 'hash1'
-        assert result[0]['manifest'] == {'key': 'value'}
+        # assert result[0]['manifest'] == {'key': 'value'} # Manifest is not included in list
