@@ -6,6 +6,8 @@ import uuid
 import tempfile
 import os
 import shutil
+import json
+import hashlib
 
 from .base import BaseMigrator
 from ..api_client import APIError, NotFoundError
@@ -52,6 +54,46 @@ class DatasetMigrator(BaseMigrator):
 
         return None
 
+    def _hash_inputs(self, inputs: Dict[str, Any]) -> str:
+        """Create a stable hash of example inputs for matching."""
+        # Sort keys to ensure consistent ordering
+        serialized = json.dumps(inputs, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode()).hexdigest()
+
+    def get_existing_examples(self, dataset_id: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Get existing examples from destination dataset, indexed by inputs hash.
+
+        Returns:
+            Dict mapping inputs_hash -> example dict (with id, inputs, outputs, metadata)
+        """
+        existing = {}
+        params = {
+            "dataset": dataset_id,
+            "select": ["inputs", "outputs", "metadata"]
+        }
+        for example in self.dest.get_paginated("/examples", params=params):
+            if isinstance(example, dict) and example.get("inputs"):
+                inputs_hash = self._hash_inputs(example["inputs"])
+                existing[inputs_hash] = example
+        return existing
+
+    def update_example(self, example_id: str, example_data: Dict[str, Any]) -> None:
+        """Update an existing example in destination."""
+        if self.config.migration.dry_run:
+            self.log(f"[DRY RUN] Would update example: {example_id}")
+            return
+
+        payload = {
+            "inputs": example_data.get("inputs"),
+            "outputs": example_data.get("outputs"),
+            "metadata": example_data.get("metadata"),
+        }
+        # Remove None values
+        payload = {k: v for k, v in payload.items() if v is not None}
+
+        self.dest.patch(f"/examples/{example_id}", payload)
+
     def update_dataset(self, dataset_id: str, dataset: Dict[str, Any]) -> None:
         """Update existing dataset in destination."""
         if self.config.migration.dry_run:
@@ -64,6 +106,7 @@ class DatasetMigrator(BaseMigrator):
             "inputs_schema_definition": dataset.get("inputs_schema_definition"),
             "outputs_schema_definition": dataset.get("outputs_schema_definition"),
             "transformations": dataset.get("transformations") or [],
+            "metadata": dataset.get("metadata"),
         }
         
         # Remove None values
@@ -86,18 +129,22 @@ class DatasetMigrator(BaseMigrator):
             "outputs_schema_definition": dataset.get("outputs_schema_definition"),
             "externally_managed": dataset.get("externally_managed", False),
             "transformations": dataset.get("transformations") or [],
-            "data_type": dataset.get("data_type", "kv")
+            "data_type": dataset.get("data_type", "kv"),
+            "metadata": dataset.get("metadata"),
         }
+
+        # Remove None values
+        payload = {k: v for k, v in payload.items() if v is not None}
 
         response = self.dest.post("/datasets", payload)
         return response["id"]
 
     def stream_examples(self, dataset_id: str) -> Generator[Dict[str, Any], None, None]:
         """Stream examples from a dataset without loading all into memory."""
-        # Include attachment_urls and outputs in the select to get all necessary data
+        # Include attachment_urls, outputs, and metadata in the select to get all necessary data
         params = {
             "dataset": dataset_id,
-            "select": ["attachment_urls", "outputs"]
+            "select": ["attachment_urls", "outputs", "metadata"]
         }
         for example in self.source.get_paginated("/examples", params=params):
             yield example
@@ -396,9 +443,19 @@ class DatasetMigrator(BaseMigrator):
         self,
         source_dataset_id: str,
         dest_dataset_id: str,
-        progress_callback=None
+        progress_callback=None,
+        upsert: bool = True
     ) -> Dict[str, str]:
-        """Migrate examples using streaming to avoid memory issues."""
+        """
+        Migrate examples using streaming to avoid memory issues.
+
+        Args:
+            source_dataset_id: Source dataset ID
+            dest_dataset_id: Destination dataset ID
+            progress_callback: Optional callback for progress updates
+            upsert: If True, update existing examples matched by inputs hash.
+                    If False, always create new examples.
+        """
         if self.config.migration.dry_run:
             self.log("[DRY RUN] Would migrate examples")
             return {}
@@ -407,14 +464,52 @@ class DatasetMigrator(BaseMigrator):
         batch = []
         batch_count = 0
         total_migrated = 0
+        total_updated = 0
+        total_created = 0
+
+        # If upserting, get existing examples from destination indexed by inputs hash
+        existing_examples = {}
+        if upsert:
+            self.log("Fetching existing examples from destination for upsert matching...")
+            existing_examples = self.get_existing_examples(dest_dataset_id)
+            if existing_examples:
+                self.log(f"Found {len(existing_examples)} existing examples in destination", "info")
 
         for example in self.stream_examples(source_dataset_id):
             # Debug: log example data
-            self.log(f"Example {example['id']} has outputs: {bool(example.get('outputs'))}", "info")
-            if example.get("outputs"):
-                self.log(f"Outputs content: {example.get('outputs')}", "info")
+            if self.config.migration.verbose:
+                self.log(f"Example {example['id']} has outputs: {bool(example.get('outputs'))}", "info")
+                if example.get("outputs"):
+                    self.log(f"Outputs content: {example.get('outputs')}", "info")
 
-            # Download attachments if present
+            source_inputs = example.get("inputs", {})
+            inputs_hash = self._hash_inputs(source_inputs) if upsert else None
+
+            # Check if this example already exists in destination (by inputs hash)
+            if upsert and inputs_hash in existing_examples:
+                existing = existing_examples[inputs_hash]
+                existing_id = existing.get("id")
+
+                # Update the existing example
+                try:
+                    self.update_example(existing_id, {
+                        "inputs": source_inputs,
+                        "outputs": example.get("outputs", {}),
+                        "metadata": example.get("metadata", {}),
+                    })
+                    id_mapping[example["id"]] = existing_id
+                    total_updated += 1
+                    total_migrated += 1
+                    if self.config.migration.verbose:
+                        self.log(f"Updated existing example: {example['id']} -> {existing_id}", "info")
+                except Exception as e:
+                    self.log(f"Failed to update example {existing_id}: {e}", "error")
+
+                if progress_callback:
+                    progress_callback(total_migrated)
+                continue
+
+            # Download attachments if present (only for new examples)
             downloaded_attachments = {}
             attachment_urls = example.get("attachment_urls")
             if attachment_urls:
@@ -428,7 +523,7 @@ class DatasetMigrator(BaseMigrator):
             # Prepare example for destination
             migrated_example = {
                 "dataset_id": dest_dataset_id,
-                "inputs": example.get("inputs", {}),
+                "inputs": source_inputs,
                 "outputs": example.get("outputs", {}),
                 "metadata": example.get("metadata", {}),
                 "created_at": example.get("created_at"),
@@ -440,36 +535,11 @@ class DatasetMigrator(BaseMigrator):
             # Process batch when it reaches configured size
             if len(batch) >= self.config.migration.batch_size:
                 batch_count += 1
-                self.log(f"Processing batch {batch_count} ({len(batch)} examples)")
+                self.log(f"Processing batch {batch_count} ({len(batch)} new examples)")
 
-                # Check if any example has attachments
-                has_attachments = any(len(ex[2]) > 0 for ex in batch)
-
-                if has_attachments:
-                    # Use SDK for examples with attachments
-                    self.log("Using LangSmith SDK for examples with attachments")
-                    try:
-                        batch_id_mapping = self.create_examples_with_attachments(dest_dataset_id, batch)
-                        id_mapping.update(batch_id_mapping)
-                        total_migrated += len(batch_id_mapping)
-                    except Exception as e:
-                        self.log(f"SDK upload failed: {e}", "error")
-                else:
-                    # Use regular bulk endpoint
-                    payloads = [ex[1] for ex in batch]
-                    responses = self.dest.post_batch(
-                        "/examples/bulk",
-                        payloads,
-                        batch_size=self.config.migration.batch_size
-                    )
-
-                    # Update ID mappings
-                    for i, (original_id, _, _) in enumerate(batch):
-                        if i < len(responses) and responses[i] and isinstance(responses[i], dict):
-                            new_id = responses[i].get("id")
-                            if new_id:
-                                id_mapping[original_id] = new_id
-                                total_migrated += 1
+                created = self._process_example_batch(dest_dataset_id, batch, id_mapping)
+                total_created += created
+                total_migrated += created
 
                 if progress_callback:
                     progress_callback(total_migrated)
@@ -478,38 +548,60 @@ class DatasetMigrator(BaseMigrator):
 
         # Process remaining examples
         if batch:
-            has_attachments = any(len(ex[2]) > 0 for ex in batch)
-
-            if has_attachments:
-                # Use SDK for examples with attachments
-                self.log("Using LangSmith SDK for remaining examples with attachments")
-                try:
-                    batch_id_mapping = self.create_examples_with_attachments(dest_dataset_id, batch)
-                    id_mapping.update(batch_id_mapping)
-                    total_migrated += len(batch_id_mapping)
-                except Exception as e:
-                    self.log(f"SDK upload failed: {e}", "error")
-            else:
-                # Use regular bulk endpoint
-                payloads = [ex[1] for ex in batch]
-                responses = self.dest.post_batch(
-                    "/examples/bulk",
-                    payloads,
-                    batch_size=self.config.migration.batch_size
-                )
-
-                for i, (original_id, _, _) in enumerate(batch):
-                    if i < len(responses) and responses[i] and isinstance(responses[i], dict):
-                        new_id = responses[i].get("id")
-                        if new_id:
-                            id_mapping[original_id] = new_id
-                            total_migrated += 1
+            created = self._process_example_batch(dest_dataset_id, batch, id_mapping)
+            total_created += created
+            total_migrated += created
 
             if progress_callback:
                 progress_callback(total_migrated)
 
-        self.log(f"Migrated {total_migrated} examples", "success")
+        self.log(f"Migration complete: {total_created} created, {total_updated} updated ({total_migrated} total)", "success")
         return id_mapping
+
+    def _process_example_batch(
+        self,
+        dest_dataset_id: str,
+        batch: List[Tuple[str, Dict[str, Any], Dict]],
+        id_mapping: Dict[str, str]
+    ) -> int:
+        """
+        Process a batch of examples for creation.
+
+        Returns:
+            Number of examples successfully created
+        """
+        created_count = 0
+
+        # Check if any example has attachments
+        has_attachments = any(len(ex[2]) > 0 for ex in batch)
+
+        if has_attachments:
+            # Use SDK for examples with attachments
+            self.log("Using LangSmith SDK for examples with attachments")
+            try:
+                batch_id_mapping = self.create_examples_with_attachments(dest_dataset_id, batch)
+                id_mapping.update(batch_id_mapping)
+                created_count = len(batch_id_mapping)
+            except Exception as e:
+                self.log(f"SDK upload failed: {e}", "error")
+        else:
+            # Use regular bulk endpoint
+            payloads = [ex[1] for ex in batch]
+            responses = self.dest.post_batch(
+                "/examples/bulk",
+                payloads,
+                batch_size=self.config.migration.batch_size
+            )
+
+            # Update ID mappings
+            for i, (original_id, _, _) in enumerate(batch):
+                if i < len(responses) and responses[i] and isinstance(responses[i], dict):
+                    new_id = responses[i].get("id")
+                    if new_id:
+                        id_mapping[original_id] = new_id
+                        created_count += 1
+
+        return created_count
 
     def migrate_dataset(
         self,
