@@ -8,6 +8,7 @@ on:
 
 jobs:
   test:
+    name: test (3.12)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4

@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   security-checks:
-    name: Security Checks
+    name: Security Gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
