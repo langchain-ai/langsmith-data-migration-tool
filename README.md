@@ -5,20 +5,18 @@ A Python CLI for migrating datasets, experiments, annotation queues, project rul
 ## Quick Start
 
 ```bash
-# Clone and install
-git clone https://github.com/langchain-ai/langsmith-data-migration-tool.git
-cd langsmith-data-migration-tool
-uv sync
+# Install (requires uv: https://docs.astral.sh/uv/)
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
 export LANGSMITH_NEW_API_KEY="your_destination_api_key"
 
 # Test connections
-uv run langsmith-migrator test
+langsmith-migrator test
 
 # Start migrating
-uv run langsmith-migrator datasets
+langsmith-migrator datasets
 ```
 
 ## Features
@@ -48,17 +46,29 @@ For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk E
 
 ## Installation
 
-**Prerequisites**: Python 3.12+, [uv](https://docs.astral.sh/uv/) (recommended)
+**Prerequisites**: Python 3.12+, [uv](https://docs.astral.sh/uv/)
 
+### Option 1: uv tool install (Recommended)
+```bash
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl"
+```
+
+### Option 2: uvx (One-off execution, no install)
+```bash
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl" langsmith-migrator test
+```
+
+### Option 3: pip
+```bash
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl"
+```
+
+### Option 4: From source (Development/Contributing)
 ```bash
 git clone https://github.com/langchain-ai/langsmith-data-migration-tool.git
 cd langsmith-data-migration-tool
 uv sync
-```
-
-Alternative with pip:
-```bash
-pip install https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.1-py3-none-any.whl
+# Run with: uv run langsmith-migrator <command>
 ```
 
 ## Configuration
@@ -85,35 +95,35 @@ LANGSMITH_VERIFY_SSL=true
 
 ```bash
 # Test connections
-uv run langsmith-migrator test
+langsmith-migrator test
 
 # Interactive wizard for all resources
-uv run langsmith-migrator migrate-all
+langsmith-migrator migrate-all
 
 # Datasets
-uv run langsmith-migrator datasets                    # Interactive selection
-uv run langsmith-migrator datasets --all              # All datasets
-uv run langsmith-migrator datasets --include-experiments  # With experiments
+langsmith-migrator datasets                    # Interactive selection
+langsmith-migrator datasets --all              # All datasets
+langsmith-migrator datasets --include-experiments  # With experiments
 
 # Annotation queues
-uv run langsmith-migrator queues
+langsmith-migrator queues
 
 # Prompts
-uv run langsmith-migrator prompts
-uv run langsmith-migrator prompts --all --include-all-commits
+langsmith-migrator prompts
+langsmith-migrator prompts --all --include-all-commits
 
 # Project rules
-uv run langsmith-migrator rules
-uv run langsmith-migrator rules --strip-projects      # As global rules
+langsmith-migrator rules
+langsmith-migrator rules --strip-projects      # As global rules
 
 # Charts
-uv run langsmith-migrator charts
-uv run langsmith-migrator charts --session "project-name"
+langsmith-migrator charts
+langsmith-migrator charts --session "project-name"
 
 # Utilities
-uv run langsmith-migrator list-projects --source
-uv run langsmith-migrator resume
-uv run langsmith-migrator clean
+langsmith-migrator list-projects --source
+langsmith-migrator resume
+langsmith-migrator clean
 ```
 
 ### CLI Options
@@ -142,7 +152,7 @@ For self-hosted instances with SSL errors:
 
 ```bash
 # Use --no-ssl flag
-uv run langsmith-migrator --no-ssl datasets
+langsmith-migrator --no-ssl datasets
 
 # Or set environment variable
 export LANGSMITH_VERIFY_SSL=false
