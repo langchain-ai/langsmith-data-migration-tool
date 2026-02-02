@@ -46,13 +46,6 @@ This tool **does not support migrating trace data**. It migrates:
 
 For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
 
-### Prompts and Rules Feature Availability
-
-**Prompts** and **Project Rules** require these features to be enabled on both instances:
-
-- **Prompts**: `405 Not Allowed` errors indicate the prompts feature isn't enabled. Contact your administrator to enable `/api/v1/repos/*` endpoints.
-- **Project Rules**: May not be available on all instances. The tool handles missing endpoints gracefully.
-
 ## Installation
 
 **Prerequisites**: Python 3.12+, [uv](https://docs.astral.sh/uv/) (recommended)
