@@ -27,7 +27,7 @@ jobs:
         echo "$HOME/.local/bin" >> $GITHUB_PATH
 
     - name: Install dependencies
-      run: uv sync --dev
+      run: uv sync --extra test
 
     - name: Run tests
       run: uv run pytest --cov=langsmith_migrator --cov-report=xml --cov-report=term-missing
