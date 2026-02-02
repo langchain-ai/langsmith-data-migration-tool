@@ -39,7 +39,7 @@ mdurl==0.1.2
     # via markdown-it-py
 orjson==3.11.3
     # via langsmith
-packaging==25.0
+packaging==26.0
     # via langsmith
 platformdirs==4.4.0
     # via textual
