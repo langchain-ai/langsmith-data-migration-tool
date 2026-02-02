@@ -114,8 +114,13 @@ class ChartMigrator(BaseMigrator):
                     if not matched:
                         # Some charts might be attached to a section that is attached to a project
                         # But we can't easily resolve that here without more queries.
-                        # For now, strict filtering.
-                        pass
+                        if self.config.migration.verbose:
+                            chart_title = chart.get('title') or chart.get('name', 'Untitled')
+                            self.log(
+                                f"Chart '{chart_title}' filtered out - no matching session_id/project_id "
+                                f"in filters (looking for {session_id})",
+                                "info"
+                            )
 
                 return filtered_charts
 

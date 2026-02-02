@@ -92,4 +92,13 @@ class AnnotationQueueMigrator(BaseMigrator):
         }
 
         response = self.dest.post("/annotation-queues", payload)
+
+        # Validate response has expected fields
+        if not isinstance(response, dict):
+            from ..api_client import APIError
+            raise APIError(f"Invalid response creating queue: expected dict, got {type(response)}")
+        if "id" not in response:
+            from ..api_client import APIError
+            raise APIError(f"Invalid response creating queue: missing 'id' field. Response: {response}")
+
         return response["id"]

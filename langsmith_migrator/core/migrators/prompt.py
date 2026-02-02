@@ -269,7 +269,7 @@ class PromptMigrator(BaseMigrator):
             try:
                 error_dict = e.response.json()
                 error_detail = error_dict.get("detail", error_dict.get("error", str(error_dict)))
-            except:
+            except (ValueError, AttributeError):
                 error_detail = e.response.text[:500] if e.response else ""
 
             # Check for "nothing to commit" (already up to date) - various phrasings

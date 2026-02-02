@@ -87,20 +87,66 @@ class Config:
         # Priority: CLI arg > env var > default (False, meaning update by default)
         should_skip = skip_existing if skip_existing is not None else (os.getenv('MIGRATION_SKIP_EXISTING', 'false').lower() == 'true')
 
+        # Parse migration settings with safe defaults
+        try:
+            parsed_batch_size = batch_size or int(os.getenv('MIGRATION_BATCH_SIZE', '100'))
+        except ValueError:
+            parsed_batch_size = 100
+
+        try:
+            parsed_workers = concurrent_workers or int(os.getenv('MIGRATION_WORKERS', '4'))
+        except ValueError:
+            parsed_workers = 4
+
+        try:
+            parsed_chunk_size = int(os.getenv('MIGRATION_CHUNK_SIZE', '1000'))
+        except ValueError:
+            parsed_chunk_size = 1000
+
+        try:
+            parsed_rate_limit = float(os.getenv('MIGRATION_RATE_LIMIT_DELAY', '0.1'))
+        except ValueError:
+            parsed_rate_limit = 0.1
+
         self.migration = MigrationConfig(
-            batch_size=batch_size or int(os.getenv('MIGRATION_BATCH_SIZE', '100')),
-            concurrent_workers=concurrent_workers or int(os.getenv('MIGRATION_WORKERS', '4')),
+            batch_size=parsed_batch_size,
+            concurrent_workers=parsed_workers,
             dry_run=dry_run or os.getenv('MIGRATION_DRY_RUN', 'false').lower() == 'true',
             verbose=verbose or os.getenv('MIGRATION_VERBOSE', 'false').lower() == 'true',
             skip_existing=should_skip,
             stream_examples=os.getenv('MIGRATION_STREAM_EXAMPLES', 'true').lower() != 'false',
-            chunk_size=int(os.getenv('MIGRATION_CHUNK_SIZE', '1000')),
-            rate_limit_delay=float(os.getenv('MIGRATION_RATE_LIMIT_DELAY', '0.1'))
+            chunk_size=parsed_chunk_size,
+            rate_limit_delay=parsed_rate_limit
         )
 
         # Disable SSL warnings if needed
         if not self.source.verify_ssl or not self.destination.verify_ssl:
             urllib3.disable_warnings(InsecureRequestWarning)
+
+    def _validate_url(self, url: str) -> tuple[bool, str]:
+        """
+        Validate that a URL has proper format.
+
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not url:
+            return False, "URL is empty"
+
+        # Must have a valid scheme
+        if not url.startswith('http://') and not url.startswith('https://'):
+            return False, f"URL must start with http:// or https:// (got: {url})"
+
+        # Basic structure check
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if not parsed.netloc:
+                return False, f"URL missing hostname (got: {url})"
+        except Exception as e:
+            return False, f"Invalid URL format: {e}"
+
+        return True, ""
 
     def validate(self) -> tuple[bool, list[str]]:
         """
@@ -119,9 +165,17 @@ class Config:
 
         if not self.source.base_url:
             errors.append("Source base URL is required")
+        else:
+            valid, error = self._validate_url(self.source.base_url)
+            if not valid:
+                errors.append(f"Invalid source URL: {error}")
 
         if not self.destination.base_url:
             errors.append("Destination base URL is required")
+        else:
+            valid, error = self._validate_url(self.destination.base_url)
+            if not valid:
+                errors.append(f"Invalid destination URL: {error}")
 
         if self.migration.batch_size <= 0:
             errors.append("Batch size must be positive")

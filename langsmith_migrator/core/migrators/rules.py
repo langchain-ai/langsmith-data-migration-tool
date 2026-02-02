@@ -547,10 +547,10 @@ class RulesMigrator(BaseMigrator):
             # Filter payload to only include valid PATCH fields
             patch_payload = {k: v for k, v in payload.items() if k in valid_patch_fields}
 
-            # Log if any fields were filtered out
+            # Warn if any fields were filtered out
             filtered_fields = set(payload.keys()) - valid_patch_fields
             if filtered_fields:
-                self.log(f"Note: Excluded CREATE-only fields from PATCH: {filtered_fields}", "info")
+                self.log(f"Warning: The following fields were excluded from update (CREATE-only or invalid): {filtered_fields}", "warning")
 
             endpoint = f"{self._get_rules_endpoint()}/{rule_id}"
             self.dest.patch(endpoint, patch_payload)
@@ -884,16 +884,25 @@ class RulesMigrator(BaseMigrator):
             # Filter payload to only include valid fields
             create_payload = {k: v for k, v in payload.items() if k in valid_create_fields}
 
-            # Log if any fields were filtered out
+            # Warn if any fields were filtered out
             filtered_fields = set(payload.keys()) - valid_create_fields
             if filtered_fields:
-                self.log(f"Note: Excluded invalid fields from CREATE: {filtered_fields}", "info")
+                self.log(f"Warning: The following fields were excluded from creation (invalid or unsupported): {filtered_fields}", "warning")
 
             self.log(f"Creating rule at {endpoint}", "info")
             if self.config.migration.verbose:
                 self.log(f"POST payload fields: {list(create_payload.keys())}", "info")
             response = self.dest.post(endpoint, create_payload)
+
+            # Validate response
+            if not isinstance(response, dict):
+                from ..api_client import APIError
+                raise APIError(f"Invalid response creating rule: expected dict, got {type(response)}")
+
             rule_id = response.get('id')
+            if not rule_id:
+                from ..api_client import APIError
+                raise APIError(f"Invalid response creating rule: missing 'id' field. Response: {response}")
 
             self.log(f"Created rule: {display_name} -> {rule_id}", "success")
             return rule_id

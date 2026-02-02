@@ -1,6 +1,7 @@
 """Migration orchestrator for coordinating migration operations."""
 
-from typing import Dict, List
+import threading
+from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.progress import Progress
@@ -20,6 +21,9 @@ class MigrationOrchestrator:
         self.config = config
         self.state_manager = state_manager
         self.console = Console()
+
+        # Thread lock for protecting shared state during parallel migrations
+        self._state_lock = threading.Lock()
 
         # Initialize API clients
         self.source_client = EnhancedAPIClient(
@@ -54,22 +58,27 @@ class MigrationOrchestrator:
 
     def test_connections(self) -> bool:
         """Test connections to both source and destination."""
-        source_ok = self.source_client.test_connection()
-        dest_ok = self.dest_client.test_connection()
+        source_ok, source_error = self.source_client.test_connection()
+        dest_ok, dest_error = self.dest_client.test_connection()
 
         if not source_ok and self.config.migration.verbose:
-            self.console.print("[dim]Source connection failed[/dim]")
+            self.console.print(f"[dim]Source connection failed: {source_error}[/dim]")
 
         if not dest_ok and self.config.migration.verbose:
-            self.console.print("[dim]Destination connection failed[/dim]")
+            self.console.print(f"[dim]Destination connection failed: {dest_error}[/dim]")
 
         return source_ok and dest_ok
 
-    def test_connections_detailed(self) -> tuple[bool, bool]:
-        """Test connections and return detailed results."""
-        source_ok = self.source_client.test_connection()
-        dest_ok = self.dest_client.test_connection()
-        return source_ok, dest_ok
+    def test_connections_detailed(self) -> tuple[bool, bool, Optional[str], Optional[str]]:
+        """
+        Test connections and return detailed results.
+
+        Returns:
+            Tuple of (source_ok, dest_ok, source_error, dest_error)
+        """
+        source_ok, source_error = self.source_client.test_connection()
+        dest_ok, dest_error = self.dest_client.test_connection()
+        return source_ok, dest_ok, source_error, dest_error
 
     def migrate_datasets_parallel(
         self,
@@ -127,20 +136,23 @@ class MigrationOrchestrator:
 
                     try:
                         new_id, example_mapping = future.result()
-                        id_mapping[dataset_id] = new_id
 
-                        # Update state
-                        self.state.update_item_status(
-                            item_id,
-                            MigrationStatus.COMPLETED,
-                            destination_id=new_id
-                        )
+                        # Thread-safe update of shared state
+                        with self._state_lock:
+                            id_mapping[dataset_id] = new_id
 
-                        # Store example mappings
-                        if example_mapping:
-                            if "examples" not in self.state.id_mappings:
-                                self.state.id_mappings["examples"] = {}
-                            self.state.id_mappings["examples"].update(example_mapping)
+                            # Update state
+                            self.state.update_item_status(
+                                item_id,
+                                MigrationStatus.COMPLETED,
+                                destination_id=new_id
+                            )
+
+                            # Store example mappings
+                            if example_mapping:
+                                if "examples" not in self.state.id_mappings:
+                                    self.state.id_mappings["examples"] = {}
+                                self.state.id_mappings["examples"].update(example_mapping)
 
                     except Exception as e:
                         error_msg = str(e)
@@ -150,14 +162,20 @@ class MigrationOrchestrator:
                             self.console.print("[red]SSL certificate verification failed. Use --no-ssl flag to disable SSL verification.[/red]")
                         else:
                             self.console.print(f"[red]Failed to migrate dataset {dataset_id}: {e}[/red]")
-                        self.state.update_item_status(
-                            item_id,
-                            MigrationStatus.FAILED,
-                            error=str(e)
-                        )
+
+                        # Thread-safe state update
+                        with self._state_lock:
+                            self.state.update_item_status(
+                                item_id,
+                                MigrationStatus.FAILED,
+                                error=str(e)
+                            )
 
                     progress.advance(task)
-                    self.state_manager.save()
+
+                    # Thread-safe save
+                    with self._state_lock:
+                        self.state_manager.save()
 
         # Migrate experiments if requested
         if include_experiments and id_mapping:
