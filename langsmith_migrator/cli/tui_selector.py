@@ -91,10 +91,10 @@ class ItemSelector(App):
     def _refresh_table(self) -> None:
         table = self.query_one(DataTable)
         table.clear()
-        
+
         search = self.filter_text.lower()
         self.filtered_indices = []
-        
+
         for idx, item in enumerate(self.items):
             if search:
                 match = False
@@ -105,9 +105,9 @@ class ItemSelector(App):
                         break
                 if not match:
                     continue
-            
+
             self.filtered_indices.append(idx)
-            
+
             checkbox = "✓" if idx in self.selected_items else " "
             row_data = [checkbox]
             for col in self.columns:
@@ -116,7 +116,7 @@ class ItemSelector(App):
                 if len(value) > max_width:
                     value = value[:max_width-3] + "..."
                 row_data.append(value)
-            
+
             table.add_row(*row_data, key=str(idx))
 
     def _update_stats(self) -> None:
@@ -124,7 +124,7 @@ class ItemSelector(App):
         total = len(self.items)
         selected = len(self.selected_items)
         visible = len(self.filtered_indices)
-        
+
         if self.filter_text:
             stats.update(f"Selected: {selected}/{total} | Filtered: {visible}/{total}")
         else:
@@ -150,18 +150,18 @@ class ItemSelector(App):
     def action_toggle_row(self) -> None:
         table = self.query_one(DataTable)
         cursor_row = table.cursor_row
-        
+
         if cursor_row >= 0 and cursor_row < len(self.filtered_indices):
             item_idx = self.filtered_indices[cursor_row]
-            
+
             if item_idx in self.selected_items:
                 self.selected_items.remove(item_idx)
             else:
                 self.selected_items.add(item_idx)
-            
+
             self._refresh_table()
             self._update_stats()
-            
+
             if cursor_row < len(self.filtered_indices) - 1:
                 table.move_cursor(row=cursor_row + 1)
 

@@ -1,0 +1,247 @@
+name: Security Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  sast:
+    name: SAST (Bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install bandit
+        run: pip install bandit[toml]
+
+      - name: Run Bandit
+        run: bandit -c pyproject.toml -r langsmith_migrator -f json -o bandit-results.json || true
+
+      - name: Check Bandit results
+        run: |
+          if [ -f bandit-results.json ]; then
+            HIGH_SEVERITY=$(python3 -c "import json; data=json.load(open('bandit-results.json')); print(len([r for r in data.get('results', []) if r.get('issue_severity') == 'HIGH']))")
+            MEDIUM_SEVERITY=$(python3 -c "import json; data=json.load(open('bandit-results.json')); print(len([r for r in data.get('results', []) if r.get('issue_severity') == 'MEDIUM']))")
+            echo "High severity issues: $HIGH_SEVERITY"
+            echo "Medium severity issues: $MEDIUM_SEVERITY"
+            if [ "$HIGH_SEVERITY" -gt 0 ]; then
+              echo "::error::Found $HIGH_SEVERITY high severity security issues"
+              cat bandit-results.json | python3 -m json.tool
+              exit 1
+            fi
+          fi
+
+      - name: Upload Bandit results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-results
+          path: bandit-results.json
+
+  dependency-scan:
+    name: Dependency Scan (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv and pip-audit
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          pip install pip-audit
+
+      - name: Export requirements
+        run: uv export --no-hashes > requirements.txt
+
+      - name: Run pip-audit
+        run: |
+          pip-audit -r requirements.txt --format json --output pip-audit-results.json || true
+
+      - name: Check for vulnerabilities
+        run: |
+          if [ -f pip-audit-results.json ]; then
+            VULN_COUNT=$(python3 -c "import json; data=json.load(open('pip-audit-results.json')); print(len(data.get('dependencies', [])))")
+            echo "Vulnerable dependencies: $VULN_COUNT"
+            if [ "$VULN_COUNT" -gt 0 ]; then
+              echo "::error::Found $VULN_COUNT vulnerable dependencies"
+              cat pip-audit-results.json | python3 -m json.tool
+              exit 1
+            fi
+          fi
+
+      - name: Upload pip-audit results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-results
+          path: pip-audit-results.json
+
+  secret-scan:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install detect-secrets
+        run: pip install detect-secrets
+
+      - name: Run detect-secrets
+        run: |
+          detect-secrets scan --baseline .secrets.baseline || detect-secrets scan > .secrets.baseline.new
+          if [ -f .secrets.baseline ]; then
+            detect-secrets audit --report --baseline .secrets.baseline || true
+          fi
+
+      - name: Check for new secrets
+        run: |
+          if [ -f .secrets.baseline.new ]; then
+            NEW_SECRETS=$(python3 -c "import json; data=json.load(open('.secrets.baseline.new')); print(len(data.get('results', {})))")
+            if [ "$NEW_SECRETS" -gt 0 ]; then
+              echo "::error::Found $NEW_SECRETS potential secrets in codebase"
+              cat .secrets.baseline.new | python3 -m json.tool
+              exit 1
+            fi
+          fi
+
+  trivy-scan:
+    name: Trivy Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Trivy and fail on critical/high
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv and pip-licenses
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          pip install pip-licenses
+
+      - name: Install project dependencies
+        run: |
+          uv venv
+          uv sync
+
+      - name: Check licenses
+        run: |
+          source .venv/bin/activate
+          pip-licenses --format=json --output-file=licenses.json
+
+          # Check for copyleft licenses (GPL, AGPL, etc.)
+          COPYLEFT=$(python3 -c "
+          import json
+          data = json.load(open('licenses.json'))
+          copyleft_licenses = ['GPL', 'AGPL', 'LGPL', 'SSPL', 'OSL']
+          problematic = []
+          for pkg in data:
+              license_name = pkg.get('License', '').upper()
+              for cl in copyleft_licenses:
+                  if cl in license_name and 'EXCEPTION' not in license_name:
+                      problematic.append(f\"{pkg['Name']}: {pkg['License']}\")
+          print(len(problematic))
+          if problematic:
+              print('Problematic packages:', file=__import__('sys').stderr)
+              for p in problematic:
+                  print(f'  - {p}', file=__import__('sys').stderr)
+          ")
+
+          if [ "$COPYLEFT" -gt 0 ]; then
+            echo "::error::Found $COPYLEFT packages with copyleft licenses"
+            exit 1
+          fi
+
+          echo "All licenses are compliant"
+
+      - name: Upload license report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: license-report
+          path: licenses.json
+
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-scan, secret-scan, trivy-scan, license-check]
+    if: always()
+    steps:
+      - name: Check security scan results
+        run: |
+          if [ "${{ needs.sast.result }}" != "success" ]; then
+            echo "::error::SAST check failed"
+            exit 1
+          fi
+          if [ "${{ needs.dependency-scan.result }}" != "success" ]; then
+            echo "::error::Dependency scan failed"
+            exit 1
+          fi
+          if [ "${{ needs.secret-scan.result }}" != "success" ]; then
+            echo "::error::Secret scan failed"
+            exit 1
+          fi
+          if [ "${{ needs.trivy-scan.result }}" != "success" ]; then
+            echo "::error::Trivy scan failed"
+            exit 1
+          fi
+          if [ "${{ needs.license-check.result }}" != "success" ]; then
+            echo "::error::License check failed"
+            exit 1
+          fi
+          echo "All security checks passed!"

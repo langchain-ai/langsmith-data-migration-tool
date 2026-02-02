@@ -48,7 +48,7 @@ class ChartMigrator(BaseMigrator):
             # Prepare request body for listing charts according to schema
             # Note: Some versions require start_time even if omit_data is True
             start_time = (datetime.datetime.utcnow() - datetime.timedelta(days=1)).isoformat()
-            
+
             payload = {
                 "timezone": "UTC",
                 "omit_data": True,  # Only fetch metadata, not full data
@@ -87,7 +87,7 @@ class ChartMigrator(BaseMigrator):
                     # Sometimes the list is the response itself if it's not wrapped
                     # But if it has keys like "detail" it might be error, assumed handled by api_client
                     charts = [response]
-            
+
             # Filter by session_id if provided
             if session_id and charts:
                 filtered_charts = []
@@ -96,7 +96,7 @@ class ChartMigrator(BaseMigrator):
                     if chart.get('session_id') == session_id or chart.get('project_id') == session_id:
                         filtered_charts.append(chart)
                         continue
-                        
+
                     # Check inside series filters
                     # Series is usually a list of dicts
                     series = chart.get('series', [])
@@ -106,7 +106,7 @@ class ChartMigrator(BaseMigrator):
                             filters = s.get('filters')
                             if not filters:
                                 continue
-                                
+
                             if filters.get('project_id') == session_id or filters.get('session_id') == session_id:
                                 filtered_charts.append(chart)
                                 matched = True
@@ -116,7 +116,7 @@ class ChartMigrator(BaseMigrator):
                         # But we can't easily resolve that here without more queries.
                         # For now, strict filtering.
                         pass
-                
+
                 return filtered_charts
 
             return charts
@@ -140,14 +140,14 @@ class ChartMigrator(BaseMigrator):
         """
         if not title:
             return None
-            
+
         if self._dest_section_map is None:
             self._build_dest_section_map()
-            
+
         # Check if exists
         if title in self._dest_section_map:
             return self._dest_section_map[title]
-            
+
         # Create new section
         self.log(f"Creating new dashboard section: '{title}'", "info")
         try:
@@ -158,26 +158,26 @@ class ChartMigrator(BaseMigrator):
             }
             # Use the endpoint identified by user
             response = self.dest.post("/charts/section", payload)
-            
+
             if isinstance(response, dict) and 'id' in response:
                 new_id = response['id']
                 self._dest_section_map[title] = new_id # Update cache
                 self.log(f"Created section '{title}' -> {new_id}", "success")
                 return new_id
-                
+
         except Exception as e:
             self.log(f"Failed to create section '{title}': {e}", "error")
-            
+
         return None
 
     def _get_dest_section_id(self, section_title: str) -> Optional[str]:
         """Look up a destination section ID by its title."""
         if not section_title:
             return None
-            
+
         if self._dest_section_map is None:
             self._build_dest_section_map()
-            
+
         return self._dest_section_map.get(section_title)
 
     def _build_dest_section_map(self):
@@ -192,9 +192,9 @@ class ChartMigrator(BaseMigrator):
                 "start_time": start_time,
                 "stride": {"days": 0, "hours": 0, "minutes": 15}
             }
-            
+
             response = self.dest.post("/charts", payload)
-            
+
             if isinstance(response, dict) and 'sections' in response:
                 for section in response['sections']:
                     if isinstance(section, dict):
@@ -202,9 +202,9 @@ class ChartMigrator(BaseMigrator):
                         sec_id = section.get('id')
                         if title and sec_id:
                             self._dest_section_map[title] = sec_id
-                            
+
             self.log(f"Built destination section map: {list(self._dest_section_map.keys())}", "info")
-            
+
         except Exception as e:
             self.log(f"Failed to build destination section map: {e}", "warning")
 
@@ -351,16 +351,16 @@ class ChartMigrator(BaseMigrator):
                     response = self.dest.post("/charts/create", payload)
                 else:
                     raise e
-            
+
             # Response might be the chart object or just ID
             if isinstance(response, dict):
                 chart_id = response.get("id")
             else:
                 chart_id = None
-                
+
             if chart_id:
                 return str(chart_id)
-                
+
             return None
 
         except APIError as e:
@@ -415,37 +415,37 @@ class ChartMigrator(BaseMigrator):
             Dictionary mapping source chart IDs to destination chart IDs
         """
         id_mapping = {}
-        
+
         # List charts filtered by source session
         charts = self.list_charts(source_session_id)
-        
+
         if not charts:
-            self.log(f"  - No charts found for session", "info")
+            self.log("  - No charts found for session", "info")
             return id_mapping
-            
+
         self.log(f"  Processing {len(charts)} chart(s)...", "info")
-        
+
         success_count = 0
         failed_count = 0
-        
+
         for chart in charts:
             chart_id = chart.get("id")
             if not chart_id:
                 continue
-                
+
             new_id = self.migrate_chart(chart, dest_session_id)
-            
+
             if new_id:
                 id_mapping[chart_id] = new_id
                 success_count += 1
             else:
                 failed_count += 1
-                
+
         if success_count > 0:
             self.log(f"  ✓ Migrated {success_count} chart(s)", "success")
         if failed_count > 0:
             self.log(f"  ✗ Failed to migrate {failed_count} chart(s)", "warning")
-            
+
         return id_mapping
 
     def migrate_all_charts(self, same_instance: bool = False) -> Dict[str, Dict[str, str]]:
@@ -460,48 +460,48 @@ class ChartMigrator(BaseMigrator):
         """
         # Note: The structure of the return value assumes we can group by session_id.
         # But charts list is flat. We'll group them ourselves.
-        
+
         all_mappings = {}  # session_id -> map
         global_map = {} # chart_id -> new_id (for fallback)
-        
+
         self.log("Fetching all charts from source...", "info")
         charts = self.list_charts()
-        
+
         if not charts:
             self.log("No charts found in source", "info")
             return {}
-            
+
         self.log(f"Found {len(charts)} total charts to migrate", "info")
-        
+
         success_count = 0
         failed_count = 0
-        
+
         # Pre-load project mapping if needed
         if not same_instance:
             self._build_project_mapping()
-        
+
         for chart in charts:
             chart_id = chart.get("id")
             if not chart_id:
                 continue
-            
+
             # Determine source session/project ID for this chart
             source_session_id = self._extract_session_id(chart)
-            
+
             dest_session_id = None
             if source_session_id:
                 if same_instance:
                     dest_session_id = source_session_id
                 elif self._project_id_map:
                     dest_session_id = self._project_id_map.get(source_session_id)
-            
+
             # Migrate
             new_id = self.migrate_chart(chart, dest_session_id)
-            
+
             if new_id:
                 success_count += 1
                 global_map[chart_id] = new_id
-                
+
                 # Add to grouped result if possible
                 if source_session_id:
                     if source_session_id not in all_mappings:
@@ -510,15 +510,15 @@ class ChartMigrator(BaseMigrator):
             else:
                 failed_count += 1
 
-        self.log(f"\nChart Migration Summary:", "info")
+        self.log("\nChart Migration Summary:", "info")
         self.log(f"  Charts migrated: {success_count}", "success" if success_count > 0 else "info")
         if failed_count > 0:
             self.log(f"  Charts failed: {failed_count}", "warning")
-            
+
         # Return grouped mappings, or just a generic group if none found
         if not all_mappings and global_map:
             all_mappings['unknown_session'] = global_map
-            
+
         return all_mappings
 
     def _extract_session_id(self, chart: Dict[str, Any]) -> Optional[str]:
@@ -526,24 +526,24 @@ class ChartMigrator(BaseMigrator):
         # Top level
         if chart.get('session_id'): return chart['session_id']
         if chart.get('project_id'): return chart['project_id']
-        
+
         # In series
         for s in chart.get('series', []):
             if isinstance(s, dict):
                 filters = s.get('filters')
                 if not filters:
                     continue
-                    
+
                 if filters.get('project_id'): return filters['project_id']
                 if filters.get('session_id'): return filters['session_id']
-        
+
         # In common_filters
         common_filters = chart.get('common_filters')
         if isinstance(common_filters, dict):
             sessions = common_filters.get('session')
             if isinstance(sessions, list) and sessions:
                 return sessions[0]  # Return first session ID found
-                
+
         return None
 
     def _map_ids_in_chart(self, obj: Any, dest_session_id: Optional[str] = None):
@@ -563,16 +563,16 @@ class ChartMigrator(BaseMigrator):
                     obj["project_id"] = dest_session_id
                 else:
                     self._map_id_field(obj, "project_id", self._build_project_mapping())
-                    
-            if "session_id" in obj: 
+
+            if "session_id" in obj:
                 if dest_session_id:
                     obj["session_id"] = dest_session_id
                 else:
                     self._map_id_field(obj, "session_id", self._build_project_mapping())
-                    
+
             if "dataset_id" in obj:
                 self._map_id_field(obj, "dataset_id", self._build_dataset_mapping())
-            
+
             if "session" in obj and isinstance(obj["session"], list):
                 # Map list of session IDs (used in common_filters)
                 new_ids = []
@@ -580,7 +580,7 @@ class ChartMigrator(BaseMigrator):
                 mapping = {}
                 if not dest_session_id:
                     mapping = self._build_project_mapping()
-                
+
                 # If forced ID, just use that
                 if dest_session_id:
                     new_ids = [dest_session_id]
@@ -595,11 +595,11 @@ class ChartMigrator(BaseMigrator):
 
             # Handle special 'tag_value_id' which might be project ID in some contexts
             # But skipping for now as it's ambiguous
-                
+
             # Recurse into values
             for key, value in obj.items():
                 self._map_ids_in_chart(value, dest_session_id)
-                
+
         elif isinstance(obj, list):
             for item in obj:
                 self._map_ids_in_chart(item, dest_session_id)
