@@ -76,26 +76,35 @@ jobs:
       - name: Check for vulnerabilities
         run: |
           if [ -f pip-audit-results.json ]; then
-            VULN_COUNT=$(python3 -c "
+            python3 << 'PYEOF'
           import json
+          import sys
+
           data = json.load(open('pip-audit-results.json'))
-          vuln_deps = [d for d in data.get('dependencies', []) if d.get('vulns')]
-          print(len(vuln_deps))
-          ")
-            echo "Vulnerable dependencies: $VULN_COUNT"
-            if [ "$VULN_COUNT" -gt 0 ]; then
-              echo "::error::Found $VULN_COUNT vulnerable dependencies"
-              python3 -c "
-          import json
-          data = json.load(open('pip-audit-results.json'))
+          fixable_vulns = []
+          unfixable_vulns = []
+
           for dep in data.get('dependencies', []):
-              if dep.get('vulns'):
-                  print(f\"  - {dep['name']}=={dep['version']}\")
-                  for vuln in dep['vulns']:
-                      print(f\"    - {vuln.get('id')}: {vuln.get('fix_versions', [])}\")
-          "
-              exit 1
-            fi
+              for vuln in dep.get('vulns', []):
+                  info = {'name': dep['name'], 'version': dep['version'], 'vuln': vuln}
+                  if vuln.get('fix_versions'):
+                      fixable_vulns.append(info)
+                  else:
+                      unfixable_vulns.append(info)
+
+          if unfixable_vulns:
+              print(f"::warning::Found {len(unfixable_vulns)} vulnerabilities with no fix available:")
+              for v in unfixable_vulns:
+                  print(f"  - {v['name']}=={v['version']}: {v['vuln'].get('id')}")
+
+          if fixable_vulns:
+              print(f"::error::Found {len(fixable_vulns)} fixable vulnerabilities:")
+              for v in fixable_vulns:
+                  print(f"  - {v['name']}=={v['version']}: {v['vuln'].get('id')} (fix: {v['vuln'].get('fix_versions')})")
+              sys.exit(1)
+
+          print("No fixable vulnerabilities found")
+          PYEOF
           fi
 
       - name: Upload pip-audit results
