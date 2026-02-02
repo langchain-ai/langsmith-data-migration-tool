@@ -86,14 +86,6 @@ packages = ["langsmith_migrator"]
 [tool.pyright]
 typeCheckingMode = "off"
 
-[tool.bandit]
-exclude_dirs = ["tests", ".venv", "dist", "build"]
-targets = ["langsmith_migrator"]
-skips = [
-    "B101",  # Skip assert warnings (used in tests)
-    "B112",  # Skip try-except-continue (used for fallback patterns)
-]
-
 [tool.ruff]
 target-version = "py312"
 line-length = 100
@@ -103,6 +95,8 @@ select = ["E", "F", "W", "S"]  # E=errors, F=pyflakes, W=warnings, S=security
 ignore = [
     "S101",  # Allow assert statements
     "S112",  # Allow try-except-continue (used for fallback patterns)
+    "E501",  # Line too long - pre-existing, TODO: fix incrementally
+    "E701",  # Multiple statements on one line - pre-existing
 ]
 
 [tool.ruff.lint.per-file-ignores]

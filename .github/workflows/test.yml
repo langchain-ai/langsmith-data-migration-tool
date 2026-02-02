@@ -25,6 +25,9 @@ jobs:
     - name: Install dependencies
       run: uv sync --extra test
 
+    - name: Lint with ruff
+      run: uv run ruff check langsmith_migrator
+
     - name: Run tests
       run: uv run pytest --cov=langsmith_migrator --cov-report=xml --cov-report=term-missing
 

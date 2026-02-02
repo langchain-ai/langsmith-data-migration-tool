@@ -1,4 +1,4 @@
-name: Security Checks
+name: Security
 
 on:
   pull_request:
@@ -11,7 +11,21 @@ permissions:
   security-events: write
 
 jobs:
-  security:
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  security-checks:
     name: Security Checks
     runs-on: ubuntu-latest
     steps:
@@ -29,73 +43,11 @@ jobs:
         with:
           version: "latest"
 
-      - name: Install security tools
-        run: |
-          pip install bandit[toml] pip-audit detect-secrets pip-licenses
+      - name: Install tools
+        run: pip install detect-secrets pip-licenses
 
       - name: Install project dependencies
-        run: |
-          uv sync
-
-      # SAST (Bandit)
-      - name: Run Bandit
-        run: bandit -c pyproject.toml -r langsmith_migrator -f json -o bandit-results.json || true
-
-      - name: Check Bandit results
-        run: |
-          if [ -f bandit-results.json ]; then
-            HIGH_SEVERITY=$(python3 -c "import json; data=json.load(open('bandit-results.json')); print(len([r for r in data.get('results', []) if r.get('issue_severity') == 'HIGH']))")
-            MEDIUM_SEVERITY=$(python3 -c "import json; data=json.load(open('bandit-results.json')); print(len([r for r in data.get('results', []) if r.get('issue_severity') == 'MEDIUM']))")
-            echo "High severity issues: $HIGH_SEVERITY"
-            echo "Medium severity issues: $MEDIUM_SEVERITY"
-            if [ "$HIGH_SEVERITY" -gt 0 ]; then
-              echo "::error::Found $HIGH_SEVERITY high severity security issues"
-              cat bandit-results.json | python3 -m json.tool
-              exit 1
-            fi
-          fi
-
-      # Dependency Scan (pip-audit)
-      - name: Export requirements
-        run: uv export --no-hashes > requirements.txt
-
-      - name: Run pip-audit
-        run: |
-          pip-audit -r requirements.txt --format json --output pip-audit-results.json || true
-
-      - name: Check for vulnerabilities
-        run: |
-          if [ -f pip-audit-results.json ]; then
-            python3 << 'PYEOF'
-          import json
-          import sys
-
-          data = json.load(open('pip-audit-results.json'))
-          fixable_vulns = []
-          unfixable_vulns = []
-
-          for dep in data.get('dependencies', []):
-              for vuln in dep.get('vulns', []):
-                  info = {'name': dep['name'], 'version': dep['version'], 'vuln': vuln}
-                  if vuln.get('fix_versions'):
-                      fixable_vulns.append(info)
-                  else:
-                      unfixable_vulns.append(info)
-
-          if unfixable_vulns:
-              print(f"::warning::Found {len(unfixable_vulns)} vulnerabilities with no fix available:")
-              for v in unfixable_vulns:
-                  print(f"  - {v['name']}=={v['version']}: {v['vuln'].get('id')}")
-
-          if fixable_vulns:
-              print(f"::error::Found {len(fixable_vulns)} fixable vulnerabilities:")
-              for v in fixable_vulns:
-                  print(f"  - {v['name']}=={v['version']}: {v['vuln'].get('id')} (fix: {v['vuln'].get('fix_versions')})")
-              sys.exit(1)
-
-          print("No fixable vulnerabilities found")
-          PYEOF
-          fi
+        run: uv sync
 
       # Secret Detection
       - name: Run detect-secrets
@@ -117,7 +69,7 @@ jobs:
           fi
 
       # Trivy Vulnerability Scan
-      - name: Run Trivy vulnerability scanner (filesystem)
+      - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
@@ -132,23 +84,12 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
 
-      - name: Run Trivy (informational)
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'table'
-          exit-code: '0'
-          severity: 'CRITICAL,HIGH'
-          ignore-unfixed: true
-
       # License Compliance
       - name: Check licenses
         run: |
           source .venv/bin/activate
           pip-licenses --format=json --output-file=licenses.json
 
-          # Check for copyleft licenses (GPL, AGPL, etc.)
           COPYLEFT=$(python3 -c "
           import json
           data = json.load(open('licenses.json'))
@@ -172,14 +113,3 @@ jobs:
           fi
 
           echo "All licenses are compliant"
-
-      # Upload artifacts
-      - name: Upload security artifacts
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: security-results
-          path: |
-            bandit-results.json
-            pip-audit-results.json
-            licenses.json

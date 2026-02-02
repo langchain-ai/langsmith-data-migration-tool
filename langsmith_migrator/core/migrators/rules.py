@@ -30,7 +30,7 @@ class RulesMigrator(BaseMigrator):
     @staticmethod
     def _clean_none_values(obj: Any) -> Any:
         """Recursively remove None values from dicts and lists.
-        
+
         This is important for evaluators because the API returns fields like
         'prompt': None, 'schema': None which cause validation errors when sent back.
         """
@@ -86,12 +86,12 @@ class RulesMigrator(BaseMigrator):
     def _fetch_prompt_manifest(self, prompt_handle: str, commit: str = "latest", from_source: bool = True) -> Optional[Dict[str, Any]]:
         """
         Fetch a prompt manifest from source or destination.
-        
+
         Args:
             prompt_handle: The prompt repo handle
             commit: Commit hash or "latest"
             from_source: If True, fetch from source; otherwise from destination
-            
+
         Returns:
             The manifest dict, or None if failed
         """
@@ -154,12 +154,12 @@ class RulesMigrator(BaseMigrator):
     def _extract_model_from_manifest(self, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Extract the model configuration from a prompt manifest.
-        
+
         For RunnableSequence/PromptPlayground manifests, the model is in kwargs.last
-        
+
         Args:
             manifest: The prompt manifest dict
-            
+
         Returns:
             The model configuration dict, or None if not found
         """
@@ -197,13 +197,13 @@ class RulesMigrator(BaseMigrator):
     def _check_prompt_has_model(self, prompt_handle: str) -> tuple[bool, str]:
         """
         Check if a prompt on the destination includes a model configuration.
-        
+
         For v3+ evaluators, the prompt must be a RunnableSequence or PromptPlayground
         that includes a model as part of its manifest.
-        
+
         Args:
             prompt_handle: The prompt repo handle
-            
+
         Returns:
             Tuple of (has_model, message)
         """
@@ -338,7 +338,7 @@ class RulesMigrator(BaseMigrator):
     def build_dataset_mapping(self) -> Dict[str, str]:
         """
         Build a mapping of dataset IDs from source to destination by matching dataset names.
-        
+
         Returns:
             Dict mapping source_dataset_id -> dest_dataset_id
         """
@@ -442,7 +442,7 @@ class RulesMigrator(BaseMigrator):
     def list_project_rules(self, project_id: str) -> List[Dict[str, Any]]:
         """
         List rules for a specific project.
-        
+
         Project rules are often stored at /sessions/{project_id}/rules or similar.
         """
         # Try different possible endpoint names for project-specific rules
@@ -519,11 +519,11 @@ class RulesMigrator(BaseMigrator):
 
     def update_rule(self, rule_id: str, payload: Dict[str, Any]) -> Optional[str]:
         """Update existing rule in destination.
-        
+
         Args:
             rule_id: The ID of the rule to update
             payload: The full rule payload with updated values
-            
+
         Returns:
             The rule ID if successful, None if failed
         """
@@ -953,11 +953,11 @@ class RulesMigrator(BaseMigrator):
     ) -> Optional[str]:
         """
         Migrate a single rule.
-        
+
         Args:
             rule_id: Source rule ID
             target_project_id: Destination project ID (for project-specific rules)
-            
+
         Returns:
             The new rule ID, or None if failed
         """
@@ -974,11 +974,11 @@ class RulesMigrator(BaseMigrator):
     ) -> Dict[str, str]:
         """
         Migrate all rules from one project to another.
-        
+
         Args:
             source_project_id: Source project ID
             dest_project_id: Destination project ID
-            
+
         Returns:
             Mapping of source rule IDs to destination rule IDs
         """

@@ -4,7 +4,6 @@ from typing import Dict, List, Any, Optional, Generator, Tuple
 import requests
 import tempfile
 import os
-import shutil
 import json
 import hashlib
 import urllib3

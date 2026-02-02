@@ -19,7 +19,7 @@ class ChartMigrator(BaseMigrator):
     def list_sessions(self) -> List[Dict[str, Any]]:
         """
         List all sessions (projects) from source.
-        
+
         Returns:
             List of session objects
         """
@@ -37,10 +37,10 @@ class ChartMigrator(BaseMigrator):
     def list_charts(self, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         List charts from source using POST /api/v1/charts.
-        
+
         Args:
             session_id: Optional session ID to filter by
-            
+
         Returns:
             List of chart configurations
         """
@@ -456,7 +456,7 @@ class ChartMigrator(BaseMigrator):
     def migrate_all_charts(self, same_instance: bool = False) -> Dict[str, Dict[str, str]]:
         """
         Migrate all charts from all sessions.
-        
+
         Args:
             same_instance: If True, assumes source and dest have same session IDs.
 
@@ -555,7 +555,7 @@ class ChartMigrator(BaseMigrator):
         """
         Recursively map project and dataset IDs within a chart object.
         Modifies the object in-place.
-        
+
         Args:
             obj: Chart object or sub-structure
             dest_session_id: If provided, forcibly sets project_id/session_id to this value

@@ -194,7 +194,7 @@ class Config:
     def prompt_for_credentials(self, console: Optional[Console] = None) -> None:
         """
         Interactively prompt for missing credentials.
-        
+
         Args:
             console: Rich console for output
         """

@@ -57,7 +57,7 @@ class PromptMigrator(BaseMigrator):
         """
         # Test 1: Check if we can list prompts (READ access)
         try:
-            response = self.dest_ls_client.list_prompts(limit=1)
+            self.dest_ls_client.list_prompts(limit=1)
         except Exception as e:
             error_msg = str(e)
             if "405" in error_msg or "Not Allowed" in error_msg:
@@ -154,10 +154,10 @@ class PromptMigrator(BaseMigrator):
     def _get_latest_commit_hash(self, prompt_identifier: str) -> Optional[str]:
         """
         Get the latest commit hash for a prompt from destination.
-        
+
         Args:
             prompt_identifier: Prompt repo handle
-            
+
         Returns:
             The latest commit hash, or None if not found
         """
