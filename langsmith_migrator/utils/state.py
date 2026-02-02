@@ -193,7 +193,7 @@ class StateManager:
     def __init__(self, state_dir: Optional[Path] = None):
         """
         Initialize state manager.
-        
+
         Args:
             state_dir: Directory for state files (default: ~/.langsmith-migrator/state)
         """

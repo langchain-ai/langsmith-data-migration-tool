@@ -11,17 +11,15 @@ from ..utils.config import Config
 
 
 def ssl_option(f):
-    """Decorator to add --no-ssl option to commands."""
-    @click.option('--no-ssl', is_flag=True, help='Disable SSL verification')
+    """
+    Decorator kept for backwards compatibility.
+
+    Note: --no-ssl is now handled globally in the cli() group, so this decorator
+    is a no-op. It's kept to avoid breaking existing command decorations.
+    """
     @functools.wraps(f)
-    def wrapper(*args, no_ssl=False, **kwargs):
-        if no_ssl:
-            ctx = click.get_current_context()
-            config = ctx.obj['config']
-            config.source.verify_ssl = False
-            config.destination.verify_ssl = False
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    def wrapper(*args, **kwargs):
+        # The global cli() already handles --no-ssl via the config object
         return f(*args, **kwargs)
     return wrapper
 from ..utils.state import StateManager, MigrationStatus
@@ -74,13 +72,13 @@ def ensure_config(config: Config) -> bool:
 
 
 @click.group()
-@click.option('--source-key', envvar='LANGSMITH_OLD_API_KEY', help='Source API key')
-@click.option('--dest-key', envvar='LANGSMITH_NEW_API_KEY', help='Destination API key')
-@click.option('--source-url', envvar='LANGSMITH_OLD_BASE_URL', help='Source base URL')
-@click.option('--dest-url', envvar='LANGSMITH_NEW_BASE_URL', help='Destination base URL')
+@click.option('--source-key', envvar='LANGSMITH_OLD_API_KEY', help='Source API key (env: LANGSMITH_OLD_API_KEY)')
+@click.option('--dest-key', envvar='LANGSMITH_NEW_API_KEY', help='Destination API key (env: LANGSMITH_NEW_API_KEY)')
+@click.option('--source-url', envvar='LANGSMITH_OLD_BASE_URL', help='Source base URL (env: LANGSMITH_OLD_BASE_URL)')
+@click.option('--dest-url', envvar='LANGSMITH_NEW_BASE_URL', help='Destination base URL (env: LANGSMITH_NEW_BASE_URL)')
 @click.option('--no-ssl', is_flag=True, help='Disable SSL verification')
-@click.option('--batch-size', type=int, help='Batch size for operations')
-@click.option('--workers', type=int, help='Number of concurrent workers')
+@click.option('--batch-size', type=click.IntRange(min=1, max=1000), help='Batch size for operations (1-1000, default: 100)')
+@click.option('--workers', type=click.IntRange(min=1, max=10), help='Number of concurrent workers (1-10, default: 4)')
 @click.option('--dry-run', is_flag=True, help='Run in dry-run mode (no changes)')
 @click.option('--skip-existing', is_flag=True, help='Skip existing resources instead of updating them')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
@@ -150,12 +148,16 @@ def datasets(ctx, include_experiments, select_all):
 
     # Test connections first
     console.print("Testing connections... ", end="")
-    source_ok, dest_ok = orchestrator.test_connections_detailed()
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
+        if source_error:
+            console.print(f"[red]  {source_error}[/red]")
         return
     if not dest_ok:
         console.print("[yellow]⚠ Source OK, destination connection failed[/yellow]")
+        if dest_error:
+            console.print(f"[yellow]  {dest_error}[/yellow]")
         console.print("Continuing with source-only operations...")
     else:
         console.print("[green]✓[/green]")
@@ -440,7 +442,7 @@ def prompts(ctx, select_all, include_all_commits):
     orchestrator = MigrationOrchestrator(config, state_manager)
 
     console.print("Testing connections... ", end="")
-    source_ok, dest_ok = orchestrator.test_connections_detailed()
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
         return
@@ -627,7 +629,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled):
     orchestrator = MigrationOrchestrator(config, state_manager)
 
     console.print("Testing connections... ", end="")
-    source_ok, dest_ok = orchestrator.test_connections_detailed()
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
         return
@@ -836,7 +838,7 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 
     # Test connections first
     console.print("Testing connections... ", end="")
-    source_ok, dest_ok = orchestrator.test_connections_detailed()
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
         return
@@ -1083,7 +1085,7 @@ def charts(ctx, session, same_instance):
     orchestrator = MigrationOrchestrator(config, state_manager)
 
     console.print("Testing connections... ", end="")
-    source_ok, dest_ok = orchestrator.test_connections_detailed()
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
         return

@@ -248,6 +248,15 @@ class ExperimentMigrator(BaseMigrator):
         }
 
         response = self.dest.post("/sessions", payload)
+
+        # Validate response has expected fields
+        if not isinstance(response, dict):
+            from ..api_client import APIError
+            raise APIError(f"Invalid response creating experiment: expected dict, got {type(response)}")
+        if "id" not in response:
+            from ..api_client import APIError
+            raise APIError(f"Invalid response creating experiment: missing 'id' field. Response: {response}")
+
         return response["id"]
 
     def migrate_runs_streaming(
@@ -357,10 +366,10 @@ class ExperimentMigrator(BaseMigrator):
 
                     # Process batch
                     if len(batch) >= self.config.migration.batch_size:
-                        success = self._create_runs_batch(batch)
+                        success, created = self._create_runs_batch(batch)
+                        total_runs += created
                         if success:
-                            total_runs += len(batch)
-                            self.log(f"Created batch of {len(batch)} runs (total: {total_runs})", "info")
+                            self.log(f"Created batch of {created} runs (total: {total_runs})", "info")
                         else:
                             self.log(f"Failed to create batch of {len(batch)} runs", "error")
                         batch.clear()
@@ -377,17 +386,17 @@ class ExperimentMigrator(BaseMigrator):
 
         # Process remaining runs
         if batch:
-            success = self._create_runs_batch(batch)
+            success, created = self._create_runs_batch(batch)
+            total_runs += created
             if success:
-                total_runs += len(batch)
-                self.log(f"Created final batch of {len(batch)} runs", "info")
+                self.log(f"Created final batch of {created} runs", "info")
             else:
                 self.log(f"Failed to create final batch of {len(batch)} runs", "error")
 
         self.log(f"Run migration complete: {total_runs} migrated, {total_skipped} skipped", "success")
         return total_runs, run_id_mapping
 
-    def _create_runs_batch(self, runs: List[Dict[str, Any]]) -> bool:
+    def _create_runs_batch(self, runs: List[Dict[str, Any]]) -> tuple[bool, int]:
         """
         Create a batch of runs.
 
@@ -395,22 +404,43 @@ class ExperimentMigrator(BaseMigrator):
             runs: List of run dictionaries to create
 
         Returns:
-            True if successful, False otherwise
+            Tuple of (success, count_created) - success is True if at least some runs were created
         """
         if not runs:
-            return True
+            return True, 0
 
         payload = {"post": runs}
         self.log(f"Creating batch of {len(runs)} runs via /runs/batch", "info")
 
         try:
             response = self.dest.post("/runs/batch", payload)
-            self.log(f"Batch creation response: {response}", "info")
-            return True
+
+            # Validate response
+            if isinstance(response, dict):
+                # The /runs/batch endpoint typically returns summary info
+                # Check for any error indicators
+                if response.get("errors"):
+                    error_count = len(response["errors"])
+                    self.log(f"Batch creation had {error_count} error(s)", "warning")
+                    for error in response["errors"][:3]:
+                        self.log(f"  Error: {error}", "warning")
+                    return error_count < len(runs), len(runs) - error_count
+
+                if self.config.migration.verbose:
+                    self.log(f"Batch creation response: {response}", "info")
+                return True, len(runs)
+
+            elif isinstance(response, list):
+                # Some versions return list of created runs
+                return True, len(response)
+            else:
+                self.log(f"Unexpected response type from /runs/batch: {type(response)}", "warning")
+                return True, len(runs)  # Assume success if no error raised
+
         except Exception as e:
             self.log(f"Error creating runs batch: {e}", "error")
             # Log the first run for debugging
-            if runs:
+            if runs and self.config.migration.verbose:
                 import json
                 self.log(f"First run in failed batch: {json.dumps(runs[0], default=str)[:500]}", "error")
-            return False
+            return False, 0

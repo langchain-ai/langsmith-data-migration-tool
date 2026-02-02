@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.41] - 2026-02-02
+
+### Added
+- **Production Readiness Audit Fixes**: Comprehensive error handling and robustness improvements
+- **New Exception Classes**: `AuthenticationError` (401/403) and `ConflictError` (409) for explicit HTTP status handling
+- **Batch Error Tracking**: `BatchResult` and `BatchItemResult` classes to track individual item success/failure in batch operations
+- **Thread Safety**: Thread locks for shared state access during parallel migrations
+- **Attachment Validation**: Size limits (100MB max) and content-type validation for attachment downloads
+- **URL Validation**: Configuration validates URL format (must include scheme)
+- **CLI Input Validation**: `--batch-size` (1-1000) and `--workers` (1-10) now use IntRange constraints
+- **Environment Variable Documentation**: CLI help text now shows environment variable names
+
+### Fixed
+- **Silent Data Loss**: Batch operations now track which items failed instead of returning `[None]`
+- **Authentication Errors**: 401/403 errors now raise `AuthenticationError` with clear guidance
+- **Conflict Handling**: 409 errors now raise `ConflictError` for proper duplicate handling
+- **Bare `except:` Clauses**: Replaced 3 bare except clauses with specific exception types
+- **Rate Limiting**: Added `Retry-After` header support and maximum backoff cap (60 seconds)
+- **Network Errors**: Now handles `Timeout`, `ReadTimeout`, and `socket.timeout` in addition to `ConnectionError`
+- **Response Validation**: All API responses now validated before accessing fields
+- **Environment Parsing**: Safe parsing of numeric environment variables with try-catch
+
+### Changed
+- **API Client**: `test_connection()` now returns `Tuple[bool, Optional[str]]` (success, error_message)
+- **Orchestrator**: `test_connections_detailed()` now returns 4-tuple with error messages
+- **Logging**: Filtered field warnings in rules migration changed from "info" to "warning" level
+- **Chart Migration**: Added verbose logging when charts are filtered out
+
+### Security
+- **Attachment Downloads**: Enforces size limits during streaming to prevent memory exhaustion
+- **Content-Type Validation**: Validates attachment MIME types before download
+
 ## [0.0.4] - 2025-02-02
 
 ### Added
@@ -100,7 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.41...HEAD
+[0.0.41]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.4...v0.0.41
 [0.0.4]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.1...v0.0.2

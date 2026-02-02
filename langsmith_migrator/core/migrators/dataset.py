@@ -4,12 +4,33 @@ from typing import Dict, List, Any, Optional, Generator, Tuple
 import requests
 import tempfile
 import os
-import shutil
 import json
 import hashlib
+import urllib3
 
 from .base import BaseMigrator
 from ..api_client import APIError, NotFoundError
+
+
+# Maximum attachment size in bytes (100 MB)
+MAX_ATTACHMENT_SIZE_BYTES = 100 * 1024 * 1024
+
+# Allowed MIME types for attachments (add more as needed)
+ALLOWED_ATTACHMENT_TYPES = {
+    'application/octet-stream',
+    'application/json',
+    'application/pdf',
+    'image/png',
+    'image/jpeg',
+    'image/gif',
+    'image/webp',
+    'text/plain',
+    'text/csv',
+    'text/html',
+    'audio/mpeg',
+    'audio/wav',
+    'video/mp4',
+}
 
 
 class DatasetMigrator(BaseMigrator):
@@ -136,6 +157,13 @@ class DatasetMigrator(BaseMigrator):
         payload = {k: v for k, v in payload.items() if v is not None}
 
         response = self.dest.post("/datasets", payload)
+
+        # Validate response has expected fields
+        if not isinstance(response, dict):
+            raise APIError(f"Invalid response creating dataset: expected dict, got {type(response)}")
+        if "id" not in response:
+            raise APIError(f"Invalid response creating dataset: missing 'id' field. Response: {response}")
+
         return response["id"]
 
     def stream_examples(self, dataset_id: str) -> Generator[Dict[str, Any], None, None]:
@@ -152,6 +180,11 @@ class DatasetMigrator(BaseMigrator):
         """
         Download attachments from source to temporary files.
 
+        Includes safety checks:
+        - File size limit (MAX_ATTACHMENT_SIZE_BYTES)
+        - Content-type validation
+        - Integrity verification via Content-Length header
+
         Args:
             attachments: Dictionary of attachment URLs from source example
 
@@ -166,7 +199,8 @@ class DatasetMigrator(BaseMigrator):
         for key, attachment_info in attachments.items():
             try:
                 # Debug: log all available fields in attachment_info
-                self.log(f"Attachment '{key}' metadata fields: {list(attachment_info.keys())}", "info")
+                if self.config.migration.verbose:
+                    self.log(f"Attachment '{key}' metadata fields: {list(attachment_info.keys())}", "info")
 
                 # Get the presigned URL from source
                 presigned_url = attachment_info.get("presigned_url")
@@ -174,19 +208,87 @@ class DatasetMigrator(BaseMigrator):
                     self.log(f"No presigned URL for attachment '{key}', skipping", "warning")
                     continue
 
-                # Download the attachment content streaming to a temp file
                 # Suppress SSL warnings if verification is disabled
                 if not self.source.verify_ssl:
-                    import urllib3
                     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-                with requests.get(presigned_url, verify=self.source.verify_ssl, timeout=60, stream=True) as response:
+                # First, make a HEAD request to check size and content-type
+                try:
+                    head_response = requests.head(
+                        presigned_url,
+                        verify=self.source.verify_ssl,
+                        timeout=30,
+                        allow_redirects=True
+                    )
+                    head_response.raise_for_status()
+
+                    # Check content length
+                    content_length = head_response.headers.get('Content-Length')
+                    if content_length:
+                        file_size = int(content_length)
+                        if file_size > MAX_ATTACHMENT_SIZE_BYTES:
+                            self.log(
+                                f"Attachment '{key}' too large ({file_size} bytes > "
+                                f"{MAX_ATTACHMENT_SIZE_BYTES} bytes limit), skipping",
+                                "warning"
+                            )
+                            continue
+
+                    # Check content type (optional validation)
+                    server_content_type = head_response.headers.get('Content-Type', '').split(';')[0].strip()
+                    if server_content_type and server_content_type not in ALLOWED_ATTACHMENT_TYPES:
+                        self.log(
+                            f"Attachment '{key}' has unusual content type '{server_content_type}', "
+                            "proceeding with caution",
+                            "warning"
+                        )
+
+                except requests.exceptions.RequestException as e:
+                    # HEAD request failed, continue with download anyway
+                    self.log(f"HEAD request failed for '{key}': {e}, attempting download", "warning")
+
+                # Download the attachment content streaming to a temp file
+                with requests.get(
+                    presigned_url,
+                    verify=self.source.verify_ssl,
+                    timeout=300,  # 5 minute timeout for large files
+                    stream=True
+                ) as response:
                     response.raise_for_status()
 
                     # Create a temp file
                     fd, temp_path = tempfile.mkstemp()
-                    with os.fdopen(fd, 'wb') as f:
-                        shutil.copyfileobj(response.raw, f)
+                    bytes_written = 0
+
+                    try:
+                        with os.fdopen(fd, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    bytes_written += len(chunk)
+                                    # Enforce size limit during streaming
+                                    if bytes_written > MAX_ATTACHMENT_SIZE_BYTES:
+                                        raise ValueError(
+                                            f"Attachment exceeds size limit "
+                                            f"({MAX_ATTACHMENT_SIZE_BYTES} bytes)"
+                                        )
+                                    f.write(chunk)
+                    except Exception:
+                        # Clean up partial download
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+                        raise
+
+                # Verify download size matches Content-Length if provided
+                actual_size = os.path.getsize(temp_path)
+                expected_size = response.headers.get('Content-Length')
+                if expected_size and int(expected_size) != actual_size:
+                    self.log(
+                        f"Size mismatch for '{key}': expected {expected_size} bytes, "
+                        f"got {actual_size} bytes",
+                        "warning"
+                    )
 
                 # Get attachment metadata - use mime_type from attachment_info
                 content_type = attachment_info.get("mime_type") or attachment_info.get("content_type", "application/octet-stream")
@@ -196,11 +298,19 @@ class DatasetMigrator(BaseMigrator):
 
                 # Store as tuple of (mime_type, temp_file_path, original_filename)
                 downloaded[key] = (content_type, temp_path, original_filename)
-                file_size = os.path.getsize(temp_path)
-                self.log(f"Downloaded attachment '{key}' to '{temp_path}' ({file_size} bytes)", "info")
+                self.log(f"Downloaded attachment '{key}' ({actual_size} bytes)", "info")
 
+            except requests.exceptions.Timeout:
+                self.log(f"Timeout downloading attachment '{key}'", "error")
+                continue
+            except requests.exceptions.RequestException as e:
+                self.log(f"Network error downloading attachment '{key}': {e}", "error")
+                continue
+            except ValueError as e:
+                self.log(f"Validation error for attachment '{key}': {e}", "error")
+                continue
             except Exception as e:
-                self.log(f"Failed to download attachment '{key}': {e}", "error")
+                self.log(f"Unexpected error downloading attachment '{key}': {e}", "error")
                 continue
 
         return downloaded
@@ -261,11 +371,12 @@ class DatasetMigrator(BaseMigrator):
                         continue
 
                     # Upload attachment data to presigned URL
-                    import requests
                     # Suppress SSL warnings if verification is disabled
                     if not self.dest.verify_ssl:
-                        import urllib3
                         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                        if not hasattr(self, '_ssl_warning_shown'):
+                            self.log("SSL verification disabled for attachment uploads", "warning")
+                            self._ssl_warning_shown = True
 
                     upload_response = requests.put(
                         presigned_url,
@@ -325,8 +436,6 @@ class DatasetMigrator(BaseMigrator):
 
         # Add custom session with SSL verification disabled if needed
         if not self.config.destination.verify_ssl:
-            import requests
-            import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
             # Create session with SSL verification disabled
