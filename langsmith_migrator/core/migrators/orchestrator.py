@@ -9,6 +9,7 @@ from ..api_client import EnhancedAPIClient
 from ...utils.state import MigrationState, MigrationItem, MigrationStatus, StateManager
 from .dataset import DatasetMigrator
 from .experiment import ExperimentMigrator
+from .feedback import FeedbackMigrator
 
 
 class MigrationOrchestrator:
@@ -234,10 +235,11 @@ class MigrationOrchestrator:
                 )
 
         # Migrate runs if experiments were created
+        run_id_mapping = {}
         if experiment_id_mapping:
             self.console.print("\n[bold]Migrating experiment runs...[/bold]")
             try:
-                total_runs = experiment_migrator.migrate_runs_streaming(
+                total_runs, run_id_mapping = experiment_migrator.migrate_runs_streaming(
                     list(experiment_id_mapping.keys()),
                     {
                         "experiments": experiment_id_mapping,
@@ -247,6 +249,27 @@ class MigrationOrchestrator:
                 self.console.print(f"[green]✓[/green] Migrated {total_runs} run(s)")
             except Exception as e:
                 self.console.print(f"[red]✗[/red] Failed to migrate runs: {e}")
+
+        # Migrate feedback if experiments and runs were created
+        if experiment_id_mapping and run_id_mapping:
+            self.console.print("\n[bold]Migrating experiment feedback...[/bold]")
+            try:
+                feedback_migrator = FeedbackMigrator(
+                    self.source_client,
+                    self.dest_client,
+                    self.state,
+                    self.config
+                )
+                total_found, total_migrated = feedback_migrator.migrate_feedback_for_experiments(
+                    experiment_id_mapping,
+                    run_id_mapping
+                )
+                if total_found > 0:
+                    self.console.print(f"[green]✓[/green] Migrated {total_migrated}/{total_found} feedback record(s)")
+                else:
+                    self.console.print("[dim]No feedback records found[/dim]")
+            except Exception as e:
+                self.console.print(f"[red]✗[/red] Failed to migrate feedback: {e}")
 
     def cleanup(self):
         """Clean up resources."""

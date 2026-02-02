@@ -1,5 +1,6 @@
 """Simplified CLI interface with improved architecture."""
 
+import functools
 import click
 import time
 from rich.console import Console
@@ -7,6 +8,22 @@ from rich.table import Table
 from rich.prompt import Confirm
 
 from ..utils.config import Config
+
+
+def ssl_option(f):
+    """Decorator to add --no-ssl option to commands."""
+    @click.option('--no-ssl', is_flag=True, help='Disable SSL verification')
+    @functools.wraps(f)
+    def wrapper(*args, no_ssl=False, **kwargs):
+        if no_ssl:
+            ctx = click.get_current_context()
+            config = ctx.obj['config']
+            config.source.verify_ssl = False
+            config.destination.verify_ssl = False
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        return f(*args, **kwargs)
+    return wrapper
 from ..utils.state import StateManager, MigrationStatus
 from ..core.migrators import (
     MigrationOrchestrator,
@@ -91,6 +108,7 @@ def cli(ctx, source_key, dest_key, source_url, dest_url, no_ssl, batch_size, wor
 
 
 @cli.command()
+@ssl_option
 @click.pass_context
 def test(ctx):
     """Test connections to source and destination instances."""
@@ -114,6 +132,7 @@ def test(ctx):
 
 
 @cli.command()
+@ssl_option
 @click.option('--include-experiments', is_flag=True, help='Include experiments with datasets')
 @click.option('--all', 'select_all', is_flag=True, help='Migrate all datasets')
 @click.pass_context
@@ -177,8 +196,15 @@ def datasets(ctx, include_experiments, select_all):
         console.print("[yellow]No datasets selected[/yellow]")
         return
 
+    # Ask about experiments if not already specified via flag
+    if not include_experiments:
+        include_experiments = Confirm.ask("\nInclude experiments with datasets?", default=False)
+
     # Confirmation
     console.print(f"\nSelected {len(selected_datasets)} dataset(s)")
+
+    if include_experiments:
+        console.print("[dim]Including experiments, runs, and feedback[/dim]")
 
     if config.migration.dry_run:
         console.print("[dim]Mode: Dry Run (no changes)[/dim]")
@@ -221,6 +247,7 @@ def datasets(ctx, include_experiments, select_all):
 
 
 @cli.command()
+@ssl_option
 @click.pass_context
 def resume(ctx):
     """Resume a previous migration session."""
@@ -336,6 +363,7 @@ def resume(ctx):
 
 
 @cli.command()
+@ssl_option
 @click.pass_context
 def queues(ctx):
     """Migrate annotation queues."""
@@ -395,6 +423,7 @@ def queues(ctx):
 
 
 @cli.command()
+@ssl_option
 @click.option('--all', 'select_all', is_flag=True, help='Migrate all prompts')
 @click.option('--include-all-commits', is_flag=True, help='Include all commit history')
 @click.pass_context
@@ -526,6 +555,7 @@ def prompts(ctx, select_all, include_all_commits):
 
 
 @cli.command()
+@ssl_option
 @click.option('--source', is_flag=True, help='List projects from source instance')
 @click.option('--dest', is_flag=True, help='List projects from destination instance')
 @click.pass_context
@@ -578,6 +608,7 @@ def list_projects(ctx, source, dest):
 
 
 @cli.command()
+@ssl_option
 @click.option('--all', 'select_all', is_flag=True, help='Migrate all rules')
 @click.option('--strip-projects', is_flag=True, help='Strip project associations and create as global rules')
 @click.option('--project-mapping', type=str, help='JSON string or file path with project ID mapping (e.g., \'{"old-id": "new-id"}\')')
@@ -782,6 +813,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled):
 
 
 @cli.command()
+@ssl_option
 @click.option('--skip-datasets', is_flag=True, help='Skip dataset migration')
 @click.option('--skip-experiments', is_flag=True, help='Skip experiment migration')
 @click.option('--skip-prompts', is_flag=True, help='Skip prompt migration')
@@ -1034,6 +1066,7 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 
 
 @cli.command()
+@ssl_option
 @click.option('--session', help='Migrate charts for a specific session/project (by name or ID)')
 @click.option('--same-instance', is_flag=True, help='Source and destination are the same instance (use same session IDs)')
 @click.pass_context

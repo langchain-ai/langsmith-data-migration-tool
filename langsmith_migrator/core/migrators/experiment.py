@@ -1,6 +1,6 @@
 """Experiment migration logic."""
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import copy
 
 from .base import BaseMigrator
@@ -254,81 +254,163 @@ class ExperimentMigrator(BaseMigrator):
         self,
         experiment_ids: List[str],
         id_mappings: Dict[str, Dict[str, str]]
-    ) -> int:
-        """Migrate runs for experiments using streaming."""
+    ) -> Tuple[int, Dict[str, str]]:
+        """
+        Migrate runs for experiments using streaming.
+
+        Args:
+            experiment_ids: List of source experiment IDs to migrate runs for
+            id_mappings: Dict containing "experiments" and "examples" mappings
+
+        Returns:
+            Tuple of (total_runs_migrated, run_id_mapping)
+            where run_id_mapping maps source run IDs to destination run IDs
+        """
+        run_id_mapping: Dict[str, str] = {}
+
         if self.config.migration.dry_run:
             self.log("[DRY RUN] Would migrate runs")
-            return 0
+            return 0, run_id_mapping
 
         experiment_mapping = id_mappings.get("experiments", {})
         example_mapping = id_mappings.get("examples", {})
 
+        self.log(f"Starting run migration for {len(experiment_ids)} experiment(s)", "info")
+        self.log(f"Experiment ID mapping: {experiment_mapping}", "info")
+
         total_runs = 0
+        total_skipped = 0
         batch = []
 
-        # Query runs for all experiments
-        payload = {
-            "session": experiment_ids,
-            "skip_pagination": False
-        }
+        # Query runs for EACH experiment separately
+        # The LangSmith /runs/query API only processes the first session ID when given a list
+        for exp_idx, experiment_id in enumerate(experiment_ids, 1):
+            self.log(f"Fetching runs for experiment {exp_idx}/{len(experiment_ids)}: {experiment_id}", "info")
 
-        while True:
-            response = self.source.post("/runs/query", payload)
-            runs = response.get("runs", [])
+            payload = {
+                "session": [experiment_id],  # Single ID in a list (API requires list format)
+                "skip_pagination": False
+            }
 
-            for run in runs:
-                # Map IDs
-                if run.get("session_id") not in experiment_mapping:
-                    continue
+            page_num = 0
+            while True:
+                page_num += 1
+                try:
+                    response = self.source.post("/runs/query", payload)
+                except Exception as e:
+                    self.log(f"Error querying runs for experiment {experiment_id}: {e}", "error")
+                    break
 
-                migrated_run = {
-                    "name": run["name"],
-                    "inputs": run.get("inputs"),
-                    "outputs": run.get("outputs"),
-                    "run_type": run["run_type"],
-                    "start_time": run.get("start_time"),
-                    "end_time": run.get("end_time"),
-                    "extra": run.get("extra"),
-                    "error": run.get("error"),
-                    "serialized": run.get("serialized", {}),
-                    "parent_run_id": run.get("parent_run_id"),
-                    "events": run.get("events", []),
-                    "tags": run.get("tags", []),
-                    "trace_id": run["trace_id"],
-                    "id": run["id"],
-                    "dotted_order": run.get("dotted_order"),
-                    "session_id": experiment_mapping[run["session_id"]],
-                    "reference_example_id": example_mapping.get(run.get("reference_example_id"))
-                }
+                runs = response.get("runs", [])
+                self.log(f"Experiment {experiment_id} page {page_num}: Retrieved {len(runs)} runs", "info")
 
-                batch.append(migrated_run)
+                if not runs:
+                    if page_num == 1:
+                        self.log(f"No runs found for experiment {experiment_id}", "info")
+                    break
 
-                # Process batch
-                if len(batch) >= self.config.migration.batch_size:
-                    self._create_runs_batch(batch)
-                    total_runs += len(batch)
-                    batch.clear()
+                for run in runs:
+                    source_session_id = run.get("session_id")
+                    source_run_id = run.get("id")
 
-            # Check for next page
-            cursors = response.get("cursors")
-            next_cursor = cursors.get("next") if cursors else None
-            if not next_cursor:
-                break
+                    # Map IDs
+                    if source_session_id not in experiment_mapping:
+                        self.log(
+                            f"Skipping run {source_run_id} - session_id {source_session_id} not in experiment mapping",
+                            "warning"
+                        )
+                        total_skipped += 1
+                        continue
 
-            payload["cursor"] = next_cursor
+                    dest_session_id = experiment_mapping[source_session_id]
+
+                    # Map parent_run_id if present and already migrated
+                    parent_run_id = run.get("parent_run_id")
+                    if parent_run_id and parent_run_id in run_id_mapping:
+                        mapped_parent_id = run_id_mapping[parent_run_id]
+                    else:
+                        mapped_parent_id = parent_run_id  # Keep original if not mapped yet
+
+                    migrated_run = {
+                        "name": run["name"],
+                        "inputs": run.get("inputs"),
+                        "outputs": run.get("outputs"),
+                        "run_type": run["run_type"],
+                        "start_time": run.get("start_time"),
+                        "end_time": run.get("end_time"),
+                        "extra": run.get("extra"),
+                        "error": run.get("error"),
+                        "serialized": run.get("serialized", {}),
+                        "parent_run_id": mapped_parent_id,
+                        "events": run.get("events", []),
+                        "tags": run.get("tags", []),
+                        "trace_id": run.get("trace_id"),
+                        "id": source_run_id,  # Preserve original run ID
+                        "dotted_order": run.get("dotted_order"),
+                        "session_id": dest_session_id,
+                        "reference_example_id": example_mapping.get(run.get("reference_example_id"))
+                    }
+
+                    batch.append(migrated_run)
+                    # Track the mapping (source ID -> destination ID, same for now)
+                    run_id_mapping[source_run_id] = source_run_id
+
+                    # Process batch
+                    if len(batch) >= self.config.migration.batch_size:
+                        success = self._create_runs_batch(batch)
+                        if success:
+                            total_runs += len(batch)
+                            self.log(f"Created batch of {len(batch)} runs (total: {total_runs})", "info")
+                        else:
+                            self.log(f"Failed to create batch of {len(batch)} runs", "error")
+                        batch.clear()
+
+                # Check for next page
+                cursors = response.get("cursors")
+                next_cursor = cursors.get("next") if cursors else None
+
+                if not next_cursor:
+                    break
+
+                payload["cursor"] = next_cursor
+                self.log(f"Fetching next page with cursor: {next_cursor}", "info")
 
         # Process remaining runs
         if batch:
-            self._create_runs_batch(batch)
-            total_runs += len(batch)
+            success = self._create_runs_batch(batch)
+            if success:
+                total_runs += len(batch)
+                self.log(f"Created final batch of {len(batch)} runs", "info")
+            else:
+                self.log(f"Failed to create final batch of {len(batch)} runs", "error")
 
-        self.log(f"Migrated {total_runs} runs", "success")
-        return total_runs
+        self.log(f"Run migration complete: {total_runs} migrated, {total_skipped} skipped", "success")
+        return total_runs, run_id_mapping
 
-    def _create_runs_batch(self, runs: List[Dict[str, Any]]):
-        """Create a batch of runs."""
+    def _create_runs_batch(self, runs: List[Dict[str, Any]]) -> bool:
+        """
+        Create a batch of runs.
+
+        Args:
+            runs: List of run dictionaries to create
+
+        Returns:
+            True if successful, False otherwise
+        """
         if not runs:
-            return
+            return True
 
         payload = {"post": runs}
-        self.dest.post("/runs/batch", payload)
+        self.log(f"Creating batch of {len(runs)} runs via /runs/batch", "info")
+
+        try:
+            response = self.dest.post("/runs/batch", payload)
+            self.log(f"Batch creation response: {response}", "info")
+            return True
+        except Exception as e:
+            self.log(f"Error creating runs batch: {e}", "error")
+            # Log the first run for debugging
+            if runs:
+                import json
+                self.log(f"First run in failed batch: {json.dumps(runs[0], default=str)[:500]}", "error")
+            return False

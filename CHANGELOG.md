@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4] - 2025-02-02
+
+### Added
+- **Feedback Migration**: New `FeedbackMigrator` class to migrate feedback records for experiment runs
+  - Automatically migrates feedback when using `--include-experiments` with datasets
+  - Maps run IDs correctly between source and destination
+- **CLAUDE.md**: Development guidance file for Claude Code
+
+### Fixed
+- **Multi-experiment Run Migration**: Fixed bug where only the first experiment's runs were migrated
+  - Now queries runs per-experiment instead of all at once (LangSmith API only processes first session ID in list)
+  - Added detailed logging for run migration progress
+- **SSL Option**: Added `@ssl_option` decorator to all CLI commands for consistent SSL handling
+
+### Changed
+- **README.md**: Simplified from ~430 lines to ~170 lines for better readability
+  - Kept full Limitations section for transparency
+  - Condensed installation, configuration, and usage sections
+- **Experiment Prompt**: CLI now prompts whether to include experiments when running `datasets` command
+
+## [0.0.3] - 2025-01-15
+
+### Fixed
+- **Dataset Migration**: Fixed metadata migration with upsert support
+- **Example Migration**: Improved example metadata handling
+
 ## [0.0.2] - 2025-12-08
 
 ### Added
@@ -74,6 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.3...v0.0.4
+[0.0.3]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/langchain-ai/langsmith-data-migration-tool/releases/tag/v0.0.1
