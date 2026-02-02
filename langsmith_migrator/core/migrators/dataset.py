@@ -2,7 +2,6 @@
 
 from typing import Dict, List, Any, Optional, Generator, Tuple
 import requests
-import uuid
 import tempfile
 import os
 import shutil
@@ -108,7 +107,7 @@ class DatasetMigrator(BaseMigrator):
             "transformations": dataset.get("transformations") or [],
             "metadata": dataset.get("metadata"),
         }
-        
+
         # Remove None values
         payload = {k: v for k, v in payload.items() if v is not None}
 
@@ -168,7 +167,7 @@ class DatasetMigrator(BaseMigrator):
             try:
                 # Debug: log all available fields in attachment_info
                 self.log(f"Attachment '{key}' metadata fields: {list(attachment_info.keys())}", "info")
-                
+
                 # Get the presigned URL from source
                 presigned_url = attachment_info.get("presigned_url")
                 if not presigned_url:
@@ -183,7 +182,7 @@ class DatasetMigrator(BaseMigrator):
 
                 with requests.get(presigned_url, verify=self.source.verify_ssl, timeout=60, stream=True) as response:
                     response.raise_for_status()
-                    
+
                     # Create a temp file
                     fd, temp_path = tempfile.mkstemp()
                     with os.fdopen(fd, 'wb') as f:
@@ -272,7 +271,8 @@ class DatasetMigrator(BaseMigrator):
                         presigned_url,
                         data=data,
                         headers={"Content-Type": mime_type},
-                        verify=self.dest.verify_ssl
+                        verify=self.dest.verify_ssl,
+                        timeout=300  # 5 minute timeout for large attachments
                     )
                     upload_response.raise_for_status()
 
@@ -352,7 +352,7 @@ class DatasetMigrator(BaseMigrator):
                         temp_files_to_cleanup.append(temp_path)
                         with open(temp_path, "rb") as f:
                             data = f.read()
-                        
+
                         # Use the original filename which should include the extension
                         sdk_attachments[original_filename] = Attachment(
                             mime_type=mime_type,
@@ -518,7 +518,7 @@ class DatasetMigrator(BaseMigrator):
                 if downloaded_attachments:
                     self.log(f"Successfully downloaded {len(downloaded_attachments)} attachment(s)", "success")
                 else:
-                    self.log(f"No attachments were downloaded", "warning")
+                    self.log("No attachments were downloaded", "warning")
 
             # Prepare example for destination
             migrated_example = {
@@ -619,7 +619,7 @@ class DatasetMigrator(BaseMigrator):
 
         # Check if already exists
         existing_id = self.find_existing_dataset(dataset["name"])
-        
+
         if existing_id:
             if self.config.migration.skip_existing:
                 self.log(f"Dataset '{dataset['name']}' already exists, skipping", "warning")

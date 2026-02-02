@@ -1,12 +1,10 @@
 """Prompt migration logic."""
 
-import json
 from typing import Dict, List, Any, Optional
 from langsmith import Client
 import requests
 
 from .base import BaseMigrator
-from ..api_client import NotFoundError
 
 
 class PromptMigrator(BaseMigrator):
@@ -165,20 +163,20 @@ class PromptMigrator(BaseMigrator):
         """
         owner, repo, _ = self._parse_prompt_identifier(prompt_identifier)
         owner_path = owner if owner else "-"
-        
+
         try:
             url = f"{self._get_api_url(self.config.destination.base_url)}/commits/{owner_path}/{repo}/latest"
             headers = {"x-api-key": self.config.destination.api_key}
-            
+
             session = requests.Session()
             if not self.config.destination.verify_ssl:
                 session.verify = False
-            
+
             response = session.get(url, headers=headers, timeout=30)
             if response.status_code == 404:
                 return None
             response.raise_for_status()
-            
+
             data = response.json()
             return data.get("commit_hash")
         except Exception as e:
@@ -537,7 +535,7 @@ class PromptMigrator(BaseMigrator):
 
                 # Fallback: if no commits were successfully migrated, try latest version
                 if commits_migrated == 0:
-                    self.log(f"No commits migrated, falling back to latest version", "warning")
+                    self.log("No commits migrated, falling back to latest version", "warning")
                     manifest_data = self._pull_prompt_manifest(prompt_identifier, "latest")
 
                     if not manifest_data or not manifest_data.get('manifest'):
@@ -564,7 +562,7 @@ class PromptMigrator(BaseMigrator):
                 if not manifest_data or not manifest_data.get('manifest'):
                     raise ValueError("Failed to pull prompt manifest - prompt may not exist or be inaccessible")
 
-                self.log(f"Pushing manifest to destination...", "info")
+                self.log("Pushing manifest to destination...", "info")
                 new_commit_hash = self._push_prompt_manifest(
                     prompt_identifier,
                     manifest_data['manifest']
@@ -582,7 +580,7 @@ class PromptMigrator(BaseMigrator):
 
         except Exception as e:
             error_msg = str(e)
-            
+
             # Provide specific guidance for 405 errors
             if "405" in error_msg or "Not Allowed" in error_msg:
                 self.log(f"Failed to migrate prompt {prompt_identifier}: {e}", "error")
@@ -592,7 +590,7 @@ class PromptMigrator(BaseMigrator):
                 self.log("Please contact your LangSmith administrator for assistance.", "error")
             else:
                 self.log(f"Failed to migrate prompt {prompt_identifier}: {e}", "error")
-            
+
             if self.config.migration.verbose:
                 import traceback
                 self.log(f"Full traceback: {traceback.format_exc()}", "error")

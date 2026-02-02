@@ -18,7 +18,7 @@ class APIError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.request_info = request_info
-        
+
     def __str__(self):
         msg = super().__str__()
         if self.request_info:

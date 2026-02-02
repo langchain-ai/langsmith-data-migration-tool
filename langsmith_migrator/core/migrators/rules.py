@@ -19,7 +19,7 @@ class RulesMigrator(BaseMigrator):
         # ID mappings for projects and datasets
         self._project_id_map = None  # Maps old_project_id -> new_project_id
         self._dataset_id_map = None  # Maps old_dataset_id -> new_dataset_id
-        
+
         # Initialize LangSmith client for checking prompts
         self.dest_ls_client = None
         try:
@@ -55,21 +55,21 @@ class RulesMigrator(BaseMigrator):
             "api_url": self._get_api_url(self.config.destination.base_url),
             "info": {}
         }
-        
+
         if not self.config.destination.verify_ssl:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             session = requests.Session()
             session.verify = False
             dest_kwargs["session"] = session
-            
+
         self.dest_ls_client = Client(**dest_kwargs)
 
     def _find_existing_prompt(self, prompt_handle: str) -> bool:
         """Check if a prompt exists in destination."""
         if not self.dest_ls_client:
             return False
-            
+
         try:
             # Try to list prompts and find a match by repo_handle
             # We iterate because accessing directly might fail or require different permissions
@@ -96,7 +96,7 @@ class RulesMigrator(BaseMigrator):
             The manifest dict, or None if failed
         """
         source_name = "source" if from_source else "destination"
-        
+
         try:
             if from_source:
                 base_url = self.config.source.base_url.rstrip('/')
@@ -106,33 +106,33 @@ class RulesMigrator(BaseMigrator):
                 base_url = self.config.destination.base_url.rstrip('/')
                 api_key = self.config.destination.api_key
                 verify_ssl = self.config.destination.verify_ssl
-            
+
             if not base_url.endswith('/api/v1'):
                 base_url = f"{base_url}/api/v1"
-            
+
             url = f"{base_url}/commits/-/{prompt_handle}/{commit}"
             # include_model=true returns the full manifest with model config
             # This does NOT invoke the LLM - it just includes the model serialization
             params = {"include_model": "true"}
             headers = {"x-api-key": api_key}
-            
+
             session = requests.Session()
             if not verify_ssl:
                 session.verify = False
-            
+
             if self.config.migration.verbose:
                 self.log(f"  Fetching prompt manifest from {source_name}: {url}", "info")
-            
+
             response = session.get(url, headers=headers, params=params, timeout=30)
-            
+
             if response.status_code == 404:
                 self.log(f"  Prompt '{prompt_handle}' not found on {source_name} (404)", "warning")
                 return None
-            
+
             response.raise_for_status()
             data = response.json()
             manifest = data.get('manifest')
-            
+
             if self.config.migration.verbose:
                 if manifest:
                     manifest_id = manifest.get('id', [])
@@ -141,9 +141,9 @@ class RulesMigrator(BaseMigrator):
                     self.log(f"  Manifest type: {type_name}, has 'last' (model): {has_last}", "info")
                 else:
                     self.log(f"  Response has no 'manifest' field. Keys: {list(data.keys())}", "warning")
-            
+
             return manifest
-            
+
         except Exception as e:
             self.log(f"  Failed to fetch prompt manifest for {prompt_handle} from {source_name}: {e}", "warning")
             if self.config.migration.verbose:
@@ -165,15 +165,15 @@ class RulesMigrator(BaseMigrator):
         """
         if not manifest:
             if self.config.migration.verbose:
-                self.log(f"  _extract_model_from_manifest: manifest is None/empty", "warning")
+                self.log("  _extract_model_from_manifest: manifest is None/empty", "warning")
             return None
-        
+
         manifest_id = manifest.get('id', [])
         type_name = manifest_id[-1] if isinstance(manifest_id, list) and manifest_id else ''
-        
+
         if self.config.migration.verbose:
             self.log(f"  Manifest type: '{type_name}'", "info")
-        
+
         if type_name in ('RunnableSequence', 'PromptPlayground'):
             kwargs = manifest.get('kwargs', {})
             model = kwargs.get('last')
@@ -186,7 +186,7 @@ class RulesMigrator(BaseMigrator):
             else:
                 if self.config.migration.verbose:
                     self.log(f"  Manifest kwargs keys: {list(kwargs.keys())}", "warning")
-                    self.log(f"  No 'last' key found in kwargs", "warning")
+                    self.log("  No 'last' key found in kwargs", "warning")
                 return None
         else:
             if self.config.migration.verbose:
@@ -208,14 +208,14 @@ class RulesMigrator(BaseMigrator):
             Tuple of (has_model, message)
         """
         manifest = self._fetch_prompt_manifest(prompt_handle, from_source=False)
-        
+
         if manifest is None:
             return False, "Prompt not found on destination"
-        
+
         model = self._extract_model_from_manifest(manifest)
         if model:
             return True, "Prompt has model configuration"
-        
+
         manifest_id = manifest.get('id', [])
         type_name = manifest_id[-1] if isinstance(manifest_id, list) and manifest_id else 'unknown'
         return False, f"Prompt type is '{type_name}', missing model in kwargs.last"
@@ -334,7 +334,7 @@ class RulesMigrator(BaseMigrator):
             self._project_id_map = {}
 
         return self._project_id_map
-    
+
     def build_dataset_mapping(self) -> Dict[str, str]:
         """
         Build a mapping of dataset IDs from source to destination by matching dataset names.
@@ -344,35 +344,35 @@ class RulesMigrator(BaseMigrator):
         """
         if self._dataset_id_map is not None:
             return self._dataset_id_map
-            
+
         self.log("Building dataset ID mapping...", "info")
         self._dataset_id_map = {}
-        
+
         try:
             # Get all datasets from source
             source_datasets = {}
             for dataset in self.source.get_paginated("/datasets", page_size=100):
                 if isinstance(dataset, dict):
                     source_datasets[dataset['name']] = dataset['id']
-            
+
             # Get all datasets from destination
             dest_datasets = {}
             for dataset in self.dest.get_paginated("/datasets", page_size=100):
                 if isinstance(dataset, dict):
                     dest_datasets[dataset['name']] = dataset['id']
-            
+
             # Build mapping by matching names
             for name, source_id in source_datasets.items():
                 if name in dest_datasets:
                     self._dataset_id_map[source_id] = dest_datasets[name]
                     self.log(f"Mapped dataset '{name}': {source_id} -> {dest_datasets[name]}", "info")
-            
+
             self.log(f"Built dataset mapping: {len(self._dataset_id_map)} datasets matched", "success")
-            
+
         except Exception as e:
             self.log(f"Failed to build dataset mapping: {e}", "error")
             self._dataset_id_map = {}
-        
+
         return self._dataset_id_map
 
     def _get_rules_endpoint(self) -> str:
@@ -453,29 +453,29 @@ class RulesMigrator(BaseMigrator):
             f"/sessions/{project_id}/monitors",
             f"/sessions/{project_id}/online-evaluations",
         ]
-        
+
         for endpoint in possible_endpoints:
             try:
                 self.log(f"Trying to list project rules from {endpoint}...", "info")
                 rules = []
-                
+
                 for rule in self.source.get_paginated(endpoint, page_size=100):
                     if isinstance(rule, dict):
                         rules.append(rule)
-                
+
                 if rules:
                     self.log(f"Found {len(rules)} rule(s) for project at {endpoint}", "success")
                     return rules
                 else:
                     self.log(f"No rules found at {endpoint}, trying next...", "info")
-                    
+
             except NotFoundError:
                 self.log(f"Endpoint {endpoint} not found, trying next...", "info")
                 continue
             except Exception as e:
                 self.log(f"Error accessing {endpoint}: {e}", "warning")
                 continue
-        
+
         self.log(f"No rules endpoints found for project {project_id}", "warning")
         return []
 
@@ -535,7 +535,7 @@ class RulesMigrator(BaseMigrator):
             # PATCH endpoint only accepts specific fields (group_by is CREATE-only)
             # See: https://api.smith.langchain.com/api/v1/runs/rules/{rule_id}
             valid_patch_fields = {
-                'display_name', 'session_id', 'is_enabled', 'dataset_id', 
+                'display_name', 'session_id', 'is_enabled', 'dataset_id',
                 'sampling_rate', 'filter', 'trace_filter', 'tree_filter',
                 'backfill_from', 'use_corrections_dataset', 'num_few_shot_examples',
                 'extend_only', 'transient', 'add_to_annotation_queue_id',
@@ -543,15 +543,15 @@ class RulesMigrator(BaseMigrator):
                 'evaluators', 'code_evaluators', 'alerts', 'webhooks',
                 'evaluator_version', 'create_alignment_queue', 'include_extended_stats'
             }
-            
+
             # Filter payload to only include valid PATCH fields
             patch_payload = {k: v for k, v in payload.items() if k in valid_patch_fields}
-            
+
             # Log if any fields were filtered out
             filtered_fields = set(payload.keys()) - valid_patch_fields
             if filtered_fields:
                 self.log(f"Note: Excluded CREATE-only fields from PATCH: {filtered_fields}", "info")
-            
+
             endpoint = f"{self._get_rules_endpoint()}/{rule_id}"
             self.dest.patch(endpoint, patch_payload)
             self.log(f"Updated rule: {payload.get('display_name')} ({rule_id})", "success")
@@ -590,34 +590,34 @@ class RulesMigrator(BaseMigrator):
 
         try:
             display_name = rule.get('display_name') or rule.get('name')
-            
+
             if not display_name:
                 rule_id = rule.get('id', 'unknown')
                 display_name = f"Rule {rule_id}"
                 self.log(f"Warning: Rule {rule_id} missing display_name/name, using: {display_name}", "warning")
                 self.log(f"Available fields in rule: {list(rule.keys())}", "info")
-            
+
             # Build dataset mapping to map add_to_dataset_id
             dataset_map = self.build_dataset_mapping()
             source_add_to_dataset_id = rule.get('add_to_dataset_id')
             dest_add_to_dataset_id = None
-            
+
             if source_add_to_dataset_id:
                 dest_add_to_dataset_id = dataset_map.get(source_add_to_dataset_id)
                 if dest_add_to_dataset_id:
                     self.log(f"Mapped add_to_dataset_id: {source_add_to_dataset_id} -> {dest_add_to_dataset_id}", "info")
                 else:
                     self.log(f"Warning: add_to_dataset_id {source_add_to_dataset_id} not found in destination mapping", "warning")
-            
+
             # Build initial payload - we'll filter out None values later
             # If create_disabled is True, force is_enabled=False to bypass secrets validation
             # The backend adds placeholder secrets when is_enabled=False
             source_is_enabled = rule.get('is_enabled', rule.get('enabled', True))
             is_enabled = False if create_disabled else source_is_enabled
-            
+
             if create_disabled and source_is_enabled:
-                self.log(f"Creating rule as disabled (to bypass secrets validation)", "info")
-            
+                self.log("Creating rule as disabled (to bypass secrets validation)", "info")
+
             payload = {
                 'display_name': display_name,
                 'is_enabled': is_enabled,
@@ -636,7 +636,7 @@ class RulesMigrator(BaseMigrator):
                 'evaluator_version': rule.get('evaluator_version'),
                 'include_extended_stats': rule.get('include_extended_stats', False),
             }
-            
+
             # Remove None values from payload to avoid API validation errors
             payload = {k: v for k, v in payload.items() if v is not None}
 
@@ -653,76 +653,75 @@ class RulesMigrator(BaseMigrator):
 
                 hub_ref = f"{prompt_handle}:{commit_or_tag}"
                 self.log(f"Reconstructing v3+ evaluator: hub_ref={hub_ref}", "info")
-                
+
                 # For v3+ evaluators, we need to ensure the model is available.
                 # The model can come from:
                 # 1. The destination prompt (if it's a RunnableSequence/PromptPlayground with model)
                 # 2. The source prompt (we can fetch it and include it explicitly)
-                # 
+                #
                 # We'll try to get the model from the source prompt and include it explicitly
                 # to ensure validation succeeds even if the destination prompt doesn't have it.
-                
+
                 model_config = None
-                
+
                 # First, try to get the model from the SOURCE prompt
                 source_manifest = self._fetch_prompt_manifest(prompt_handle, commit_or_tag, from_source=True)
                 if source_manifest:
                     # Debug: log the manifest structure
                     if self.config.migration.verbose:
-                        import json
                         manifest_id = source_manifest.get('id', [])
                         manifest_kwargs_keys = list(source_manifest.get('kwargs', {}).keys())
                         self.log(f"  Source manifest id: {manifest_id}", "info")
                         self.log(f"  Source manifest kwargs keys: {manifest_kwargs_keys}", "info")
-                    
+
                     model_config = self._extract_model_from_manifest(source_manifest)
                     if model_config:
-                        self.log(f"  Extracted model config from source prompt", "info")
+                        self.log("  Extracted model config from source prompt", "info")
                     else:
-                        self.log(f"  Source prompt doesn't have model config (not a RunnableSequence/PromptPlayground)", "warning")
+                        self.log("  Source prompt doesn't have model config (not a RunnableSequence/PromptPlayground)", "warning")
                         # Log more details for debugging
                         if self.config.migration.verbose:
                             self.log(f"  Full manifest structure (first 500 chars): {str(source_manifest)[:500]}", "info")
                 else:
-                    self.log(f"  Could not fetch source prompt manifest", "warning")
-                
+                    self.log("  Could not fetch source prompt manifest", "warning")
+
                 # Build the evaluator structure
                 evaluator_structured = {
                     'hub_ref': hub_ref,
                     'variable_mapping': variable_mapping,
                 }
-                
+
                 # Include the model if we found it
                 if model_config:
                     evaluator_structured['model'] = model_config
-                    self.log(f"  Including model config in evaluator (ensures validation passes)", "info")
-                
+                    self.log("  Including model config in evaluator (ensures validation passes)", "info")
+
                 evaluators = [{'structured': evaluator_structured}]
 
                 # If we still don't have a model, try to get it from destination prompt
                 if not model_config:
-                    self.log(f"  Trying to get model from destination prompt...", "info")
+                    self.log("  Trying to get model from destination prompt...", "info")
                     dest_manifest = self._fetch_prompt_manifest(prompt_handle, commit_or_tag, from_source=False)
                     if dest_manifest:
                         model_config = self._extract_model_from_manifest(dest_manifest)
                         if model_config:
-                            self.log(f"  Got model config from destination prompt", "info")
+                            self.log("  Got model config from destination prompt", "info")
                             evaluator_structured['model'] = model_config
 
                 # Final check - do we have a model?
                 if not model_config:
                     self.log(f"[ERROR] Could not find model config for evaluator prompt '{prompt_handle}'", "error")
-                    self.log(f"  The prompt must be a RunnableSequence/PromptPlayground with a model", "error")
-                    self.log(f"  This typically means:", "error")
-                    self.log(f"    1. The prompt on source doesn't have a model (simple prompt, not RunnableSequence)", "error")
-                    self.log(f"    2. Or the prompt migration didn't include the model", "error")
-                    self.log(f"  Skipping this rule - it will fail validation without a model", "error")
+                    self.log("  The prompt must be a RunnableSequence/PromptPlayground with a model", "error")
+                    self.log("  This typically means:", "error")
+                    self.log("    1. The prompt on source doesn't have a model (simple prompt, not RunnableSequence)", "error")
+                    self.log("    2. Or the prompt migration didn't include the model", "error")
+                    self.log("  Skipping this rule - it will fail validation without a model", "error")
                     return None
-                
+
                 # Check if prompt exists on destination (for informational purposes)
                 if not self._find_existing_prompt(prompt_handle):
                     self.log(f"[WARNING] Prompt '{prompt_handle}' does NOT exist on destination", "warning")
-                    self.log(f"  Run 'langsmith-migrator prompts' first to migrate prompts", "warning")
+                    self.log("  Run 'langsmith-migrator prompts' first to migrate prompts", "warning")
                 else:
                     self.log(f"  Prompt '{prompt_handle}' exists on destination", "info")
 
@@ -740,13 +739,13 @@ class RulesMigrator(BaseMigrator):
                     hub_ref = structured.get('hub_ref')
                     has_model = 'model' in structured
                     has_prompt = 'prompt' in structured
-                    
+
                     if hub_ref:
                         self.log(f"  Evaluator {i+1}: hub_ref={hub_ref}, has_model={has_model}", "info")
                         # Extract prompt name from hub_ref (format: "owner/name:tag" or "name:tag")
                         prompt_name = hub_ref.split(':')[0] if ':' in hub_ref else hub_ref
                         missing_prompts.append(prompt_name)
-                        
+
                         if not has_model:
                             self.log(f"  [WARNING] Evaluator {i+1} has no model - validation may fail!", "warning")
                     elif has_prompt:
@@ -764,7 +763,7 @@ class RulesMigrator(BaseMigrator):
                     self.log(f"[WARNING] Rule references {len(actually_missing)} prompt(s) that must exist on destination:", "warning")
                     for prompt in actually_missing:
                         self.log(f"  - {prompt}", "warning")
-                    self.log(f"Run 'langsmith-migrator prompts' first to migrate prompts", "warning")
+                    self.log("Run 'langsmith-migrator prompts' first to migrate prompts", "warning")
 
             # Copy code_evaluators array directly (contains code evaluator configs)
             # Each code evaluator has: { code: str, language?: 'python' | 'javascript' }
@@ -789,26 +788,26 @@ class RulesMigrator(BaseMigrator):
             # Determine what to do with session_id and dataset_id
             source_session_id = rule.get('session_id')
             source_dataset_id = rule.get('dataset_id')
-            
+
             # Build ID mappings if not already done
             # If ensure_project is True, create missing projects in destination
             project_map = self.build_project_mapping(create_missing=ensure_project)
             dataset_map = self.build_dataset_mapping()
-            
+
             # Map IDs from source to destination
             dest_session_id = None
             dest_dataset_id = None
-            
+
             if source_session_id:
                 dest_session_id = project_map.get(source_session_id)
                 if not dest_session_id:
                     self.log(f"Warning: Project {source_session_id} not found in destination", "warning")
-            
+
             if source_dataset_id:
                 dest_dataset_id = dataset_map.get(source_dataset_id)
                 if not dest_dataset_id:
                     self.log(f"Warning: Dataset {source_dataset_id} not found in destination", "warning")
-            
+
             # Determine endpoint and payload based on project/dataset context
             if strip_project_reference:
                 # User wants to strip project references
@@ -816,10 +815,10 @@ class RulesMigrator(BaseMigrator):
                 if dest_dataset_id:
                     # Use mapped dataset_id even when stripping project
                     payload['dataset_id'] = dest_dataset_id
-                    self.log(f"Using mapped dataset_id (stripping project)", "info")
+                    self.log("Using mapped dataset_id (stripping project)", "info")
                 elif source_dataset_id:
                     self.log(f"Warning: Dataset {source_dataset_id} not found in destination", "warning")
-                    self.log(f"Cannot migrate rule without valid dataset or project", "warning")
+                    self.log("Cannot migrate rule without valid dataset or project", "warning")
                     return None
                 else:
                     self.log(f"Warning: Cannot strip project from rule '{display_name}' - no dataset_id to use instead", "warning")
@@ -837,11 +836,11 @@ class RulesMigrator(BaseMigrator):
                 # Use mapped IDs from source to destination
                 if dest_session_id:
                     payload['session_id'] = dest_session_id
-                    self.log(f"Using mapped project ID", "info")
+                    self.log("Using mapped project ID", "info")
                 if dest_dataset_id:
                     payload['dataset_id'] = dest_dataset_id
-                    self.log(f"Using mapped dataset ID", "info")
-                    
+                    self.log("Using mapped dataset ID", "info")
+
                 # API requires at least one of these
                 if not dest_session_id and not dest_dataset_id:
                     self.log(f"Error: Rule '{display_name}' cannot be mapped", "error")
@@ -850,16 +849,16 @@ class RulesMigrator(BaseMigrator):
                     if source_dataset_id and not dest_dataset_id:
                         self.log(f"  Dataset {source_dataset_id} not found in destination", "error")
                     if not source_session_id and not source_dataset_id:
-                        self.log(f"  Rule has neither session_id nor dataset_id in source", "error")
+                        self.log("  Rule has neither session_id nor dataset_id in source", "error")
                     return None
-                    
+
                 endpoint = base_endpoint
 
             # Check for existence before creating
             # We use dest_session_id or dest_dataset_id to narrow search
             # If payload has both, we search by both? Usually rules are one or other or both.
             existing_id = self.find_existing_rule(display_name, session_id=payload.get('session_id'), dataset_id=payload.get('dataset_id'))
-            
+
             if existing_id:
                 if self.config.migration.skip_existing:
                     self.log(f"Rule '{display_name}' already exists, skipping", "warning")
@@ -881,15 +880,15 @@ class RulesMigrator(BaseMigrator):
                 'evaluator_version', 'create_alignment_queue', 'include_extended_stats',
                 'group_by'  # CREATE-only field for thread evaluators
             }
-            
+
             # Filter payload to only include valid fields
             create_payload = {k: v for k, v in payload.items() if k in valid_create_fields}
-            
+
             # Log if any fields were filtered out
             filtered_fields = set(payload.keys()) - valid_create_fields
             if filtered_fields:
                 self.log(f"Note: Excluded invalid fields from CREATE: {filtered_fields}", "info")
-            
+
             self.log(f"Creating rule at {endpoint}", "info")
             if self.config.migration.verbose:
                 self.log(f"POST payload fields: {list(create_payload.keys())}", "info")
@@ -903,7 +902,7 @@ class RulesMigrator(BaseMigrator):
             rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
             error_str = str(e)
             self.log(f"Failed to create rule {rule_name}: {e}", "error")
-            
+
             # Provide specific guidance for common errors
             if "RunnableSequence must have at least 2 steps" in error_str:
                 self.log("", "error")
@@ -915,23 +914,23 @@ class RulesMigrator(BaseMigrator):
                 self.log("1. Run 'langsmith-migrator prompts' to migrate prompts from source", "error")
                 self.log("2. Ensure the prompt was migrated with include_model=true", "error")
                 self.log("3. Or manually add the model to the prompt on the destination", "error")
-                
+
                 # Log which prompt is problematic
                 if payload.get('evaluators'):
                     for ev in payload['evaluators']:
                         hub_ref = ev.get('structured', {}).get('hub_ref')
                         if hub_ref:
                             self.log(f"   Problematic prompt: {hub_ref}", "error")
-            
+
             elif "Evaluator failed validation" in error_str:
                 self.log("", "error")
                 self.log("Evaluator validation failed. Common causes:", "error")
                 self.log("- Missing or invalid prompt in destination hub", "error")
-                self.log("- Prompt exists but doesn't include model configuration", "error") 
+                self.log("- Prompt exists but doesn't include model configuration", "error")
                 self.log("- Missing secrets required by the model (e.g., API keys)", "error")
                 self.log("", "error")
                 self.log("Run 'langsmith-migrator prompts' first to ensure prompts are migrated", "error")
-            
+
             if self.config.migration.verbose:
                 self.log(f"Payload that failed: {list(payload.keys())}", "info")
                 if payload.get('evaluators'):
@@ -956,7 +955,7 @@ class RulesMigrator(BaseMigrator):
         rule = self.get_rule(rule_id)
         if not rule:
             return None
-            
+
         return self.create_rule(rule, target_project_id)
 
     def migrate_project_rules(
@@ -975,24 +974,24 @@ class RulesMigrator(BaseMigrator):
             Mapping of source rule IDs to destination rule IDs
         """
         rules = self.list_project_rules(source_project_id)
-        
+
         if not rules:
             self.log(f"No rules found for project {source_project_id}")
             return {}
-        
+
         self.log(f"Found {len(rules)} rules for project {source_project_id}")
-        
+
         id_mapping = {}
         for rule in rules:
             rule_id = rule.get('id')
             new_rule_id = self.create_rule(rule, dest_project_id)
-            
+
             if new_rule_id:
                 id_mapping[rule_id] = new_rule_id
-        
+
         self.log(
             f"Migrated {len(id_mapping)}/{len(rules)} rules for project",
             "success" if len(id_mapping) == len(rules) else "warning"
         )
-        
+
         return id_mapping

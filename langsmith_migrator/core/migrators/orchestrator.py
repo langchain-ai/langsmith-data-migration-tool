@@ -6,7 +6,7 @@ from rich.console import Console
 from rich.progress import Progress
 
 from ..api_client import EnhancedAPIClient
-from ...utils.state import MigrationState, MigrationItem, MigrationStatus, StateManager
+from ...utils.state import MigrationItem, MigrationStatus, StateManager
 from .dataset import DatasetMigrator
 from .experiment import ExperimentMigrator
 from .feedback import FeedbackMigrator
@@ -147,7 +147,7 @@ class MigrationOrchestrator:
                         # Provide helpful hint for SSL errors
                         if "SSL" in error_msg or "certificate verify failed" in error_msg:
                             self.console.print(f"[red]Failed to migrate dataset {dataset_id}:[/red]")
-                            self.console.print(f"[red]SSL certificate verification failed. Use --no-ssl flag to disable SSL verification.[/red]")
+                            self.console.print("[red]SSL certificate verification failed. Use --no-ssl flag to disable SSL verification.[/red]")
                         else:
                             self.console.print(f"[red]Failed to migrate dataset {dataset_id}: {e}[/red]")
                         self.state.update_item_status(

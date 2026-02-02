@@ -47,7 +47,7 @@ class AnnotationQueueMigrator(BaseMigrator):
             "rubric_items": queue.get("rubric_items"),
             "rubric_instructions": queue.get("rubric_instructions"),
         }
-        
+
         # Remove None values
         payload = {k: v for k, v in payload.items() if v is not None}
 
@@ -60,10 +60,10 @@ class AnnotationQueueMigrator(BaseMigrator):
         default_dataset_id: Optional[str] = None
     ) -> str:
         """Create or update annotation queue in destination."""
-        
+
         # Check if exists
         existing_id = self.find_existing_queue(queue["name"])
-        
+
         if existing_id:
             if self.config.migration.skip_existing:
                 self.log(f"Annotation queue '{queue['name']}' already exists, skipping", "warning")

@@ -38,7 +38,7 @@ class MigrationConfig:
 
 class Config:
     """Main configuration class that loads from environment variables."""
-    
+
     def __init__(self,
                  source_api_key: Optional[str] = None,
                  dest_api_key: Optional[str] = None,
@@ -82,7 +82,7 @@ class Config:
             base_url=dest_url or os.getenv('LANGSMITH_NEW_BASE_URL', 'https://api.smith.langchain.com'),
             verify_ssl=ssl_verify
         )
-        
+
         # Migration settings
         # Priority: CLI arg > env var > default (False, meaning update by default)
         should_skip = skip_existing if skip_existing is not None else (os.getenv('MIGRATION_SKIP_EXISTING', 'false').lower() == 'true')
@@ -97,11 +97,11 @@ class Config:
             chunk_size=int(os.getenv('MIGRATION_CHUNK_SIZE', '1000')),
             rate_limit_delay=float(os.getenv('MIGRATION_RATE_LIMIT_DELAY', '0.1'))
         )
-        
+
         # Disable SSL warnings if needed
         if not self.source.verify_ssl or not self.destination.verify_ssl:
             urllib3.disable_warnings(InsecureRequestWarning)
-    
+
     def validate(self) -> tuple[bool, list[str]]:
         """
         Validate the configuration.
@@ -136,7 +136,7 @@ class Config:
             errors.append("Concurrent workers should not exceed 10 to avoid rate limiting")
 
         return len(errors) == 0, errors
-    
+
     def prompt_for_credentials(self, console: Optional[Console] = None) -> None:
         """
         Interactively prompt for missing credentials.
@@ -146,12 +146,12 @@ class Config:
         """
         if console is None:
             console = Console()
-        
+
         # Check if we need to prompt for source credentials
         if not self.source.api_key:
             console.print("\n[cyan]Source Instance Configuration[/cyan]")
             self.source.api_key = getpass.getpass("Source API Key: ")
-            
+
             # Only prompt for URL if not already set
             if self.source.base_url == "https://api.smith.langchain.com":
                 new_url = Prompt.ask(
@@ -160,12 +160,12 @@ class Config:
                 )
                 if new_url:
                     self.source.base_url = new_url
-        
+
         # Check if we need to prompt for destination credentials
         if not self.destination.api_key:
             console.print("\n[cyan]Destination Instance Configuration[/cyan]")
             self.destination.api_key = getpass.getpass("Destination API Key: ")
-            
+
             # Only prompt for URL if not already set
             if self.destination.base_url == "https://api.smith.langchain.com":
                 new_url = Prompt.ask(
@@ -174,9 +174,9 @@ class Config:
                 )
                 if new_url:
                     self.destination.base_url = new_url
-        
+
         console.print()  # Add blank line after prompting
-    
+
     def display_summary(self, console) -> None:
         """Display minimal configuration summary."""
         if self.migration.verbose:

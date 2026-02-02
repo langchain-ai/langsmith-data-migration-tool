@@ -74,7 +74,7 @@ class EnhancedAPIClient:
                 error_detail = error_data.get("detail", error_data.get("message", ""))
             except:
                 error_detail = response.text[:200]
-                
+
             raise NotFoundError(
                 f"Resource not found: {endpoint} - {error_detail}",
                 status_code=404,
@@ -254,34 +254,34 @@ class EnhancedAPIClient:
         """
         if not items:
             return []
-            
+
         try:
             # Try to post the whole batch
             response = self.post(endpoint, items)
-            
+
             # Normalize response to list
             if isinstance(response, list):
                 return response
             # Fallback for endpoints that might return single object for batch (unlikely but safe)
             return [response] * len(items)
-            
+
         except APIError as e:
             # Base case: if batch size is 1, it's a definitive failure for this item
             if len(items) == 1:
                 if self.verbose:
                     self.console.print(f"[red]Item failed permanently: {e}[/red]")
                 return [None]
-                
+
             # Recursive step: Split and retry
             mid = len(items) // 2
             left = items[:mid]
             right = items[mid:]
-            
+
             if self.verbose:
                 self.console.print(f"[yellow]Batch failed, splitting into {len(left)} and {len(right)} items to isolate error[/yellow]")
-                
+
             return (
-                self._post_batch_recursive(endpoint, left) + 
+                self._post_batch_recursive(endpoint, left) +
                 self._post_batch_recursive(endpoint, right)
             )
 
