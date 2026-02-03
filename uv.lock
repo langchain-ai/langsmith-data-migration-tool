@@ -1519,6 +1519,12 @@ test = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "respx" },
+    { name = "ruff" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -1548,10 +1554,14 @@ requires-dist = [
     { name = "requests", specifier = ">=2.31.0" },
     { name = "respx", marker = "extra == 'test'", specifier = ">=0.20.0" },
     { name = "rich", specifier = ">=13.0.0" },
+    { name = "ruff", marker = "extra == 'test'", specifier = ">=0.4.0" },
     { name = "textual", specifier = ">=6.2.0" },
     { name = "urllib3", specifier = ">=2.6.0" },
 ]
 provides-extras = ["test", "models", "all"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.0.1" }]
 
 [[package]]
 name = "linkify-it-py"
