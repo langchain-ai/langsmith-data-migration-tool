@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.42] - 2026-02-02
+
+### Fixed
+- **Experiment Run Migration**: Fixed `trace_id does not match first part of dotted_order` validation errors
+  - Root runs now correctly set `trace_id = run_id` (API requirement)
+  - Child runs properly look up `trace_id` from mapping set by root run
+  - Added `_regenerate_dotted_order()` to remap UUIDs in dotted_order field
+  - Runs sorted by dotted_order to ensure parents processed before children
+  - Generate new UUIDs for destination runs to avoid conflicts
+  - Remove None values from run payloads to avoid 422 errors
+
+### Improved
+- **API Error Messages**: Enhanced error detail extraction to handle validation errors and various error response formats
+
+### Added
+- **Dev Dependencies**: Added pytest as dev dependency
+
 ## [0.0.41] - 2026-02-02
 
 ### Added
