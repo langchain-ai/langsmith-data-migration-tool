@@ -144,7 +144,18 @@ class EnhancedAPIClient:
         def get_error_detail() -> str:
             try:
                 error_data = response.json()
-                return error_data.get("detail", error_data.get("message", str(error_data)))
+                if isinstance(error_data, dict):
+                    # Handle various error response formats including validation errors
+                    detail = error_data.get("detail")
+                    if detail:
+                        # detail can be a string or a list of validation errors
+                        if isinstance(detail, list):
+                            # Format validation errors for readability
+                            errors = [str(e) for e in detail[:5]]  # Limit to first 5
+                            return "; ".join(errors)
+                        return str(detail)
+                    return error_data.get("message") or error_data.get("error") or str(error_data)
+                return str(error_data)
             except (ValueError, AttributeError):
                 return response.text[:500] if response.text else "No response body"
 
