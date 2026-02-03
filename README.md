@@ -51,6 +51,9 @@ For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk E
 ### Option 1: uv tool install (Recommended)
 ```bash
 uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl"
+
+# To update an existing installation, use --force:
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
@@ -103,7 +106,10 @@ langsmith-migrator migrate-all
 # Datasets
 langsmith-migrator datasets                    # Interactive selection
 langsmith-migrator datasets --all              # All datasets
-langsmith-migrator datasets --include-experiments  # With experiments
+langsmith-migrator datasets --include-experiments  # With experiments, runs, and feedback
+
+# Note: When running `datasets` without `--include-experiments`, you'll be prompted
+# interactively whether to include experiments. Experiments include all runs and feedback.
 
 # Annotation queues
 langsmith-migrator queues
@@ -138,6 +144,13 @@ langsmith-migrator clean
 --workers INTEGER       Concurrent workers (default: 4)
 --dry-run               Run without making changes
 --verbose, -v           Verbose output
+```
+
+### Dataset Options
+
+```bash
+--include-experiments   Include experiments, runs, and feedback (prompts if not specified)
+--all                   Migrate all datasets without interactive selection
 ```
 
 ### Interactive Selection
