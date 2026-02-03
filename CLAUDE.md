@@ -85,6 +85,25 @@ Environment variables (can also use CLI flags):
 ## Release Process
 
 1. Update version in `pyproject.toml`
-2. Update `CHANGELOG.md`
-3. Create and push git tag: `git tag -a v0.0.x -m "Release v0.0.x" && git push origin v0.0.x`
-4. GitHub Actions automatically builds and creates release
+2. Update `CHANGELOG.md` with new version section
+3. Commit and push changes (via PR if branch protection enabled)
+4. Create and push git tag:
+   ```bash
+   git tag -a v0.0.x -m "Release v0.0.x"
+   git push origin v0.0.x
+   ```
+5. Create GitHub release:
+   ```bash
+   gh release create v0.0.x --title "v0.0.x" --notes "Release notes here"
+   ```
+6. Build and upload artifacts:
+   ```bash
+   uv build
+   gh release upload v0.0.x dist/langsmith_data_migration_tool-0.0.x-py3-none-any.whl dist/langsmith_data_migration_tool-0.0.x.tar.gz
+   ```
+
+### Installing from Release
+
+```bash
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/download/v0.0.x/langsmith_data_migration_tool-0.0.x-py3-none-any.whl"
+```
