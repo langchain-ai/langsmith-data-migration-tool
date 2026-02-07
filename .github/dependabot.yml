@@ -11,17 +11,12 @@ updates:
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
-      - "security"
     commit-message:
       prefix: "deps"
     groups:
-      # Group minor and patch updates together
-      python-minor-patch:
+      python-dependencies:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
