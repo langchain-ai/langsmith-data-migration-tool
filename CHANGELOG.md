@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.50] - 2026-03-06
+
+### Added
+- **`.env` file support**: API keys and configuration are now auto-loaded from a `.env` file on startup via `python-dotenv`
+
+### Improved
+- **Project Mapper TUI**: Redesigned destination picker to be text-input-first — type a destination name directly with existing projects shown as filterable suggestions below
+- **Project Mapper UX**: Fixed focus stealing when typing in the destination name input
+- **Project Mapper UX**: Updated help text to clarify `Enter/Space` opens the destination editor
+
+### Fixed
+- **TUI Key Handling**: App-level priority keybindings (`s`, `m`, `u`, `a`, `q`) no longer intercept keystrokes when the destination picker modal is open
+
 ## [0.0.42] - 2026-02-02
 
 ### Fixed

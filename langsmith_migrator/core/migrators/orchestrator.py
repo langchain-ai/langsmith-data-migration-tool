@@ -215,42 +215,60 @@ class MigrationOrchestrator:
 
         # Create experiments in destination
         experiment_id_mapping = {}
-        for experiment in all_experiments:
-            source_dataset_id = experiment_to_dataset[experiment['id']]
-            dest_dataset_id = dataset_id_mapping.get(source_dataset_id)
+        success_count = 0
+        failed_items = []
+        skipped_items = []
 
-            if not dest_dataset_id:
-                self.console.print(f"[yellow]Skipping experiment {experiment['name']} - dataset not migrated[/yellow]")
-                continue
+        with Progress(console=self.console) as progress:
+            task = progress.add_task("Migrating experiments...", total=len(all_experiments))
 
-            try:
-                # Add to state
-                item = MigrationItem(
-                    id=f"experiment_{experiment['id']}",
-                    type="experiment",
-                    name=experiment['name'],
-                    source_id=experiment['id']
-                )
-                self.state.add_item(item)
-                self.state.update_item_status(item.id, MigrationStatus.IN_PROGRESS)
+            for experiment in all_experiments:
+                source_dataset_id = experiment_to_dataset[experiment['id']]
+                dest_dataset_id = dataset_id_mapping.get(source_dataset_id)
 
-                new_exp_id = experiment_migrator.create_experiment(experiment, dest_dataset_id)
-                experiment_id_mapping[experiment['id']] = new_exp_id
+                if not dest_dataset_id:
+                    skipped_items.append((experiment['name'], "dataset not migrated"))
+                    progress.advance(task)
+                    continue
 
-                self.state.update_item_status(
-                    item.id,
-                    MigrationStatus.COMPLETED,
-                    destination_id=new_exp_id
-                )
-                self.console.print(f"[green]✓[/green] Migrated experiment: {experiment['name']}")
+                try:
+                    # Add to state
+                    item = MigrationItem(
+                        id=f"experiment_{experiment['id']}",
+                        type="experiment",
+                        name=experiment['name'],
+                        source_id=experiment['id']
+                    )
+                    self.state.add_item(item)
+                    self.state.update_item_status(item.id, MigrationStatus.IN_PROGRESS)
 
-            except Exception as e:
-                self.console.print(f"[red]✗[/red] Failed to migrate experiment {experiment['name']}: {e}")
-                self.state.update_item_status(
-                    item.id,
-                    MigrationStatus.FAILED,
-                    error=str(e)
-                )
+                    new_exp_id = experiment_migrator.create_experiment(experiment, dest_dataset_id)
+                    experiment_id_mapping[experiment['id']] = new_exp_id
+
+                    self.state.update_item_status(
+                        item.id,
+                        MigrationStatus.COMPLETED,
+                        destination_id=new_exp_id
+                    )
+                    success_count += 1
+
+                except Exception as e:
+                    failed_items.append((experiment['name'], str(e)))
+                    self.state.update_item_status(
+                        item.id,
+                        MigrationStatus.FAILED,
+                        error=str(e)
+                    )
+
+                progress.advance(task)
+
+        # Summary
+        self.console.print(f"Experiments: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed")
+        if (failed_items or skipped_items) and self.config.migration.verbose:
+            for name, err in skipped_items:
+                self.console.print(f"  [yellow]⊘[/yellow] {name}: {err}")
+            for name, err in failed_items:
+                self.console.print(f"  [red]✗[/red] {name}: {err}")
 
         # Migrate runs if experiments were created
         run_id_mapping = {}
