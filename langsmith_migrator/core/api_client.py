@@ -370,14 +370,13 @@ class EnhancedAPIClient:
         # Log summary of failures if any occurred
         if result.failure_count > 0:
             self.console.print(
-                f"[yellow]Batch operation completed with {result.failure_count} failure(s) "
-                f"out of {len(items)} items[/yellow]"
+                f"[yellow]Batch: {result.failure_count} failure(s) out of {len(items)} items[/yellow]"
             )
-            # Log first few errors for debugging
-            for failure in result.failures[:3]:
-                self.console.print(f"[red]  Item {failure.item_index}: {failure.error}[/red]")
-            if result.failure_count > 3:
-                self.console.print(f"[red]  ... and {result.failure_count - 3} more failures[/red]")
+            if self.verbose:
+                for failure in result.failures[:3]:
+                    self.console.print(f"[red]  Item {failure.item_index}: {failure.error}[/red]")
+                if result.failure_count > 3:
+                    self.console.print(f"[red]  ... and {result.failure_count - 3} more failures[/red]")
 
         return result.get_responses()
 

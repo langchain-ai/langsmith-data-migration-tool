@@ -3,9 +3,13 @@
 import functools
 import click
 import time
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 from rich.prompt import Confirm
+from rich.progress import Progress
+
+load_dotenv()
 
 from ..utils.config import Config
 
@@ -32,9 +36,28 @@ from ..core.migrators import (
     ChartMigrator,
 )
 from .tui_selector import select_items
+from .tui_project_mapper import build_project_mapping_tui
+from ..utils.workspace import list_projects as _list_projects
 
 
 console = Console()
+
+
+def _name_mapping_to_id_mapping(
+    name_mapping: dict,
+    source_projects: list,
+    dest_projects: list,
+) -> dict:
+    """Convert a name-based project mapping to an ID-based mapping."""
+    src_name_to_id = {p['name']: p['id'] for p in source_projects if 'name' in p and 'id' in p}
+    dst_name_to_id = {p['name']: p['id'] for p in dest_projects if 'name' in p and 'id' in p}
+    id_map = {}
+    for src_name, dst_name in name_mapping.items():
+        src_id = src_name_to_id.get(src_name)
+        dst_id = dst_name_to_id.get(dst_name)
+        if src_id and dst_id:
+            id_map[src_id] = dst_id
+    return id_map
 
 
 def display_banner():
@@ -416,12 +439,23 @@ def queues(ctx):
     console.print(f"\n[bold]Migrating {len(selected_queues)} annotation queue(s)...[/bold]")
 
     # Perform migration
-    for queue in selected_queues:
-        try:
-            new_id = queue_migrator.create_queue(queue)
-            console.print(f"[green]✓[/green] Migrated queue: {queue['name']} -> {new_id}")
-        except Exception as e:
-            console.print(f"[red]✗[/red] Failed to migrate {queue['name']}: {e}")
+    success_count = 0
+    failed_items = []
+
+    with Progress(console=console) as progress:
+        task = progress.add_task("Migrating queues...", total=len(selected_queues))
+        for queue in selected_queues:
+            try:
+                new_id = queue_migrator.create_queue(queue)
+                success_count += 1
+            except Exception as e:
+                failed_items.append((queue['name'], str(e)))
+            progress.advance(task)
+
+    console.print(f"Queues: {success_count} migrated, {len(failed_items)} failed")
+    if failed_items and config.migration.verbose:
+        for name, err in failed_items:
+            console.print(f"  [red]✗[/red] {name}: {err}")
 
 
 @cli.command()
@@ -518,40 +552,39 @@ def prompts(ctx, select_all, include_all_commits):
         return
 
     success_count = 0
-    failed_count = 0
     has_405_error = False
+    failed_items = []
 
-    for prompt in selected_prompts:
-        try:
-            result = prompt_migrator.migrate_prompt(
-                prompt['repo_handle'],
-                include_all_commits=include_all_commits
-            )
-            if result:
-                console.print(f"[green]✓[/green] Migrated: {prompt['repo_handle']}")
-                success_count += 1
-            else:
-                console.print(f"[red]✗[/red] Failed: {prompt['repo_handle']}")
-                failed_count += 1
-        except Exception as e:
-            error_msg = str(e)
-            if "405" in error_msg or "Not Allowed" in error_msg:
-                has_405_error = True
-            console.print(f"[red]✗[/red] Failed {prompt['repo_handle']}: {e}")
-            failed_count += 1
+    with Progress(console=console) as progress:
+        task = progress.add_task("Migrating prompts...", total=len(selected_prompts))
+        for prompt in selected_prompts:
+            try:
+                result = prompt_migrator.migrate_prompt(
+                    prompt['repo_handle'],
+                    include_all_commits=include_all_commits
+                )
+                if result:
+                    success_count += 1
+                else:
+                    failed_items.append((prompt['repo_handle'], "migration returned None"))
+            except Exception as e:
+                error_msg = str(e)
+                if "405" in error_msg or "Not Allowed" in error_msg:
+                    has_405_error = True
+                failed_items.append((prompt['repo_handle'], error_msg))
+            progress.advance(task)
 
-    console.print(f"\n[green]✓[/green] Migration completed")
-    console.print(f"  Migrated: {success_count} prompt(s)")
-    if failed_count > 0:
-        console.print(f"  [red]Failed: {failed_count}[/red]")
-        
-        if has_405_error:
-            console.print("\n[yellow]⚠ All failures were due to 405 Not Allowed errors[/yellow]")
-            console.print("[dim]This indicates the destination instance does not support prompt write operations.[/dim]")
-            console.print("[dim]Possible solutions:[/dim]")
-            console.print("[dim]  • Enable the prompts feature on your LangSmith instance[/dim]")
-            console.print("[dim]  • Check nginx/proxy configuration for /api/v1/repos/* endpoints[/dim]")
-            console.print("[dim]  • Contact your LangSmith administrator[/dim]")
+    console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
+    if failed_items and config.migration.verbose:
+        for name, err in failed_items:
+            console.print(f"  [red]✗[/red] {name}: {err}")
+    if failed_items and has_405_error:
+        console.print("\n[yellow]⚠ Some failures were due to 405 Not Allowed errors[/yellow]")
+        console.print("[dim]This indicates the destination instance does not support prompt write operations.[/dim]")
+        console.print("[dim]Possible solutions:[/dim]")
+        console.print("[dim]  • Enable the prompts feature on your LangSmith instance[/dim]")
+        console.print("[dim]  • Check nginx/proxy configuration for /api/v1/repos/* endpoints[/dim]")
+        console.print("[dim]  • Contact your LangSmith administrator[/dim]")
 
     orchestrator.cleanup()
 
@@ -615,8 +648,9 @@ def list_projects(ctx, source, dest):
 @click.option('--strip-projects', is_flag=True, help='Strip project associations and create as global rules')
 @click.option('--project-mapping', type=str, help='JSON string or file path with project ID mapping (e.g., \'{"old-id": "new-id"}\')')
 @click.option('--create-enabled', is_flag=True, help='Create rules as enabled (default is disabled to bypass API key/secrets validation)')
+@click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
 @click.pass_context
-def rules(ctx, select_all, strip_projects, project_mapping, create_enabled):
+def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_projects):
     """Migrate project rules (automation rules)."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -638,13 +672,34 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled):
         return
     console.print("[green]✓[/green]")
 
+    # --map-projects and --project-mapping are mutually exclusive
+    if map_projects and project_mapping:
+        console.print("[red]Error: --map-projects and --project-mapping are mutually exclusive[/red]")
+        return
+
     rules_migrator = RulesMigrator(
         orchestrator.source_client,
         orchestrator.dest_client,
         None,
         config
     )
-    
+
+    # Launch interactive TUI project mapper
+    if map_projects:
+        console.print("Fetching projects from both instances... ", end="")
+        source_projects = _list_projects(orchestrator.source_client)
+        dest_projects = _list_projects(orchestrator.dest_client)
+        console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
+
+        name_mapping = build_project_mapping_tui(source_projects, dest_projects)
+        if name_mapping is None:
+            console.print("[yellow]Cancelled[/yellow]")
+            return
+
+        id_map = _name_mapping_to_id_mapping(name_mapping, source_projects, dest_projects)
+        rules_migrator._project_id_map = id_map
+        console.print(f"Using interactive project mapping with {len(id_map)} project(s)")
+
     # Parse and apply custom project mapping if provided
     if project_mapping:
         import json
@@ -757,52 +812,42 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled):
         return
 
     success_count = 0
-    failed_count = 0
-    skipped_count = 0
+    failed_items = []
+    skipped_items = []
 
-    for rule in selected_rules:
-        try:
-            rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
-            has_project = bool(rule.get('session_id'))
-            has_dataset = bool(rule.get('dataset_id'))
-            has_evaluators = bool(rule.get('evaluators') or rule.get('evaluator_prompt_handle'))
+    with Progress(console=console) as progress:
+        task = progress.add_task("Migrating rules...", total=len(selected_rules))
+        for rule in selected_rules:
+            try:
+                rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+                has_project = bool(rule.get('session_id'))
+                has_dataset = bool(rule.get('dataset_id'))
+                has_evaluators = bool(rule.get('evaluators') or rule.get('evaluator_prompt_handle'))
 
-            # Let create_rule handle all mapping logic - it will:
-            # 1. Map source project IDs to destination (creating projects if ensure_project=True)
-            # 2. Map source dataset IDs to destination
-            # 3. Handle strip_project_reference if requested
-            # By default, create rules as disabled to bypass secrets validation
-            create_disabled = not create_enabled
-            result = rules_migrator.create_rule(rule, strip_project_reference=strip_projects, create_disabled=create_disabled)
-            if result:
-                console.print(f"[green]✓[/green] Migrated: {rule_name}")
-                success_count += 1
-            else:
-                # Result is None - could be validation error, API error, or missing mapping
-                # Check common causes and provide helpful feedback
-                if not has_dataset and not has_project:
-                    console.print(f"[yellow]⊘[/yellow] Skipped: {rule_name} (no dataset or project)")
-                    skipped_count += 1
-                elif has_project and not has_dataset:
-                    console.print(f"[yellow]⊘[/yellow] Skipped: {rule_name} (project not found in destination)")
-                    skipped_count += 1
-                elif has_evaluators:
-                    console.print(f"[red]✗[/red] Failed: {rule_name} (check prompts exist on destination)")
-                    failed_count += 1
+                create_disabled = not create_enabled
+                result = rules_migrator.create_rule(rule, strip_project_reference=strip_projects, create_disabled=create_disabled)
+                if result:
+                    success_count += 1
                 else:
-                    console.print(f"[red]✗[/red] Failed: {rule_name} (see verbose logs)")
-                    failed_count += 1
-        except Exception as e:
-            rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
-            console.print(f"[red]✗[/red] Failed {rule_name}: {e}")
-            failed_count += 1
+                    if not has_dataset and not has_project:
+                        skipped_items.append((rule_name, "no dataset or project"))
+                    elif has_project and not has_dataset:
+                        skipped_items.append((rule_name, "project not found in destination"))
+                    elif has_evaluators:
+                        failed_items.append((rule_name, "check prompts exist on destination"))
+                    else:
+                        failed_items.append((rule_name, "see verbose logs"))
+            except Exception as e:
+                rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+                failed_items.append((rule_name, str(e)))
+            progress.advance(task)
 
-    console.print(f"\n[green]✓[/green] Migration completed")
-    console.print(f"  Migrated: {success_count} rule(s)")
-    if skipped_count > 0:
-        console.print(f"  [yellow]Skipped: {skipped_count}[/yellow]")
-    if failed_count > 0:
-        console.print(f"  [red]Failed: {failed_count}[/red]")
+    console.print(f"Rules: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed")
+    if (failed_items or skipped_items) and config.migration.verbose:
+        for name, err in skipped_items:
+            console.print(f"  [yellow]⊘[/yellow] {name}: {err}")
+        for name, err in failed_items:
+            console.print(f"  [red]✗[/red] {name}: {err}")
     
     # Show helpful message about disabled rules
     if success_count > 0 and not create_enabled:
@@ -823,8 +868,9 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled):
 @click.option('--skip-rules', is_flag=True, help='Skip rules migration')
 @click.option('--include-all-commits', is_flag=True, help='Include all prompt commit history')
 @click.option('--strip-projects', is_flag=True, help='Strip project associations from rules')
+@click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
 @click.pass_context
-def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, include_all_commits, strip_projects):
+def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, include_all_commits, strip_projects, map_projects):
     """Migrate all resources interactively."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -849,6 +895,22 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 
     console.print("[bold cyan]LangSmith Data Migration Wizard[/bold cyan]\n")
     console.print("This wizard will guide you through migrating all your data.\n")
+
+    # Launch interactive TUI project mapper if requested
+    project_id_map = None
+    if map_projects:
+        console.print("Fetching projects from both instances... ", end="")
+        source_projects = _list_projects(orchestrator.source_client)
+        dest_projects = _list_projects(orchestrator.dest_client)
+        console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
+
+        name_mapping = build_project_mapping_tui(source_projects, dest_projects)
+        if name_mapping is None:
+            console.print("[yellow]Cancelled[/yellow]")
+            return
+
+        project_id_map = _name_mapping_to_id_mapping(name_mapping, source_projects, dest_projects)
+        console.print(f"Using interactive project mapping with {len(project_id_map)} project(s)\n")
 
     # Track dataset ID mappings for use in rules migration
     dataset_id_mapping = {}
@@ -908,25 +970,29 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
                 include_history = include_all_commits or Confirm.ask("Include full commit history?")
 
                 success_count = 0
-                failed_count = 0
+                failed_items = []
 
-                for prompt in prompts:
-                    try:
-                        result = prompt_migrator.migrate_prompt(
-                            prompt['repo_handle'],
-                            include_all_commits=include_history
-                        )
-                        if result:
-                            console.print(f"[green]✓[/green] {prompt['repo_handle']}")
-                            success_count += 1
-                        else:
-                            console.print(f"[red]✗[/red] {prompt['repo_handle']}")
-                            failed_count += 1
-                    except Exception as e:
-                        console.print(f"[red]✗[/red] {prompt['repo_handle']}: {e}")
-                        failed_count += 1
+                with Progress(console=console) as progress:
+                    task = progress.add_task("Migrating prompts...", total=len(prompts))
+                    for prompt in prompts:
+                        try:
+                            result = prompt_migrator.migrate_prompt(
+                                prompt['repo_handle'],
+                                include_all_commits=include_history
+                            )
+                            if result:
+                                success_count += 1
+                            else:
+                                failed_items.append((prompt['repo_handle'], "migration returned None"))
+                        except Exception as e:
+                            failed_items.append((prompt['repo_handle'], str(e)))
+                        progress.advance(task)
 
-                console.print(f"[green]✓ Prompts migrated: {success_count} successful, {failed_count} failed[/green]\n")
+                console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
+                if failed_items and config.migration.verbose:
+                    for name, err in failed_items:
+                        console.print(f"  [red]✗[/red] {name}: {err}")
+                console.print()
             else:
                 console.print("[yellow]Skipped prompts[/yellow]\n")
         else:
@@ -952,18 +1018,23 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 
             if Confirm.ask(f"Migrate {len(queues)} annotation queue(s)?"):
                 success_count = 0
-                failed_count = 0
+                failed_items = []
 
-                for queue in queues:
-                    try:
-                        new_id = queue_migrator.create_queue(queue)
-                        console.print(f"[green]✓[/green] {queue['name']}")
-                        success_count += 1
-                    except Exception as e:
-                        console.print(f"[red]✗[/red] {queue['name']}: {e}")
-                        failed_count += 1
+                with Progress(console=console) as progress:
+                    task = progress.add_task("Migrating queues...", total=len(queues))
+                    for queue in queues:
+                        try:
+                            new_id = queue_migrator.create_queue(queue)
+                            success_count += 1
+                        except Exception as e:
+                            failed_items.append((queue['name'], str(e)))
+                        progress.advance(task)
 
-                console.print(f"[green]✓ Queues migrated: {success_count} successful, {failed_count} failed[/green]\n")
+                console.print(f"Queues: {success_count} migrated, {len(failed_items)} failed")
+                if failed_items and config.migration.verbose:
+                    for name, err in failed_items:
+                        console.print(f"  [red]✗[/red] {name}: {err}")
+                console.print()
             else:
                 console.print("[yellow]Skipped queues[/yellow]\n")
         else:
@@ -988,6 +1059,11 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
         if dataset_id_mapping:
             rules_migrator._dataset_id_map = dataset_id_mapping
             console.print(f"[dim]Using dataset mapping from Step 1 ({len(dataset_id_mapping)} dataset(s))[/dim]")
+
+        # Apply interactive project mapping if provided
+        if project_id_map:
+            rules_migrator._project_id_map = project_id_map
+            console.print(f"[dim]Using interactive project mapping ({len(project_id_map)} project(s))[/dim]")
 
         rules = rules_migrator.list_rules()
 
@@ -1017,45 +1093,46 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
                         ensure_projects = Confirm.ask("Create corresponding projects for project-specific rules?", default=True)
 
                 success_count = 0
-                failed_count = 0
-                skipped_count = 0
+                failed_items = []
+                skipped_items = []
 
-                for rule in rules:
-                    try:
-                        has_project = bool(rule.get('session_id'))
-                        has_dataset = bool(rule.get('dataset_id'))
-                        has_evaluators = bool(rule.get('evaluators') or rule.get('evaluator_prompt_handle'))
-                        rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+                with Progress(console=console) as progress:
+                    task = progress.add_task("Migrating rules...", total=len(rules))
+                    for rule in rules:
+                        try:
+                            has_project = bool(rule.get('session_id'))
+                            has_dataset = bool(rule.get('dataset_id'))
+                            has_evaluators = bool(rule.get('evaluators') or rule.get('evaluator_prompt_handle'))
+                            rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
 
-                        # Let create_rule handle all mapping - it auto-creates missing projects if ensure_projects=True
-                        result = rules_migrator.create_rule(
-                            rule,
-                            strip_project_reference=strip,
-                            ensure_project=ensure_projects
-                        )
-                        if result:
-                            console.print(f"[green]✓[/green] {rule_name}")
-                            success_count += 1
-                        else:
-                            # Result is None - provide helpful error context
-                            if not has_dataset and not has_project:
-                                console.print(f"[yellow]⊘[/yellow] {rule_name} (no dataset or project)")
-                                skipped_count += 1
-                            elif has_project and not has_dataset and not ensure_projects:
-                                console.print(f"[yellow]⊘[/yellow] {rule_name} (project not found in destination)")
-                                skipped_count += 1
-                            elif has_evaluators:
-                                console.print(f"[red]✗[/red] {rule_name} (check prompts exist on destination)")
-                                failed_count += 1
+                            result = rules_migrator.create_rule(
+                                rule,
+                                strip_project_reference=strip,
+                                ensure_project=ensure_projects
+                            )
+                            if result:
+                                success_count += 1
                             else:
-                                console.print(f"[red]✗[/red] {rule_name} (see verbose logs)")
-                                failed_count += 1
-                    except Exception as e:
-                        rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
-                        console.print(f"[red]✗[/red] {rule_name}: {e}")
-                        failed_count += 1
+                                if not has_dataset and not has_project:
+                                    skipped_items.append((rule_name, "no dataset or project"))
+                                elif has_project and not has_dataset and not ensure_projects:
+                                    skipped_items.append((rule_name, "project not found in destination"))
+                                elif has_evaluators:
+                                    failed_items.append((rule_name, "check prompts exist on destination"))
+                                else:
+                                    failed_items.append((rule_name, "see verbose logs"))
+                        except Exception as e:
+                            rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+                            failed_items.append((rule_name, str(e)))
+                        progress.advance(task)
 
-                console.print(f"[green]✓ Rules migrated: {success_count} successful, {skipped_count} skipped, {failed_count} failed[/green]\n")
+                console.print(f"Rules: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed")
+                if (failed_items or skipped_items) and config.migration.verbose:
+                    for name, err in skipped_items:
+                        console.print(f"  [yellow]⊘[/yellow] {name}: {err}")
+                    for name, err in failed_items:
+                        console.print(f"  [red]✗[/red] {name}: {err}")
+                console.print()
             else:
                 console.print("[yellow]Skipped rules[/yellow]\n")
         else:
@@ -1071,8 +1148,9 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 @ssl_option
 @click.option('--session', help='Migrate charts for a specific session/project (by name or ID)')
 @click.option('--same-instance', is_flag=True, help='Source and destination are the same instance (use same session IDs)')
+@click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
 @click.pass_context
-def charts(ctx, session, same_instance):
+def charts(ctx, session, same_instance, map_projects):
     """Migrate monitoring charts from sessions/projects."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -1114,6 +1192,22 @@ def charts(ctx, session, same_instance):
         orchestrator.state,
         config
     )
+
+    # Launch interactive TUI project mapper
+    if map_projects:
+        console.print("Fetching projects from both instances... ", end="")
+        source_projects = _list_projects(orchestrator.source_client)
+        dest_projects = _list_projects(orchestrator.dest_client)
+        console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
+
+        name_mapping = build_project_mapping_tui(source_projects, dest_projects)
+        if name_mapping is None:
+            console.print("[yellow]Cancelled[/yellow]")
+            return
+
+        id_map = _name_mapping_to_id_mapping(name_mapping, source_projects, dest_projects)
+        chart_migrator._project_id_map = id_map
+        console.print(f"Using interactive project mapping with {len(id_map)} project(s)")
 
     if session:
         # Migrate charts for a specific session

@@ -6,7 +6,7 @@ A Python CLI for migrating datasets, experiments, annotation queues, project rul
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -50,20 +50,20 @@ For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk E
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.41-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -87,10 +87,12 @@ export LANGSMITH_OLD_BASE_URL="https://your-source-instance.com"
 export LANGSMITH_NEW_BASE_URL="https://your-destination-instance.com"
 ```
 
-Or use a `.env` file:
+Or use a `.env` file (auto-loaded on startup):
 ```env
 LANGSMITH_OLD_API_KEY=your_source_api_key
 LANGSMITH_NEW_API_KEY=your_destination_api_key
+LANGSMITH_OLD_BASE_URL=https://your-source-instance.com
+LANGSMITH_NEW_BASE_URL=https://your-destination-instance.com
 LANGSMITH_VERIFY_SSL=true
 ```
 
@@ -121,10 +123,15 @@ langsmith-migrator prompts --all --include-all-commits
 # Project rules
 langsmith-migrator rules
 langsmith-migrator rules --strip-projects      # As global rules
+langsmith-migrator rules --project-mapping '{"old-project-id": "new-project-id"}'
+langsmith-migrator rules --project-mapping mapping.json   # From file
+langsmith-migrator rules --map-projects         # Interactive TUI project mapping
+langsmith-migrator rules --create-enabled      # Create rules enabled (default: disabled)
 
 # Charts
 langsmith-migrator charts
 langsmith-migrator charts --session "project-name"
+langsmith-migrator charts --map-projects        # Interactive TUI project mapping
 
 # Utilities
 langsmith-migrator list-projects --source
@@ -153,11 +160,34 @@ langsmith-migrator clean
 --all                   Migrate all datasets without interactive selection
 ```
 
+### Rules Options
+
+```bash
+--strip-projects        Strip project associations and create as global rules
+--project-mapping TEXT  JSON string or file path mapping source project IDs to destination
+--map-projects          Launch interactive TUI to map source projects to destination projects
+--create-enabled        Create rules as enabled (default: disabled to bypass secrets validation)
+--all                   Migrate all rules without interactive selection
+```
+
+### Project Mapping
+
+Rules and charts reference projects by ID. When migrating between instances, project IDs differ.
+
+- **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input. Supports auto-match by name, skip, and custom name entry.
+- **Rules (`--project-mapping`)**: Supply an explicit source→destination project ID mapping as JSON or a file path. Use `list-projects --source` and `list-projects --dest` to get IDs. Mutually exclusive with `--map-projects`.
+- **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination.
+- **`migrate-all`**: Supports `--strip-projects` and `--map-projects` for rules. Use the standalone `rules` command for `--project-mapping` JSON mappings.
+
 ### Interactive Selection
 
-Keyboard shortcuts in TUI:
+Keyboard shortcuts in resource selection TUI:
 - `↑↓` Navigate | `Space` Toggle | `a` Select all | `n` Clear
 - `/` Search | `Enter` Confirm | `Esc` Cancel
+
+Keyboard shortcuts in project mapper TUI (`--map-projects`):
+- `Enter/Space` Edit destination | `s` Skip | `m` Same name | `u` Unmap
+- `a` Auto-match all | `/` Search | `Ctrl+S` Save | `Esc` Cancel
 
 ## SSL Certificate Issues
 
