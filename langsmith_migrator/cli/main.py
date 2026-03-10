@@ -34,6 +34,8 @@ from ..core.migrators import (
     PromptMigrator,
     RulesMigrator,
     ChartMigrator,
+    RoleMigrator,
+    UserMigrator,
 )
 from .tui_selector import select_items
 from .tui_project_mapper import build_project_mapping_tui
@@ -71,6 +73,71 @@ def _name_mapping_to_id_mapping(
         if src_id and dst_id:
             id_map[src_id] = dst_id
     return id_map
+
+
+def _ensure_workspace_projects(orchestrator, ws_project_name_mapping=None):
+    """Auto-create missing projects in the destination workspace.
+
+    Args:
+        orchestrator: MigrationOrchestrator with workspace context already set.
+        ws_project_name_mapping: Optional name mapping from workspace TUI 'p' key
+            (src_name -> dst_name). Overrides same-name matching for listed projects.
+
+    Returns:
+        tuple: (src_project_id -> dst_project_id mapping,
+                source_projects list, dest_projects list)
+    """
+    source_projects = _list_projects(orchestrator.source_client)
+    dest_projects = _list_projects(orchestrator.dest_client)
+
+    dst_by_name = {p["name"]: p["id"] for p in dest_projects if "name" in p}
+    name_mapping = ws_project_name_mapping or {}
+    dry_run = orchestrator.config.migration.dry_run
+
+    id_map = {}
+    created = 0
+    for sp in source_projects:
+        src_name = sp.get("name", "")
+        src_id = sp.get("id", "")
+        if not src_name or not src_id:
+            continue
+
+        dst_name = name_mapping.get(src_name, src_name)
+
+        if dst_name in dst_by_name:
+            id_map[src_id] = dst_by_name[dst_name]
+        elif dry_run:
+            created += 1
+        else:
+            try:
+                payload = {"name": dst_name, "description": sp.get("description")}
+                new_proj = orchestrator.dest_client.post("/sessions", payload)
+                if new_proj and new_proj.get("id"):
+                    id_map[src_id] = new_proj["id"]
+                    dst_by_name[dst_name] = new_proj["id"]
+                    created += 1
+            except Exception as e:
+                console.print(
+                    f"  [red]Failed to create project '{dst_name}': {e}[/red]"
+                )
+
+    if created:
+        prefix = "[DRY RUN] Would create" if dry_run else "Projects:"
+        console.print(
+            f"  {prefix} {created} project(s), {len(id_map)} matched"
+        )
+    elif id_map:
+        console.print(f"  Projects: {len(id_map)} matched")
+
+    return id_map, source_projects, dest_projects
+
+
+def _enter_workspace_pair(orchestrator, ws_result, src_ws, dst_ws):
+    """Set workspace context and auto-create projects. Returns project ID map."""
+    orchestrator.set_workspace_context(src_ws, dst_ws)
+    console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+    ws_pm = ws_result.project_mappings.get(src_ws) if ws_result else None
+    return _ensure_workspace_projects(orchestrator, ws_pm)
 
 
 _WS_CANCELLED = "__cancelled__"
@@ -272,8 +339,7 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
     try:
         for src_ws, dst_ws in ws_pairs:
             if src_ws and dst_ws:
-                orchestrator.set_workspace_context(src_ws, dst_ws)
-                console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+                _enter_workspace_pair(orchestrator, ws_result, src_ws, dst_ws)
 
             # Get datasets
             console.print("Fetching datasets... ", end="")
@@ -505,8 +571,7 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
 
     for src_ws, dst_ws in ws_pairs:
         if src_ws and dst_ws:
-            orchestrator.set_workspace_context(src_ws, dst_ws)
-            console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+            _enter_workspace_pair(orchestrator, ws_result, src_ws, dst_ws)
 
         # Get queues
         console.print("\n[bold]Fetching annotation queues from source...[/bold]")
@@ -602,8 +667,7 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
 
     for src_ws, dst_ws in ws_pairs:
         if src_ws and dst_ws:
-            orchestrator.set_workspace_context(src_ws, dst_ws)
-            console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+            _enter_workspace_pair(orchestrator, ws_result, src_ws, dst_ws)
 
         # Check if prompts API is available on destination
         console.print("Checking prompts API availability... ", end="")
@@ -859,8 +923,11 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
     for src_ws, dst_ws in ws_pairs:
         if src_ws and dst_ws:
-            orchestrator.set_workspace_context(src_ws, dst_ws)
-            console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+            auto_project_id_map, source_projects, dest_projects = (
+                _enter_workspace_pair(orchestrator, ws_result, src_ws, dst_ws)
+            )
+        else:
+            auto_project_id_map, source_projects, dest_projects = {}, [], []
 
         rules_migrator = RulesMigrator(
             orchestrator.source_client,
@@ -869,12 +936,17 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
             config
         )
 
-        # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
+        # Apply auto-created project mapping as default
+        if auto_project_id_map:
+            rules_migrator._project_id_map = auto_project_id_map
+
+        # Launch interactive TUI project mapper (overrides auto mapping)
         if map_projects:
-            console.print("Fetching projects from both instances... ", end="")
-            source_projects = _list_projects(orchestrator.source_client)
-            dest_projects = _list_projects(orchestrator.dest_client)
-            console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
+            if not source_projects or not dest_projects:
+                console.print("Fetching projects from both instances... ", end="")
+                source_projects = _list_projects(orchestrator.source_client)
+                dest_projects = _list_projects(orchestrator.dest_client)
+                console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
 
             name_mapping = build_project_mapping_tui(source_projects, dest_projects)
             if name_mapping is None:
@@ -1020,17 +1092,240 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
 @cli.command()
 @ssl_option
+@click.pass_context
+def roles(ctx):
+    """Migrate custom RBAC roles."""
+    config = ctx.obj['config']
+    state_manager = ctx.obj['state_manager']
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        return
+    if not dest_ok:
+        console.print("[red]✗ Destination connection failed[/red]")
+        return
+    console.print("[green]✓[/green]")
+
+    # Roles are org-level — clear any workspace scoping
+    orchestrator.clear_workspace_context()
+
+    role_migrator = RoleMigrator(
+        orchestrator.source_client,
+        orchestrator.dest_client,
+        None,
+        config,
+    )
+
+    console.print("\n[bold]Fetching custom roles from source...[/bold]")
+    custom_roles = role_migrator.list_custom_roles()
+
+    if not custom_roles:
+        console.print("[yellow]No custom roles found[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    selected_roles = select_items(
+        items=custom_roles,
+        title="Select Custom Roles to Migrate",
+        columns=[
+            {"key": "name", "title": "Name", "width": 30},
+            {"key": "id", "title": "ID", "width": 36},
+            {"key": "description", "title": "Description", "width": 50},
+        ],
+    )
+
+    if not selected_roles:
+        console.print("[yellow]No roles selected[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    console.print(f"\n[bold]Migrating {len(selected_roles)} custom role(s)...[/bold]")
+
+    success_count = 0
+    failed_items = []
+
+    # Fetch dest roles once for the entire loop (avoids N+1 API calls)
+    dest_roles_by_name = role_migrator.get_dest_custom_roles_by_name()
+
+    with Progress(console=console) as progress:
+        task = progress.add_task("Migrating roles...", total=len(selected_roles))
+        for role in selected_roles:
+            try:
+                result = role_migrator.create_custom_role(role, dest_roles_by_name)
+                if result:
+                    success_count += 1
+                    # Keep cache consistent for subsequent iterations
+                    dest_roles_by_name[role.get("name", "")] = {"id": result, **role}
+                else:
+                    failed_items.append((role.get("name", "unnamed"), "see verbose logs"))
+            except Exception as e:
+                failed_items.append((role.get("name", "unnamed"), str(e)))
+            progress.advance(task)
+
+    console.print(f"Roles: {success_count} migrated, {len(failed_items)} failed")
+    if failed_items and config.migration.verbose:
+        for name, err in failed_items:
+            console.print(f"  [red]✗[/red] {name}: {err}")
+
+    orchestrator.cleanup()
+
+
+@cli.command()
+@ssl_option
+@workspace_options
+@click.option('--skip-workspace-members', is_flag=True,
+              help='Skip workspace membership migration (org-level only)')
+@click.pass_context
+def users(ctx, source_workspace, dest_workspace, map_workspaces, skip_workspace_members):
+    """Migrate organization members (invite by email) and workspace memberships."""
+    config = ctx.obj['config']
+    state_manager = ctx.obj['state_manager']
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        return
+    if not dest_ok:
+        console.print("[red]✗ Destination connection failed[/red]")
+        return
+    console.print("[green]✓[/green]")
+
+    # Step 1: Build role ID map (org-level, no workspace scoping)
+    orchestrator.clear_workspace_context()
+
+    console.print("\n[bold]Step 1: Building role mapping...[/bold]")
+    role_migrator = RoleMigrator(
+        orchestrator.source_client,
+        orchestrator.dest_client,
+        None,
+        config,
+    )
+    # Fetch source roles once and derive both the ID map and unmapped check
+    source_roles = role_migrator.list_roles()
+    role_id_map = role_migrator.build_role_id_map()
+    console.print(f"  Mapped {len(role_id_map)} role(s)")
+
+    # Check for unmapped custom roles (reuses already-fetched source roles)
+    from ..core.migrators.role import _is_custom_role
+    unmapped_custom = [r for r in source_roles
+                       if _is_custom_role(r) and r.get("id") not in role_id_map]
+    if unmapped_custom:
+        names = ", ".join(r.get("name", "?") for r in unmapped_custom)
+        console.print(f"  [yellow]Warning: {len(unmapped_custom)} custom role(s) unmapped: {names}[/yellow]")
+        console.print("  [dim]Run 'roles' command first to migrate custom roles[/dim]")
+
+    user_migrator = UserMigrator(
+        orchestrator.source_client,
+        orchestrator.dest_client,
+        None,
+        config,
+        role_id_map=role_id_map,
+    )
+
+    # Step 2: Org-level member migration
+    console.print("\n[bold]Step 2: Org members[/bold]")
+    console.print("Fetching org members from source... ", end="")
+    org_members = user_migrator.list_org_members()
+
+    if not org_members:
+        console.print("[yellow]none found[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    console.print(f"found {len(org_members)}")
+
+    selected_members = select_items(
+        items=org_members,
+        title="Select Members to Migrate",
+        columns=[
+            {"key": "email", "title": "Email", "width": 40},
+            {"key": "full_name", "title": "Name", "width": 30},
+            {"key": "status", "title": "Status", "width": 10},
+        ],
+    )
+
+    if not selected_members:
+        console.print("[yellow]No members selected[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    if not config.migration.dry_run:
+        if not Confirm.ask(f"\nThis will invite {len(selected_members)} user(s) to the destination org. Proceed?"):
+            console.print("[yellow]Cancelled[/yellow]")
+            orchestrator.cleanup()
+            return
+
+    console.print(f"\n[bold]Migrating {len(selected_members)} org member(s)...[/bold]")
+
+    org_identity_map = user_migrator.migrate_org_members(selected_members)
+    invited = len(org_identity_map)
+    failed = len(selected_members) - invited
+    console.print(f"Org members: {invited} migrated, {failed} failed")
+
+    # Step 3: Workspace membership migration
+    if skip_workspace_members:
+        console.print("\n[dim]Skipping workspace members (--skip-workspace-members)[/dim]")
+        orchestrator.cleanup()
+        return
+
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    if ws_result is _WS_CANCELLED:
+        console.print("[yellow]Workspace selection cancelled[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else []
+
+    if not ws_pairs:
+        console.print("\n[dim]No workspace pairs to migrate members for[/dim]")
+        orchestrator.cleanup()
+        return
+
+    console.print(f"\n[bold]Step 3: Workspace memberships ({len(ws_pairs)} pair(s))[/bold]")
+
+    for src_ws, dst_ws in ws_pairs:
+        orchestrator.set_workspace_context(src_ws, dst_ws)
+        console.print(f"\n  [cyan]Workspace: {src_ws} -> {dst_ws}[/cyan]")
+
+        count = user_migrator.migrate_workspace_members(org_identity_map)
+        console.print(f"  Workspace members: {count} migrated")
+
+    orchestrator.clear_workspace_context()
+    orchestrator.cleanup()
+
+
+@cli.command()
+@ssl_option
 @click.option('--skip-datasets', is_flag=True, help='Skip dataset migration')
 @click.option('--skip-experiments', is_flag=True, help='Skip experiment migration')
 @click.option('--skip-prompts', is_flag=True, help='Skip prompt migration')
 @click.option('--skip-queues', is_flag=True, help='Skip annotation queue migration')
 @click.option('--skip-rules', is_flag=True, help='Skip rules migration')
+@click.option('--skip-custom-roles', is_flag=True, help='Skip custom role migration')
+@click.option('--skip-users', is_flag=True, help='Skip user/member migration')
 @click.option('--include-all-commits', is_flag=True, help='Include all prompt commit history')
 @click.option('--strip-projects', is_flag=True, help='Strip project associations from rules')
 @click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
 @workspace_options
 @click.pass_context
-def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, include_all_commits, strip_projects, map_projects, source_workspace, dest_workspace, map_workspaces):
+def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, skip_custom_roles, skip_users, include_all_commits, strip_projects, map_projects, source_workspace, dest_workspace, map_workspaces):
     """Migrate all resources interactively."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -1062,7 +1357,67 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
     console.print("[bold cyan]LangSmith Data Migration Wizard[/bold cyan]\n")
     console.print("This wizard will guide you through migrating all your data.\n")
 
-    # If multi-workspace, iterate per pair; otherwise run once
+    # ── Org-level steps (run once, before workspace loop) ──
+
+    # Single RoleMigrator instance — reused for roles migration and role ID map
+    orchestrator.clear_workspace_context()
+    role_migrator = RoleMigrator(
+        orchestrator.source_client, orchestrator.dest_client, None, config
+    )
+
+    # Roles (org-level)
+    if not skip_custom_roles:
+        console.print("[bold]Org Step: Custom Roles[/bold]")
+        custom_roles = role_migrator.list_custom_roles()
+        if custom_roles:
+            console.print(f"Found {len(custom_roles)} custom role(s)")
+            if Confirm.ask(f"Migrate {len(custom_roles)} custom role(s)?"):
+                dest_roles_by_name = role_migrator.get_dest_custom_roles_by_name()
+                success = 0
+                for role in custom_roles:
+                    try:
+                        result = role_migrator.create_custom_role(role, dest_roles_by_name)
+                        if result:
+                            success += 1
+                            dest_roles_by_name[role.get("name", "")] = {"id": result, **role}
+                    except Exception as e:
+                        console.print(f"  [red]✗[/red] {role.get('name')}: {e}")
+                console.print(f"Roles: {success}/{len(custom_roles)} migrated\n")
+            else:
+                console.print("[yellow]Skipped roles[/yellow]\n")
+        else:
+            console.print("[yellow]No custom roles found[/yellow]\n")
+    else:
+        console.print("[dim]Skipping custom roles (--skip-custom-roles)[/dim]\n")
+
+    # Build role ID map once (needed for user migration regardless of --skip-custom-roles)
+    role_id_map = role_migrator.build_role_id_map()
+
+    # Users (org-level)
+    org_identity_map = {}
+    user_migrator = None
+    if not skip_users:
+        console.print("[bold]Org Step: Members[/bold]")
+        user_migrator = UserMigrator(
+            orchestrator.source_client, orchestrator.dest_client, None, config,
+            role_id_map=role_id_map,
+        )
+        org_members = user_migrator.list_org_members()
+        if org_members:
+            console.print(f"Found {len(org_members)} org member(s)")
+            if Confirm.ask(f"Invite/update {len(org_members)} member(s) on destination?"):
+                org_identity_map = user_migrator.migrate_org_members(org_members)
+                invited = len(org_identity_map)
+                console.print(f"Org members: {invited}/{len(org_members)} migrated\n")
+            else:
+                console.print("[yellow]Skipped members[/yellow]\n")
+        else:
+            console.print("[yellow]No org members found[/yellow]\n")
+    else:
+        console.print("[dim]Skipping users (--skip-users)[/dim]\n")
+
+    # ── Per-workspace steps ──
+
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
 
     for ws_idx, (src_ws, dst_ws) in enumerate(ws_pairs):
@@ -1070,14 +1425,26 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
             orchestrator.set_workspace_context(src_ws, dst_ws)
             console.print(f"\n[bold cyan]━━━ Workspace {ws_idx + 1}/{len(ws_pairs)}: {src_ws} -> {dst_ws} ━━━[/bold cyan]\n")
 
-        # Use per-workspace project mapping from the TUI if available
-        ws_project_mapping = None
-        if ws_result and src_ws and src_ws in ws_result.project_mappings:
-            ws_project_mapping = ws_result.project_mappings[src_ws]
+        # Auto-create projects and get ID mapping
+        if src_ws and dst_ws:
+            auto_project_id_map, _, _ = (
+                _enter_workspace_pair(orchestrator, ws_result, src_ws, dst_ws)
+            )
+        else:
+            auto_project_id_map = None
 
-        _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
-                                   skip_prompts, skip_queues, skip_rules, include_all_commits,
-                                   strip_projects, map_projects, ws_project_mapping)
+        _migrate_all_for_workspace(
+            orchestrator, config, skip_datasets, skip_experiments,
+            skip_prompts, skip_queues, skip_rules, include_all_commits,
+            strip_projects, map_projects,
+            auto_project_id_map=auto_project_id_map,
+        )
+
+        # Workspace member migration (reuse the org-level user_migrator)
+        if user_migrator and org_identity_map and src_ws and dst_ws:
+            count = user_migrator.migrate_workspace_members(org_identity_map)
+            if count:
+                console.print(f"  Workspace members: {count} migrated")
 
     if ws_result:
         orchestrator.clear_workspace_context()
@@ -1086,27 +1453,19 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
     orchestrator.cleanup()
 
 
-def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
+def _migrate_all_for_workspace(orchestrator, config, skip_datasets, skip_experiments,
                                 skip_prompts, skip_queues, skip_rules, include_all_commits,
-                                strip_projects, map_projects, ws_project_mapping=None):
+                                strip_projects, map_projects, auto_project_id_map=None):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
     Args:
-        ws_project_mapping: Optional name-based project mapping from workspace TUI.
-            If provided, --map-projects is skipped (already done at workspace level).
+        auto_project_id_map: Optional pre-computed project ID mapping from
+            _ensure_workspace_projects(). Used as default when no TUI override.
     """
 
-    # Launch interactive TUI project mapper if requested (and not already done at workspace level)
-    project_id_map = None
-    if ws_project_mapping:
-        # Convert the name mapping from the workspace TUI to an ID mapping
-        console.print("Fetching projects for project mapping... ", end="")
-        source_projects = _list_projects(orchestrator.source_client)
-        dest_projects = _list_projects(orchestrator.dest_client)
-        console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
-        project_id_map = _name_mapping_to_id_mapping(ws_project_mapping, source_projects, dest_projects)
-        console.print(f"Using workspace-scoped project mapping with {len(project_id_map)} project(s)\n")
-    elif map_projects:
+    # Use auto-created mapping as default, allow --map-projects TUI to override
+    project_id_map = auto_project_id_map
+    if map_projects:
         console.print("Fetching projects from both instances... ", end="")
         source_projects = _list_projects(orchestrator.source_client)
         dest_projects = _list_projects(orchestrator.dest_client)
@@ -1400,8 +1759,11 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
     for src_ws, dst_ws in ws_pairs:
         if src_ws and dst_ws:
-            orchestrator.set_workspace_context(src_ws, dst_ws)
-            console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+            auto_project_id_map, source_projects, dest_projects = (
+                _enter_workspace_pair(orchestrator, ws_result, src_ws, dst_ws)
+            )
+        else:
+            auto_project_id_map, source_projects, dest_projects = {}, [], []
 
         chart_migrator = ChartMigrator(
             orchestrator.source_client,
@@ -1410,12 +1772,17 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             config
         )
 
-        # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
+        # Apply auto-created project mapping as default
+        if auto_project_id_map:
+            chart_migrator._project_id_map = auto_project_id_map
+
+        # Launch interactive TUI project mapper (overrides auto mapping)
         if map_projects:
-            console.print("Fetching projects from both instances... ", end="")
-            source_projects = _list_projects(orchestrator.source_client)
-            dest_projects = _list_projects(orchestrator.dest_client)
-            console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
+            if not source_projects or not dest_projects:
+                console.print("Fetching projects from both instances... ", end="")
+                source_projects = _list_projects(orchestrator.source_client)
+                dest_projects = _list_projects(orchestrator.dest_client)
+                console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
 
             name_mapping = build_project_mapping_tui(source_projects, dest_projects)
             if name_mapping is None:
