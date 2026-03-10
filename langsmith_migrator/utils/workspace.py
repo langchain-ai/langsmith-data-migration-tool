@@ -101,6 +101,6 @@ def list_projects(client: EnhancedAPIClient) -> List[Dict]:
         for project in client.get_paginated("/sessions", page_size=100):
             if isinstance(project, dict):
                 projects.append(project)
-    except Exception:
+    except Exception:  # noqa: S110
         pass
     return projects
