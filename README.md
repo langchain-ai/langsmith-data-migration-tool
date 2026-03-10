@@ -6,7 +6,7 @@ A Python CLI for migrating datasets, experiments, annotation queues, project rul
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -50,20 +50,20 @@ For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk E
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.50-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -188,6 +188,30 @@ Keyboard shortcuts in resource selection TUI:
 Keyboard shortcuts in project mapper TUI (`--map-projects`):
 - `Enter/Space` Edit destination | `s` Skip | `m` Same name | `u` Unmap
 - `a` Auto-match all | `/` Search | `Ctrl+S` Save | `Esc` Cancel
+
+Keyboard shortcuts in workspace mapper TUI (`--map-workspaces`):
+- `Enter` Pick destination | `n` Create new | `c` Create all unmapped
+- `p` Map projects | `s` Skip | `a` Auto-match all | `u` Unmap
+- `Ctrl+S` Save | `Esc` Cancel
+
+### Workspace Scoping
+
+For multi-workspace organizations, all resource commands support workspace-scoped migration:
+
+```bash
+# Interactive workspace mapping TUI (available on all commands)
+langsmith-migrator datasets --map-workspaces
+langsmith-migrator queues --map-workspaces
+langsmith-migrator prompts --map-workspaces
+langsmith-migrator rules --map-workspaces --map-projects
+langsmith-migrator charts --map-workspaces --map-projects
+langsmith-migrator migrate-all --map-workspaces
+
+# Explicit workspace pair
+langsmith-migrator datasets --source-workspace WS_ID --dest-workspace WS_ID
+```
+
+When using `--map-workspaces`, each command iterates all mapped workspace pairs, running the full fetch/select/migrate flow per pair. For `rules` and `charts` with `--map-projects`, the project mapping TUI is shown per workspace pair so projects are correctly scoped.
 
 ## SSL Certificate Issues
 

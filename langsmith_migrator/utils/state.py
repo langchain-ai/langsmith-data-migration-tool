@@ -74,6 +74,9 @@ class MigrationState:
     items: Dict[str, MigrationItem] = field(default_factory=dict)
     id_mappings: Dict[str, Dict[str, str]] = field(default_factory=dict)  # type -> {source_id: dest_id}
     statistics: Dict[str, int] = field(default_factory=dict)
+    source_workspace_id: Optional[str] = None
+    dest_workspace_id: Optional[str] = None
+    workspace_mapping: Dict[str, str] = field(default_factory=dict)  # source_ws_id -> dest_ws_id
 
     def add_item(self, item: MigrationItem):
         """Add an item to track."""
@@ -157,7 +160,7 @@ class MigrationState:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
+        d = {
             "session_id": self.session_id,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
@@ -165,8 +168,15 @@ class MigrationState:
             "destination_url": self.destination_url,
             "items": {k: v.to_dict() for k, v in self.items.items()},
             "id_mappings": self.id_mappings,
-            "statistics": self.get_statistics()
+            "statistics": self.get_statistics(),
         }
+        if self.source_workspace_id:
+            d["source_workspace_id"] = self.source_workspace_id
+        if self.dest_workspace_id:
+            d["dest_workspace_id"] = self.dest_workspace_id
+        if self.workspace_mapping:
+            d["workspace_mapping"] = self.workspace_mapping
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'MigrationState':
@@ -177,7 +187,10 @@ class MigrationState:
             updated_at=data["updated_at"],
             source_url=data["source_url"],
             destination_url=data["destination_url"],
-            id_mappings=data.get("id_mappings", {})
+            id_mappings=data.get("id_mappings", {}),
+            source_workspace_id=data.get("source_workspace_id"),
+            dest_workspace_id=data.get("dest_workspace_id"),
+            workspace_mapping=data.get("workspace_mapping", {}),
         )
 
         # Reconstruct items

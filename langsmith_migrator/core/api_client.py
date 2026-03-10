@@ -92,7 +92,8 @@ class EnhancedAPIClient:
         timeout: int = 30,
         max_retries: int = 3,
         rate_limit_delay: float = 0.1,
-        verbose: bool = False
+        verbose: bool = False,
+        workspace_id: Optional[str] = None
     ):
         """
         Initialize the API client.
@@ -105,6 +106,7 @@ class EnhancedAPIClient:
             max_retries: Maximum number of retries for failed requests
             rate_limit_delay: Delay between requests to avoid rate limits
             verbose: Whether to log verbose output
+            workspace_id: Optional workspace ID to scope requests via X-Tenant-Id header
         """
         self.base_url = base_url.rstrip('/')
         self.headers = headers
@@ -123,6 +125,21 @@ class EnhancedAPIClient:
         self.session = requests.Session()
         self.session.headers.update(headers)
         self.session.verify = verify_ssl
+
+        # Set workspace scoping if provided
+        if workspace_id:
+            self.session.headers["X-Tenant-Id"] = workspace_id
+
+    def set_workspace(self, workspace_id: Optional[str]) -> None:
+        """Set or remove the workspace scoping header.
+
+        Args:
+            workspace_id: Workspace ID to scope requests to, or None to remove scoping.
+        """
+        if workspace_id:
+            self.session.headers["X-Tenant-Id"] = workspace_id
+        else:
+            self.session.headers.pop("X-Tenant-Id", None)
 
     def _prepare_url(self, endpoint: str) -> str:
         """Prepare full URL from endpoint."""

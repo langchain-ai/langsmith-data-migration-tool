@@ -307,6 +307,16 @@ class MigrationOrchestrator:
             except Exception as e:
                 self.console.print(f"[red]✗[/red] Failed to migrate feedback: {e}")
 
+    def set_workspace_context(self, source_ws_id: str, dest_ws_id: str) -> None:
+        """Scope both clients to the given workspace pair."""
+        self.source_client.set_workspace(source_ws_id)
+        self.dest_client.set_workspace(dest_ws_id)
+
+    def clear_workspace_context(self) -> None:
+        """Remove workspace scoping from both clients."""
+        self.source_client.set_workspace(None)
+        self.dest_client.set_workspace(None)
+
     def cleanup(self):
         """Clean up resources."""
         self.source_client.close()

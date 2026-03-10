@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.51] - 2026-03-10
+
+### Added
+- **Workspace TUI "Create all unmapped" bulk action**: Press `c` in the workspace mapper TUI to mark all unmapped source workspaces as "create new" in one keystroke
+- **All commands iterate all workspace pairs**: `queues`, `prompts`, `rules`, and `charts` now iterate every mapped workspace pair when using `--map-workspaces`, matching the behavior of `datasets` and `migrate-all`
+
+### Fixed
+- **Workspace scoping for queues/prompts/rules/charts**: Previously these commands only activated the first workspace pair and silently ignored the rest; resources now land in the correct workspace
+
+### Removed
+- Internal `_activate_workspace_or_cancel` helper (replaced by per-command workspace iteration loops)
+
 ## [0.0.50] - 2026-03-06
 
 ### Added
@@ -162,7 +174,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.41...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.51...HEAD
+[0.0.51]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.50...v0.0.51
 [0.0.41]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.4...v0.0.41
 [0.0.4]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.2...v0.0.3

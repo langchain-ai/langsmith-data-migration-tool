@@ -38,7 +38,16 @@ uv run langsmith-migrator migrate_all  # Migrate everything
 uv run langsmith-migrator migrate_all --map-projects                # Migrate all with interactive project mapping
 uv run langsmith-migrator resume       # Resume a previous session
 uv run langsmith-migrator list_projects # List available projects
+uv run langsmith-migrator list_workspaces --source --dest           # List workspaces
 uv run langsmith-migrator clean        # Clean migration state
+
+# Workspace-scoped migration (available on all resource commands)
+uv run langsmith-migrator datasets --map-workspaces                 # Interactive workspace mapping TUI
+uv run langsmith-migrator queues --map-workspaces                   # Queues across all workspace pairs
+uv run langsmith-migrator prompts --map-workspaces                  # Prompts across all workspace pairs
+uv run langsmith-migrator rules --map-workspaces --map-projects     # Rules with per-workspace project mapping
+uv run langsmith-migrator charts --map-workspaces --map-projects    # Charts with per-workspace project mapping
+uv run langsmith-migrator datasets --source-workspace WS_ID --dest-workspace WS_ID  # Explicit workspace pair
 ```
 
 ## Architecture
@@ -67,6 +76,8 @@ BaseMigrator (core/migrators/base.py)
 - **State Management** (`utils/state.py`): Session tracking, ID mappings, and resume capability
 - **TUI Selector** (`cli/tui_selector.py`): Textual-based interactive selection with search/filter
 - **TUI Project Mapper** (`cli/tui_project_mapper.py`): Text-input-first project mapping with suggestion filtering
+- **TUI Workspace Mapper** (`cli/tui_workspace_mapper.py`): Interactive N-to-N workspace mapping with create-new support
+- **Workspace Resolver** (`utils/workspace_resolver.py`): Auto-detection and resolution of multi-workspace environments
 - **Config** (`utils/config.py`): Environment variables, CLI arguments, and `.env` file handling
 - **Pagination** (`utils/pagination.py`): Pagination helpers for API list endpoints
 
