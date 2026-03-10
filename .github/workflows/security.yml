@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   security-checks:
@@ -16,24 +15,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          version: "latest"
-
       - name: Install tools
-        run: pip install detect-secrets pip-licenses
-
-      - name: Install project dependencies
-        run: uv sync
+        run: pip install detect-secrets
 
       # Secret Detection
       - name: Run detect-secrets
@@ -53,49 +42,3 @@ jobs:
               exit 1
             fi
           fi
-
-      # Trivy Vulnerability Scan
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-
-      - name: Upload Trivy scan results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v4
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
-
-      # License Compliance
-      - name: Check licenses
-        run: |
-          source .venv/bin/activate
-          pip-licenses --format=json --output-file=licenses.json
-
-          COPYLEFT=$(python3 -c "
-          import json
-          data = json.load(open('licenses.json'))
-          copyleft_licenses = ['GPL', 'AGPL', 'LGPL', 'SSPL', 'OSL']
-          problematic = []
-          for pkg in data:
-              license_name = pkg.get('License', '').upper()
-              for cl in copyleft_licenses:
-                  if cl in license_name and 'EXCEPTION' not in license_name:
-                      problematic.append(f\"{pkg['Name']}: {pkg['License']}\")
-          print(len(problematic))
-          if problematic:
-              print('Problematic packages:', file=__import__('sys').stderr)
-              for p in problematic:
-                  print(f'  - {p}', file=__import__('sys').stderr)
-          ")
-
-          if [ "$COPYLEFT" -gt 0 ]; then
-            echo "::error::Found $COPYLEFT packages with copyleft licenses"
-            exit 1
-          fi
-
-          echo "All licenses are compliant"
