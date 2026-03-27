@@ -53,7 +53,7 @@ pygments==2.19.2
     #   textual
 python-dotenv==1.2.1
     # via langsmith-data-migration-tool (pyproject.toml)
-requests==2.32.5
+requests==2.33.0
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langsmith
