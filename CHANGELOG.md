@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.52] - 2026-03-30
+
+### Fixed
+- **Prompt workspace scoping**: Propagate `X-Tenant-Id` workspace headers to PromptMigrator SDK sessions so prompts land in the correct workspace during multi-workspace migrations
+- **Security workflow**: Pin trivy-action to safe SHA to mitigate supply chain attack risk
+
+### Changed
+- Dependency updates: langchain-core, requests, pyasn1
+
 ## [0.0.51] - 2026-03-10
 
 ### Added
