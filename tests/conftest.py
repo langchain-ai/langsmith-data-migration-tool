@@ -11,6 +11,9 @@ def mock_api_client():
     client = Mock(spec=EnhancedAPIClient)
     client.base_url = "https://api.test.langsmith.com/api/v1"
     client.headers = {"X-API-Key": "test-key"}
+    # Provide a real session mock so _sync_workspace_headers can read X-Tenant-Id
+    client.session = Mock()
+    client.session.headers = {}
     return client
 
 

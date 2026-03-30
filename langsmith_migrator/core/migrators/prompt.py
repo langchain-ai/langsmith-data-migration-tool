@@ -13,39 +13,47 @@ class PromptMigrator(BaseMigrator):
     def __init__(self, source_client, dest_client, state, config):
         super().__init__(source_client, dest_client, state, config)
 
-        # Create client kwargs with SSL verification settings
-        source_kwargs = {
-            "api_key": config.source.api_key,
-            "api_url": self._get_api_url(config.source.base_url),
-            "info": {}  # Skip automatic /info fetch to avoid compatibility issues
-        }
-        dest_kwargs = {
-            "api_key": config.destination.api_key,
-            "api_url": self._get_api_url(config.destination.base_url),
-            "info": {}  # Skip automatic /info fetch to avoid compatibility issues
-        }
+        # Create managed sessions so we can update workspace headers dynamically.
+        # The parent EnhancedAPIClient (self.source / self.dest) may have
+        # X-Tenant-Id set after init via orchestrator.set_workspace_context().
+        # We sync that header into these sessions before each operation.
+        self._source_session = requests.Session()
+        self._dest_session = requests.Session()
 
-        # Add custom session with SSL verification disabled if needed
-        # Note: verify_ssl is stored in config.source and config.destination, not config.migration
         if not config.source.verify_ssl or not config.destination.verify_ssl:
-            import requests
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-            # Create sessions with SSL verification disabled
-            if not config.source.verify_ssl:
-                source_session = requests.Session()
-                source_session.verify = False
-                source_kwargs["session"] = source_session
+        if not config.source.verify_ssl:
+            self._source_session.verify = False
+        if not config.destination.verify_ssl:
+            self._dest_session.verify = False
 
-            if not config.destination.verify_ssl:
-                dest_session = requests.Session()
-                dest_session.verify = False
-                dest_kwargs["session"] = dest_session
+        # Create LangSmith SDK clients with our managed sessions
+        self.source_ls_client = Client(
+            api_key=config.source.api_key,
+            api_url=self._get_api_url(config.source.base_url),
+            session=self._source_session,
+            info={},
+        )
+        self.dest_ls_client = Client(
+            api_key=config.destination.api_key,
+            api_url=self._get_api_url(config.destination.base_url),
+            session=self._dest_session,
+            info={},
+        )
 
-        # Create LangSmith SDK clients for prompt operations
-        self.source_ls_client = Client(**source_kwargs)
-        self.dest_ls_client = Client(**dest_kwargs)
+    def _sync_workspace_headers(self):
+        """Sync X-Tenant-Id from parent API clients to SDK sessions."""
+        for session, client in [
+            (self._source_session, self.source),
+            (self._dest_session, self.dest),
+        ]:
+            ws_id = client.session.headers.get("X-Tenant-Id")
+            if ws_id:
+                session.headers["X-Tenant-Id"] = ws_id
+            else:
+                session.headers.pop("X-Tenant-Id", None)
 
     def check_prompts_api_available(self) -> tuple[bool, str]:
         """
@@ -55,6 +63,7 @@ class PromptMigrator(BaseMigrator):
         Returns:
             Tuple of (is_available, error_message)
         """
+        self._sync_workspace_headers()
         # Test 1: Check if we can list prompts (READ access)
         try:
             self.dest_ls_client.list_prompts(limit=1)
@@ -135,11 +144,7 @@ class PromptMigrator(BaseMigrator):
             url = f"{self._get_api_url(self.config.source.base_url)}{endpoint}"
             headers = {"x-api-key": self.config.source.api_key}
 
-            session = requests.Session()
-            if not self.config.source.verify_ssl:
-                session.verify = False
-
-            response = session.get(url, headers=headers, params=params, timeout=30)
+            response = self._source_session.get(url, headers=headers, params=params, timeout=30)
             response.raise_for_status()
 
             data = response.json()
@@ -168,11 +173,7 @@ class PromptMigrator(BaseMigrator):
             url = f"{self._get_api_url(self.config.destination.base_url)}/commits/{owner_path}/{repo}/latest"
             headers = {"x-api-key": self.config.destination.api_key}
 
-            session = requests.Session()
-            if not self.config.destination.verify_ssl:
-                session.verify = False
-
-            response = session.get(url, headers=headers, timeout=30)
+            response = self._dest_session.get(url, headers=headers, timeout=30)
             if response.status_code == 404:
                 return None
             response.raise_for_status()
@@ -252,11 +253,7 @@ class PromptMigrator(BaseMigrator):
                 "Content-Type": "application/json"
             }
 
-            session = requests.Session()
-            if not self.config.destination.verify_ssl:
-                session.verify = False
-
-            response = session.post(url, headers=headers, json=payload, timeout=30)
+            response = self._dest_session.post(url, headers=headers, json=payload, timeout=30)
             response.raise_for_status()
 
             data = response.json()
@@ -354,6 +351,7 @@ class PromptMigrator(BaseMigrator):
 
     def list_prompts(self, is_archived: bool = False) -> List[Dict[str, Any]]:
         """List all prompts from source instance."""
+        self._sync_workspace_headers()
         prompts = []
         try:
             offset = 0
@@ -448,6 +446,7 @@ class PromptMigrator(BaseMigrator):
         Returns:
             True if the prompt exists, False otherwise
         """
+        self._sync_workspace_headers()
         try:
             # Try to list prompts and find a match by repo_handle
             response = self.dest_ls_client.list_prompts(limit=100)
@@ -476,6 +475,7 @@ class PromptMigrator(BaseMigrator):
         Returns:
             The prompt identifier in the destination instance, or None if failed
         """
+        self._sync_workspace_headers()
         if self.config.migration.dry_run:
             self.log(f"[DRY RUN] Would migrate prompt: {prompt_identifier}")
             return prompt_identifier
