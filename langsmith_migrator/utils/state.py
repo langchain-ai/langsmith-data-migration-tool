@@ -83,6 +83,17 @@ class MigrationState:
         self.items[item.id] = item
         self.updated_at = time.time()
 
+    def get_mapped_id(self, item_type: str, source_id: str) -> Optional[str]:
+        """Return the destination ID for a previously migrated item."""
+        return self.id_mappings.get(item_type, {}).get(source_id)
+
+    def set_mapped_id(self, item_type: str, source_id: str, destination_id: str) -> None:
+        """Store a source to destination ID mapping."""
+        if item_type not in self.id_mappings:
+            self.id_mappings[item_type] = {}
+        self.id_mappings[item_type][source_id] = destination_id
+        self.updated_at = time.time()
+
     def update_item_status(self, item_id: str, status: MigrationStatus,
                           destination_id: Optional[str] = None, error: Optional[str] = None):
         """Update the status of an item."""
@@ -94,10 +105,7 @@ class MigrationState:
 
             if destination_id:
                 item.destination_id = destination_id
-                # Update ID mappings
-                if item.type not in self.id_mappings:
-                    self.id_mappings[item.type] = {}
-                self.id_mappings[item.type][item.source_id] = destination_id
+                self.set_mapped_id(item.type, item.source_id, destination_id)
 
             if error:
                 item.error = error
