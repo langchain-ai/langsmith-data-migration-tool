@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.54] - 2026-03-31
+
+### Removed
+- **Trivy vulnerability scanner**: Removed Trivy scan and SARIF upload steps from security workflow
+
+### Fixed
+- **Workspace mapper cursor**: Preserve cursor position when navigating workspace mapper TUI
+
+### Changed
+- **LangSmith SDK**: Bumped minimum `langsmith` dependency to `>=0.7.23`
+
 ## [0.0.53] - 2026-03-31
 
 ### Added
