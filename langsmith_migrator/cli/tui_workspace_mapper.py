@@ -321,6 +321,12 @@ class ProjectMappingScreen(Screen[Optional[Dict[str, str]]]):
             if m.dest_name and m.status not in (self._ProjStatus.UNMAPPED, self._ProjStatus.SKIPPED)
         }
 
+    def _row_for_index(self, index: int) -> Optional[int]:
+        try:
+            return self.filtered_indices.index(index)
+        except ValueError:
+            return None
+
     # -- compose / mount --
 
     def compose(self) -> ComposeResult:
@@ -371,9 +377,16 @@ class ProjectMappingScreen(Screen[Optional[Dict[str, str]]]):
             f"Mapped: {mapped} | Skipped: {skipped} | Unmapped: {unmapped} | Total: {len(self.mappings)}"
         )
 
-    def _refresh_and_stats(self) -> None:
+    def _refresh_and_stats(self, preserve_index: Optional[int] = None) -> None:
+        if preserve_index is None:
+            preserve_index = self._current_index()
         self._refresh_table()
         self._update_stats()
+        if preserve_index is None:
+            return
+        row = self._row_for_index(preserve_index)
+        if row is not None:
+            self.query_one("#pm-table", DataTable).move_cursor(row=row)
 
     # -- key actions --
 
@@ -397,7 +410,7 @@ class ProjectMappingScreen(Screen[Optional[Dict[str, str]]]):
         m = self.mappings[idx]
         m.dest_name = result
         m.status = self._status_for_same(m.source_name, result) if result == m.source_name else self._ProjStatus.MAPPED
-        self._refresh_and_stats()
+        self._refresh_and_stats(preserve_index=idx)
 
     def action_skip(self) -> None:
         if self._modal_is_active():
@@ -408,7 +421,7 @@ class ProjectMappingScreen(Screen[Optional[Dict[str, str]]]):
         m = self.mappings[idx]
         m.dest_name = None
         m.status = self._ProjStatus.SKIPPED
-        self._refresh_and_stats()
+        self._refresh_and_stats(preserve_index=idx)
 
     def action_same_name(self) -> None:
         if self._modal_is_active():
@@ -419,7 +432,7 @@ class ProjectMappingScreen(Screen[Optional[Dict[str, str]]]):
         m = self.mappings[idx]
         m.dest_name = m.source_name
         m.status = self._status_for_same(m.source_name, m.source_name)
-        self._refresh_and_stats()
+        self._refresh_and_stats(preserve_index=idx)
 
     def action_unmap(self) -> None:
         if self._modal_is_active():
@@ -430,7 +443,7 @@ class ProjectMappingScreen(Screen[Optional[Dict[str, str]]]):
         m = self.mappings[idx]
         m.dest_name = None
         m.status = self._ProjStatus.UNMAPPED
-        self._refresh_and_stats()
+        self._refresh_and_stats(preserve_index=idx)
 
     def action_auto_match_all(self) -> None:
         if self._modal_is_active():
@@ -726,9 +739,22 @@ class WorkspaceMapperApp(App):
             if m.dest_id and m.status in (WsMappingStatus.MAPPED, WsMappingStatus.AUTO_MATCHED)
         }
 
-    def _refresh_and_stats(self) -> None:
+    def _row_for_index(self, index: int) -> Optional[int]:
+        try:
+            return self.filtered_indices.index(index)
+        except ValueError:
+            return None
+
+    def _refresh_and_stats(self, preserve_index: Optional[int] = None) -> None:
+        if preserve_index is None:
+            preserve_index = self._current_index()
         self._refresh_table()
         self._update_stats()
+        if preserve_index is None:
+            return
+        row = self._row_for_index(preserve_index)
+        if row is not None:
+            self.query_one("#ws-main-table", DataTable).move_cursor(row=row)
 
     # -- search --
 
@@ -772,7 +798,7 @@ class WorkspaceMapperApp(App):
         m.dest_name = _ws_label(dest_ws) if dest_ws else result
         m.status = WsMappingStatus.MAPPED
         m.create_new_name = None
-        self._refresh_and_stats()
+        self._refresh_and_stats(preserve_index=idx)
 
     def action_create_new(self) -> None:
         if self._modal_is_active():
@@ -796,7 +822,7 @@ class WorkspaceMapperApp(App):
         m.create_new_name = result
         m.dest_id = None
         m.dest_name = None
-        self._refresh_and_stats()
+        self._refresh_and_stats(preserve_index=idx)
 
     def action_map_projects(self) -> None:
         """Drill into project mapping for the selected workspace pair."""
@@ -838,7 +864,7 @@ class WorkspaceMapperApp(App):
         if idx is None or result is None:
             return
         self.mappings[idx].project_mapping = result
-        self._refresh_and_stats()
+        self._refresh_and_stats(preserve_index=idx)
 
     def action_skip(self) -> None:
         if self._modal_is_active():
@@ -851,7 +877,7 @@ class WorkspaceMapperApp(App):
         m.dest_name = None
         m.create_new_name = None
         m.status = WsMappingStatus.SKIPPED
-        self._refresh_and_stats()
+        self._refresh_and_stats(preserve_index=idx)
 
     def action_unmap(self) -> None:
         if self._modal_is_active():
@@ -864,7 +890,7 @@ class WorkspaceMapperApp(App):
         m.dest_name = None
         m.create_new_name = None
         m.status = WsMappingStatus.UNMAPPED
-        self._refresh_and_stats()
+        self._refresh_and_stats(preserve_index=idx)
 
     def action_auto_match_all(self) -> None:
         if self._modal_is_active():
