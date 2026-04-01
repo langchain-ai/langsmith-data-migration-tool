@@ -5,8 +5,8 @@ from typing import Dict, List, Optional
 from ..core.api_client import EnhancedAPIClient, NotFoundError
 
 
-def list_workspaces(client: EnhancedAPIClient) -> List[Dict]:
-    """Discover workspaces accessible to the current API key.
+def discover_workspaces(client: EnhancedAPIClient) -> Dict[str, object]:
+    """Discover workspaces and record endpoint-level probe outcomes.
 
     Tries multiple endpoints since the workspace API varies across LangSmith versions.
 
@@ -14,32 +14,46 @@ def list_workspaces(client: EnhancedAPIClient) -> List[Dict]:
         client: An EnhancedAPIClient instance.
 
     Returns:
-        List of workspace dicts with at least 'id' and 'display_name'/'name' keys.
-        Empty list if workspaces are not supported or none found.
+        Dict with ``workspaces`` and ``probes`` keys.
     """
     endpoints = ["/api/v1/workspaces", "/workspaces", "/orgs/current/workspaces"]
+    probes: List[Dict[str, object]] = []
 
     for endpoint in endpoints:
         try:
             response = client.get(endpoint)
             # Response may be a list directly or wrapped in a key
             if isinstance(response, list):
-                return response
+                probes.append({"endpoint": endpoint, "supported": True, "detail": "list"})
+                return {"workspaces": response, "probes": probes}
             if isinstance(response, dict):
                 # Common wrapper keys
                 for key in ("workspaces", "items", "results"):
                     if key in response and isinstance(response[key], list):
-                        return response[key]
+                        probes.append(
+                            {"endpoint": endpoint, "supported": True, "detail": f"wrapped:{key}"}
+                        )
+                        return {"workspaces": response[key], "probes": probes}
                 # Single workspace returned as dict
                 if "id" in response:
-                    return [response]
-            return []
-        except NotFoundError:
+                    probes.append({"endpoint": endpoint, "supported": True, "detail": "single"})
+                    return {"workspaces": [response], "probes": probes}
+            probes.append({"endpoint": endpoint, "supported": True, "detail": "empty"})
+            return {"workspaces": [], "probes": probes}
+        except NotFoundError as e:
+            probes.append({"endpoint": endpoint, "supported": False, "detail": str(e)})
             continue
-        except Exception:
+        except Exception as e:
+            probes.append({"endpoint": endpoint, "supported": False, "detail": str(e)})
             continue
 
-    return []
+    return {"workspaces": [], "probes": probes}
+
+
+def list_workspaces(client: EnhancedAPIClient) -> List[Dict]:
+    """Discover workspaces accessible to the current API key."""
+    result = discover_workspaces(client)
+    return list(result.get("workspaces", []))
 
 
 def create_workspace(

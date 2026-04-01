@@ -180,6 +180,7 @@ def test_test_command_exits_nonzero_when_connections_fail(cli_harness):
 
     assert result.exit_code == 1
     assert "✗" in cli_harness.console.text
+    assert cli_harness.orchestrator_factory.instances[0].cleanup_called is True
 
 
 def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_harness):
@@ -226,6 +227,22 @@ def test_prompts_command_surfaces_unavailable_prompts_api(cli_harness):
     assert result.exit_code == 0
     cli_harness.migrators.prompt.list_prompts.assert_not_called()
     assert "Feature disabled" in cli_harness.console.text
+
+
+def test_prompts_command_cleans_up_on_connection_failure(cli_harness):
+    """Prompt command should clean up the orchestrator even on early connection failures."""
+
+    cli_harness.orchestrator_factory.test_connections_detailed_value = (
+        False,
+        True,
+        "source failure",
+        None,
+    )
+
+    result = cli_harness.invoke(["prompts", "--all"])
+
+    assert result.exit_code == 0
+    assert cli_harness.orchestrator_factory.instances[0].cleanup_called is True
 
 
 def test_prompts_command_reports_405_failures_with_helpful_guidance(cli_harness):
@@ -370,6 +387,35 @@ def test_rules_command_uses_custom_project_mapping_and_create_enabled(cli_harnes
     assert "Rules: 1 migrated, 0 skipped, 0 failed" in cli_harness.console.text
 
 
+def test_rules_command_uses_workspace_project_mappings(cli_harness):
+    """Standalone rules migration should consume per-workspace project mappings from workspace resolution."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Source Project": "Destination Project"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "source-project-id", "name": "Source Project"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "dest-project-id", "name": "Destination Project"},
+    ]
+    cli_harness.migrators.rules.list_rules.return_value = [
+        {"id": "rule-1", "display_name": "Rule One", "dataset_id": "dataset-1"},
+    ]
+    cli_harness.migrators.rules.create_rule.return_value = "dest-rule-1"
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(["rules", "--all"])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.rules._project_id_map == {
+        "source-project-id": "dest-project-id"
+    }
+    assert "Using workspace-scoped project mapping" in cli_harness.console.text
+
+
 def test_migrate_all_runs_every_step_and_applies_workspace_project_mappings(cli_harness):
     """The all-in-one wizard should thread dataset and project mappings through later steps."""
 
@@ -455,6 +501,34 @@ def test_charts_command_auto_detects_same_instance(cli_harness):
     assert "Detected same source and destination instance" in cli_harness.console.text
 
 
+def test_charts_command_uses_workspace_project_mappings(cli_harness):
+    """Standalone chart migration should consume per-workspace project mappings from workspace resolution."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Source Project": "Destination Project"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "source-project-id", "name": "Source Project"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "dest-project-id", "name": "Destination Project"},
+    ]
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "source-project-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(["charts"])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {
+        "source-project-id": "dest-project-id"
+    }
+    assert "Using workspace-scoped project mapping" in cli_harness.console.text
+
+
 def test_charts_command_uses_saved_project_mapping_for_session_migration(cli_harness):
     """Session-scoped chart migration should resolve the destination project from saved state."""
 
@@ -509,6 +583,92 @@ def test_resume_command_retries_pending_datasets(cli_harness):
         }
     ]
     assert "Resuming migration of 1 items" in cli_harness.console.text
+
+
+def test_resume_command_retries_prompt_queue_rule_and_chart_items(cli_harness):
+    """Resume should replay tracked non-dataset items using their saved state metadata."""
+
+    state = build_state("migration_resume_non_dataset")
+    state.add_item(
+        MigrationItem(
+            id="prompt_default_team_prompt-a",
+            type="prompt",
+            name="team/prompt-a",
+            source_id="team/prompt-a",
+            status=MigrationStatus.PENDING,
+            metadata={"include_all_commits": True},
+        )
+    )
+    state.add_item(
+        MigrationItem(
+            id="queue_default_queue-1",
+            type="queue",
+            name="Queue One",
+            source_id="queue-1",
+            status=MigrationStatus.PENDING,
+            metadata={"queue": {"id": "queue-1", "name": "Queue One"}},
+        )
+    )
+    state.add_item(
+        MigrationItem(
+            id="rule_default_rule-1",
+            type="rule",
+            name="Rule One",
+            source_id="rule-1",
+            status=MigrationStatus.PENDING,
+            metadata={
+                "rule": {"id": "rule-1", "display_name": "Rule One"},
+                "strip_projects": True,
+                "create_disabled": True,
+                "project_id_map": {"source-project-id": "dest-project-id"},
+            },
+        )
+    )
+    state.add_item(
+        MigrationItem(
+            id="chart_default_chart-1",
+            type="chart",
+            name="Chart One",
+            source_id="chart-1",
+            status=MigrationStatus.PENDING,
+            metadata={
+                "chart": {"id": "chart-1", "title": "Chart One", "series": [{"filters": {}}]},
+                "dest_session_id": "dest-session-1",
+            },
+        )
+    )
+    save_session(cli_harness.state_manager, state)
+    cli_harness.console.inputs = ["1"]
+    cli_harness.controls.confirm_answers = [True]
+    cli_harness.migrators.prompt.migrate_prompt.return_value = "team/prompt-a"
+    cli_harness.migrators.queue.create_queue.return_value = "dest-queue-1"
+    cli_harness.migrators.rules.create_rule.return_value = "dest-rule-1"
+    cli_harness.migrators.chart.migrate_chart.return_value = "dest-chart-1"
+
+    result = cli_harness.invoke(["resume"])
+
+    assert result.exit_code == 0
+    cli_harness.migrators.prompt.migrate_prompt.assert_called_once_with(
+        "team/prompt-a",
+        include_all_commits=True,
+    )
+    cli_harness.migrators.queue.create_queue.assert_called_once_with(
+        {"id": "queue-1", "name": "Queue One"}
+    )
+    assert cli_harness.migrators.rules._project_id_map == {
+        "source-project-id": "dest-project-id"
+    }
+    cli_harness.migrators.rules.create_rule.assert_called_once_with(
+        {"id": "rule-1", "display_name": "Rule One"},
+        strip_project_reference=True,
+        ensure_project=False,
+        create_disabled=True,
+    )
+    cli_harness.migrators.chart.migrate_chart.assert_called_once_with(
+        {"id": "chart-1", "title": "Chart One", "series": [{"filters": {}}]},
+        "dest-session-1",
+    )
+    assert "Resume processing completed" in cli_harness.console.text
 
 
 def test_clean_command_deletes_saved_sessions(cli_harness):

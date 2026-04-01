@@ -74,6 +74,79 @@ class TestPromptMigrator:
 
         assert len(result) == 0
 
+    def test_list_prompts_includes_private_and_public_prompts(self, prompt_migrator):
+        """Prompt listing should include both tenant-private and public prompts."""
+        private_response = Mock()
+        private_prompt = Mock()
+        private_prompt.id = "private-1"
+        private_prompt.repo_handle = "team/private-prompt"
+        private_prompt.description = "private"
+        private_prompt.readme = ""
+        private_prompt.is_public = False
+        private_prompt.is_archived = False
+        private_prompt.tags = []
+        private_prompt.num_likes = 0
+        private_prompt.num_downloads = 0
+        private_prompt.num_commits = 1
+        private_prompt.updated_at = None
+        private_response.repos = [private_prompt]
+
+        public_response = Mock()
+        public_prompt = Mock()
+        public_prompt.id = "public-1"
+        public_prompt.repo_handle = "team/public-prompt"
+        public_prompt.description = "public"
+        public_prompt.readme = ""
+        public_prompt.is_public = True
+        public_prompt.is_archived = False
+        public_prompt.tags = []
+        public_prompt.num_likes = 0
+        public_prompt.num_downloads = 0
+        public_prompt.num_commits = 1
+        public_prompt.updated_at = None
+        public_response.repos = [public_prompt]
+
+        empty_response = Mock()
+        empty_response.repos = []
+        prompt_migrator.source_ls_client.list_prompts.side_effect = [
+            private_response,
+            public_response,
+        ]
+
+        result = prompt_migrator.list_prompts()
+
+        assert [prompt["repo_handle"] for prompt in result] == [
+            "team/private-prompt",
+            "team/public-prompt",
+        ]
+        assert prompt_migrator.source_ls_client.list_prompts.call_args_list[0].kwargs["is_public"] is False
+        assert prompt_migrator.source_ls_client.list_prompts.call_args_list[1].kwargs["is_public"] is True
+
+    def test_find_existing_prompt_paginates_destination_results(self, prompt_migrator):
+        """Destination prompt existence checks should scan all pages, not just the first page."""
+        first_page = Mock()
+        first_page.repos = []
+        for index in range(100):
+            prompt = Mock()
+            prompt.repo_handle = f"team/prompt-{index}"
+            first_page.repos.append(prompt)
+
+        second_page = Mock()
+        target_prompt = Mock()
+        target_prompt.repo_handle = "team/target-prompt"
+        second_page.repos = [target_prompt]
+
+        empty_response = Mock()
+        empty_response.repos = []
+        prompt_migrator.dest_ls_client.list_prompts.side_effect = [
+            first_page,
+            second_page,
+        ]
+
+        assert prompt_migrator.find_existing_prompt("team/target-prompt") is True
+        assert prompt_migrator.dest_ls_client.list_prompts.call_args_list[0].kwargs["offset"] == 0
+        assert prompt_migrator.dest_ls_client.list_prompts.call_args_list[1].kwargs["offset"] == 100
+
     def test_migrate_prompt_dry_run(self, prompt_migrator, sample_config):
         """Test migrating prompt in dry-run mode."""
         sample_config.migration.dry_run = True
@@ -94,6 +167,7 @@ class TestPromptMigrator:
             "manifest": mock_manifest
         })
         prompt_migrator._push_prompt_manifest = Mock(return_value="new-commit-hash-123")
+        prompt_migrator._verify_prompt_commit = Mock(return_value=(True, "new-commit-hash-123"))
 
         result = prompt_migrator.migrate_prompt('user/test-prompt')
 
@@ -129,6 +203,7 @@ class TestPromptMigrator:
             "manifest": mock_manifest
         })
         prompt_migrator._push_prompt_manifest = Mock(return_value="new-commit-hash")
+        prompt_migrator._verify_prompt_commit = Mock(return_value=(True, "new-commit-hash"))
 
         result = prompt_migrator.migrate_prompt('user/test-prompt', include_all_commits=True)
 

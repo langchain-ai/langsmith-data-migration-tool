@@ -1,5 +1,7 @@
 """Feedback migration logic."""
 
+import hashlib
+import json
 from typing import Dict, List, Any, Tuple
 
 from .base import BaseMigrator
@@ -7,6 +9,25 @@ from .base import BaseMigrator
 
 class FeedbackMigrator(BaseMigrator):
     """Handles feedback migration for experiments."""
+
+    def _feedback_fingerprint(
+        self,
+        source_experiment_id: str,
+        feedback: Dict[str, Any],
+    ) -> str:
+        """Create a stable provenance fingerprint for feedback replay."""
+        payload = {
+            "source_experiment_id": source_experiment_id,
+            "source_feedback_id": feedback.get("id"),
+            "run_id": feedback.get("run_id"),
+            "key": feedback.get("key"),
+            "score": feedback.get("score"),
+            "value": feedback.get("value"),
+            "comment": feedback.get("comment"),
+            "correction": feedback.get("correction"),
+        }
+        serialized = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     def list_feedback_for_session(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         """
@@ -119,13 +140,14 @@ class FeedbackMigrator(BaseMigrator):
             return True
 
         try:
-            self.dest.post("/feedback", feedback)
+            payload = {k: v for k, v in feedback.items() if not k.startswith("_")}
+            self.dest.post("/feedback", payload)
             return True
         except Exception as e:
             self.log(f"Failed to create feedback '{feedback.get('key')}': {e}", "warning")
             return False
 
-    def create_feedback_batch(self, feedbacks: List[Dict[str, Any]]) -> int:
+    def create_feedback_batch(self, feedbacks: List[Dict[str, Any]]) -> Tuple[int, List[Dict[str, Any]]]:
         """
         Create feedback records in destination.
 
@@ -136,18 +158,20 @@ class FeedbackMigrator(BaseMigrator):
             feedbacks: List of feedback records to create
 
         Returns:
-            Number of successfully created feedback records
+            Tuple of (number_created, created_feedbacks)
         """
         if self.config.migration.dry_run:
             self.log(f"[DRY RUN] Would create {len(feedbacks)} feedback records", "info")
-            return len(feedbacks)
+            return len(feedbacks), list(feedbacks)
 
         created = 0
+        created_feedbacks: List[Dict[str, Any]] = []
         for feedback in feedbacks:
             if self.create_feedback(feedback):
                 created += 1
+                created_feedbacks.append(feedback)
 
-        return created
+        return created, created_feedbacks
 
     def migrate_feedback_for_experiments(
         self,
@@ -173,6 +197,9 @@ class FeedbackMigrator(BaseMigrator):
 
         for source_exp_id, dest_exp_id in experiment_id_mapping.items():
             self.log(f"Fetching feedback for experiment {source_exp_id}...", "info")
+            experiment_item_id = f"experiment_{source_exp_id}"
+            if self.state:
+                self.checkpoint_item(experiment_item_id, stage="migrate_feedback")
 
             # Fetch feedback for this experiment session
             feedbacks = self.list_feedback_for_session(source_exp_id)
@@ -189,6 +216,14 @@ class FeedbackMigrator(BaseMigrator):
             skipped = 0
 
             for fb in feedbacks:
+                fingerprint = self._feedback_fingerprint(source_exp_id, fb)
+                if self.state and self.state.get_mapped_id("feedback_fingerprint", fingerprint):
+                    self.log(
+                        f"Skipping feedback '{fb.get('key')}' - already replayed in a prior attempt",
+                        "warning",
+                    )
+                    continue
+
                 # Map run_id to destination
                 source_run_id = fb.get("run_id")
 
@@ -223,6 +258,7 @@ class FeedbackMigrator(BaseMigrator):
                 if fb.get("feedback_source"):
                     migrated_fb["feedback_source"] = fb["feedback_source"]
 
+                migrated_fb["_fingerprint"] = fingerprint
                 migrated_feedbacks.append(migrated_fb)
 
             if skipped > 0:
@@ -230,11 +266,48 @@ class FeedbackMigrator(BaseMigrator):
 
             # Create feedback in destination
             if migrated_feedbacks:
-                created = self.create_feedback_batch(migrated_feedbacks)
+                created, created_feedbacks = self.create_feedback_batch(migrated_feedbacks)
                 total_migrated += created
                 self.log(
                     f"Migrated {created}/{len(migrated_feedbacks)} feedback for experiment {source_exp_id}",
                     "success"
                 )
+                if self.state:
+                    for migrated_fb in created_feedbacks:
+                        fingerprint = migrated_fb.get("_fingerprint")
+                        if fingerprint:
+                            self.state.set_mapped_id(
+                                "feedback_fingerprint", fingerprint, fingerprint
+                            )
+                    if created == len(migrated_feedbacks):
+                        self.checkpoint_item(
+                            experiment_item_id,
+                            stage="completed",
+                            metadata={
+                                "feedback_found": len(feedbacks),
+                                "feedback_migrated": created,
+                                "feedback_verified": True,
+                            },
+                        )
+                    elif created < len(migrated_feedbacks):
+                        issue = self.record_issue(
+                            "transient",
+                            "feedback_partial_replay",
+                            f"Some feedback could not be replayed for experiment {source_exp_id}",
+                            item_id=experiment_item_id,
+                            next_action="Re-run `langsmith-migrator resume` to retry feedback creation.",
+                            evidence={
+                                "feedback_found": len(feedbacks),
+                                "feedback_migrated": created,
+                            },
+                        )
+                        if issue:
+                            self.queue_remediation(
+                                issue_id=issue.id,
+                                next_action=issue.next_action or "Retry feedback replay.",
+                                item_id=experiment_item_id,
+                                command="langsmith-migrator resume",
+                            )
+                    self.persist_state()
 
         return total_found, total_migrated

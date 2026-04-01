@@ -139,6 +139,7 @@ class FakeOrchestratorInstance:
     test_connections_detailed_value: tuple[bool, bool, str | None, str | None]
     migrate_datasets_return: dict[str, str]
     migrate_datasets_side_effect: Exception | None
+    migrators: Any | None = None
     migrate_dataset_calls: list[dict[str, Any]] = field(default_factory=list)
     workspace_calls: list[tuple[str, str]] = field(default_factory=list)
     clear_workspace_called: bool = False
@@ -177,6 +178,44 @@ class FakeOrchestratorInstance:
         self.source_client.set_workspace(None)
         self.dest_client.set_workspace(None)
 
+    def resume_items(self, items_to_process: list[Any]) -> dict[str, list[str]]:
+        results = {"resumed": [], "blocked": []}
+        for item in items_to_process:
+            if item.type == "dataset":
+                self.migrate_datasets_parallel(
+                    [item.source_id],
+                    include_examples=True,
+                    include_experiments=False,
+                )
+                results["resumed"].append(f"dataset:{item.source_id}")
+            elif item.type == "prompt":
+                self.migrators.prompt.migrate_prompt(
+                    item.source_id,
+                    include_all_commits=item.metadata.get("include_all_commits", False),
+                )
+                results["resumed"].append(f"prompt:{item.source_id}")
+            elif item.type == "queue":
+                self.migrators.queue.create_queue(item.metadata.get("queue"))
+                results["resumed"].append(f"queue:{item.source_id}")
+            elif item.type == "rule":
+                self.migrators.rules._project_id_map = dict(item.metadata.get("project_id_map") or {})
+                self.migrators.rules.create_rule(
+                    item.metadata.get("rule"),
+                    strip_project_reference=item.metadata.get("strip_projects", False),
+                    ensure_project=item.metadata.get("ensure_project", False),
+                    create_disabled=item.metadata.get("create_disabled", False),
+                )
+                results["resumed"].append(f"rule:{item.source_id}")
+            elif item.type == "chart":
+                self.migrators.chart.migrate_chart(
+                    item.metadata.get("chart"),
+                    item.metadata.get("dest_session_id"),
+                )
+                results["resumed"].append(f"chart:{item.source_id}")
+            else:
+                results["blocked"].append(f"{item.type}:{item.source_id}")
+        return results
+
     def cleanup(self) -> None:
         self.cleanup_called = True
         self.source_client.close()
@@ -195,6 +234,7 @@ class FakeOrchestratorFactory:
         self.test_connections_detailed_value = (True, True, None, None)
         self.migrate_datasets_return: dict[str, str] = {}
         self.migrate_datasets_side_effect: Exception | None = None
+        self.migrators: Any | None = None
 
     def __call__(self, config: Any, state_manager: StateManager) -> FakeOrchestratorInstance:
         instance = FakeOrchestratorInstance(
@@ -207,6 +247,7 @@ class FakeOrchestratorFactory:
             test_connections_detailed_value=self.test_connections_detailed_value,
             migrate_datasets_return=self.migrate_datasets_return,
             migrate_datasets_side_effect=self.migrate_datasets_side_effect,
+            migrators=self.migrators,
         )
         self.instances.append(instance)
         return instance
@@ -256,8 +297,12 @@ class MigratorRegistry:
         self.dataset.list_datasets.return_value = []
         self.queue.list_queues.return_value = []
         self.prompt.check_prompts_api_available.return_value = (True, None)
+        self.prompt.probe_capabilities.return_value = {}
         self.prompt.list_prompts.return_value = []
+        self.rules.probe_capabilities.return_value = {}
         self.rules.list_rules.return_value = []
+        self.chart.probe_capabilities.return_value = {}
+        self.chart.list_charts.return_value = []
         self.chart.list_sessions.return_value = []
         self.chart.migrate_all_charts.return_value = {}
         self.chart.migrate_session_charts.return_value = {}
@@ -299,6 +344,7 @@ def cli_harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> CliHarness:
     controls = CliControls(console=console)
     orchestrator_factory = FakeOrchestratorFactory()
     migrators = MigratorRegistry()
+    orchestrator_factory.migrators = migrators
     state_manager = StateManager(tmp_path / "state")
 
     monkeypatch.setattr(cli_main, "console", console)
