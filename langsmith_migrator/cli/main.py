@@ -1,6 +1,7 @@
 """Simplified CLI interface with improved architecture."""
 
 import functools
+import logging
 from typing import Iterable
 import click
 import time
@@ -49,6 +50,26 @@ from ..utils.workspace_resolver import resolve_workspace_context, display_worksp
 
 
 console = Console()
+
+
+class _SuppressRunCompressionNoise(logging.Filter):
+    """Hide known low-signal LangSmith run compression info logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage().lower()
+        return "run compression is not enabled" not in message
+
+
+def _install_log_filters() -> None:
+    """Install process-wide filters for noisy third-party logs."""
+    noise_filter = _SuppressRunCompressionNoise()
+    root_logger = logging.getLogger()
+
+    for handler in root_logger.handlers:
+        handler.addFilter(noise_filter)
+
+    # Also attach directly to the common LangSmith logger namespace.
+    logging.getLogger("langsmith").addFilter(noise_filter)
 
 
 def workspace_options(f):
@@ -498,6 +519,7 @@ def ensure_config(config: Config) -> bool:
 def cli(ctx, source_key, dest_key, source_url, dest_url, no_ssl, batch_size, workers, dry_run, skip_existing, non_interactive, verbose):
     """LangSmith Migration Tool - Migrate data between LangSmith instances."""
     ctx.ensure_object(dict)
+    _install_log_filters()
 
     # Create configuration
     config = Config(

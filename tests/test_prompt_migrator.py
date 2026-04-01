@@ -95,7 +95,7 @@ class TestPromptMigrator:
         result = prompt_migrator.list_prompts()
 
         assert [prompt["repo_handle"] for prompt in result] == ["team/private-prompt"]
-        assert "is_public" not in prompt_migrator.source_ls_client.list_prompts.call_args.kwargs
+        assert prompt_migrator.source_ls_client.list_prompts.call_args.kwargs["is_public"] is False
 
     def test_find_existing_prompt_paginates_destination_results(self, prompt_migrator):
         """Destination prompt existence checks should scan all pages, not just the first page."""
@@ -121,6 +121,7 @@ class TestPromptMigrator:
         assert prompt_migrator.find_existing_prompt("team/target-prompt") is True
         assert prompt_migrator.dest_ls_client.list_prompts.call_args_list[0].kwargs["offset"] == 0
         assert prompt_migrator.dest_ls_client.list_prompts.call_args_list[1].kwargs["offset"] == 100
+        assert prompt_migrator.dest_ls_client.list_prompts.call_args_list[0].kwargs["is_public"] is False
 
     def test_migrate_prompt_dry_run(self, prompt_migrator, sample_config):
         """Test migrating prompt in dry-run mode."""

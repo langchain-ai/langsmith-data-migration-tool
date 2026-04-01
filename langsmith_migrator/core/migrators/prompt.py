@@ -588,13 +588,12 @@ class PromptMigrator(BaseMigrator):
             seen_handles = set()
 
             try:
-                # Do not force visibility filters here. With workspace scoping enabled
-                # (X-Tenant-Id), this keeps discovery limited to the selected workspace
-                # instead of unioning broad public catalogs.
+                # Explicitly scope to tenant-private prompts. Some instances return
+                # a broad public catalog unless is_public is set to False.
                 for prompt in self._iter_prompt_repos(
                     self.source_ls_client,
                     is_archived=is_archived,
-                    is_public=None,
+                    is_public=False,
                 ):
                     if prompt.repo_handle in seen_handles:
                         continue
@@ -658,7 +657,7 @@ class PromptMigrator(BaseMigrator):
         try:
             for prompt in self._iter_prompt_repos(
                 self.dest_ls_client,
-                is_public=None,
+                is_public=False,
             ):
                 if prompt.repo_handle == prompt_identifier:
                     return True
