@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.53] - 2026-03-31
+
+### Added
+- **Comprehensive CLI functional test suite**: End-to-end test coverage for all CLI commands including datasets, queues, prompts, rules, charts, migrate-all, resume, and workspace flows
+- **Migration resolution regression tests**: Coverage for experiment resume, state resolution, and remediation bundle preservation
+
+### Fixed
+- **Rules enable defaults**: Aligned `--create-enabled` / `--rules-create-enabled` flag behavior across `rules` and `migrate-all` commands to match documentation
+- **Migration reliability**: Addressed gaps in state resolution, remediation bundle preservation on resume, and resolver CLI flows
+- **Ruff lint**: Removed unused `commits_by_hash` variable in prompt migrator
+
 ## [0.0.51] - 2026-03-10
 
 ### Added
