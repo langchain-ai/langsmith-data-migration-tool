@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.57] - 2026-03-31
+
+### Added
+- **User and role migration**: New `users` CLI command migrates custom workspace roles, org members, and workspace memberships between LangSmith instances.
+- **Custom role sync**: Matches built-in roles by name and creates/updates custom roles by display name with full permission mapping.
+- **Workspace member migration**: Per-workspace-pair member migration with `--map-workspaces` support.
+- **Granular control**: `--roles-only` to sync only custom roles, `--skip-workspace-members` to skip workspace-level migration.
+- **Resume support**: Added `org_member` and `ws_member` item types to the resume workflow.
+
 ## [0.0.56] - 2026-04-01
 
 ### Added
