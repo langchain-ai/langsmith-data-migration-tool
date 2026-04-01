@@ -6,6 +6,7 @@ from langsmith import Client
 
 from .base import BaseMigrator
 from ..api_client import NotFoundError
+from ...utils.matching import unique_name_map
 
 
 class RulesMigrator(BaseMigrator):
@@ -22,6 +23,7 @@ class RulesMigrator(BaseMigrator):
 
         # Initialize LangSmith client for checking prompts
         self.dest_ls_client = None
+        self._dest_session = requests.Session()
         try:
             self._init_ls_client()
         except Exception as e:
@@ -53,17 +55,49 @@ class RulesMigrator(BaseMigrator):
         dest_kwargs = {
             "api_key": self.config.destination.api_key,
             "api_url": self._get_api_url(self.config.destination.base_url),
-            "info": {}
+            "info": {},
+            "session": self._dest_session,
         }
 
         if not self.config.destination.verify_ssl:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            session = requests.Session()
-            session.verify = False
-            dest_kwargs["session"] = session
+            self._dest_session.verify = False
 
         self.dest_ls_client = Client(**dest_kwargs)
+
+    def _sync_workspace_headers(self) -> None:
+        """Sync X-Tenant-Id from the destination API client to the SDK session."""
+        ws_id = self.dest.session.headers.get("X-Tenant-Id")
+        if ws_id:
+            self._dest_session.headers["X-Tenant-Id"] = ws_id
+        else:
+            self._dest_session.headers.pop("X-Tenant-Id", None)
+
+    def _iter_dest_prompt_repos(self, *, limit: int = 100):
+        """Yield destination prompt repos with pagination support."""
+        if not self.dest_ls_client:
+            return
+
+        self._sync_workspace_headers()
+        for visibility in (False, True):
+            offset = 0
+            while True:
+                response = self.dest_ls_client.list_prompts(
+                    limit=limit,
+                    offset=offset,
+                    is_public=visibility,
+                )
+                repos = list(getattr(response, "repos", []) or [])
+                if not repos:
+                    break
+
+                for prompt in repos:
+                    yield prompt
+
+                if len(repos) < limit:
+                    break
+                offset += len(repos)
 
     def _find_existing_prompt(self, prompt_handle: str) -> bool:
         """Check if a prompt exists in destination."""
@@ -71,17 +105,91 @@ class RulesMigrator(BaseMigrator):
             return False
 
         try:
-            # Try to list prompts and find a match by repo_handle
-            # We iterate because accessing directly might fail or require different permissions
-            response = self.dest_ls_client.list_prompts(limit=100)
-            if response and hasattr(response, 'repos'):
-                for prompt in response.repos:
-                    if prompt.repo_handle == prompt_handle:
-                        return True
+            for prompt in self._iter_dest_prompt_repos():
+                if prompt.repo_handle == prompt_handle:
+                    return True
             return False
         except Exception as e:
             self.log(f"Failed to check prompt existence for {prompt_handle}: {e}", "warning")
             return False
+
+    def _rule_item_id(self, rule: Dict[str, Any]) -> str:
+        return f"rule_{rule.get('id', rule.get('display_name', 'unnamed'))}"
+
+    def probe_capabilities(self) -> Dict[str, Dict[str, Any]]:
+        """Probe rules-related capabilities without mutating destination state."""
+        capabilities: Dict[str, Dict[str, Any]] = {}
+
+        def record(name: str, supported: Optional[bool], detail: str) -> None:
+            capabilities[name] = {"supported": supported, "detail": detail}
+            self.record_capability(
+                "rules",
+                name,
+                supported=supported,
+                detail=detail,
+                probe="/runs/rules",
+            )
+
+        try:
+            iterator = iter(self.dest.get_paginated(self._get_rules_endpoint(), params={"limit": 1}))
+            next(iterator, None)
+            record("rules_read", True, "ok")
+        except Exception as e:
+            record("rules_read", False, str(e))
+
+        record("rules_write", None, "deferred_until_first_write")
+        return capabilities
+
+    def _normalize_rule_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a rule payload for verification."""
+        normalized = {}
+        for key, value in payload.items():
+            if key in {"evaluators", "code_evaluators"} and isinstance(value, list):
+                normalized[key] = self._clean_none_values(value)
+            elif value is not None:
+                normalized[key] = value
+        return normalized
+
+    def _verify_rule(self, rule_id: str, payload: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+        """Verify created or updated rule fields by refetching the resource."""
+        try:
+            actual = self.dest.get(f"{self._get_rules_endpoint()}/{rule_id}")
+        except Exception as e:
+            return False, {"error": str(e)}
+
+        mismatches = {}
+        for key, expected in self._normalize_rule_payload(payload).items():
+            actual_value = actual.get(key)
+            if actual_value != expected:
+                mismatches[key] = {"expected": expected, "actual": actual_value}
+        return not mismatches, mismatches
+
+    def _export_rule_manual_apply(
+        self,
+        rule: Dict[str, Any],
+        payload: Dict[str, Any],
+        *,
+        reason: str,
+        unmet_dependencies: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Export a normalized rule payload for manual apply."""
+        item_id = self._rule_item_id(rule)
+        return self.export_payload(
+            item_id,
+            "manual_apply",
+            {
+                "rule_id": rule.get("id"),
+                "display_name": rule.get("display_name") or rule.get("name"),
+                "reason": reason,
+                "unmet_dependencies": unmet_dependencies or {},
+                "payload": self._normalize_rule_payload(payload),
+                "manual_steps": [
+                    "Resolve the unmet dependencies listed in this artifact.",
+                    "Create or update the rule with the exported payload.",
+                    "Re-run `langsmith-migrator resume` after the rule exists on destination.",
+                ],
+            },
+        )
 
     def _fetch_prompt_manifest(self, prompt_handle: str, commit: str = "latest", from_source: bool = True) -> Optional[Dict[str, Any]]:
         """
@@ -286,46 +394,72 @@ class RulesMigrator(BaseMigrator):
         self._project_id_map = {}
 
         try:
-            # Get all projects from source (store full objects for potential creation)
-            source_projects = {}  # name -> full project dict
-            source_projects_by_id = {}  # id -> full project dict
+            source_records: List[Dict[str, Any]] = []
             for project in self.source.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
-                    source_projects[project['name']] = project
-                    source_projects_by_id[project['id']] = project
+                    source_records.append(project)
 
-            # Get all projects from destination
-            dest_projects = {}  # name -> project id
+            dest_records: List[Dict[str, Any]] = []
             for project in self.dest.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
-                    dest_projects[project['name']] = project['id']
+                    dest_records.append(project)
 
-            # Build mapping by matching names
+            _, source_duplicates = unique_name_map(source_records)
+            dest_unique, dest_duplicates = unique_name_map(dest_records)
             existing_count = 0
             created_count = 0
 
-            for name, source_project in source_projects.items():
-                source_id = source_project['id']
+            for source_project in source_records:
+                source_id = source_project["id"]
+                source_name = source_project["name"]
 
-                if name in dest_projects:
-                    # Project exists in both - create mapping
-                    self._project_id_map[source_id] = dest_projects[name]
-                    self.log(f"Mapped project '{name}': {source_id} -> {dest_projects[name]}", "info")
+                if self.state and self.state.get_mapped_id("project", source_id):
+                    mapped_id = self.state.get_mapped_id("project", source_id)
+                    self._project_id_map[source_id] = mapped_id
+                    self.record_provenance(f"project:{source_id}", "state_mapping")
+                    continue
+
+                if source_name in source_duplicates:
+                    self.log(
+                        f"Project '{source_name}' is duplicated on source; skipping automatic mapping",
+                        "warning",
+                    )
+                    continue
+                if source_name in dest_duplicates:
+                    self.log(
+                        f"Project '{source_name}' is duplicated on destination; skipping automatic mapping",
+                        "warning",
+                    )
+                    continue
+
+                if source_name in dest_unique:
+                    self._project_id_map[source_id] = dest_unique[source_name]
+                    self.record_provenance(f"project:{source_id}", "exact_name_match")
+                    self.log(
+                        f"Mapped project '{source_name}': {source_id} -> {dest_unique[source_name]}",
+                        "info",
+                    )
                     existing_count += 1
                 elif create_missing:
-                    # Project missing in destination - create it
-                    self.log(f"Project '{name}' not found in destination, creating...", "info")
+                    self.log(f"Project '{source_name}' not found in destination, creating...", "info")
                     new_project = self._create_project(source_project)
                     if new_project:
-                        self._project_id_map[source_id] = new_project['id']
-                        self.log(f"Mapped project '{name}': {source_id} -> {new_project['id']}", "info")
+                        self._project_id_map[source_id] = new_project["id"]
+                        self.record_provenance(f"project:{source_id}", "created_on_destination")
+                        self.log(
+                            f"Mapped project '{source_name}': {source_id} -> {new_project['id']}",
+                            "info",
+                        )
                         created_count += 1
                     else:
-                        self.log(f"Failed to create project '{name}' in destination", "error")
+                        self.log(f"Failed to create project '{source_name}' in destination", "error")
 
             total_mapped = len(self._project_id_map)
             if created_count > 0:
-                self.log(f"Built project mapping: {existing_count} existing, {created_count} created, {total_mapped} total", "success")
+                self.log(
+                    f"Built project mapping: {existing_count} existing, {created_count} created, {total_mapped} total",
+                    "success",
+                )
             else:
                 self.log(f"Built project mapping: {total_mapped} projects mapped", "success")
 
@@ -349,23 +483,43 @@ class RulesMigrator(BaseMigrator):
         self._dataset_id_map = {}
 
         try:
-            # Get all datasets from source
-            source_datasets = {}
+            source_records: List[Dict[str, Any]] = []
             for dataset in self.source.get_paginated("/datasets", page_size=100):
                 if isinstance(dataset, dict):
-                    source_datasets[dataset['name']] = dataset['id']
+                    source_records.append(dataset)
 
-            # Get all datasets from destination
-            dest_datasets = {}
+            dest_records: List[Dict[str, Any]] = []
             for dataset in self.dest.get_paginated("/datasets", page_size=100):
                 if isinstance(dataset, dict):
-                    dest_datasets[dataset['name']] = dataset['id']
+                    dest_records.append(dataset)
 
-            # Build mapping by matching names
-            for name, source_id in source_datasets.items():
-                if name in dest_datasets:
-                    self._dataset_id_map[source_id] = dest_datasets[name]
-                    self.log(f"Mapped dataset '{name}': {source_id} -> {dest_datasets[name]}", "info")
+            _, source_duplicates = unique_name_map(source_records)
+            dest_unique, dest_duplicates = unique_name_map(dest_records)
+
+            for dataset in source_records:
+                source_id = dataset["id"]
+                dataset_name = dataset["name"]
+
+                if self.state and self.state.get_mapped_id("dataset", source_id):
+                    mapped_id = self.state.get_mapped_id("dataset", source_id)
+                    self._dataset_id_map[source_id] = mapped_id
+                    self.record_provenance(f"dataset:{source_id}", "state_mapping")
+                    continue
+
+                if dataset_name in source_duplicates or dataset_name in dest_duplicates:
+                    self.log(
+                        f"Dataset '{dataset_name}' is duplicated; skipping automatic exact-name mapping",
+                        "warning",
+                    )
+                    continue
+
+                if dataset_name in dest_unique:
+                    self._dataset_id_map[source_id] = dest_unique[dataset_name]
+                    self.record_provenance(f"dataset:{source_id}", "exact_name_match")
+                    self.log(
+                        f"Mapped dataset '{dataset_name}': {source_id} -> {dest_unique[dataset_name]}",
+                        "info",
+                    )
 
             self.log(f"Built dataset mapping: {len(self._dataset_id_map)} datasets matched", "success")
 
@@ -597,6 +751,16 @@ class RulesMigrator(BaseMigrator):
                 self.log(f"Warning: Rule {rule_id} missing display_name/name, using: {display_name}", "warning")
                 self.log(f"Available fields in rule: {list(rule.keys())}", "info")
 
+            item_id = self._rule_item_id(rule)
+            self.ensure_item(
+                item_id,
+                "rule",
+                display_name,
+                rule.get("id", display_name),
+                stage="planning",
+                metadata={"display_name": display_name},
+            )
+
             # Build dataset mapping to map add_to_dataset_id
             dataset_map = self.build_dataset_mapping()
             source_add_to_dataset_id = rule.get('add_to_dataset_id')
@@ -716,6 +880,36 @@ class RulesMigrator(BaseMigrator):
                     self.log("    1. The prompt on source doesn't have a model (simple prompt, not RunnableSequence)", "error")
                     self.log("    2. Or the prompt migration didn't include the model", "error")
                     self.log("  Skipping this rule - it will fail validation without a model", "error")
+                    export_path = self._export_rule_manual_apply(
+                        rule,
+                        payload,
+                        reason="missing_evaluator_model",
+                        unmet_dependencies={"prompt_handle": prompt_handle},
+                    )
+                    issue = self.record_issue(
+                        "dependency",
+                        "missing_evaluator_model",
+                        f"Rule '{display_name}' is missing evaluator model configuration",
+                        item_id=item_id,
+                        next_action="Migrate the evaluator prompt with model config, then run `langsmith-migrator resume`.",
+                        evidence={"prompt_handle": prompt_handle},
+                        export_path=export_path,
+                    )
+                    if issue:
+                        self.queue_remediation(
+                            issue_id=issue.id,
+                            item_id=item_id,
+                            next_action=issue.next_action or "Resolve evaluator prompt dependency.",
+                            export_path=export_path,
+                            command="langsmith-migrator resume",
+                        )
+                    self.mark_exported(
+                        item_id,
+                        "missing_evaluator_model",
+                        next_action="Resolve the evaluator prompt model config, then run `langsmith-migrator resume`.",
+                        export_path=export_path,
+                        evidence={"prompt_handle": prompt_handle},
+                    )
                     return None
 
                 # Check if prompt exists on destination (for informational purposes)
@@ -764,6 +958,37 @@ class RulesMigrator(BaseMigrator):
                     for prompt in actually_missing:
                         self.log(f"  - {prompt}", "warning")
                     self.log("Run 'langsmith-migrator prompts' first to migrate prompts", "warning")
+                    export_path = self._export_rule_manual_apply(
+                        rule,
+                        payload,
+                        reason="missing_prompt_dependencies",
+                        unmet_dependencies={"prompts": actually_missing},
+                    )
+                    issue = self.record_issue(
+                        "dependency",
+                        "missing_prompt_dependencies",
+                        f"Rule '{display_name}' references prompts that do not exist on destination",
+                        item_id=item_id,
+                        next_action="Migrate the missing prompts, then run `langsmith-migrator resume`.",
+                        evidence={"prompts": actually_missing},
+                        export_path=export_path,
+                    )
+                    if issue:
+                        self.queue_remediation(
+                            issue_id=issue.id,
+                            item_id=item_id,
+                            next_action=issue.next_action or "Migrate prompt dependencies.",
+                            export_path=export_path,
+                            command="langsmith-migrator resume",
+                        )
+                    self.mark_exported(
+                        item_id,
+                        "missing_prompt_dependencies",
+                        next_action="Migrate the missing prompts, then run `langsmith-migrator resume`.",
+                        export_path=export_path,
+                        evidence={"prompts": actually_missing},
+                    )
+                    return None
 
             # Copy code_evaluators array directly (contains code evaluator configs)
             # Each code evaluator has: { code: str, language?: 'python' | 'javascript' }
@@ -819,9 +1044,51 @@ class RulesMigrator(BaseMigrator):
                 elif source_dataset_id:
                     self.log(f"Warning: Dataset {source_dataset_id} not found in destination", "warning")
                     self.log("Cannot migrate rule without valid dataset or project", "warning")
+                    export_path = self._export_rule_manual_apply(
+                        rule,
+                        payload,
+                        reason="missing_dataset_dependency",
+                        unmet_dependencies={"dataset_id": source_dataset_id},
+                    )
+                    issue = self.record_issue(
+                        "dependency",
+                        "missing_dataset_dependency",
+                        f"Rule '{display_name}' could not resolve dataset {source_dataset_id}",
+                        item_id=item_id,
+                        next_action="Migrate or map the missing dataset, then run `langsmith-migrator resume`.",
+                        evidence={"dataset_id": source_dataset_id},
+                        export_path=export_path,
+                    )
+                    if issue:
+                        self.queue_remediation(
+                            issue_id=issue.id,
+                            item_id=item_id,
+                            next_action=issue.next_action or "Resolve dataset dependency.",
+                            export_path=export_path,
+                            command="langsmith-migrator resume",
+                        )
+                    self.mark_exported(
+                        item_id,
+                        "missing_dataset_dependency",
+                        next_action="Resolve the dataset dependency, then run `langsmith-migrator resume`.",
+                        export_path=export_path,
+                        evidence={"dataset_id": source_dataset_id},
+                    )
                     return None
                 else:
                     self.log(f"Warning: Cannot strip project from rule '{display_name}' - no dataset_id to use instead", "warning")
+                    export_path = self._export_rule_manual_apply(
+                        rule,
+                        payload,
+                        reason="strip_projects_requires_dataset",
+                    )
+                    self.mark_exported(
+                        item_id,
+                        "strip_projects_requires_dataset",
+                        next_action="Provide a dataset mapping or keep the project association, then run `langsmith-migrator resume`.",
+                        export_path=export_path,
+                        evidence={"display_name": display_name},
+                    )
                     return None
                 endpoint = base_endpoint
             elif target_project_id:
@@ -850,6 +1117,41 @@ class RulesMigrator(BaseMigrator):
                         self.log(f"  Dataset {source_dataset_id} not found in destination", "error")
                     if not source_session_id and not source_dataset_id:
                         self.log("  Rule has neither session_id nor dataset_id in source", "error")
+                    unmet_dependencies = {}
+                    if source_session_id and not dest_session_id:
+                        unmet_dependencies["project_id"] = source_session_id
+                    if source_dataset_id and not dest_dataset_id:
+                        unmet_dependencies["dataset_id"] = source_dataset_id
+                    export_path = self._export_rule_manual_apply(
+                        rule,
+                        payload,
+                        reason="unresolved_rule_dependencies",
+                        unmet_dependencies=unmet_dependencies,
+                    )
+                    issue = self.record_issue(
+                        "dependency",
+                        "unresolved_rule_dependencies",
+                        f"Rule '{display_name}' could not resolve its project/dataset dependencies",
+                        item_id=item_id,
+                        next_action="Provide explicit mappings or migrate the missing dependencies, then run `langsmith-migrator resume`.",
+                        evidence=unmet_dependencies,
+                        export_path=export_path,
+                    )
+                    if issue:
+                        self.queue_remediation(
+                            issue_id=issue.id,
+                            item_id=item_id,
+                            next_action=issue.next_action or "Resolve rule dependencies.",
+                            export_path=export_path,
+                            command="langsmith-migrator resume",
+                        )
+                    self.mark_exported(
+                        item_id,
+                        "unresolved_rule_dependencies",
+                        next_action="Resolve the exported dependency issues, then run `langsmith-migrator resume`.",
+                        export_path=export_path,
+                        evidence=unmet_dependencies,
+                    )
                     return None
 
                 endpoint = base_endpoint
@@ -862,10 +1164,46 @@ class RulesMigrator(BaseMigrator):
             if existing_id:
                 if self.config.migration.skip_existing:
                     self.log(f"Rule '{display_name}' already exists, skipping", "warning")
+                    self.mark_migrated(
+                        item_id,
+                        outcome_code="rule_already_exists",
+                        evidence={"rule_id": existing_id},
+                    )
                     return existing_id
                 else:
                     self.log(f"Rule '{display_name}' exists, updating...", "info")
                     result = self.update_rule(existing_id, payload)
+                    if result:
+                        verified, mismatches = self._verify_rule(existing_id, payload)
+                        if verified:
+                            self.checkpoint_item(item_id, stage="completed", destination_id=existing_id)
+                            self.mark_migrated(
+                                item_id,
+                                outcome_code="rule_updated",
+                                evidence={"rule_id": existing_id},
+                            )
+                        else:
+                            issue = self.record_issue(
+                                "post_write_verification",
+                                "rule_update_verification_failed",
+                                f"Rule '{display_name}' did not match the requested payload after update",
+                                item_id=item_id,
+                                next_action="Review the verification mismatches in the remediation bundle, then re-run resume.",
+                                evidence=mismatches,
+                            )
+                            if issue:
+                                self.queue_remediation(
+                                    issue_id=issue.id,
+                                    item_id=item_id,
+                                    next_action=issue.next_action or "Review rule update mismatches.",
+                                    command="langsmith-migrator resume",
+                                )
+                            self.mark_degraded(
+                                item_id,
+                                "rule_update_verification_mismatch",
+                                next_action="Review rule field mismatches in the remediation bundle.",
+                                evidence=mismatches,
+                            )
                     return result  # Will be existing_id on success, None on failure
 
             # Filter payload to only include valid CREATE fields per API spec
@@ -905,12 +1243,49 @@ class RulesMigrator(BaseMigrator):
                 raise APIError(f"Invalid response creating rule: missing 'id' field. Response: {response}")
 
             self.log(f"Created rule: {display_name} -> {rule_id}", "success")
+            self.record_capability(
+                "rules",
+                "rules_write",
+                supported=True,
+                detail="write_succeeded",
+            )
+            verified, mismatches = self._verify_rule(rule_id, create_payload)
+            self.checkpoint_item(item_id, destination_id=rule_id, stage="completed")
+            if verified:
+                self.mark_migrated(
+                    item_id,
+                    outcome_code="rule_migrated",
+                    evidence={"rule_id": rule_id},
+                )
+            else:
+                issue = self.record_issue(
+                    "post_write_verification",
+                    "rule_create_verification_failed",
+                    f"Rule '{display_name}' did not match the requested payload after creation",
+                    item_id=item_id,
+                    next_action="Review the verification mismatches in the remediation bundle, then re-run resume.",
+                    evidence=mismatches,
+                )
+                if issue:
+                    self.queue_remediation(
+                        issue_id=issue.id,
+                        item_id=item_id,
+                        next_action=issue.next_action or "Review rule verification mismatches.",
+                        command="langsmith-migrator resume",
+                    )
+                self.mark_degraded(
+                    item_id,
+                    "rule_create_verification_mismatch",
+                    next_action="Review rule field mismatches in the remediation bundle.",
+                    evidence=mismatches,
+                )
             return rule_id
 
         except Exception as e:
             rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
             error_str = str(e)
             self.log(f"Failed to create rule {rule_name}: {e}", "error")
+            current_payload = locals().get("payload", {})
 
             # Provide specific guidance for common errors
             if "RunnableSequence must have at least 2 steps" in error_str:
@@ -940,10 +1315,42 @@ class RulesMigrator(BaseMigrator):
                 self.log("", "error")
                 self.log("Run 'langsmith-migrator prompts' first to ensure prompts are migrated", "error")
 
+            export_path = self._export_rule_manual_apply(
+                rule,
+                current_payload or {"display_name": rule_name},
+                reason="rule_migration_failed",
+                unmet_dependencies={"error": error_str},
+            )
+            issue = self.record_issue(
+                "transient",
+                "rule_migration_failed",
+                f"Rule migration failed for '{rule_name}'",
+                item_id=locals().get("item_id"),
+                next_action="Review the exported rule payload, then run `langsmith-migrator resume`.",
+                evidence={"error": error_str},
+                export_path=export_path,
+            )
+            if issue:
+                self.queue_remediation(
+                    issue_id=issue.id,
+                    item_id=locals().get("item_id"),
+                    next_action=issue.next_action or "Review exported rule payload.",
+                    export_path=export_path,
+                    command="langsmith-migrator resume",
+                )
+            if locals().get("item_id"):
+                self.mark_exported(
+                    locals()["item_id"],
+                    "rule_migration_failed",
+                    next_action="Review the exported rule payload, then run `langsmith-migrator resume`.",
+                    export_path=export_path,
+                    evidence={"error": error_str},
+                )
+
             if self.config.migration.verbose:
-                self.log(f"Payload that failed: {list(payload.keys())}", "info")
-                if payload.get('evaluators'):
-                    self.log(f"Evaluators in payload: {payload['evaluators']}", "info")
+                self.log(f"Payload that failed: {list(current_payload.keys())}", "info")
+                if current_payload.get('evaluators'):
+                    self.log(f"Evaluators in payload: {current_payload['evaluators']}", "info")
             return None
 
     def migrate_rule(

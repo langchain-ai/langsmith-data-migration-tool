@@ -10,6 +10,16 @@ from .base import BaseMigrator
 class ExperimentMigrator(BaseMigrator):
     """Handles experiment and run migration."""
 
+    _RUN_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "langsmith-data-migration-tool/runs")
+
+    def _deterministic_run_id(self, source_run_id: str) -> str:
+        """Generate a stable destination run ID for idempotent replay."""
+        return str(uuid.uuid5(self._RUN_NAMESPACE, source_run_id))
+
+    def _experiment_item_id(self, experiment_id: str) -> str:
+        """Return the tracked item id for an experiment."""
+        return f"experiment_{experiment_id}"
+
     def _regenerate_dotted_order(
         self,
         dotted_order: Optional[str],
@@ -57,7 +67,7 @@ class ExperimentMigrator(BaseMigrator):
                 new_parts.append(timestamp + new_run_id)
             else:
                 # Map the UUID to its new value for parent chain
-                new_uuid = id_mapping.get(old_uuid, old_uuid)
+                new_uuid = id_mapping.get(old_uuid, self._deterministic_run_id(old_uuid))
                 new_parts.append(timestamp + new_uuid)
 
         return ".".join(new_parts)
@@ -316,7 +326,7 @@ class ExperimentMigrator(BaseMigrator):
         self,
         experiment_ids: List[str],
         id_mappings: Dict[str, Dict[str, str]]
-    ) -> Tuple[int, Dict[str, str]]:
+    ) -> Tuple[int, Dict[str, str], int]:
         """
         Migrate runs for experiments using streaming.
 
@@ -325,17 +335,16 @@ class ExperimentMigrator(BaseMigrator):
             id_mappings: Dict containing "experiments" and "examples" mappings
 
         Returns:
-            Tuple of (total_runs_migrated, run_id_mapping)
+            Tuple of (total_runs_migrated, run_id_mapping, failed_run_count)
             where run_id_mapping maps source run IDs to destination run IDs
         """
         run_id_mapping: Dict[str, str] = {}
-        # Track trace_id mappings separately (trace_id is the root run's ID)
-        # All runs in the same trace share the same trace_id
-        trace_id_mapping: Dict[str, str] = {}
+        if self.state:
+            run_id_mapping.update(self.state.id_mappings.get("run", {}))
 
         if self.config.migration.dry_run:
             self.log("[DRY RUN] Would migrate runs")
-            return 0, run_id_mapping
+            return 0, run_id_mapping, 0
 
         experiment_mapping = id_mappings.get("experiments", {})
         example_mapping = id_mappings.get("examples", {})
@@ -345,17 +354,34 @@ class ExperimentMigrator(BaseMigrator):
 
         total_runs = 0
         total_skipped = 0
-        batch = []
+        total_failed = 0
 
         # Query runs for EACH experiment separately
         # The LangSmith /runs/query API only processes the first session ID when given a list
         for exp_idx, experiment_id in enumerate(experiment_ids, 1):
+            experiment_item_id = self._experiment_item_id(experiment_id)
+            experiment_item = self.state.get_item(experiment_item_id) if self.state else None
+            start_cursor = experiment_item.metadata.get("run_cursor") if experiment_item else None
+            pending_run_mapping: Dict[str, str] = {}
+            batch: List[Dict[str, Any]] = []
+            experiment_runs_created = 0
+            experiment_failed_runs = 0
+
             self.log(f"Fetching runs for experiment {exp_idx}/{len(experiment_ids)}: {experiment_id}", "info")
 
             payload = {
                 "session": [experiment_id],  # Single ID in a list (API requires list format)
                 "skip_pagination": False
             }
+            if start_cursor:
+                payload["cursor"] = start_cursor
+                self.log(f"Resuming runs for experiment {experiment_id} from cursor {start_cursor}", "info")
+            if experiment_item:
+                self.checkpoint_item(
+                    experiment_item_id,
+                    stage="migrate_runs",
+                    metadata={"run_cursor": start_cursor},
+                )
 
             page_num = 0
             while True:
@@ -385,6 +411,8 @@ class ExperimentMigrator(BaseMigrator):
                 for run in runs:
                     source_session_id = run.get("session_id")
                     source_run_id = run.get("id")
+                    if not source_run_id:
+                        continue
 
                     # Map IDs
                     if source_session_id not in experiment_mapping:
@@ -395,51 +423,35 @@ class ExperimentMigrator(BaseMigrator):
                         total_skipped += 1
                         continue
 
+                    if source_run_id in run_id_mapping:
+                        total_skipped += 1
+                        continue
+
                     dest_session_id = experiment_mapping[source_session_id]
 
                     # Map parent_run_id if present and already migrated
-                    # If parent not mapped yet, omit the field entirely to avoid 422 errors
                     parent_run_id = run.get("parent_run_id")
-                    mapped_parent_id = None
-                    if parent_run_id and parent_run_id in run_id_mapping:
-                        mapped_parent_id = run_id_mapping[parent_run_id]
+                    mapped_parent_id = (
+                        self._deterministic_run_id(parent_run_id) if parent_run_id else None
+                    )
 
                     # Map reference_example_id if present
                     source_example_id = run.get("reference_example_id")
                     mapped_example_id = example_mapping.get(source_example_id) if source_example_id else None
 
-                    # Generate a new UUID for the destination run to avoid conflicts
-                    new_run_id = str(uuid.uuid4())
-
-                    # Handle trace_id mapping
-                    # trace_id identifies the root run of a trace - all runs in the same trace share it
-                    # API requirement: For root runs, trace_id MUST equal run_id
-                    # For child runs, trace_id is the root run's ID (shared across the trace)
+                    # Deterministic IDs make interrupted batches safe to replay.
+                    new_run_id = self._deterministic_run_id(source_run_id)
                     source_trace_id = run.get("trace_id")
+                    new_trace_id = (
+                        self._deterministic_run_id(source_trace_id)
+                        if source_trace_id
+                        else new_run_id
+                    )
+                    pending_run_mapping[source_run_id] = new_run_id
 
-                    if not parent_run_id:
-                        # Root run: trace_id = run_id (API requirement)
-                        # Store mapping so children can look up the new trace_id
-                        new_trace_id = new_run_id
-                        if source_trace_id:
-                            trace_id_mapping[source_trace_id] = new_run_id
-                    else:
-                        # Child run: use mapped trace_id from root
-                        if source_trace_id and source_trace_id in trace_id_mapping:
-                            new_trace_id = trace_id_mapping[source_trace_id]
-                        else:
-                            # Fallback: use run's own ID (shouldn't happen with sorted runs)
-                            new_trace_id = new_run_id
-
-                    # Store the run ID mapping before regenerating dotted_order
-                    run_id_mapping[source_run_id] = new_run_id
-
-                    # Build combined mapping for dotted_order regeneration
-                    # (includes both run IDs and trace IDs)
-                    combined_mapping = {**run_id_mapping, **trace_id_mapping}
+                    combined_mapping = {**run_id_mapping, **pending_run_mapping}
 
                     # Regenerate dotted_order with new IDs
-                    # Pass new_run_id to ensure the last part always matches the run's ID
                     new_dotted_order = self._regenerate_dotted_order(
                         run.get("dotted_order"),
                         combined_mapping,
@@ -464,6 +476,7 @@ class ExperimentMigrator(BaseMigrator):
                         "dotted_order": new_dotted_order,
                         "session_id": dest_session_id,
                         "reference_example_id": mapped_example_id,
+                        "_source_run_id": source_run_id,
                     }
 
                     # Remove None values to avoid API validation errors (422)
@@ -473,37 +486,115 @@ class ExperimentMigrator(BaseMigrator):
 
                     # Process batch
                     if len(batch) >= self.config.migration.batch_size:
-                        success, created = self._create_runs_batch(batch)
-                        total_runs += created
-                        if success:
-                            self.log(f"Created batch of {created} runs (total: {total_runs})", "info")
-                        else:
-                            self.log(f"Failed to create batch of {len(batch)} runs", "error")
+                        created_mapping, failed_runs = self._create_runs_batch(batch)
+                        total_runs += len(created_mapping)
+                        total_failed += len(failed_runs)
+                        experiment_runs_created += len(created_mapping)
+                        experiment_failed_runs += len(failed_runs)
+                        if created_mapping:
+                            run_id_mapping.update(created_mapping)
+                            if self.state:
+                                for old_id, new_id in created_mapping.items():
+                                    self.state.set_mapped_id("run", old_id, new_id)
+                                self.persist_state()
+                            self.log(
+                                f"Created batch of {len(created_mapping)} runs (total: {total_runs})",
+                                "info",
+                            )
+                        if failed_runs:
+                            failed_ids = {entry["source_run_id"] for entry in failed_runs}
+                            for failed_id in failed_ids:
+                                pending_run_mapping.pop(failed_id, None)
+                            self.log(f"Failed to create {len(failed_runs)} run(s) in batch", "error")
+                            if experiment_item:
+                                issue = self.record_issue(
+                                    "transient",
+                                    "run_batch_failed",
+                                    f"Run batch creation failed for experiment {experiment_id}",
+                                    item_id=experiment_item_id,
+                                    next_action="Re-run `langsmith-migrator resume` to replay the failed runs.",
+                                    evidence={"failed_runs": failed_runs[:10], "failed_count": len(failed_runs)},
+                                )
+                                if issue:
+                                    self.queue_remediation(
+                                        issue_id=issue.id,
+                                        next_action=issue.next_action or "Resume experiment runs.",
+                                        item_id=experiment_item_id,
+                                        command="langsmith-migrator resume",
+                                    )
+                        for created_id in created_mapping:
+                            pending_run_mapping.pop(created_id, None)
                         batch.clear()
 
                 # Check for next page
                 cursors = response.get("cursors")
                 next_cursor = cursors.get("next") if cursors else None
 
+                if experiment_item:
+                    self.checkpoint_item(
+                        experiment_item_id,
+                        stage="migrate_runs",
+                        metadata={
+                            "run_cursor": next_cursor,
+                            "run_failures": experiment_failed_runs,
+                            "runs_migrated": experiment_runs_created,
+                        },
+                    )
                 if not next_cursor:
                     break
 
                 payload["cursor"] = next_cursor
                 self.log(f"Fetching next page with cursor: {next_cursor}", "info")
 
-        # Process remaining runs
-        if batch:
-            success, created = self._create_runs_batch(batch)
-            total_runs += created
-            if success:
-                self.log(f"Created final batch of {created} runs", "info")
-            else:
-                self.log(f"Failed to create final batch of {len(batch)} runs", "error")
+            if batch:
+                created_mapping, failed_runs = self._create_runs_batch(batch)
+                total_runs += len(created_mapping)
+                total_failed += len(failed_runs)
+                experiment_runs_created += len(created_mapping)
+                experiment_failed_runs += len(failed_runs)
+                if created_mapping:
+                    run_id_mapping.update(created_mapping)
+                    if self.state:
+                        for old_id, new_id in created_mapping.items():
+                            self.state.set_mapped_id("run", old_id, new_id)
+                        self.persist_state()
+                    self.log(f"Created final batch of {len(created_mapping)} runs", "info")
+                if failed_runs:
+                    self.log(f"Failed to create {len(failed_runs)} run(s) in final batch", "error")
+                    if experiment_item:
+                        issue = self.record_issue(
+                            "transient",
+                            "run_batch_failed",
+                            f"Final run batch creation failed for experiment {experiment_id}",
+                            item_id=experiment_item_id,
+                            next_action="Re-run `langsmith-migrator resume` to replay the failed runs.",
+                            evidence={"failed_runs": failed_runs[:10], "failed_count": len(failed_runs)},
+                        )
+                        if issue:
+                            self.queue_remediation(
+                                issue_id=issue.id,
+                                next_action=issue.next_action or "Resume experiment runs.",
+                                item_id=experiment_item_id,
+                                command="langsmith-migrator resume",
+                            )
+                if experiment_item:
+                    next_stage = "migrate_feedback" if experiment_failed_runs == 0 else "migrate_runs"
+                    self.checkpoint_item(
+                        experiment_item_id,
+                        stage=next_stage,
+                        metadata={
+                            "run_cursor": None,
+                            "run_failures": experiment_failed_runs,
+                            "runs_migrated": experiment_runs_created,
+                        },
+                    )
 
         self.log(f"Run migration complete: {total_runs} migrated, {total_skipped} skipped", "success")
-        return total_runs, run_id_mapping
+        return total_runs, run_id_mapping, total_failed
 
-    def _create_runs_batch(self, runs: List[Dict[str, Any]]) -> tuple[bool, int]:
+    def _create_runs_batch(
+        self, runs: List[Dict[str, Any]]
+    ) -> tuple[Dict[str, str], List[Dict[str, str]]]:
         """
         Create a batch of runs.
 
@@ -511,43 +602,52 @@ class ExperimentMigrator(BaseMigrator):
             runs: List of run dictionaries to create
 
         Returns:
-            Tuple of (success, count_created) - success is True if at least some runs were created
+            Tuple of (created_mapping, failed_runs).
         """
         if not runs:
-            return True, 0
+            return {}, []
 
-        payload = {"post": runs}
-        self.log(f"Creating batch of {len(runs)} runs via /runs/batch", "info")
+        created_mapping: Dict[str, str] = {}
+        failed_runs: List[Dict[str, str]] = []
 
-        try:
-            response = self.dest.post("/runs/batch", payload)
+        def strip_internal_fields(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            stripped = []
+            for run in batch:
+                stripped.append({k: v for k, v in run.items() if not k.startswith("_")})
+            return stripped
 
-            # Validate response
-            if isinstance(response, dict):
-                # The /runs/batch endpoint typically returns summary info
-                # Check for any error indicators
-                if response.get("errors"):
-                    error_count = len(response["errors"])
-                    self.log(f"Batch creation had {error_count} error(s)", "warning")
-                    for error in response["errors"][:3]:
-                        self.log(f"  Error: {error}", "warning")
-                    return error_count < len(runs), len(runs) - error_count
+        def post_recursive(batch: List[Dict[str, Any]]) -> None:
+            payload = {"post": strip_internal_fields(batch)}
+            self.log(f"Creating batch of {len(batch)} runs via /runs/batch", "info")
+            try:
+                response = self.dest.post("/runs/batch", payload)
+                if isinstance(response, dict) and response.get("errors"):
+                    raise ValueError(f"Batch creation had {len(response['errors'])} error(s)")
 
-                if self.config.migration.verbose:
-                    self.log(f"Batch creation response: {response}", "info")
-                return True, len(runs)
+                for run in batch:
+                    source_run_id = run.get("_source_run_id")
+                    if source_run_id:
+                        created_mapping[source_run_id] = run["id"]
+            except Exception as e:
+                if len(batch) == 1:
+                    source_run_id = batch[0].get("_source_run_id", "unknown")
+                    error_text = str(e)
+                    if "409" in error_text or "Conflict" in error_text:
+                        created_mapping[source_run_id] = batch[0]["id"]
+                        self.log(
+                            f"Run {source_run_id} already exists with deterministic ID; treating as replay success",
+                            "warning",
+                        )
+                        return
 
-            elif isinstance(response, list):
-                # Some versions return list of created runs
-                return True, len(response)
-            else:
-                self.log(f"Unexpected response type from /runs/batch: {type(response)}", "warning")
-                return True, len(runs)  # Assume success if no error raised
+                    failed_runs.append(
+                        {"source_run_id": source_run_id, "error": error_text}
+                    )
+                    return
 
-        except Exception as e:
-            self.log(f"Error creating runs batch: {e}", "error")
-            # Log the first run for debugging
-            if runs and self.config.migration.verbose:
-                import json
-                self.log(f"First run in failed batch: {json.dumps(runs[0], default=str)[:500]}", "error")
-            return False, 0
+                midpoint = len(batch) // 2
+                post_recursive(batch[:midpoint])
+                post_recursive(batch[midpoint:])
+
+        post_recursive(runs)
+        return created_mapping, failed_runs

@@ -12,12 +12,15 @@ class TestRulesMigrator:
     @pytest.fixture
     def rules_migrator(self, mock_api_client, sample_config, migration_state):
         """Create a RulesMigrator instance."""
-        return RulesMigrator(
-            mock_api_client,
-            mock_api_client,
-            migration_state,
-            sample_config
-        )
+        with patch('langsmith_migrator.core.migrators.rules.Client'):
+            migrator = RulesMigrator(
+                mock_api_client,
+                mock_api_client,
+                migration_state,
+                sample_config
+            )
+            migrator.dest_ls_client = Mock()
+            return migrator
 
     @pytest.fixture
     def sample_rule(self):
@@ -215,7 +218,8 @@ class TestRulesMigrator:
             ]
         }
 
-        result = rules_migrator.create_rule(enhanced_rule)
+        with patch.object(rules_migrator, '_find_existing_prompt', return_value=True):
+            result = rules_migrator.create_rule(enhanced_rule)
 
         assert result == 'new-rule-123'
 
@@ -466,7 +470,8 @@ class TestRulesMigrator:
         
         mock_api_client.post.return_value = {'id': 'new-rule-123'}
         
-        result = rules_migrator.create_rule(rule_with_none_evaluators)
+        with patch.object(rules_migrator, '_find_existing_prompt', return_value=True):
+            result = rules_migrator.create_rule(rule_with_none_evaluators)
         
         assert result == 'new-rule-123'
         
@@ -486,3 +491,28 @@ class TestRulesMigrator:
         assert structured['hub_ref'] == 'eval_test:latest'
         assert structured['variable_mapping'] == {'inputs': 'input'}
 
+    def test_find_existing_prompt_paginates_destination_prompts(self, rules_migrator):
+        """Prompt existence checks for rules should scan all destination prompt pages."""
+        rules_migrator.dest.session.headers["X-Tenant-Id"] = "workspace-123"
+
+        first_page = Mock()
+        first_page.repos = []
+        for index in range(100):
+            prompt = Mock()
+            prompt.repo_handle = f"team/prompt-{index}"
+            first_page.repos.append(prompt)
+
+        second_page = Mock()
+        target_prompt = Mock()
+        target_prompt.repo_handle = "team/target-prompt"
+        second_page.repos = [target_prompt]
+
+        rules_migrator.dest_ls_client.list_prompts.side_effect = [
+            first_page,
+            second_page,
+        ]
+
+        assert rules_migrator._find_existing_prompt("team/target-prompt") is True
+        assert rules_migrator.dest_ls_client.list_prompts.call_args_list[0].kwargs["offset"] == 0
+        assert rules_migrator.dest_ls_client.list_prompts.call_args_list[1].kwargs["offset"] == 100
+        assert rules_migrator._dest_session.headers["X-Tenant-Id"] == "workspace-123"

@@ -55,32 +55,155 @@ class PromptMigrator(BaseMigrator):
             else:
                 session.headers.pop("X-Tenant-Id", None)
 
+    def _iter_prompt_repos(
+        self,
+        client: Client,
+        *,
+        is_archived: bool = False,
+        is_public: Optional[bool] = None,
+        limit: int = 100,
+    ):
+        """Yield prompt repos from the SDK with pagination support."""
+        offset = 0
+
+        while True:
+            kwargs: Dict[str, Any] = {
+                "limit": limit,
+                "offset": offset,
+                "is_archived": is_archived,
+            }
+            if is_public is not None:
+                kwargs["is_public"] = is_public
+
+            response = client.list_prompts(**kwargs)
+            repos = list(getattr(response, "repos", []) or [])
+            if not repos:
+                break
+
+            yield from repos
+
+            if len(repos) < limit:
+                break
+            offset += len(repos)
+
+    def _prompt_item_id(self, prompt_identifier: str) -> str:
+        return f"prompt_{prompt_identifier.replace('/', '_').replace(':', '_')}"
+
+    def _probe_commit_endpoint(
+        self,
+        prompt_identifier: str,
+        *,
+        from_source: bool,
+        commit: str = "latest",
+    ) -> tuple[Optional[bool], str]:
+        """Probe whether commit read endpoints exist without mutating data."""
+        owner, repo, _ = self._parse_prompt_identifier(prompt_identifier)
+        owner_path = owner if owner else "-"
+        base_url = self.config.source.base_url if from_source else self.config.destination.base_url
+        api_key = self.config.source.api_key if from_source else self.config.destination.api_key
+        session = self._source_session if from_source else self._dest_session
+        url = f"{self._get_api_url(base_url)}/commits/{owner_path}/{repo}/{commit}"
+        headers = {"x-api-key": api_key}
+
+        try:
+            response = session.get(
+                url,
+                headers=headers,
+                params={"include_model": "true"},
+                timeout=30,
+            )
+            if response.status_code == 404:
+                return True, "endpoint_supported_resource_missing"
+            response.raise_for_status()
+            return True, "ok"
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code in {404, 405}:
+                if e.response.status_code == 404:
+                    return True, "endpoint_supported_resource_missing"
+                return False, "405_not_allowed"
+            return False, str(e)
+        except Exception as e:
+            return False, str(e)
+
+    def probe_capabilities(
+        self,
+        prompt_identifier: str = "codex-capability-probe",
+    ) -> Dict[str, Dict[str, Any]]:
+        """Probe prompt-related capabilities without mutating destination data."""
+        self._sync_workspace_headers()
+        capabilities: Dict[str, Dict[str, Any]] = {}
+
+        def record(name: str, supported: Optional[bool], detail: str, probe: str) -> None:
+            capabilities[name] = {
+                "supported": supported,
+                "detail": detail,
+                "probe": probe,
+            }
+            self.record_capability(
+                "prompts",
+                name,
+                supported=supported,
+                detail=detail,
+                probe=probe,
+                evidence={"prompt_identifier": prompt_identifier},
+            )
+
+        try:
+            self.dest_ls_client.list_prompts(limit=1)
+            record("list_read", True, "ok", "sdk.list_prompts")
+        except Exception as e:
+            error_msg = str(e)
+            if "405" in error_msg or "Not Allowed" in error_msg:
+                record("list_read", False, "405_not_allowed", "sdk.list_prompts")
+            elif "404" in error_msg:
+                record("list_read", False, "404_not_found", "sdk.list_prompts")
+            else:
+                record("list_read", False, error_msg, "sdk.list_prompts")
+
+        repo_lookup_supported, repo_lookup_detail = self._probe_commit_endpoint(
+            prompt_identifier,
+            from_source=False,
+        )
+        record("repo_lookup", repo_lookup_supported, repo_lookup_detail, "GET /commits/.../latest")
+        record(
+            "latest_commit_lookup",
+            repo_lookup_supported,
+            repo_lookup_detail,
+            "GET /commits/.../latest",
+        )
+        record(
+            "repo_create",
+            None,
+            "deferred_until_first_write",
+            "POST create_prompt",
+        )
+        record(
+            "commit_write",
+            None,
+            "deferred_until_first_write",
+            "POST /commits/{owner}/{repo}",
+        )
+
+        return capabilities
+
     def check_prompts_api_available(self) -> tuple[bool, str]:
         """
         Check if the prompts API is available on the destination instance.
-        Tests both read (list) and write (push) operations.
+        Uses capability probes instead of relying only on list_prompts().
 
         Returns:
             Tuple of (is_available, error_message)
         """
-        self._sync_workspace_headers()
-        # Test 1: Check if we can list prompts (READ access)
-        try:
-            self.dest_ls_client.list_prompts(limit=1)
-        except Exception as e:
-            error_msg = str(e)
-            if "405" in error_msg or "Not Allowed" in error_msg:
-                return False, "Prompts API returned 405 Not Allowed - prompts may not be enabled on this instance"
-            elif "404" in error_msg:
-                return False, "Prompts API endpoints not found - this instance may not support prompts"
-            else:
-                return False, f"Prompts API read check failed: {error_msg}"
+        capabilities = self.probe_capabilities()
+        if capabilities["list_read"]["supported"] or capabilities["repo_lookup"]["supported"]:
+            return True, ""
 
-        # Note: We're NOT testing write access here because:
-        # 1. Testing with fake prompts may give false negatives
-        # 2. The SDK's push_prompt has an existence check that may fail even if push works
-        # 3. Better to attempt actual migration and provide good error messages if it fails
-        return True, ""
+        detail = capabilities["list_read"]["detail"]
+        if detail == "405_not_allowed":
+            return False, "Prompts API returned 405 Not Allowed - prompt listing is disabled on this instance"
+        if detail == "404_not_found":
+            return False, "Prompts API endpoints not found - this instance may not support prompts"
+        return False, f"Prompts API capability probe failed: {detail}"
 
     def _get_api_url(self, base_url: str) -> str:
         """
@@ -183,6 +306,113 @@ class PromptMigrator(BaseMigrator):
         except Exception as e:
             self.log(f"Could not get latest commit for {prompt_identifier}: {e}", "warning")
             return None
+
+    def _order_commits_for_replay(self, commits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Replay commit history from oldest to newest."""
+        if not commits:
+            return []
+
+        children: Dict[Optional[str], List[Dict[str, Any]]] = {}
+        for commit in commits:
+            children.setdefault(commit.get("parent_commit_hash"), []).append(commit)
+
+        ordered: List[Dict[str, Any]] = []
+        roots = children.get(None, [])
+        if not roots:
+            roots = [commits[-1]]
+
+        stack = list(reversed(roots))
+        seen = set()
+        while stack:
+            commit = stack.pop()
+            commit_hash = commit["commit_hash"]
+            if commit_hash in seen:
+                continue
+            seen.add(commit_hash)
+            ordered.append(commit)
+            next_children = children.get(commit_hash, [])
+            for child in reversed(next_children):
+                stack.append(child)
+
+        for commit in commits:
+            if commit["commit_hash"] not in seen:
+                ordered.append(commit)
+        return ordered
+
+    def _verify_prompt_commit(
+        self,
+        prompt_identifier: str,
+        commit_hash: Optional[str] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """Verify that a prompt commit can be fetched from destination."""
+        owner, repo, _ = self._parse_prompt_identifier(prompt_identifier)
+        owner_path = owner if owner else "-"
+        target_commit = commit_hash or "latest"
+        url = f"{self._get_api_url(self.config.destination.base_url)}/commits/{owner_path}/{repo}/{target_commit}"
+        headers = {"x-api-key": self.config.destination.api_key}
+
+        try:
+            response = self._dest_session.get(
+                url,
+                headers=headers,
+                params={"include_model": "true"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+            actual_commit_hash = data.get("commit_hash") or target_commit
+            return True, actual_commit_hash
+        except Exception as e:
+            self.log(f"Failed to verify prompt commit for {prompt_identifier}: {e}", "warning")
+            return False, None
+
+    def _export_prompt_manual_apply(
+        self,
+        prompt_identifier: str,
+        *,
+        include_all_commits: bool,
+        reason: str,
+        capabilities: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Export prompt data into the remediation bundle for manual apply."""
+        item_id = self._prompt_item_id(prompt_identifier)
+        commits = self.get_prompt_commits(prompt_identifier) if include_all_commits else []
+        commit_payload = []
+        if include_all_commits and commits:
+            for commit in self._order_commits_for_replay(commits):
+                manifest_data = self._pull_prompt_manifest(prompt_identifier, commit["commit_hash"])
+                if manifest_data and manifest_data.get("manifest"):
+                    commit_payload.append(
+                        {
+                            "source_commit_hash": commit["commit_hash"],
+                            "parent_commit_hash": commit.get("parent_commit_hash"),
+                            "manifest": manifest_data["manifest"],
+                        }
+                    )
+        else:
+            latest_manifest = self._pull_prompt_manifest(prompt_identifier, "latest")
+            if latest_manifest and latest_manifest.get("manifest"):
+                commit_payload.append(
+                    {
+                        "source_commit_hash": latest_manifest.get("commit_hash") or "latest",
+                        "parent_commit_hash": None,
+                        "manifest": latest_manifest["manifest"],
+                    }
+                )
+
+        export_payload = {
+            "prompt_identifier": prompt_identifier,
+            "include_all_commits": include_all_commits,
+            "reason": reason,
+            "capabilities": capabilities or {},
+            "commits": commit_payload,
+            "manual_steps": [
+                "Confirm prompt write support on the destination instance.",
+                "Apply the exported manifests in order using the destination prompt API.",
+                "Re-run `langsmith-migrator resume` after the prompt exists on destination.",
+            ],
+        }
+        return self.export_payload(item_id, "manual_apply", export_payload)
 
     def _push_prompt_manifest(
         self,
@@ -354,65 +584,41 @@ class PromptMigrator(BaseMigrator):
         self._sync_workspace_headers()
         prompts = []
         try:
-            offset = 0
-            limit = 100
-            max_iterations = 1000  # Safety limit to prevent infinite loops
-            iterations = 0
-
             self.log(f"Fetching prompts (archived={is_archived})...", "info")
+            seen_handles = set()
 
-            while iterations < max_iterations:
-                iterations += 1
-
-                self.log(f"Fetching prompts: offset={offset}, limit={limit}", "info")
-
+            for visibility in (False, True):
                 try:
-                    response = self.source_ls_client.list_prompts(
-                        limit=limit,
-                        offset=offset,
+                    for prompt in self._iter_prompt_repos(
+                        self.source_ls_client,
                         is_archived=is_archived,
-                        is_public=False  # Only fetch private prompts from this tenant
-                    )
+                        is_public=visibility,
+                    ):
+                        if prompt.repo_handle in seen_handles:
+                            continue
+                        seen_handles.add(prompt.repo_handle)
+                        prompts.append({
+                            'id': str(prompt.id),
+                            'repo_handle': prompt.repo_handle,
+                            'description': prompt.description,
+                            'readme': prompt.readme,
+                            'is_public': prompt.is_public,
+                            'is_archived': prompt.is_archived,
+                            'tags': prompt.tags or [],
+                            'num_likes': prompt.num_likes,
+                            'num_downloads': prompt.num_downloads,
+                            'num_commits': prompt.num_commits,
+                            'updated_at': str(prompt.updated_at) if prompt.updated_at else None,
+                        })
                 except Exception as api_error:
                     self.log(f"API error while listing prompts: {api_error}", "error")
-                    # If we got some prompts already, return them
                     if prompts:
-                        self.log(f"Returning {len(prompts)} prompts fetched before error", "warning")
+                        self.log(
+                            f"Returning {len(prompts)} prompts fetched before error",
+                            "warning",
+                        )
                         return prompts
                     raise
-
-                # Note: ListPromptsResponse has 'repos' attribute, not 'prompts'
-                if not response or not hasattr(response, 'repos') or not response.repos:
-                    self.log(f"No more prompts found at offset {offset}", "info")
-                    break
-
-                batch_size = len(response.repos)
-                self.log(f"Retrieved {batch_size} prompt(s) in this batch", "info")
-
-                for prompt in response.repos:
-                    prompts.append({
-                        'id': str(prompt.id),
-                        'repo_handle': prompt.repo_handle,
-                        'description': prompt.description,
-                        'readme': prompt.readme,
-                        'is_public': prompt.is_public,
-                        'is_archived': prompt.is_archived,
-                        'tags': prompt.tags or [],
-                        'num_likes': prompt.num_likes,
-                        'num_downloads': prompt.num_downloads,
-                        'num_commits': prompt.num_commits,
-                        'updated_at': str(prompt.updated_at) if prompt.updated_at else None,
-                    })
-
-                # If we got fewer results than the limit, we've reached the end
-                if batch_size < limit:
-                    self.log(f"Reached end of prompts (got {batch_size} < {limit})", "info")
-                    break
-
-                offset += batch_size
-
-            if iterations >= max_iterations:
-                self.log(f"Reached maximum iteration limit ({max_iterations}), stopping", "warning")
 
             self.log(f"Total prompts fetched: {len(prompts)}", "success")
             return prompts
@@ -448,17 +654,17 @@ class PromptMigrator(BaseMigrator):
         """
         self._sync_workspace_headers()
         try:
-            # Try to list prompts and find a match by repo_handle
-            response = self.dest_ls_client.list_prompts(limit=100)
-            if response and hasattr(response, 'repos'):
-                for prompt in response.repos:
+            for visibility in (False, True):
+                for prompt in self._iter_prompt_repos(
+                    self.dest_ls_client,
+                    is_public=visibility,
+                ):
                     if prompt.repo_handle == prompt_identifier:
                         return True
             return False
         except Exception as e:
-            # If we can't check, assume it doesn't exist and let push_prompt handle it
             self.log(f"Could not check if prompt exists: {e}", "warning")
-            return False
+            return self._get_latest_commit_hash(prompt_identifier) is not None
 
     def migrate_prompt(
         self,
@@ -476,6 +682,18 @@ class PromptMigrator(BaseMigrator):
             The prompt identifier in the destination instance, or None if failed
         """
         self._sync_workspace_headers()
+        item_id = self._prompt_item_id(prompt_identifier)
+        self.ensure_item(
+            item_id,
+            "prompt",
+            prompt_identifier,
+            prompt_identifier,
+            stage="planning",
+            strategy="full_history" if include_all_commits else "latest_only",
+            metadata={"include_all_commits": include_all_commits},
+        )
+        capabilities = self.probe_capabilities(prompt_identifier)
+
         if self.config.migration.dry_run:
             self.log(f"[DRY RUN] Would migrate prompt: {prompt_identifier}")
             return prompt_identifier
@@ -486,42 +704,97 @@ class PromptMigrator(BaseMigrator):
         if exists:
             if self.config.migration.skip_existing:
                 self.log(f"Prompt '{prompt_identifier}' already exists, skipping", "warning")
+                self.mark_migrated(
+                    item_id,
+                    outcome_code="prompt_already_exists",
+                    evidence={"prompt_identifier": prompt_identifier},
+                )
                 return prompt_identifier
             else:
                 self.log(f"Prompt '{prompt_identifier}' exists, updating with new commits...", "info")
 
         try:
             self.log(f"Migrating prompt: {prompt_identifier}", "info")
-
+            self.checkpoint_item(item_id, stage="migrating", destination_id=prompt_identifier)
             commits_migrated = 0
+            degraded_history = False
+            commit_map: Dict[str, str] = {}
 
             if include_all_commits:
-                commits = self.get_prompt_commits(prompt_identifier)
+                commits = self._order_commits_for_replay(
+                    self.get_prompt_commits(prompt_identifier)
+                )
                 self.log(f"Found {len(commits)} commits for {prompt_identifier}", "info")
+                existing_dest_parent = self._get_latest_commit_hash(prompt_identifier) if exists else None
 
                 for i, commit in enumerate(commits):
                     try:
-                        commit_hash = commit['commit_hash']
+                        commit_hash = commit["commit_hash"]
                         self.log(f"Pulling commit {commit_hash[:16]} manifest...", "info")
 
-                        # Use direct API to get raw manifest (includes model config without instantiating it)
                         manifest_data = self._pull_prompt_manifest(prompt_identifier, commit_hash)
 
-                        if not manifest_data or not manifest_data.get('manifest'):
+                        if not manifest_data or not manifest_data.get("manifest"):
                             self.log(f"Pull returned empty manifest for commit {commit_hash[:16]}", "warning")
                             continue
 
-                        parent_hash = commit['parent_commit_hash'] if i > 0 else None
+                        source_parent_hash = commit.get("parent_commit_hash")
+                        parent_hash = commit_map.get(source_parent_hash)
+                        if parent_hash is None and i == 0 and existing_dest_parent:
+                            parent_hash = existing_dest_parent
+                            degraded_history = True
 
-                        # Push manifest directly to destination
                         new_commit_hash = self._push_prompt_manifest(
                             prompt_identifier,
-                            manifest_data['manifest'],
-                            parent_commit=parent_hash
+                            manifest_data["manifest"],
+                            parent_commit=parent_hash,
+                            auto_parent=False,
                         )
 
                         if new_commit_hash:
-                            self.log(f"Migrated commit {commit_hash[:16]} -> {new_commit_hash[:16] if new_commit_hash != 'already_up_to_date' else 'already up to date'}", "success")
+                            if new_commit_hash == "already_up_to_date":
+                                verified, actual_commit_hash = self._verify_prompt_commit(
+                                    prompt_identifier,
+                                    None,
+                                )
+                                if not verified:
+                                    raise ValueError(
+                                        f"Post-write verification failed for commit {commit_hash[:16]}"
+                                    )
+                                mapped_commit_hash = actual_commit_hash or parent_hash or existing_dest_parent
+                            else:
+                                self.record_capability(
+                                    "prompts",
+                                    "commit_write",
+                                    supported=True,
+                                    detail="write_succeeded",
+                                    probe="POST /commits/{owner}/{repo}",
+                                )
+                                verified, actual_commit_hash = self._verify_prompt_commit(
+                                    prompt_identifier,
+                                    new_commit_hash,
+                                )
+                                if not verified:
+                                    raise ValueError(
+                                        f"Post-write verification failed for commit {commit_hash[:16]}"
+                                    )
+                                mapped_commit_hash = actual_commit_hash or new_commit_hash
+
+                            if mapped_commit_hash:
+                                commit_map[commit_hash] = mapped_commit_hash
+                                if self.state:
+                                    self.state.set_mapped_id(
+                                        "prompt_commit",
+                                        f"{prompt_identifier}:{commit_hash}",
+                                        mapped_commit_hash,
+                                    )
+                                    self.persist_state()
+
+                            self.log(
+                                f"Migrated commit {commit_hash[:16]} -> "
+                                f"{mapped_commit_hash[:16] if mapped_commit_hash else 'verified latest'}",
+                                "success",
+                            )
                             commits_migrated += 1
                         else:
                             self.log(f"Failed to push commit {commit_hash[:16]}", "warning")
@@ -533,42 +806,72 @@ class PromptMigrator(BaseMigrator):
                             self.log(f"Traceback: {traceback.format_exc()}", "error")
                         continue
 
-                # Fallback: if no commits were successfully migrated, try latest version
                 if commits_migrated == 0:
                     self.log("No commits migrated, falling back to latest version", "warning")
                     manifest_data = self._pull_prompt_manifest(prompt_identifier, "latest")
 
-                    if not manifest_data or not manifest_data.get('manifest'):
+                    if not manifest_data or not manifest_data.get("manifest"):
                         raise ValueError("Failed to pull prompt manifest")
 
                     new_commit_hash = self._push_prompt_manifest(
                         prompt_identifier,
-                        manifest_data['manifest']
+                        manifest_data["manifest"],
                     )
 
                     if new_commit_hash:
+                        verified, actual_commit_hash = self._verify_prompt_commit(
+                            prompt_identifier,
+                            None if new_commit_hash == "already_up_to_date" else new_commit_hash,
+                        )
+                        if not verified:
+                            raise ValueError("Failed to verify latest prompt commit")
+                        if self.state and manifest_data.get("commit_hash") and actual_commit_hash:
+                            self.state.set_mapped_id(
+                                "prompt_commit",
+                                f"{prompt_identifier}:{manifest_data['commit_hash']}",
+                                actual_commit_hash,
+                            )
+                            self.persist_state()
                         self.log(f"Migrated prompt (latest only): {prompt_identifier}", "success")
-                        return prompt_identifier
                     else:
                         raise ValueError("Failed to push prompt manifest")
                 else:
                     self.log(f"Successfully migrated {commits_migrated}/{len(commits)} commits", "success")
             else:
-                # Migrate only latest version using direct API (doesn't instantiate models)
                 self.log(f"Pulling latest version of {prompt_identifier} (manifest)...", "info")
 
                 manifest_data = self._pull_prompt_manifest(prompt_identifier, "latest")
 
-                if not manifest_data or not manifest_data.get('manifest'):
+                if not manifest_data or not manifest_data.get("manifest"):
                     raise ValueError("Failed to pull prompt manifest - prompt may not exist or be inaccessible")
 
                 self.log("Pushing manifest to destination...", "info")
                 new_commit_hash = self._push_prompt_manifest(
                     prompt_identifier,
-                    manifest_data['manifest']
+                    manifest_data["manifest"],
                 )
 
                 if new_commit_hash:
+                    self.record_capability(
+                        "prompts",
+                        "commit_write",
+                        supported=True,
+                        detail="write_succeeded" if new_commit_hash != "already_up_to_date" else "already_up_to_date",
+                        probe="POST /commits/{owner}/{repo}",
+                    )
+                    verified, actual_commit_hash = self._verify_prompt_commit(
+                        prompt_identifier,
+                        None if new_commit_hash == "already_up_to_date" else new_commit_hash,
+                    )
+                    if not verified:
+                        raise ValueError("Failed post-write verification for prompt commit")
+                    if self.state and manifest_data.get("commit_hash") and actual_commit_hash:
+                        self.state.set_mapped_id(
+                            "prompt_commit",
+                            f"{prompt_identifier}:{manifest_data['commit_hash']}",
+                            actual_commit_hash,
+                        )
+                        self.persist_state()
                     if new_commit_hash == "already_up_to_date":
                         self.log(f"Prompt already up to date: {prompt_identifier}", "success")
                     else:
@@ -576,20 +879,90 @@ class PromptMigrator(BaseMigrator):
                 else:
                     raise ValueError("Failed to push prompt manifest")
 
+            self.checkpoint_item(item_id, stage="completed")
+            if degraded_history:
+                self.mark_degraded(
+                    item_id,
+                    "prompt_history_rebased_on_existing_destination_head",
+                    next_action="Review the prompt commit history if exact ancestry must be preserved.",
+                    evidence={"prompt_identifier": prompt_identifier},
+                )
+            else:
+                self.mark_migrated(
+                    item_id,
+                    outcome_code="prompt_migrated",
+                    evidence={
+                        "prompt_identifier": prompt_identifier,
+                        "include_all_commits": include_all_commits,
+                    },
+                )
             return prompt_identifier
 
         except Exception as e:
             error_msg = str(e)
 
-            # Provide specific guidance for 405 errors
             if "405" in error_msg or "Not Allowed" in error_msg:
                 self.log(f"Failed to migrate prompt {prompt_identifier}: {e}", "error")
-                self.log("", "error")
-                self.log("The destination instance does not support prompt write operations.", "error")
-                self.log("This feature may not be enabled or available on your LangSmith instance.", "error")
-                self.log("Please contact your LangSmith administrator for assistance.", "error")
+                self.record_capability(
+                    "prompts",
+                    "commit_write",
+                    supported=False,
+                    detail="405_not_allowed",
+                    probe="POST /commits/{owner}/{repo}",
+                )
+                export_path = self._export_prompt_manual_apply(
+                    prompt_identifier,
+                    include_all_commits=include_all_commits,
+                    reason="destination_prompt_write_not_supported",
+                    capabilities=capabilities,
+                )
+                issue = self.record_issue(
+                    "capability",
+                    "prompt_write_unsupported",
+                    f"Destination prompt write API is not available for {prompt_identifier}",
+                    item_id=item_id,
+                    next_action="Enable prompt write support or apply the exported payload manually, then run `langsmith-migrator resume`.",
+                    evidence={"error": error_msg, "capabilities": capabilities},
+                    export_path=export_path,
+                )
+                if issue:
+                    self.queue_remediation(
+                        issue_id=issue.id,
+                        item_id=item_id,
+                        export_path=export_path,
+                        next_action=issue.next_action or "Apply exported prompt payload manually.",
+                        command="langsmith-migrator resume",
+                    )
+                self.mark_exported(
+                    item_id,
+                    "prompt_write_unsupported",
+                    next_action="Apply the exported prompt payload manually, then run `langsmith-migrator resume`.",
+                    export_path=export_path,
+                    evidence={"error": error_msg},
+                )
             else:
                 self.log(f"Failed to migrate prompt {prompt_identifier}: {e}", "error")
+                issue = self.record_issue(
+                    "post_write_verification" if "verification" in error_msg.lower() else "transient",
+                    "prompt_migration_failed",
+                    f"Prompt migration failed for {prompt_identifier}",
+                    item_id=item_id,
+                    next_action="Re-run `langsmith-migrator resume` after reviewing the error.",
+                    evidence={"error": error_msg},
+                )
+                if issue:
+                    self.queue_remediation(
+                        issue_id=issue.id,
+                        item_id=item_id,
+                        next_action=issue.next_action or "Retry prompt migration.",
+                        command="langsmith-migrator resume",
+                    )
+                self.mark_blocked(
+                    item_id,
+                    "prompt_migration_failed",
+                    next_action="Re-run `langsmith-migrator resume` after reviewing the error.",
+                    evidence={"error": error_msg},
+                )
 
             if self.config.migration.verbose:
                 import traceback

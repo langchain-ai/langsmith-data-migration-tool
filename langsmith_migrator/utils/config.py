@@ -29,6 +29,8 @@ class MigrationConfig:
     skip_existing: bool = False
     resume_on_error: bool = True
     verbose: bool = False
+    interactive: bool = True
+    non_interactive: bool = False
 
     # Performance settings
     stream_examples: bool = True  # Stream instead of loading all into memory
@@ -49,7 +51,8 @@ class Config:
                  concurrent_workers: Optional[int] = None,
                  dry_run: bool = False,
                  skip_existing: Optional[bool] = None,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 non_interactive: bool = False):
         """
         Initialize configuration from CLI args, falling back to environment variables.
 
@@ -64,6 +67,7 @@ class Config:
             dry_run: Whether to run in dry-run mode
             skip_existing: If True, skip existing resources; if False, update them (overrides env)
             verbose: Whether to enable verbose logging
+            non_interactive: Disable guided remediation prompts
         """
         # Determine SSL verification setting
         # Priority: CLI arg > env var > default (True)
@@ -114,10 +118,13 @@ class Config:
             dry_run=dry_run or os.getenv('MIGRATION_DRY_RUN', 'false').lower() == 'true',
             verbose=verbose or os.getenv('MIGRATION_VERBOSE', 'false').lower() == 'true',
             skip_existing=should_skip,
+            interactive=not non_interactive,
+            non_interactive=non_interactive,
             stream_examples=os.getenv('MIGRATION_STREAM_EXAMPLES', 'true').lower() != 'false',
             chunk_size=parsed_chunk_size,
             rate_limit_delay=parsed_rate_limit
         )
+        self.state_manager = None
 
         # Disable SSL warnings if needed
         if not self.source.verify_ssl or not self.destination.verify_ssl:

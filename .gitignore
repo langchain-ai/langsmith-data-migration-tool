@@ -158,5 +158,6 @@ run_dataset_tests.py
 
 # Test files
 test_*.py
+!tests/**/test_*.py
 demo_*.py
 main.py
