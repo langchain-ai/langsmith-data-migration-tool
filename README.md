@@ -25,8 +25,8 @@ langsmith-migrator datasets
 - **Datasets**: Migrate datasets with examples and file attachments
 - **Experiments**: Migrate experiments with runs and feedback (`--include-experiments`)
 - **Annotation Queues**: Transfer queue configurations
-- **Project Rules**: Copy automation rules with automatic project creation
-- **Prompts**: Migrate prompts with version history
+- **Project Rules**: Copy automation rules with project mapping and optional project creation in interactive flows
+- **Prompts**: Migrate prompts (latest by default, full history with `--include-all-commits`)
 - **Charts**: Migrate monitoring charts with filter preservation
 - **Interactive CLI**: TUI-based selection with search/filter
 
@@ -104,6 +104,7 @@ langsmith-migrator test
 
 # Interactive wizard for all resources
 langsmith-migrator migrate-all
+langsmith-migrator migrate-all --rules-create-enabled   # Create migrated rules as enabled
 
 # Datasets
 langsmith-migrator datasets                    # Interactive selection
@@ -132,10 +133,12 @@ langsmith-migrator rules --create-enabled      # Create rules enabled (default: 
 langsmith-migrator charts
 langsmith-migrator charts --session "project-name"
 langsmith-migrator charts --map-projects        # Interactive TUI project mapping
+langsmith-migrator charts --same-instance       # Reuse source project/session IDs on destination
 
 # Utilities
 langsmith-migrator list-projects --source
-langsmith-migrator resume
+langsmith-migrator list_workspaces --source --dest
+langsmith-migrator resume  # Resume interrupted dataset migration
 langsmith-migrator clean
 ```
 
@@ -150,6 +153,7 @@ langsmith-migrator clean
 --batch-size INTEGER    Batch size (default: 100)
 --workers INTEGER       Concurrent workers (default: 4)
 --dry-run               Run without making changes
+--skip-existing         Skip existing resources instead of updating them
 --verbose, -v           Verbose output
 ```
 
@@ -170,6 +174,23 @@ langsmith-migrator clean
 --all                   Migrate all rules without interactive selection
 ```
 
+### Migrate-All Rules Options
+
+```bash
+--rules-create-enabled  Create migrated rules as enabled (default: disabled)
+```
+
+If `--rules-create-enabled` is omitted, `migrate-all` asks interactively whether to create rules enabled.
+The prompt default is `No` (rules are created disabled).
+
+### Chart Options
+
+```bash
+--session TEXT          Migrate charts for a specific session/project (by name or ID)
+--map-projects          Launch interactive TUI to map source projects to destination projects
+--same-instance         Reuse source project/session IDs on destination
+```
+
 ### Project Mapping
 
 Rules and charts reference projects by ID. When migrating between instances, project IDs differ.
@@ -177,7 +198,7 @@ Rules and charts reference projects by ID. When migrating between instances, pro
 - **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input. Supports auto-match by name, skip, and custom name entry.
 - **Rules (`--project-mapping`)**: Supply an explicit source→destination project ID mapping as JSON or a file path. Use `list-projects --source` and `list-projects --dest` to get IDs. Mutually exclusive with `--map-projects`.
 - **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination.
-- **`migrate-all`**: Supports `--strip-projects` and `--map-projects` for rules. Use the standalone `rules` command for `--project-mapping` JSON mappings.
+- **`migrate-all`**: Supports `--strip-projects`, `--map-projects`, and `--rules-create-enabled` for rules. Use the standalone `rules` command for `--project-mapping` JSON mappings.
 
 ### Interactive Selection
 
@@ -212,6 +233,10 @@ langsmith-migrator datasets --source-workspace WS_ID --dest-workspace WS_ID
 ```
 
 When using `--map-workspaces`, each command iterates all mapped workspace pairs, running the full fetch/select/migrate flow per pair. For `rules` and `charts` with `--map-projects`, the project mapping TUI is shown per workspace pair so projects are correctly scoped.
+
+### Resume Scope
+
+`resume` currently resumes interrupted dataset migration flows. Experiment-only resume is not yet supported.
 
 ## SSL Certificate Issues
 

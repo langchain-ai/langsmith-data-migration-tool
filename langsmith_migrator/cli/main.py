@@ -1440,9 +1440,16 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 @click.option('--include-all-commits', is_flag=True, help='Include all prompt commit history')
 @click.option('--strip-projects', is_flag=True, help='Strip project associations from rules')
 @click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
+@click.option(
+    '--rules-create-enabled',
+    'rules_create_enabled',
+    flag_value=True,
+    default=None,
+    help='Create migrated rules as enabled (default: disabled). If omitted, migrate-all asks interactively (default: No)'
+)
 @workspace_options
 @click.pass_context
-def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, include_all_commits, strip_projects, map_projects, source_workspace, dest_workspace, map_workspaces):
+def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, include_all_commits, strip_projects, map_projects, rules_create_enabled, source_workspace, dest_workspace, map_workspaces):
     """Migrate all resources interactively."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -1506,7 +1513,7 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 
         _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
                                    skip_prompts, skip_queues, skip_rules, include_all_commits,
-                                   strip_projects, map_projects, ws_project_mapping)
+                                   strip_projects, map_projects, rules_create_enabled, ws_project_mapping)
 
     if ws_result:
         orchestrator.clear_workspace_context()
@@ -1519,10 +1526,12 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 
 def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
                                 skip_prompts, skip_queues, skip_rules, include_all_commits,
-                                strip_projects, map_projects, ws_project_mapping=None):
+                                strip_projects, map_projects, rules_create_enabled=None, ws_project_mapping=None):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
     Args:
+        rules_create_enabled: If True, create rules enabled. If None, ask interactively
+            (default prompt answer is No, i.e. rules disabled).
         ws_project_mapping: Optional name-based project mapping from workspace TUI.
             If provided, --map-projects is skipped (already done at workspace level).
     """
@@ -1750,6 +1759,7 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
             if _confirm_action(config, f"Migrate {len(rules)} rule(s)?", default=True, non_interactive_value=True):
                 strip = strip_projects
                 ensure_projects = False
+                create_enabled = rules_create_enabled
                 
                 if project_specific and not strip:
                     strip = _confirm_action(
@@ -1765,6 +1775,14 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                             default=True,
                             non_interactive_value=True,
                         )
+                if create_enabled is None:
+                    create_enabled = _confirm_action(
+                        config,
+                        "Create migrated rules as enabled?",
+                        default=False,
+                        non_interactive_value=False,
+                    )
+                create_disabled = not create_enabled
 
                 success_count = 0
                 failed_items = []
@@ -1798,7 +1816,8 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                             result = rules_migrator.create_rule(
                                 rule,
                                 strip_project_reference=strip,
-                                ensure_project=ensure_projects
+                                ensure_project=ensure_projects,
+                                create_disabled=create_disabled
                             )
                             if result:
                                 success_count += 1
@@ -1822,6 +1841,11 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                         progress.advance(task)
 
                 console.print(f"Rules: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed")
+                if success_count > 0 and create_disabled:
+                    console.print(f"\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
+                    console.print(f"  To enable rules:")
+                    console.print(f"  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
+                    console.print(f"  2. Enable each rule in the LangSmith UI or rerun with --rules-create-enabled")
                 if (failed_items or skipped_items) and config.migration.verbose:
                     for name, err in skipped_items:
                         console.print(f"  [yellow]⊘[/yellow] {name}: {err}")

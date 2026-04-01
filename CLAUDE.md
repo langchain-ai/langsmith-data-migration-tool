@@ -34,10 +34,12 @@ uv run langsmith-migrator rules --map-projects                      # Interactiv
 uv run langsmith-migrator rules --create-enabled                    # Create rules enabled
 uv run langsmith-migrator charts       # Migrate charts
 uv run langsmith-migrator charts --map-projects                     # Charts with interactive project mapping
-uv run langsmith-migrator migrate_all  # Migrate everything
-uv run langsmith-migrator migrate_all --map-projects                # Migrate all with interactive project mapping
-uv run langsmith-migrator resume       # Resume a previous session
-uv run langsmith-migrator list_projects # List available projects
+uv run langsmith-migrator charts --same-instance                    # Reuse source session IDs
+uv run langsmith-migrator migrate-all  # Migrate everything
+uv run langsmith-migrator migrate-all --map-projects                # Migrate all with interactive project mapping
+uv run langsmith-migrator migrate-all --rules-create-enabled        # Create migrated rules enabled
+uv run langsmith-migrator resume       # Resume interrupted dataset migration
+uv run langsmith-migrator list-projects # List available projects
 uv run langsmith-migrator list_workspaces --source --dest           # List workspaces
 uv run langsmith-migrator clean        # Clean migration state
 
@@ -104,7 +106,7 @@ Environment variables (can also use CLI flags or a `.env` file — auto-loaded o
 1. **Streaming for large datasets**: Examples are processed in chunks to avoid memory issues
 2. **Retry with exponential backoff**: All API calls use retry logic in `utils/retry.py`
 3. **ID Mapping**: Migrators track source→destination ID mappings for cross-references
-4. **Rules disabled by default**: Rules are created disabled to avoid secrets validation issues
+4. **Rules disabled by default**: Rules are created disabled by default in all flows to avoid secrets validation issues; use explicit flags (`--create-enabled` / `--rules-create-enabled`) to create enabled rules
 
 ## Testing
 
