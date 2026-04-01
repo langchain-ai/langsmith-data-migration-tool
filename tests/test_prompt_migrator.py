@@ -224,6 +224,18 @@ class TestPromptMigrator:
 
         assert result is None
 
+    def test_prompts_api_available_via_commit_lookup_when_listing_is_disabled(self, prompt_migrator):
+        """Capability probing should allow migration when commit lookups work but prompt listing does not."""
+
+        prompt_migrator.probe_capabilities = Mock(
+            return_value={
+                "list_read": {"supported": False, "detail": "405_not_allowed"},
+                "repo_lookup": {"supported": True, "detail": "ok"},
+            }
+        )
+
+        assert prompt_migrator.check_prompts_api_available() == (True, "")
+
     def test_get_prompt_commits(self, prompt_migrator):
         """Test getting prompt commits."""
         mock_commit = Mock()
