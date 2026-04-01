@@ -1,6 +1,7 @@
 """Simplified CLI interface with improved architecture."""
 
 import functools
+import logging
 from typing import Iterable
 import click
 import time
@@ -49,6 +50,26 @@ from ..utils.workspace_resolver import resolve_workspace_context, display_worksp
 
 
 console = Console()
+
+
+class _SuppressRunCompressionNoise(logging.Filter):
+    """Hide known low-signal LangSmith run compression info logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage().lower()
+        return "run compression is not enabled" not in message
+
+
+def _install_log_filters() -> None:
+    """Install process-wide filters for noisy third-party logs."""
+    noise_filter = _SuppressRunCompressionNoise()
+    root_logger = logging.getLogger()
+
+    for handler in root_logger.handlers:
+        handler.addFilter(noise_filter)
+
+    # Also attach directly to the common LangSmith logger namespace.
+    logging.getLogger("langsmith").addFilter(noise_filter)
 
 
 def workspace_options(f):
@@ -498,6 +519,7 @@ def ensure_config(config: Config) -> bool:
 def cli(ctx, source_key, dest_key, source_url, dest_url, no_ssl, batch_size, workers, dry_run, skip_existing, non_interactive, verbose):
     """LangSmith Migration Tool - Migrate data between LangSmith instances."""
     ctx.ensure_object(dict)
+    _install_log_filters()
 
     # Create configuration
     config = Config(
@@ -1437,6 +1459,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 @click.option('--skip-prompts', is_flag=True, help='Skip prompt migration')
 @click.option('--skip-queues', is_flag=True, help='Skip annotation queue migration')
 @click.option('--skip-rules', is_flag=True, help='Skip rules migration')
+@click.option('--skip-charts', is_flag=True, help='Skip chart migration')
 @click.option('--include-all-commits', is_flag=True, help='Include all prompt commit history')
 @click.option('--strip-projects', is_flag=True, help='Strip project associations from rules')
 @click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
@@ -1449,7 +1472,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 )
 @workspace_options
 @click.pass_context
-def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, include_all_commits, strip_projects, map_projects, rules_create_enabled, source_workspace, dest_workspace, map_workspaces):
+def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits, strip_projects, map_projects, rules_create_enabled, source_workspace, dest_workspace, map_workspaces):
     """Migrate all resources interactively."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -1503,7 +1526,8 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
             preflight_resources.append("queues")
         if not skip_rules:
             preflight_resources.append("rules")
-        preflight_resources.append("charts")
+        if not skip_charts:
+            preflight_resources.append("charts")
         _run_preflight(orchestrator, config, preflight_resources)
 
         # Use per-workspace project mapping from the TUI if available
@@ -1512,7 +1536,7 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
             ws_project_mapping = ws_result.project_mappings[src_ws]
 
         _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
-                                   skip_prompts, skip_queues, skip_rules, include_all_commits,
+                                   skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits,
                                    strip_projects, map_projects, rules_create_enabled, ws_project_mapping)
 
     if ws_result:
@@ -1525,7 +1549,7 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 
 
 def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
-                                skip_prompts, skip_queues, skip_rules, include_all_commits,
+                                skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits,
                                 strip_projects, map_projects, rules_create_enabled=None, ws_project_mapping=None):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
@@ -1858,6 +1882,98 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
             console.print("[yellow]none found[/yellow]\n")
     else:
         console.print("[dim]Skipping rules (--skip-rules)[/dim]\n")
+
+    # 5. Charts
+    if not skip_charts:
+        console.print("[bold]Step 5: Charts[/bold]")
+        from ..core.migrators import ChartMigrator
+        chart_migrator = ChartMigrator(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            orchestrator.state,
+            config
+        )
+
+        if project_id_map:
+            chart_migrator._project_id_map = dict(project_id_map)
+            console.print(f"[dim]Using interactive project mapping ({len(project_id_map)} project(s))[/dim]")
+
+        same_instance = False
+        source_url = config.source.base_url.rstrip('/').lower()
+        dest_url = config.destination.base_url.rstrip('/').lower()
+        if source_url == dest_url:
+            if config.source.api_key == config.destination.api_key:
+                same_instance = True
+                console.print("[dim]Detected same source and destination instance (same URL and API key)[/dim]")
+            else:
+                console.print("[dim]Detected same instance URL but different API keys (likely different workspaces).[/dim]")
+                console.print("[dim]Will use project name matching instead of same session IDs.[/dim]")
+
+        source_charts = chart_migrator.list_charts()
+        if source_charts:
+            console.print(f"found {len(source_charts)}")
+            if _confirm_action(config, f"Migrate {len(source_charts)} chart(s)?", default=True, non_interactive_value=True):
+                _ensure_migration_session(orchestrator, config)
+                chart_migrator.state = orchestrator.state
+                tracked_chart_items = {}
+
+                if not same_instance and not chart_migrator._project_id_map:
+                    chart_migrator._build_project_mapping()
+
+                for chart in source_charts:
+                    chart_id = chart.get("id")
+                    if not chart_id:
+                        continue
+                    chart_title = chart.get("title") or chart.get("name") or "Untitled Chart"
+                    source_session_id = chart_migrator._extract_session_id(chart)
+                    dest_session_id = None
+                    if source_session_id:
+                        if same_instance:
+                            dest_session_id = source_session_id
+                        elif chart_migrator._project_id_map:
+                            dest_session_id = chart_migrator._project_id_map.get(source_session_id)
+                    item_id = _ensure_state_item(
+                        orchestrator,
+                        config,
+                        "chart",
+                        chart_id,
+                        chart_title,
+                        metadata={
+                            "chart": chart,
+                            "dest_session_id": dest_session_id,
+                            "same_instance": same_instance,
+                        },
+                    )
+                    tracked_chart_items[chart_id] = item_id
+                    _mark_state_item_started(orchestrator, item_id)
+
+                all_mappings = chart_migrator.migrate_all_charts(same_instance=same_instance)
+                flat_chart_map = {}
+                for session_chart_map in all_mappings.values():
+                    flat_chart_map.update(session_chart_map)
+
+                for chart_id, item_id in tracked_chart_items.items():
+                    if chart_id in flat_chart_map:
+                        _mark_state_item_completed(
+                            orchestrator,
+                            item_id,
+                            destination_id=flat_chart_map[chart_id],
+                        )
+                    else:
+                        _mark_state_item_failed(
+                            orchestrator,
+                            item_id,
+                            "chart migration returned None",
+                        )
+
+                console.print(f"Charts: {len(flat_chart_map)} migrated, {len(tracked_chart_items) - len(flat_chart_map)} failed")
+                console.print()
+            else:
+                console.print("[yellow]Skipped charts[/yellow]\n")
+        else:
+            console.print("[yellow]none found[/yellow]\n")
+    else:
+        console.print("[dim]Skipping charts (--skip-charts)[/dim]\n")
 
 
 @cli.command()

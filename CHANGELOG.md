@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.56] - 2026-04-01
+
+### Added
+- **migrate-all charts support**: Included chart migration as step 5 in `migrate-all`, with same-instance detection and migration-state tracking.
+- **Charts skip flag for migrate-all**: Added `--skip-charts` to bypass chart migration when desired.
+
+### Improved
+- **Wizard control for charts**: Users can now explicitly skip charts from the interactive `migrate-all` wizard prompt even when charts are available.
+- **Workspace/project mapping parity**: `migrate-all` chart migration now honors workspace-scoped and project-mapped flows consistently.
+
+## [0.0.55] - 2026-04-01
+
+### Fixed
+- **CLI log noise**: Suppressed low-signal `run compression is not enabled` output during normal migration runs
+- **Release workflow reliability**: Made release publishing idempotent when the tag/release already exists
+
 ## [0.0.54] - 2026-03-31
 
 ### Removed
