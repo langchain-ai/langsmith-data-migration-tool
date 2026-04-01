@@ -74,9 +74,9 @@ class TestPromptMigrator:
 
         assert len(result) == 0
 
-    def test_list_prompts_includes_private_and_public_prompts(self, prompt_migrator):
-        """Prompt listing should include both tenant-private and public prompts."""
-        private_response = Mock()
+    def test_list_prompts_uses_workspace_scoped_listing(self, prompt_migrator):
+        """Prompt listing should rely on workspace scoping rather than visibility sweeps."""
+        scoped_response = Mock()
         private_prompt = Mock()
         private_prompt.id = "private-1"
         private_prompt.repo_handle = "team/private-prompt"
@@ -89,38 +89,13 @@ class TestPromptMigrator:
         private_prompt.num_downloads = 0
         private_prompt.num_commits = 1
         private_prompt.updated_at = None
-        private_response.repos = [private_prompt]
-
-        public_response = Mock()
-        public_prompt = Mock()
-        public_prompt.id = "public-1"
-        public_prompt.repo_handle = "team/public-prompt"
-        public_prompt.description = "public"
-        public_prompt.readme = ""
-        public_prompt.is_public = True
-        public_prompt.is_archived = False
-        public_prompt.tags = []
-        public_prompt.num_likes = 0
-        public_prompt.num_downloads = 0
-        public_prompt.num_commits = 1
-        public_prompt.updated_at = None
-        public_response.repos = [public_prompt]
-
-        empty_response = Mock()
-        empty_response.repos = []
-        prompt_migrator.source_ls_client.list_prompts.side_effect = [
-            private_response,
-            public_response,
-        ]
+        scoped_response.repos = [private_prompt]
+        prompt_migrator.source_ls_client.list_prompts.return_value = scoped_response
 
         result = prompt_migrator.list_prompts()
 
-        assert [prompt["repo_handle"] for prompt in result] == [
-            "team/private-prompt",
-            "team/public-prompt",
-        ]
-        assert prompt_migrator.source_ls_client.list_prompts.call_args_list[0].kwargs["is_public"] is False
-        assert prompt_migrator.source_ls_client.list_prompts.call_args_list[1].kwargs["is_public"] is True
+        assert [prompt["repo_handle"] for prompt in result] == ["team/private-prompt"]
+        assert "is_public" not in prompt_migrator.source_ls_client.list_prompts.call_args.kwargs
 
     def test_find_existing_prompt_paginates_destination_results(self, prompt_migrator):
         """Destination prompt existence checks should scan all pages, not just the first page."""

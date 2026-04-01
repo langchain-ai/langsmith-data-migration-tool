@@ -587,38 +587,40 @@ class PromptMigrator(BaseMigrator):
             self.log(f"Fetching prompts (archived={is_archived})...", "info")
             seen_handles = set()
 
-            for visibility in (False, True):
-                try:
-                    for prompt in self._iter_prompt_repos(
-                        self.source_ls_client,
-                        is_archived=is_archived,
-                        is_public=visibility,
-                    ):
-                        if prompt.repo_handle in seen_handles:
-                            continue
-                        seen_handles.add(prompt.repo_handle)
-                        prompts.append({
-                            'id': str(prompt.id),
-                            'repo_handle': prompt.repo_handle,
-                            'description': prompt.description,
-                            'readme': prompt.readme,
-                            'is_public': prompt.is_public,
-                            'is_archived': prompt.is_archived,
-                            'tags': prompt.tags or [],
-                            'num_likes': prompt.num_likes,
-                            'num_downloads': prompt.num_downloads,
-                            'num_commits': prompt.num_commits,
-                            'updated_at': str(prompt.updated_at) if prompt.updated_at else None,
-                        })
-                except Exception as api_error:
-                    self.log(f"API error while listing prompts: {api_error}", "error")
-                    if prompts:
-                        self.log(
-                            f"Returning {len(prompts)} prompts fetched before error",
-                            "warning",
-                        )
-                        return prompts
-                    raise
+            try:
+                # Do not force visibility filters here. With workspace scoping enabled
+                # (X-Tenant-Id), this keeps discovery limited to the selected workspace
+                # instead of unioning broad public catalogs.
+                for prompt in self._iter_prompt_repos(
+                    self.source_ls_client,
+                    is_archived=is_archived,
+                    is_public=None,
+                ):
+                    if prompt.repo_handle in seen_handles:
+                        continue
+                    seen_handles.add(prompt.repo_handle)
+                    prompts.append({
+                        'id': str(prompt.id),
+                        'repo_handle': prompt.repo_handle,
+                        'description': prompt.description,
+                        'readme': prompt.readme,
+                        'is_public': prompt.is_public,
+                        'is_archived': prompt.is_archived,
+                        'tags': prompt.tags or [],
+                        'num_likes': prompt.num_likes,
+                        'num_downloads': prompt.num_downloads,
+                        'num_commits': prompt.num_commits,
+                        'updated_at': str(prompt.updated_at) if prompt.updated_at else None,
+                    })
+            except Exception as api_error:
+                self.log(f"API error while listing prompts: {api_error}", "error")
+                if prompts:
+                    self.log(
+                        f"Returning {len(prompts)} prompts fetched before error",
+                        "warning",
+                    )
+                    return prompts
+                raise
 
             self.log(f"Total prompts fetched: {len(prompts)}", "success")
             return prompts
@@ -654,13 +656,12 @@ class PromptMigrator(BaseMigrator):
         """
         self._sync_workspace_headers()
         try:
-            for visibility in (False, True):
-                for prompt in self._iter_prompt_repos(
-                    self.dest_ls_client,
-                    is_public=visibility,
-                ):
-                    if prompt.repo_handle == prompt_identifier:
-                        return True
+            for prompt in self._iter_prompt_repos(
+                self.dest_ls_client,
+                is_public=None,
+            ):
+                if prompt.repo_handle == prompt_identifier:
+                    return True
             return False
         except Exception as e:
             self.log(f"Could not check if prompt exists: {e}", "warning")
