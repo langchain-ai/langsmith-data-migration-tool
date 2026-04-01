@@ -8,6 +8,7 @@ from .annotation_queue import AnnotationQueueMigrator
 from .prompt import PromptMigrator
 from .rules import RulesMigrator
 from .chart import ChartMigrator
+from .user_role import UserRoleMigrator
 from .orchestrator import MigrationOrchestrator
 
 __all__ = [
@@ -19,5 +20,6 @@ __all__ = [
     "PromptMigrator",
     "RulesMigrator",
     "ChartMigrator",
+    "UserRoleMigrator",
     "MigrationOrchestrator",
 ]
