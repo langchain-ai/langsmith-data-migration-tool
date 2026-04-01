@@ -312,7 +312,6 @@ class PromptMigrator(BaseMigrator):
         if not commits:
             return []
 
-        commits_by_hash = {commit["commit_hash"]: commit for commit in commits}
         children: Dict[Optional[str], List[Dict[str, Any]]] = {}
         for commit in commits:
             children.setdefault(commit.get("parent_commit_hash"), []).append(commit)
