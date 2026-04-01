@@ -442,11 +442,17 @@ def test_migrate_all_runs_every_step_and_applies_workspace_project_mappings(cli_
     cli_harness.migrators.rules.list_rules.return_value = [
         {"id": "rule-1", "display_name": "Rule One", "dataset_id": "dataset-1"},
     ]
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
+    ]
     cli_harness.orchestrator_factory.migrate_datasets_return = {"dataset-1": "dest-dataset-1"}
     cli_harness.migrators.prompt.migrate_prompt.return_value = True
     cli_harness.migrators.queue.create_queue.return_value = "dest-queue-1"
     cli_harness.migrators.rules.create_rule.return_value = "dest-rule-1"
-    cli_harness.controls.confirm_answers = [True, True, True, True, True]
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "source-project-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True, True, True, True, True, True]
 
     result = cli_harness.invoke(["migrate-all", "--include-all-commits"])
 
@@ -467,8 +473,49 @@ def test_migrate_all_runs_every_step_and_applies_workspace_project_mappings(cli_
     assert cli_harness.migrators.prompt.migrate_prompt.call_count == 1
     assert cli_harness.migrators.queue.create_queue.call_count == 1
     assert cli_harness.migrators.rules.create_rule.call_count == 1
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
+    assert cli_harness.migrators.chart._project_id_map == {
+        "source-project-id": "dest-project-id"
+    }
     assert orchestrator.clear_workspace_called is True
     assert "Migration wizard completed!" in cli_harness.console.text
+
+
+def test_migrate_all_supports_skipping_charts_via_flag_and_prompt(cli_harness):
+    """migrate-all should support chart skipping through both CLI flag and wizard confirmation."""
+
+    # Flag path: charts step is bypassed entirely.
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One"},
+    ]
+    result_flag = cli_harness.invoke(["migrate-all", "--skip-charts"])
+    assert result_flag.exit_code == 0
+    cli_harness.migrators.chart.list_charts.assert_not_called()
+    assert "Skipping charts (--skip-charts)" in cli_harness.console.text
+
+    # Prompt path: charts are discovered but user opts out interactively.
+    cli_harness.migrators.chart.reset_mock()
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
+    ]
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Source Project": "Destination Project"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "source-project-id", "name": "Source Project"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "dest-project-id", "name": "Destination Project"},
+    ]
+    cli_harness.controls.confirm_answers = [False]
+
+    result_prompt = cli_harness.invoke(["migrate-all"])
+    assert result_prompt.exit_code == 0
+    cli_harness.migrators.chart.list_charts.assert_called_once()
+    cli_harness.migrators.chart.migrate_all_charts.assert_not_called()
+    assert "Skipped charts" in cli_harness.console.text
 
 
 def test_charts_command_auto_detects_same_instance(cli_harness):
