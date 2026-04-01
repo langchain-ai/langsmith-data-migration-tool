@@ -671,6 +671,48 @@ def test_resume_command_retries_prompt_queue_rule_and_chart_items(cli_harness):
     assert "Resume processing completed" in cli_harness.console.text
 
 
+def test_resume_command_non_interactive_uses_latest_session_without_console_input(cli_harness):
+    """Non-interactive resume should auto-select the latest session and dispatch through the orchestrator."""
+
+    state = build_state("migration_resume_non_interactive")
+    state.add_item(
+        MigrationItem(
+            id="prompt_default_team_prompt-a",
+            type="prompt",
+            name="team/prompt-a",
+            source_id="team/prompt-a",
+            status=MigrationStatus.PENDING,
+            metadata={"include_all_commits": True},
+        )
+    )
+    save_session(cli_harness.state_manager, state)
+    cli_harness.migrators.prompt.migrate_prompt.return_value = "team/prompt-a"
+
+    result = cli_harness.invoke(["--non-interactive", "resume"])
+
+    assert result.exit_code == 0
+    cli_harness.migrators.prompt.migrate_prompt.assert_called_once_with(
+        "team/prompt-a",
+        include_all_commits=True,
+    )
+    assert "Resume processing completed" in cli_harness.console.text
+
+
+def test_queues_command_non_interactive_exits_with_code_2_for_blocked_items(cli_harness):
+    """Non-interactive runs should exit with code 2 when the session requires remediation."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One"},
+    ]
+    cli_harness.migrators.queue.create_queue.side_effect = Exception("queue create failed")
+
+    result = cli_harness.invoke(["--non-interactive", "queues"])
+
+    assert result.exit_code == 2
+    assert "Resolution Summary" in cli_harness.console.text
+    assert "Remediation bundle:" in cli_harness.console.text
+
+
 def test_clean_command_deletes_saved_sessions(cli_harness):
     """Cleaning sessions should remove persisted state files after confirmation."""
 
