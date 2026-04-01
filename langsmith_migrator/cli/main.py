@@ -27,7 +27,13 @@ def ssl_option(f):
         # The global cli() already handles --no-ssl via the config object
         return f(*args, **kwargs)
     return wrapper
-from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
+from ..utils.state import (
+    MANUAL_FOLLOW_UP_STATES,
+    MigrationStatus,
+    ResolutionOutcome,
+    StateManager,
+    VerificationState,
+)
 from ..core.migrators import (
     MigrationOrchestrator,
     DatasetMigrator,
@@ -432,9 +438,8 @@ def _needs_operator_action(state) -> bool:
         return False
     terminal = state.get_terminal_counts()
     return bool(
-        terminal.get(ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value)
-        or terminal.get(ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY.value)
-        or state.remediation_queue
+        any(terminal.get(outcome) for outcome in MANUAL_FOLLOW_UP_STATES)
+        or state.get_active_remediation_tasks()
     )
 
 

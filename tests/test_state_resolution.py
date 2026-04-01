@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import time
 
+from langsmith_migrator.cli.main import _needs_operator_action
 from langsmith_migrator.utils.state import (
+    MigrationStatus,
     MigrationState,
     ResolutionOutcome,
     StateManager,
@@ -95,3 +97,61 @@ def test_loading_v1_state_upgrades_to_schema_v2(tmp_path):
     assert loaded is not None
     assert loaded.schema_version == 2
     assert loaded.verification_summary["total"] == 1
+
+
+def test_resume_items_include_exported_and_resume_info_marks_resumable(tmp_path):
+    """Exported items should be eligible for resume and visible as resumable."""
+
+    state_manager = StateManager(tmp_path / "state")
+    state = state_manager.create_session("https://source.example", "https://dest.example")
+    item = state.ensure_item("prompt_1", "prompt", "prompt-1", "prompt-1")
+    state.mark_terminal(
+        item.id,
+        ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
+        "prompt_write_unsupported",
+        verification_state=VerificationState.EXPORTED,
+        next_action="Apply exported prompt then run resume.",
+    )
+
+    resume_items = state.get_resume_items()
+    assert {resume_item.id for resume_item in resume_items} == {item.id}
+
+    resume_info = state_manager.get_resume_info(state)
+    assert resume_info["can_resume"] is True
+    assert resume_info["exported"] == 1
+
+
+def test_completed_items_do_not_leave_stale_operator_action_tasks(tmp_path):
+    """Resolved items should not keep non-interactive runs in operator-action mode."""
+
+    state = MigrationState(
+        session_id="migration_test",
+        started_at=time.time(),
+        updated_at=time.time(),
+        source_url="https://source.example",
+        destination_url="https://dest.example",
+    )
+    item = state.ensure_item("prompt_2", "prompt", "prompt-2", "prompt-2")
+    issue = state.add_issue(
+        "transient",
+        "resume_dispatch_failed",
+        "Resume failed",
+        item_id=item.id,
+        next_action="Run resume again.",
+    )
+    state.queue_remediation(
+        issue_id=issue.id,
+        item_id=item.id,
+        next_action="Run resume again.",
+        command="langsmith-migrator resume",
+    )
+    state.update_item_status(item.id, MigrationStatus.COMPLETED)
+    state.mark_terminal(
+        item.id,
+        ResolutionOutcome.MIGRATED,
+        "prompt_migrated",
+        verification_state=VerificationState.VERIFIED,
+    )
+
+    assert state.get_active_remediation_tasks() == []
+    assert _needs_operator_action(state) is False

@@ -42,6 +42,12 @@ class VerificationState(Enum):
     EXPORTED = "exported"
 
 
+MANUAL_FOLLOW_UP_STATES = {
+    ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value,
+    ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY.value,
+}
+
+
 class IssueClass(Enum):
     """Typed incident classes for resolver workflows."""
 
@@ -470,18 +476,45 @@ class MigrationState:
 
     def get_resume_items(self, max_attempts: int = 3) -> List[MigrationItem]:
         """Return items that should be reconsidered by resume."""
-        items = self.get_pending_items(include_in_progress=True)
-        items.extend(self.get_failed_items(max_attempts=max_attempts))
-        return items
+        resumable: Dict[str, MigrationItem] = {}
+        for item in self.get_pending_items(include_in_progress=True):
+            resumable[item.id] = item
+        for item in self.get_failed_items(max_attempts=max_attempts):
+            resumable[item.id] = item
+        for item in self.get_checkpoint_items():
+            resumable[item.id] = item
+        return list(resumable.values())
+
+    def get_active_remediation_tasks(self) -> List[RemediationTask]:
+        """Return remediation tasks that still require operator follow-up."""
+        active_tasks: List[RemediationTask] = []
+        for task in self.remediation_queue:
+            if task.status not in {"pending", "in_progress"}:
+                continue
+            if not task.item_id:
+                active_tasks.append(task)
+                continue
+            item = self.items.get(task.item_id)
+            if item is None:
+                active_tasks.append(task)
+                continue
+            if (
+                item.status == MigrationStatus.COMPLETED
+                or item.terminal_state
+                in (
+                    ResolutionOutcome.MIGRATED.value,
+                    ResolutionOutcome.MIGRATED_WITH_VERIFIED_DOWNGRADE.value,
+                )
+            ):
+                continue
+            active_tasks.append(task)
+        return active_tasks
 
     def get_checkpoint_items(self) -> List[MigrationItem]:
         """Return items that landed in a checkpoint/export terminal state."""
         items = []
         for item in self.items.values():
-            if item.terminal_state in (
-                ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value,
-                ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY.value,
-            ):
+            if item.terminal_state in MANUAL_FOLLOW_UP_STATES:
                 items.append(item)
         return items
 
@@ -943,6 +976,8 @@ class StateManager:
         exported = stats["terminal"].get(
             ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY.value, 0
         )
+        resumable_items = state.get_resume_items()
+        active_remediation_tasks = state.get_active_remediation_tasks()
         return {
             "session_id": state.session_id,
             "total_items": stats["total"],
@@ -951,13 +986,9 @@ class StateManager:
             "pending": stats["pending"],
             "blocked": blocked,
             "exported": exported,
-            "can_resume": (
-                stats["pending"] > 0
-                or stats["failed"] > 0
-                or len(state.remediation_queue) > 0
-            ),
+            "can_resume": len(resumable_items) > 0,
             "elapsed_time": stats["elapsed_time"],
             "by_type": stats["by_type"],
             "remediation_bundle_path": state.remediation_bundle_path,
-            "remediation_tasks": len(state.remediation_queue),
+            "remediation_tasks": len(active_remediation_tasks),
         }
