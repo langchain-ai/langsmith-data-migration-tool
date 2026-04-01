@@ -35,6 +35,7 @@ from ..core.migrators import (
     PromptMigrator,
     RulesMigrator,
     ChartMigrator,
+    UserRoleMigrator,
 )
 from .tui_selector import select_items
 from .tui_project_mapper import build_project_mapping_tui
@@ -917,6 +918,147 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
 
     if ws_result:
         orchestrator.clear_workspace_context()
+
+    _display_resolution_summary(orchestrator)
+    _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
+
+
+@cli.command()
+@ssl_option
+@click.option('--roles-only', is_flag=True, help='Only migrate custom roles (skip members)')
+@click.option('--skip-workspace-members', is_flag=True, help='Skip workspace member migration')
+@workspace_options
+@click.pass_context
+def users(ctx, roles_only, skip_workspace_members, source_workspace, dest_workspace, map_workspaces):
+    """Migrate users, roles, and workspace memberships."""
+    config = ctx.obj['config']
+    state_manager = ctx.obj['state_manager']
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    if not orchestrator.test_connections():
+        console.print("\n[red]Cannot proceed without valid connections[/red]")
+        orchestrator.cleanup()
+        return
+
+    # Resolve workspace context (needed for phase 3)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    if ws_result is _WS_CANCELLED:
+        console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+
+    # Clear workspace context for org-scoped phases 1-2
+    orchestrator.clear_workspace_context()
+
+    user_role_migrator = UserRoleMigrator(
+        orchestrator.source_client,
+        orchestrator.dest_client,
+        None,
+        config,
+    )
+
+    _run_preflight(orchestrator, config, ["users"])
+
+    # ── Phase 1: Role synchronisation ──
+    console.print("\n[bold]Phase 1: Synchronising roles...[/bold]")
+
+    try:
+        role_mapping = user_role_migrator.build_role_mapping()
+        console.print(f"  [green]{len(role_mapping)} role(s) mapped[/green]")
+    except Exception as e:
+        console.print(f"  [red]Failed to build role mapping: {e}[/red]")
+        orchestrator.cleanup()
+        return
+
+    if roles_only:
+        console.print("\n[dim]--roles-only: skipping member migration[/dim]")
+        orchestrator.cleanup()
+        return
+
+    # ── Phase 2: Org member migration ──
+    console.print("\n[bold]Phase 2: Migrating organisation members...[/bold]")
+
+    org_members = user_role_migrator.list_source_org_members()
+    pending_members = user_role_migrator.list_source_pending_org_members()
+
+    if not org_members and not pending_members:
+        console.print("  [yellow]No org members found[/yellow]")
+    else:
+        all_members = org_members + [
+            {**p, "_pending": True} for p in pending_members
+        ]
+
+        selected_members = _select_or_all(
+            config,
+            all_members,
+            select_all=config.migration.non_interactive,
+            title="Select Organisation Members to Migrate",
+            columns=[
+                {"key": "email", "title": "Email", "width": 40},
+                {"key": "full_name", "title": "Name", "width": 30},
+                {"key": "role_name", "title": "Role", "width": 25},
+            ],
+        )
+
+        if selected_members:
+            _ensure_migration_session(orchestrator, config)
+            user_role_migrator.state = orchestrator.state
+
+            migrated, skipped, failed = user_role_migrator.migrate_org_members(
+                selected_members
+            )
+            console.print(
+                f"  Org members: [green]{migrated} migrated[/green], "
+                f"{skipped} skipped, [red]{failed} failed[/red]"
+            )
+        else:
+            console.print("  [yellow]No members selected[/yellow]")
+
+    # ── Phase 3: Workspace member migration ──
+    if skip_workspace_members:
+        console.print("\n[dim]--skip-workspace-members: skipping workspace member migration[/dim]")
+    else:
+        has_ws_pairs = any(s and d for s, d in ws_pairs)
+        if has_ws_pairs:
+            console.print("\n[bold]Phase 3: Migrating workspace members...[/bold]")
+            _ensure_migration_session(orchestrator, config)
+            user_role_migrator.state = orchestrator.state
+
+            # Refresh dest org members for workspace member lookups
+            if not user_role_migrator._dest_email_to_identity:
+                dest_members = user_role_migrator.list_dest_org_members()
+                for m in dest_members:
+                    email = (m.get("email") or "").lower()
+                    if email:
+                        user_role_migrator._dest_email_to_identity[email] = m
+
+            for src_ws, dst_ws in ws_pairs:
+                if not src_ws or not dst_ws:
+                    continue
+                orchestrator.set_workspace_context(src_ws, dst_ws)
+                console.print(f"\n  [cyan]Workspace: {src_ws} -> {dst_ws}[/cyan]")
+
+                try:
+                    m, s, f = user_role_migrator.migrate_workspace_members()
+                    console.print(
+                        f"    [green]{m} migrated[/green], {s} skipped, "
+                        f"[red]{f} failed[/red]"
+                    )
+                except Exception as e:
+                    console.print(f"    [red]Failed: {e}[/red]")
+
+            orchestrator.clear_workspace_context()
+        else:
+            console.print("\n[dim]No workspace pairs configured, skipping workspace member migration[/dim]")
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
