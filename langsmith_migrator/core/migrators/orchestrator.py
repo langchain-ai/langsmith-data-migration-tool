@@ -94,6 +94,10 @@ class MigrationOrchestrator:
                 self.config.source.base_url,
                 self.config.destination.base_url,
             )
+        elif not self.state.remediation_bundle_path:
+            self.state.remediation_bundle_path = str(
+                self.state_manager._default_bundle_path(self.state.session_id).resolve()
+            )
         self.state_manager.current_state = self.state
         return self.state
 

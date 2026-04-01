@@ -161,6 +161,10 @@ def _ensure_migration_session(orchestrator, config):
             config.source.base_url,
             config.destination.base_url,
         )
+    elif not orchestrator.state.remediation_bundle_path:
+        orchestrator.state.remediation_bundle_path = str(
+            orchestrator.state_manager._default_bundle_path(orchestrator.state.session_id).resolve()
+        )
     config.state_manager = orchestrator.state_manager
     orchestrator.state_manager.current_state = orchestrator.state
     return orchestrator.state
