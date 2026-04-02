@@ -37,7 +37,7 @@ mdit-py-plugins==0.5.0
     # via markdown-it-py
 mdurl==0.1.2
     # via markdown-it-py
-orjson==3.11.7
+orjson==3.11.8
     # via langsmith
 packaging==26.0
     # via langsmith
