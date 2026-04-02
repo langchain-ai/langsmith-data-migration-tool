@@ -181,9 +181,10 @@ class ItemSelector(App):
         self._update_stats()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter on a row confirms the selection."""
         event.prevent_default()
         event.stop()
-        self.action_toggle_row()
+        self.action_confirm()
 
     def action_confirm(self) -> None:
         self.result = [self.items[idx] for idx in sorted(self.selected_items)]
