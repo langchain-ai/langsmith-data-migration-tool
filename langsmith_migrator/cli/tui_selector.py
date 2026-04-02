@@ -56,13 +56,13 @@ class ItemSelector(App):
         Binding("/", "focus_search", "Search", show=True),
     ]
 
-    selected_items: reactive[set] = reactive(set)
     filter_text: reactive[str] = reactive("")
 
     def __init__(self, items: List[Dict[str, Any]], columns: List[Dict[str, str]]):
         super().__init__()
         self.items = items
         self.columns = columns
+        self.selected_items: set = set()
         self.filtered_indices = list(range(len(items)))
         self.result = None
         self.filter_timer = None
@@ -112,7 +112,7 @@ class ItemSelector(App):
             row_data = [checkbox]
             for col in self.columns:
                 value = str(item.get(col["key"], ""))
-                max_width = col.get("width", 20) - 2
+                max_width = max(0, col.get("width", 20) - 2)
                 if len(value) > max_width:
                     value = value[:max_width-3] + "..."
                 row_data.append(value)
@@ -139,8 +139,10 @@ class ItemSelector(App):
     def _debounced_refresh(self) -> None:
         self._refresh_table()
         self._update_stats()
-        table = self.query_one(DataTable)
-        self.set_focus(table)
+        search_input = self.query_one("#search-input", Input)
+        if not search_input.has_focus:
+            table = self.query_one(DataTable)
+            self.set_focus(table)
         self.filter_timer = None
 
     def action_focus_search(self) -> None:
@@ -181,7 +183,7 @@ class ItemSelector(App):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         event.prevent_default()
         event.stop()
-        self.action_confirm()
+        self.action_toggle_row()
 
     def action_confirm(self) -> None:
         self.result = [self.items[idx] for idx in sorted(self.selected_items)]

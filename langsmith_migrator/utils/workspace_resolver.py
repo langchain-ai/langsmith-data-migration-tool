@@ -18,6 +18,7 @@ def resolve_workspace_context(
     console: Console,
     saved_config: Optional[MigrationFileConfig] = None,
     force_tui: bool = False,
+    non_interactive: bool = False,
 ) -> Optional[WorkspaceProjectResult]:
     """Detect workspaces on both sides and resolve a mapping if needed.
 
@@ -51,12 +52,17 @@ def resolve_workspace_context(
     # Check for saved mapping
     if saved_config and saved_config.workspace_mapping:
         _display_saved_mapping(console, saved_config.workspace_mapping, source_workspaces, dest_workspaces)
-        if Confirm.ask("Reuse this workspace mapping?", default=True):
+        if non_interactive or Confirm.ask("Reuse this workspace mapping?", default=True):
             return WorkspaceProjectResult(
                 workspace_mapping=saved_config.workspace_mapping,
                 project_mappings={},
                 workspaces_to_create=[],
             )
+
+    # In non-interactive mode, we cannot launch the TUI
+    if non_interactive:
+        console.print("[red]Error: --map-workspaces requires interactive mode (no saved mapping found)[/red]")
+        return None
 
     # Build a callback for fetching projects scoped to a workspace
     def fetch_projects(ws_id: str, side: str) -> List[Dict]:

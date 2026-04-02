@@ -29,6 +29,27 @@ class FeedbackMigrator(BaseMigrator):
         serialized = json.dumps(payload, sort_keys=True, default=str)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
+    def _remap_feedback_source(self, feedback_source, run_id_mapping):
+        """Walk feedback_source dict and remap any known run IDs."""
+        if not isinstance(feedback_source, dict):
+            return feedback_source
+        result = {}
+        for k, v in feedback_source.items():
+            if isinstance(v, str) and v in run_id_mapping:
+                result[k] = run_id_mapping[v]
+            elif isinstance(v, dict):
+                result[k] = self._remap_feedback_source(v, run_id_mapping)
+            elif isinstance(v, list):
+                result[k] = [
+                    self._remap_feedback_source(item, run_id_mapping)
+                    if isinstance(item, dict) else
+                    (run_id_mapping.get(item, item) if isinstance(item, str) else item)
+                    for item in v
+                ]
+            else:
+                result[k] = v
+        return result
+
     def list_feedback_for_session(self, session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         """
         Fetch feedback records for an experiment session.
@@ -240,23 +261,25 @@ class FeedbackMigrator(BaseMigrator):
                 else:
                     dest_run_id = None
 
-                # Build the feedback record for destination
+                # Build the feedback record for destination (denylist approach)
+                STRIP_FIELDS = {"id", "created_at", "modified_at", "run_id", "session_id"}
                 migrated_fb = {
-                    "run_id": dest_run_id,
-                    "key": fb["key"],
+                    k: v for k, v in fb.items()
+                    if k not in STRIP_FIELDS and not k.startswith("_") and v is not None
                 }
+                migrated_fb["run_id"] = dest_run_id
 
-                # Add optional fields if present
-                if fb.get("score") is not None:
-                    migrated_fb["score"] = fb["score"]
-                if fb.get("value") is not None:
-                    migrated_fb["value"] = fb["value"]
-                if fb.get("comment"):
-                    migrated_fb["comment"] = fb["comment"]
-                if fb.get("correction"):
-                    migrated_fb["correction"] = fb["correction"]
-                if fb.get("feedback_source"):
-                    migrated_fb["feedback_source"] = fb["feedback_source"]
+                # Remap run IDs inside feedback_source
+                if migrated_fb.get("feedback_source"):
+                    migrated_fb["feedback_source"] = self._remap_feedback_source(
+                        migrated_fb["feedback_source"], run_id_mapping
+                    )
+
+                # Remap source_run_id if present
+                if migrated_fb.get("source_run_id") and run_id_mapping:
+                    migrated_fb["source_run_id"] = run_id_mapping.get(
+                        migrated_fb["source_run_id"], migrated_fb["source_run_id"]
+                    )
 
                 migrated_fb["_fingerprint"] = fingerprint
                 migrated_feedbacks.append(migrated_fb)

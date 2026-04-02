@@ -106,7 +106,7 @@ def _name_mapping_to_id_mapping(
 _WS_CANCELLED = "__cancelled__"
 
 
-def _resolve_workspaces(orchestrator, source_workspace=None, dest_workspace=None, map_workspaces=False):
+def _resolve_workspaces(orchestrator, source_workspace=None, dest_workspace=None, map_workspaces=False, non_interactive=False):
     """Resolve workspace context from explicit IDs or auto-detection.
 
     Returns:
@@ -134,6 +134,7 @@ def _resolve_workspaces(orchestrator, source_workspace=None, dest_workspace=None
         orchestrator.dest_client,
         console,
         force_tui=map_workspaces,
+        non_interactive=non_interactive,
     )
 
     # If force_tui was set and user cancelled, treat as abort
@@ -673,13 +674,12 @@ def test(ctx):
     config.display_summary(console)
 
     console.print("Testing connections... ", end="")
-    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, ctx.obj['state_manager']))
 
     if orchestrator.test_connections():
         console.print("[green]✓[/green]")
     else:
         console.print("[red]✗[/red]")
-        orchestrator.cleanup()
         ctx.exit(1)
         return
 
@@ -693,8 +693,6 @@ def test(ctx):
                 display_workspaces(console, source_ws, "Source")
             if dest_ws:
                 display_workspaces(console, dest_ws, "Destination")
-
-    orchestrator.cleanup()
 
 
 @cli.command()
@@ -713,7 +711,7 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, state_manager)
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
 
     # Test connections first
     console.print("Testing connections... ", end="")
@@ -732,7 +730,7 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
         console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
         return
@@ -836,8 +834,6 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
     except Exception as e:
         console.print(f"\n[red]Migration failed: {e}[/red]")
         ctx.exit(1)
-    finally:
-        orchestrator.cleanup()
 
 
 @cli.command()
@@ -929,7 +925,7 @@ def resume(ctx):
 
     # Resume migration
     config = ctx.obj['config']
-    orchestrator = MigrationOrchestrator(config, state_manager)
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
     orchestrator.state = state
     config.state_manager = state_manager
 
@@ -947,7 +943,6 @@ def resume(ctx):
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
-    orchestrator.cleanup()
 
 
 @cli.command()
@@ -964,19 +959,17 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, state_manager)
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
 
     # Test connections
     if not orchestrator.test_connections():
         console.print("\n[red]Cannot proceed without valid connections[/red]")
-        orchestrator.cleanup()
         return
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
-        orchestrator.cleanup()
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
@@ -1059,7 +1052,6 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
-    orchestrator.cleanup()
 
 
 @cli.command()
@@ -1094,18 +1086,16 @@ def users(
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, state_manager)
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
 
     if not orchestrator.test_connections():
         console.print("\n[red]Cannot proceed without valid connections[/red]")
-        orchestrator.cleanup()
         return
 
     # Resolve workspace context (needed for phase 3)
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
-        orchestrator.cleanup()
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
@@ -1132,12 +1122,10 @@ def users(
         console.print(f"  [green]{len(role_mapping)} role(s) mapped[/green]")
     except Exception as e:
         console.print(f"  [red]Failed to build role mapping: {e}[/red]")
-        orchestrator.cleanup()
         return
 
     if roles_only:
         console.print("\n[dim]--roles-only: skipping member migration[/dim]")
-        orchestrator.cleanup()
         return
 
     csv_member_rows = _load_members_csv(members_csv) if members_csv else None
@@ -1232,7 +1220,6 @@ def users(
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
-    orchestrator.cleanup()
 
 
 @cli.command()
@@ -1251,25 +1238,22 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, state_manager)
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
 
     console.print("Testing connections... ", end="")
     source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
-        orchestrator.cleanup()
         return
     if not dest_ok:
         console.print("[red]✗ Destination connection failed[/red]")
-        orchestrator.cleanup()
         return
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
-        orchestrator.cleanup()
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
@@ -1356,20 +1340,29 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
         with Progress(console=console) as progress:
             task = progress.add_task("Migrating prompts...", total=len(selected_prompts))
             for prompt in selected_prompts:
+                handle = prompt['repo_handle']
+                item_id = _ensure_state_item(
+                    orchestrator, config, "prompt", handle, handle,
+                    metadata={"include_all_commits": include_all_commits},
+                )
                 try:
+                    _mark_state_item_started(orchestrator, item_id)
                     result = prompt_migrator.migrate_prompt(
-                        prompt['repo_handle'],
+                        handle,
                         include_all_commits=include_all_commits
                     )
                     if result:
                         success_count += 1
+                        _mark_state_item_completed(orchestrator, item_id)
                     else:
-                        failed_items.append((prompt['repo_handle'], "migration returned None"))
+                        failed_items.append((handle, "migration returned None"))
+                        _mark_state_item_failed(orchestrator, item_id, "migration returned None")
                 except Exception as e:
                     error_msg = str(e)
                     if "405" in error_msg or "Not Allowed" in error_msg:
                         has_405_error = True
-                    failed_items.append((prompt['repo_handle'], error_msg))
+                    failed_items.append((handle, error_msg))
+                    _mark_state_item_failed(orchestrator, item_id, e)
                 progress.advance(task)
 
         console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
@@ -1389,7 +1382,6 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
-    orchestrator.cleanup()
 
 
 @cli.command()
@@ -1408,7 +1400,7 @@ def list_projects(ctx, source, dest):
     if not ensure_config(config):
         return
     
-    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, ctx.obj['state_manager']))
     
     from rich.table import Table
     
@@ -1441,8 +1433,6 @@ def list_projects(ctx, source, dest):
             console.print(table)
         except Exception as e:
             console.print(f"[red]Failed to list destination projects: {e}[/red]")
-    
-    orchestrator.cleanup()
 
 
 @cli.command(name='list_workspaces')
@@ -1461,7 +1451,7 @@ def list_workspaces_cmd(ctx, source, dest):
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, ctx.obj['state_manager']))
 
     if source:
         workspaces = _list_workspaces(orchestrator.source_client)
@@ -1470,8 +1460,6 @@ def list_workspaces_cmd(ctx, source, dest):
     if dest:
         workspaces = _list_workspaces(orchestrator.dest_client)
         display_workspaces(console, workspaces, "Destination")
-
-    orchestrator.cleanup()
 
 
 @cli.command()
@@ -1493,25 +1481,22 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, state_manager)
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
 
     console.print("Testing connections... ", end="")
     source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
-        orchestrator.cleanup()
         return
     if not dest_ok:
         console.print("[red]✗ Destination connection failed[/red]")
-        orchestrator.cleanup()
         return
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
-        orchestrator.cleanup()
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
@@ -1519,7 +1504,6 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
     # --map-projects and --project-mapping are mutually exclusive
     if map_projects and project_mapping:
         console.print("[red]Error: --map-projects and --project-mapping are mutually exclusive[/red]")
-        orchestrator.cleanup()
         return
 
     # Parse custom project mapping once (outside loop, not workspace-scoped)
@@ -1569,6 +1553,9 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
         # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
         if map_projects and not ws_project_id_map:
+            if config.migration.non_interactive:
+                console.print("[red]Error: --map-projects requires interactive mode[/red]")
+                raise click.Abort()
             console.print("Fetching projects from both instances... ", end="")
             source_projects = _list_projects(orchestrator.source_client)
             dest_projects = _list_projects(orchestrator.dest_client)
@@ -1739,7 +1726,6 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
-    orchestrator.cleanup()
 
 
 @cli.command()
@@ -1773,26 +1759,23 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, state_manager)
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
 
     # Test connections first
     console.print("Testing connections... ", end="")
     source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
-        orchestrator.cleanup()
         return
     if not dest_ok:
         console.print("[red]✗ Destination connection failed[/red]")
-        orchestrator.cleanup()
         return
     console.print("[green]✓[/green]\n")
 
     # Resolve workspace context (runs before asset discovery)
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
-        orchestrator.cleanup()
         return
 
     console.print("[bold cyan]LangSmith Data Migration Wizard[/bold cyan]\n")
@@ -1899,7 +1882,6 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
     console.print("\n[bold green]Migration wizard completed![/bold green]")
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
-    orchestrator.cleanup()
 
 
 def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
@@ -1925,6 +1907,9 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
         project_id_map = _name_mapping_to_id_mapping(ws_project_mapping, source_projects, dest_projects)
         console.print(f"Using workspace-scoped project mapping with {len(project_id_map)} project(s)\n")
     elif map_projects:
+        if config.migration.non_interactive:
+            console.print("[red]Error: --map-projects requires interactive mode[/red]")
+            raise click.Abort()
         console.print("Fetching projects from both instances... ", end="")
         source_projects = _list_projects(orchestrator.source_client)
         dest_projects = _list_projects(orchestrator.dest_client)
@@ -1983,7 +1968,6 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
     # 2. Prompts
     if not skip_prompts:
         console.print("[bold]Step 2: Prompts[/bold]")
-        console.print("Fetching prompts... ", end="")
         from ..core.migrators import PromptMigrator
         prompt_migrator = PromptMigrator(
             orchestrator.source_client,
@@ -1991,50 +1975,69 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
             None,
             config
         )
-        prompts = prompt_migrator.list_prompts()
 
-        if prompts:
-            console.print(f"found {len(prompts)}")
-            console.print("[dim]Note: Prompt migration uses the SDK. API-created prompts may not be accessible.[/dim]")
-
-            if _confirm_action(config, f"Migrate {len(prompts)} prompt(s)?", default=True, non_interactive_value=True):
-                include_history = include_all_commits or _confirm_action(
-                    config,
-                    "Include full commit history?",
-                    default=False,
-                    non_interactive_value=include_all_commits,
-                )
-                _ensure_migration_session(orchestrator, config)
-                prompt_migrator.state = orchestrator.state
-
-                success_count = 0
-                failed_items = []
-
-                with Progress(console=console) as progress:
-                    task = progress.add_task("Migrating prompts...", total=len(prompts))
-                    for prompt in prompts:
-                        try:
-                            result = prompt_migrator.migrate_prompt(
-                                prompt['repo_handle'],
-                                include_all_commits=include_history
-                            )
-                            if result:
-                                success_count += 1
-                            else:
-                                failed_items.append((prompt['repo_handle'], "migration returned None"))
-                        except Exception as e:
-                            failed_items.append((prompt['repo_handle'], str(e)))
-                        progress.advance(task)
-
-                console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
-                if failed_items and config.migration.verbose:
-                    for name, err in failed_items:
-                        console.print(f"  [red]✗[/red] {name}: {err}")
-                console.print()
-            else:
-                console.print("[yellow]Skipped prompts[/yellow]\n")
+        console.print("Checking prompts API availability... ", end="")
+        api_available, error_msg = prompt_migrator.check_prompts_api_available()
+        if not api_available:
+            console.print("[red]✗[/red]")
+            console.print(f"\n[red]Error:[/red] {error_msg}")
+            console.print("[yellow]Skipping prompts — destination does not support the prompts API.[/yellow]\n")
         else:
-            console.print("[yellow]none found[/yellow]\n")
+            console.print("[green]✓[/green]")
+            console.print("Fetching prompts... ", end="")
+            prompts = prompt_migrator.list_prompts()
+
+            if prompts:
+                console.print(f"found {len(prompts)}")
+                console.print("[dim]Note: Prompt migration uses the SDK. API-created prompts may not be accessible.[/dim]")
+
+                if _confirm_action(config, f"Migrate {len(prompts)} prompt(s)?", default=True, non_interactive_value=True):
+                    include_history = include_all_commits or _confirm_action(
+                        config,
+                        "Include full commit history?",
+                        default=False,
+                        non_interactive_value=include_all_commits,
+                    )
+                    _ensure_migration_session(orchestrator, config)
+                    prompt_migrator.state = orchestrator.state
+
+                    success_count = 0
+                    failed_items = []
+
+                    with Progress(console=console) as progress:
+                        task = progress.add_task("Migrating prompts...", total=len(prompts))
+                        for prompt in prompts:
+                            handle = prompt['repo_handle']
+                            item_id = _ensure_state_item(
+                                orchestrator, config, "prompt", handle, handle,
+                                metadata={"include_all_commits": include_history},
+                            )
+                            try:
+                                _mark_state_item_started(orchestrator, item_id)
+                                result = prompt_migrator.migrate_prompt(
+                                    handle,
+                                    include_all_commits=include_history
+                                )
+                                if result:
+                                    success_count += 1
+                                    _mark_state_item_completed(orchestrator, item_id)
+                                else:
+                                    failed_items.append((handle, "migration returned None"))
+                                    _mark_state_item_failed(orchestrator, item_id, "migration returned None")
+                            except Exception as e:
+                                failed_items.append((handle, str(e)))
+                                _mark_state_item_failed(orchestrator, item_id, e)
+                            progress.advance(task)
+
+                    console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
+                    if failed_items and config.migration.verbose:
+                        for name, err in failed_items:
+                            console.print(f"  [red]✗[/red] {name}: {err}")
+                    console.print()
+                else:
+                    console.print("[yellow]Skipped prompts[/yellow]\n")
+            else:
+                console.print("[yellow]none found[/yellow]\n")
     else:
         console.print("[dim]Skipping prompts (--skip-prompts)[/dim]\n")
 
@@ -2347,25 +2350,22 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, state_manager)
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
 
     console.print("Testing connections... ", end="")
     source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
-        orchestrator.cleanup()
         return
     if not dest_ok:
         console.print("[red]✗ Destination connection failed[/red]")
-        orchestrator.cleanup()
         return
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
-        orchestrator.cleanup()
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
@@ -2402,6 +2402,9 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
         # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
         if map_projects and not ws_project_id_map:
+            if config.migration.non_interactive:
+                console.print("[red]Error: --map-projects requires interactive mode[/red]")
+                raise click.Abort()
             console.print("Fetching projects from both instances... ", end="")
             source_projects = _list_projects(orchestrator.source_client)
             dest_projects = _list_projects(orchestrator.dest_client)
@@ -2590,7 +2593,6 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
-    orchestrator.cleanup()
 
 
 @cli.command()
@@ -2613,6 +2615,132 @@ def clean(ctx):
         console.print("[green]✓ All sessions deleted[/green]")
     else:
         console.print("[yellow]Cleanup cancelled[/yellow]")
+
+
+@cli.command()
+@ssl_option
+@click.pass_context
+def resume(ctx):
+    """Resume a previous migration session (retry pending/failed items)."""
+    config = ctx.obj['config']
+    state_manager = ctx.obj['state_manager']
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    # List available sessions
+    sessions = state_manager.list_sessions()
+    if not sessions:
+        console.print("[yellow]No migration sessions found. Nothing to resume.[/yellow]")
+        return
+
+    # Show available sessions
+    console.print(f"Found {len(sessions)} migration session(s):\n")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("#", width=4)
+    table.add_column("Session ID", width=20)
+    table.add_column("Source", width=30)
+    table.add_column("Destination", width=30)
+    table.add_column("Updated", width=22)
+    for idx, session in enumerate(sessions, 1):
+        table.add_row(
+            str(idx),
+            session["session_id"][:16] + "...",
+            str(session["source_url"]),
+            str(session["destination_url"]),
+            str(session["updated_at"]),
+        )
+    console.print(table)
+    console.print()
+
+    # Load the latest session (first in the sorted list)
+    session_id = sessions[0]["session_id"]
+    console.print(f"Loading latest session: {session_id[:16]}...")
+
+    state = state_manager.load_session(session_id)
+    if not state:
+        console.print(f"[red]Failed to load session {session_id}[/red]")
+        return
+
+    # Create orchestrator and attach state
+    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+
+    # Test connections first
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        if source_error:
+            console.print(f"[red]  {source_error}[/red]")
+        return
+    if not dest_ok:
+        console.print("[yellow]⚠ Source OK, destination connection failed[/yellow]")
+        if dest_error:
+            console.print(f"[yellow]  {dest_error}[/yellow]")
+        console.print("Continuing with source-only operations...")
+    else:
+        console.print("[green]✓[/green]")
+
+    # Attach state to orchestrator
+    orchestrator.state = state
+    orchestrator.state_manager.current_state = state
+    config.state_manager = state_manager
+
+    # Get resumable items
+    resume_items = state.get_resume_items()
+    checkpoint_items = state.get_checkpoint_items()
+
+    console.print(f"\nResumable items: {len(resume_items)}")
+    console.print(f"Checkpoint/manual items: {len(checkpoint_items)}")
+
+    if checkpoint_items:
+        console.print("\n[bold]Items requiring manual attention:[/bold]")
+        for item in checkpoint_items[:10]:
+            console.print(f"  • {item.name}: {item.next_action or item.outcome_code or 'needs attention'}")
+
+    if not resume_items:
+        console.print("\n[yellow]No items to resume automatically.[/yellow]")
+        if checkpoint_items:
+            console.print("[dim]Review the checkpoint items above and resolve them manually.[/dim]")
+        return
+
+    # Show what will be resumed
+    console.print(f"\n[bold]Items to resume ({len(resume_items)}):[/bold]")
+    type_counts: dict[str, int] = {}
+    for item in resume_items:
+        type_counts[item.type] = type_counts.get(item.type, 0) + 1
+    for item_type, count in sorted(type_counts.items()):
+        console.print(f"  {item_type}: {count}")
+
+    if not _confirm_action(config, "\nProceed with resume?", default=True, non_interactive_value=True):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+
+    # Run resume
+    console.print(f"\n[bold]Resuming migration of {len(resume_items)} items[/bold]")
+    results = orchestrator.resume_items(resume_items)
+
+    # Save state
+    state_manager.save()
+
+    console.print("[green]Resume processing completed[/green]")
+
+    # Report results
+    resumed = results.get("resumed", [])
+    blocked = results.get("blocked", [])
+    console.print(f"\n[bold]Resume Results:[/bold]")
+    console.print(f"  [green]Resumed successfully: {len(resumed)}[/green]")
+    console.print(f"  [yellow]Blocked/needs attention: {len(blocked)}[/yellow]")
+
+    if blocked and config.migration.verbose:
+        console.print("\n[dim]Blocked items:[/dim]")
+        for item_ref in blocked[:20]:
+            console.print(f"  • {item_ref}")
+
+    _display_resolution_summary(orchestrator)
+    _exit_for_remediation_if_needed(ctx, config, orchestrator)
 
 
 def main():

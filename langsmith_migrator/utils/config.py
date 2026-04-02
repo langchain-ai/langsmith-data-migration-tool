@@ -93,7 +93,7 @@ class Config:
 
         # Parse migration settings with safe defaults
         try:
-            parsed_batch_size = batch_size or int(os.getenv('MIGRATION_BATCH_SIZE', '100'))
+            parsed_batch_size = batch_size if batch_size is not None else int(os.getenv('MIGRATION_BATCH_SIZE', '100'))
         except ValueError:
             parsed_batch_size = 100
 
@@ -195,6 +195,18 @@ class Config:
 
         if self.migration.concurrent_workers > 10:
             errors.append("Concurrent workers should not exceed 10 to avoid rate limiting")
+
+        if self.source.timeout <= 0:
+            errors.append("Source timeout must be positive")
+
+        if self.destination.timeout <= 0:
+            errors.append("Destination timeout must be positive")
+
+        if self.migration.chunk_size <= 0:
+            errors.append("Chunk size must be positive")
+
+        if self.migration.rate_limit_delay < 0:
+            errors.append("Rate limit delay cannot be negative")
 
         return len(errors) == 0, errors
 
