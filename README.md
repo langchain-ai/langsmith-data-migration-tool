@@ -1,6 +1,6 @@
 # LangSmith Data Migration Tool
 
-A Python CLI for migrating datasets, experiments, annotation queues, project rules, prompts, and charts between LangSmith instances.
+A Python CLI for migrating datasets, experiments, annotation queues, project rules, prompts, charts, users, and roles between LangSmith instances.
 
 ## Quick Start
 
@@ -28,6 +28,7 @@ langsmith-migrator datasets
 - **Project Rules**: Copy automation rules with project mapping and optional project creation in interactive flows
 - **Prompts**: Migrate prompts (latest by default, full history with `--include-all-commits`)
 - **Charts**: Migrate monitoring charts with filter preservation
+- **Users & Roles**: Sync custom roles, invite org members, add workspace members
 - **Interactive CLI**: TUI-based selection with search/filter
 
 ## Limitations
@@ -41,6 +42,7 @@ This tool **does not support migrating trace data**. It migrates:
 - Project rules
 - Prompts
 - Charts
+- Users, roles, and workspace memberships
 
 For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
 
@@ -105,6 +107,7 @@ langsmith-migrator test
 # Interactive wizard for all resources
 langsmith-migrator migrate-all
 langsmith-migrator migrate-all --rules-create-enabled   # Create migrated rules as enabled
+langsmith-migrator migrate-all --skip-users              # Skip user/role migration
 
 # Datasets
 langsmith-migrator datasets                    # Interactive selection
@@ -134,6 +137,13 @@ langsmith-migrator charts
 langsmith-migrator charts --session "project-name"
 langsmith-migrator charts --map-projects        # Interactive TUI project mapping
 langsmith-migrator charts --same-instance       # Reuse source project/session IDs on destination
+
+# Users & roles
+langsmith-migrator users                        # Sync roles, invite org members, add workspace members
+langsmith-migrator users --roles-only           # Only sync custom roles (skip members)
+langsmith-migrator users --skip-workspace-members  # Skip workspace member migration
+langsmith-migrator users --map-workspaces       # Interactive workspace mapping for phase 3
+langsmith-migrator users --members-csv members.csv --map-workspaces  # CSV-driven member input
 
 # Utilities
 langsmith-migrator list-projects --source
@@ -211,6 +221,29 @@ The prompt default is `No` (rules are created disabled).
 --same-instance         Reuse source project/session IDs on destination
 ```
 
+### Users Options
+
+```bash
+--roles-only               Only sync custom roles (skip member migration)
+--skip-workspace-members   Skip workspace member migration (phases 1-2 only)
+--members-csv PATH         CSV file with member details (email, role_id, workspace_id)
+```
+
+Migration proceeds in three phases:
+1. **Role sync** (org-scoped): match built-in roles by name, create/update custom roles
+2. **Org members** (org-scoped): invite missing members, update roles for existing ones
+3. **Workspace members** (per workspace pair): add members to workspaces with correct roles
+
+Rules are created disabled by default. Use `--create-enabled` on the `rules` command to override.
+
+### Migrate-All Users Options
+
+```bash
+--skip-users               Skip user and role migration in migrate-all wizard
+```
+
+When `--skip-users` is omitted, `migrate-all` runs user/role migration as Step 0 before all other resources. Phases 1-2 (roles + org members) run once; phase 3 (workspace members) runs per workspace pair.
+
 ### Project Mapping
 
 Rules and charts reference projects by ID. When migrating between instances, project IDs differ.
@@ -246,6 +279,7 @@ langsmith-migrator queues --map-workspaces
 langsmith-migrator prompts --map-workspaces
 langsmith-migrator rules --map-workspaces --map-projects
 langsmith-migrator charts --map-workspaces --map-projects
+langsmith-migrator users --map-workspaces
 langsmith-migrator migrate-all --map-workspaces
 
 # Explicit workspace pair
@@ -256,7 +290,7 @@ When using `--map-workspaces`, each command iterates all mapped workspace pairs,
 
 ### Resume Scope
 
-`resume` currently resumes interrupted dataset migration flows. Experiment-only resume is not yet supported.
+`resume` resumes interrupted migration flows for datasets, experiments, user/role items, and other tracked resources. Per-member state tracking enables granular resume for org and workspace member migrations.
 
 ## SSL Certificate Issues
 
