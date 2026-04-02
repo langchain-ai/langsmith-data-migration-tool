@@ -1,7 +1,9 @@
 """Simplified CLI interface with improved architecture."""
 
+import csv
 import functools
 import logging
+from pathlib import Path
 from typing import Iterable
 import click
 import time
@@ -288,11 +290,125 @@ def _confirm_action(config: Config, prompt: str, *, default: bool = False, non_i
     return Confirm.ask(prompt, default=default)
 
 
+_MEMBER_COLUMNS = [
+    {"key": "email", "title": "Email", "width": 40},
+    {"key": "full_name", "title": "Name", "width": 30},
+    {"key": "role_name", "title": "Role", "width": 25},
+]
+
+
 def _select_or_all(config: Config, items: list, *, select_all: bool, title: str, columns: list[dict]) -> list:
     """Return interactive selections or all items in non-interactive mode."""
     if select_all or config.migration.non_interactive:
         return items
     return select_items(items=items, title=title, columns=columns)
+
+
+def _load_members_csv(path: str) -> list[dict]:
+    """Load and validate a members CSV file.
+
+    Click's ``type=click.Path(exists=True, dir_okay=False)`` already
+    validates existence and file-type before this function is called.
+    """
+    csv_path = Path(path)
+    required_columns = {"email", "role_id", "workspace_id"}
+
+    try:
+        # utf-8-sig allows BOM-prefixed files exported by spreadsheet tools.
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = set(reader.fieldnames or [])
+            missing = sorted(required_columns - fieldnames)
+            if missing:
+                raise click.ClickException(
+                    "Members CSV is missing required columns: "
+                    + ", ".join(missing)
+                )
+
+            rows: list[dict] = []
+            for index, row in enumerate(reader, start=2):
+                email = (row.get("email") or "").strip().lower()
+                role_id = (row.get("role_id") or "").strip()
+                workspace_id = (row.get("workspace_id") or "").strip()
+
+                if not email:
+                    raise click.ClickException(
+                        f"Members CSV row {index} has an empty email value"
+                    )
+                if not role_id:
+                    raise click.ClickException(
+                        f"Members CSV row {index} has an empty role_id value"
+                    )
+                if not workspace_id:
+                    raise click.ClickException(
+                        f"Members CSV row {index} has an empty workspace_id value"
+                    )
+
+                rows.append(
+                    {
+                        "email": email,
+                        "role_id": role_id,
+                        "workspace_id": workspace_id,
+                    }
+                )
+    except click.ClickException:
+        raise
+    except csv.Error as e:
+        raise click.ClickException(f"Failed parsing members CSV: {e}") from e
+    except OSError as e:
+        raise click.ClickException(f"Failed reading members CSV: {e}") from e
+
+    if not rows:
+        raise click.ClickException("Members CSV is empty")
+    return rows
+
+
+def _csv_rows_to_org_members(csv_rows: list[dict]) -> list[dict]:
+    """Build org member payloads from CSV rows.
+
+    A single org role is applied per email, so conflicting role_id values
+    for the same email across workspaces are rejected.
+    """
+    members_by_email: dict[str, dict] = {}
+    for row in csv_rows:
+        email = row["email"]
+        existing = members_by_email.get(email)
+        if existing and existing["role_id"] != row["role_id"]:
+            raise click.ClickException(
+                "Members CSV has conflicting role_id values for "
+                f"{email}: '{existing['role_id']}' vs '{row['role_id']}'"
+            )
+        if not existing:
+            members_by_email[email] = {
+                "id": email,
+                "email": email,
+                "role_id": row["role_id"],
+                "full_name": "",
+            }
+    return list(members_by_email.values())
+
+
+def _csv_rows_for_workspace(csv_rows: list[dict], source_workspace_id: str) -> list[dict]:
+    """Build workspace member payloads for a specific source workspace."""
+    rows_for_workspace = [row for row in csv_rows if row["workspace_id"] == source_workspace_id]
+    members_by_email: dict[str, dict] = {}
+    for row in rows_for_workspace:
+        email = row["email"]
+        existing = members_by_email.get(email)
+        if existing and existing["role_id"] != row["role_id"]:
+            raise click.ClickException(
+                "Members CSV has conflicting role_id values for "
+                f"{email} in workspace {source_workspace_id}: "
+                f"'{existing['role_id']}' vs '{row['role_id']}'"
+            )
+        if not existing:
+            members_by_email[email] = {
+                "id": f"{source_workspace_id}:{email}",
+                "email": email,
+                "role_id": row["role_id"],
+                "full_name": "",
+            }
+    return list(members_by_email.values())
 
 
 def _workspace_scope_key(orchestrator) -> str:
@@ -950,9 +1066,25 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
 @ssl_option
 @click.option('--roles-only', is_flag=True, help='Only migrate custom roles (skip members)')
 @click.option('--skip-workspace-members', is_flag=True, help='Skip workspace member migration')
+@click.option(
+    '--members-csv',
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    help=(
+        "CSV file with member details (email, role_id, workspace_id). "
+        "Replaces source member API lookups; role_id must be consistent per email."
+    ),
+)
 @workspace_options
 @click.pass_context
-def users(ctx, roles_only, skip_workspace_members, source_workspace, dest_workspace, map_workspaces):
+def users(
+    ctx,
+    roles_only,
+    skip_workspace_members,
+    members_csv,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
+):
     """Migrate users, roles, and workspace memberships."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -981,10 +1113,12 @@ def users(ctx, roles_only, skip_workspace_members, source_workspace, dest_worksp
     # Clear workspace context for org-scoped phases 1-2
     orchestrator.clear_workspace_context()
 
+    _ensure_migration_session(orchestrator, config)
+
     user_role_migrator = UserRoleMigrator(
         orchestrator.source_client,
         orchestrator.dest_client,
-        None,
+        orchestrator.state,
         config,
     )
 
@@ -1006,35 +1140,30 @@ def users(ctx, roles_only, skip_workspace_members, source_workspace, dest_worksp
         orchestrator.cleanup()
         return
 
+    csv_member_rows = _load_members_csv(members_csv) if members_csv else None
+
     # ── Phase 2: Org member migration ──
     console.print("\n[bold]Phase 2: Migrating organisation members...[/bold]")
 
-    org_members = user_role_migrator.list_source_org_members()
-    pending_members = user_role_migrator.list_source_pending_org_members()
+    if csv_member_rows is not None:
+        all_members = _csv_rows_to_org_members(csv_member_rows)
+    else:
+        org_members = user_role_migrator.list_source_org_members()
+        pending_members = user_role_migrator.list_source_pending_org_members()
+        all_members = org_members + [{**p, "_pending": True} for p in pending_members]
 
-    if not org_members and not pending_members:
+    if not all_members:
         console.print("  [yellow]No org members found[/yellow]")
     else:
-        all_members = org_members + [
-            {**p, "_pending": True} for p in pending_members
-        ]
-
         selected_members = _select_or_all(
             config,
             all_members,
             select_all=config.migration.non_interactive,
             title="Select Organisation Members to Migrate",
-            columns=[
-                {"key": "email", "title": "Email", "width": 40},
-                {"key": "full_name", "title": "Name", "width": 30},
-                {"key": "role_name", "title": "Role", "width": 25},
-            ],
+            columns=_MEMBER_COLUMNS,
         )
 
         if selected_members:
-            _ensure_migration_session(orchestrator, config)
-            user_role_migrator.state = orchestrator.state
-
             migrated, skipped, failed = user_role_migrator.migrate_org_members(
                 selected_members
             )
@@ -1052,16 +1181,20 @@ def users(ctx, roles_only, skip_workspace_members, source_workspace, dest_worksp
         has_ws_pairs = any(s and d for s, d in ws_pairs)
         if has_ws_pairs:
             console.print("\n[bold]Phase 3: Migrating workspace members...[/bold]")
-            _ensure_migration_session(orchestrator, config)
-            user_role_migrator.state = orchestrator.state
 
-            # Refresh dest org members for workspace member lookups
-            if not user_role_migrator._dest_email_to_identity:
+            # Always refresh destination org identity index before workspace phase.
+            # Keep this best-effort so the run can continue gracefully.
+            try:
                 dest_members = user_role_migrator.list_dest_org_members()
-                for m in dest_members:
-                    email = (m.get("email") or "").lower()
-                    if email:
-                        user_role_migrator._dest_email_to_identity[email] = m
+                user_role_migrator._dest_email_to_identity = {
+                    (m.get("email") or "").lower(): m
+                    for m in dest_members
+                    if m.get("email")
+                }
+            except Exception as e:
+                console.print(
+                    f"  [yellow]Warning: failed to refresh destination org identities: {e}[/yellow]"
+                )
 
             for src_ws, dst_ws in ws_pairs:
                 if not src_ws or not dst_ws:
@@ -1069,8 +1202,30 @@ def users(ctx, roles_only, skip_workspace_members, source_workspace, dest_worksp
                 orchestrator.set_workspace_context(src_ws, dst_ws)
                 console.print(f"\n  [cyan]Workspace: {src_ws} -> {dst_ws}[/cyan]")
 
+                if csv_member_rows is not None:
+                    ws_members = _csv_rows_for_workspace(csv_member_rows, src_ws)
+                else:
+                    ws_members = user_role_migrator.list_source_workspace_members()
+                if not ws_members:
+                    console.print("    [yellow]No workspace members found[/yellow]")
+                    continue
+
+                selected_ws_members = _select_or_all(
+                    config,
+                    ws_members,
+                    select_all=config.migration.non_interactive,
+                    title="Select Workspace Members to Migrate",
+                    columns=_MEMBER_COLUMNS,
+                )
+
+                if not selected_ws_members:
+                    console.print("    [yellow]No members selected[/yellow]")
+                    continue
+
                 try:
-                    m, s, f = user_role_migrator.migrate_workspace_members()
+                    m, s, f = user_role_migrator.migrate_workspace_members(
+                        selected_members=selected_ws_members
+                    )
                     console.print(
                         f"    [green]{m} migrated[/green], {s} skipped, "
                         f"[red]{f} failed[/red]"
@@ -1596,6 +1751,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
 @cli.command()
 @ssl_option
+@click.option('--skip-users', is_flag=True, help='Skip user and role migration')
 @click.option('--skip-datasets', is_flag=True, help='Skip dataset migration')
 @click.option('--skip-experiments', is_flag=True, help='Skip experiment migration')
 @click.option('--skip-prompts', is_flag=True, help='Skip prompt migration')
@@ -1614,7 +1770,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 )
 @workspace_options
 @click.pass_context
-def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits, strip_projects, map_projects, rules_create_enabled, source_workspace, dest_workspace, map_workspaces):
+def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits, strip_projects, map_projects, rules_create_enabled, source_workspace, dest_workspace, map_workspaces):
     """Migrate all resources interactively."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
@@ -1648,6 +1804,49 @@ def migrate_all(ctx, skip_datasets, skip_experiments, skip_prompts, skip_queues,
 
     console.print("[bold cyan]LangSmith Data Migration Wizard[/bold cyan]\n")
     console.print("This wizard will guide you through migrating all your data.\n")
+
+    # Step 0: Users & Roles (org-scoped, runs once before workspace loop)
+    if not skip_users:
+        console.print("[bold]Step 0: Users & Roles[/bold]")
+
+        # Clear workspace context for org-scoped phases
+        orchestrator.clear_workspace_context()
+        _ensure_migration_session(orchestrator, config)
+
+        user_role_migrator = UserRoleMigrator(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            orchestrator.state,
+            config,
+        )
+
+        # Phase 1: Roles
+        console.print("  Synchronising roles... ", end="")
+        try:
+            role_mapping = user_role_migrator.build_role_mapping()
+            console.print(f"[green]{len(role_mapping)} mapped[/green]")
+        except Exception as e:
+            console.print(f"[red]failed: {e}[/red]")
+            role_mapping = {}
+
+        # Phase 2: Org members
+        if role_mapping:
+            org_members = user_role_migrator.list_source_org_members()
+            if org_members:
+                if _confirm_action(config, f"Migrate {len(org_members)} org member(s)?", default=True, non_interactive_value=True):
+                    migrated, skipped, failed = user_role_migrator.migrate_org_members(org_members)
+                    console.print(
+                        f"  Org members: [green]{migrated} migrated[/green], "
+                        f"{skipped} skipped, [red]{failed} failed[/red]"
+                    )
+                else:
+                    console.print("  [yellow]Skipped org members[/yellow]")
+            else:
+                console.print("  [yellow]No org members found[/yellow]")
+
+        console.print()
+    else:
+        console.print("[dim]Skipping users (--skip-users)[/dim]\n")
 
     # If multi-workspace, iterate per pair; otherwise run once
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
