@@ -393,6 +393,13 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
             state,
             config,
         ).probe_capabilities()
+    if "users" in resource_list:
+        UserRoleMigrator(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            state,
+            config,
+        ).probe_capabilities()
 
     dependency_edges = {
         f"experiments:{scope_key}": [f"datasets:{scope_key}"],
@@ -1055,13 +1062,7 @@ def users(ctx, roles_only, skip_workspace_members, source_workspace, dest_worksp
             _ensure_migration_session(orchestrator, config)
             user_role_migrator.state = orchestrator.state
 
-            # Refresh dest org members for workspace member lookups
-            if not user_role_migrator._dest_email_to_identity:
-                dest_members = user_role_migrator.list_dest_org_members()
-                for m in dest_members:
-                    email = (m.get("email") or "").lower()
-                    if email:
-                        user_role_migrator._dest_email_to_identity[email] = m
+            user_role_migrator.ensure_dest_org_index()
 
             for src_ws, dst_ws in ws_pairs:
                 if not src_ws or not dst_ws:

@@ -531,6 +531,7 @@ class MigrationOrchestrator:
         from .chart import ChartMigrator
         from .prompt import PromptMigrator
         from .rules import RulesMigrator
+        from .user_role import UserRoleMigrator
 
         prompt_migrator = PromptMigrator(
             self.source_client,
@@ -568,6 +569,13 @@ class MigrationOrchestrator:
             self.state,
             self.config,
         )
+        ur_migrator = UserRoleMigrator(
+            self.source_client,
+            self.dest_client,
+            self.state,
+            self.config,
+        )
+        ur_migrator.restore_from_state()
 
         for item in items_to_process:
             self._apply_item_workspace(item)
@@ -674,22 +682,6 @@ class MigrationOrchestrator:
                                 evidence={"destination_id": destination_id},
                             )
                 elif item.type in ("org_member", "ws_member"):
-                    from .user_role import UserRoleMigrator
-                    ur_migrator = UserRoleMigrator(
-                        self.source_client,
-                        self.dest_client,
-                        self.state,
-                        self.config,
-                    )
-                    # Restore role mapping from state
-                    role_mappings = self.state.id_mappings.get("roles", {})
-                    ur_migrator._role_id_map = dict(role_mappings)
-                    # Rebuild dest email index
-                    dest_org = ur_migrator.list_dest_org_members()
-                    for m in dest_org:
-                        email = (m.get("email") or "").lower()
-                        if email:
-                            ur_migrator._dest_email_to_identity[email] = m
                     if item.type == "org_member":
                         member_payload = item.metadata.get("member")
                         if member_payload:

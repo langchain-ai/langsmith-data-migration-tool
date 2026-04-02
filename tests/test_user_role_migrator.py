@@ -231,6 +231,7 @@ class TestUserRoleMigrator:
         migrator._dest_email_to_identity = {
             "alice@example.com": {"id": "dst-org-identity-1"},
         }
+        migrator._dest_members_loaded = True
         migrator.source.get_paginated.return_value = iter([
             {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
         ])
@@ -248,6 +249,7 @@ class TestUserRoleMigrator:
     def test_migrate_workspace_members_update_role(self, migrator):
         """Workspace members with wrong role get updated."""
         migrator._role_id_map = {"src-ws-role": "dst-ws-role-new"}
+        migrator._dest_members_loaded = True
         migrator.source.get_paginated.return_value = iter([
             {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
         ])
@@ -266,7 +268,8 @@ class TestUserRoleMigrator:
     def test_migrate_workspace_members_not_in_org(self, migrator):
         """User not an org member on dest is recorded as failed."""
         migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
-        migrator._dest_email_to_identity = {}  # Not in org
+        migrator._dest_email_to_identity = {}
+        migrator._dest_members_loaded = True
         migrator.source.get_paginated.return_value = iter([
             {"id": "src-ws-m1", "email": "bob@example.com", "role_id": "src-ws-role"},
         ])

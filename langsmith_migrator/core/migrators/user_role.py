@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from .base import BaseMigrator
 from ...utils.retry import APIError, AuthenticationError, ConflictError
 
+_CUSTOM_ROLE_KIND = "CUSTOM"
+
 
 class UserRoleMigrator(BaseMigrator):
     """Handles migration of custom roles, org members, and workspace members.
@@ -21,6 +23,41 @@ class UserRoleMigrator(BaseMigrator):
         super().__init__(source_client, dest_client, state, config)
         self._role_id_map: Dict[str, str] = {}
         self._dest_email_to_identity: Dict[str, Dict[str, Any]] = {}
+        self._dest_members_loaded: bool = False
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _collect_paginated(
+        self, client, endpoint: str
+    ) -> List[Dict[str, Any]]:
+        return [item for item in client.get_paginated(endpoint) if isinstance(item, dict)]
+
+    @staticmethod
+    def _role_payload(role: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "display_name": role.get("display_name", ""),
+            "description": role.get("description", ""),
+            "permissions": role.get("permissions", []),
+        }
+
+    def ensure_dest_org_index(self) -> None:
+        """Populate the dest email index if not already built."""
+        if self._dest_members_loaded:
+            return
+        self._dest_email_to_identity = {}
+        for m in self._collect_paginated(self.dest, "/orgs/current/members/active"):
+            email = (m.get("email") or "").lower()
+            if email:
+                self._dest_email_to_identity[email] = m
+        self._dest_members_loaded = True
+
+    def restore_from_state(self) -> None:
+        """Rebuild in-memory caches from persisted state (for resume)."""
+        if self.state:
+            self._role_id_map = dict(self.state.id_mappings.get("roles", {}))
+        self.ensure_dest_org_index()
 
     # ------------------------------------------------------------------
     # Phase 0: data fetching
@@ -36,43 +73,23 @@ class UserRoleMigrator(BaseMigrator):
 
     def list_source_org_members(self) -> List[Dict[str, Any]]:
         """Fetch active org members from source (paginated)."""
-        members = []
-        for member in self.source.get_paginated("/orgs/current/members/active"):
-            if isinstance(member, dict):
-                members.append(member)
-        return members
+        return self._collect_paginated(self.source, "/orgs/current/members/active")
 
     def list_dest_org_members(self) -> List[Dict[str, Any]]:
         """Fetch active org members from destination (paginated)."""
-        members = []
-        for member in self.dest.get_paginated("/orgs/current/members/active"):
-            if isinstance(member, dict):
-                members.append(member)
-        return members
+        return self._collect_paginated(self.dest, "/orgs/current/members/active")
 
     def list_source_pending_org_members(self) -> List[Dict[str, Any]]:
         """Fetch pending org invites from source (paginated)."""
-        members = []
-        for member in self.source.get_paginated("/orgs/current/members/pending"):
-            if isinstance(member, dict):
-                members.append(member)
-        return members
+        return self._collect_paginated(self.source, "/orgs/current/members/pending")
 
     def list_source_workspace_members(self) -> List[Dict[str, Any]]:
         """Fetch active workspace members from source (requires X-Tenant-Id)."""
-        members = []
-        for member in self.source.get_paginated("/tenants/current/members/active"):
-            if isinstance(member, dict):
-                members.append(member)
-        return members
+        return self._collect_paginated(self.source, "/tenants/current/members/active")
 
     def list_dest_workspace_members(self) -> List[Dict[str, Any]]:
         """Fetch active workspace members from destination (requires X-Tenant-Id)."""
-        members = []
-        for member in self.dest.get_paginated("/tenants/current/members/active"):
-            if isinstance(member, dict):
-                members.append(member)
-        return members
+        return self._collect_paginated(self.dest, "/tenants/current/members/active")
 
     # ------------------------------------------------------------------
     # Phase 1: role synchronisation
@@ -93,16 +110,12 @@ class UserRoleMigrator(BaseMigrator):
             f"Found {len(source_roles)} source roles, {len(dest_roles)} destination roles"
         )
 
-        # Match built-in roles
         mapping = self._match_builtin_roles(source_roles, dest_roles)
-
-        # Sync custom roles
         custom_mapping = self._sync_custom_roles(source_roles, dest_roles)
         mapping.update(custom_mapping)
 
         self._role_id_map = mapping
 
-        # Persist in state for resume
         if self.state:
             for src_id, dst_id in mapping.items():
                 self.state.set_mapped_id("roles", src_id, dst_id)
@@ -118,13 +131,13 @@ class UserRoleMigrator(BaseMigrator):
         """Match built-in roles by their ``name`` field."""
         dest_by_name: Dict[str, str] = {}
         for role in dest_roles:
-            if role.get("name") != "CUSTOM":
+            if role.get("name") != _CUSTOM_ROLE_KIND:
                 dest_by_name[role["name"]] = role["id"]
 
         mapping: Dict[str, str] = {}
         for role in source_roles:
             name = role.get("name", "")
-            if name == "CUSTOM":
+            if name == _CUSTOM_ROLE_KIND:
                 continue
             dest_id = dest_by_name.get(name)
             if dest_id:
@@ -149,13 +162,13 @@ class UserRoleMigrator(BaseMigrator):
         """
         dest_by_display: Dict[str, Dict[str, Any]] = {}
         for role in dest_roles:
-            if role.get("name") == "CUSTOM":
+            if role.get("name") == _CUSTOM_ROLE_KIND:
                 dest_by_display[role.get("display_name", "")] = role
 
         mapping: Dict[str, str] = {}
 
         for role in source_roles:
-            if role.get("name") != "CUSTOM":
+            if role.get("name") != _CUSTOM_ROLE_KIND:
                 continue
 
             display_name = role.get("display_name", "")
@@ -167,7 +180,6 @@ class UserRoleMigrator(BaseMigrator):
                     self.log(f"Custom role '{display_name}' exists, skipping")
                     continue
 
-                # Check if permissions differ
                 src_perms = set(role.get("permissions", []))
                 dst_perms = set(existing.get("permissions", []))
                 if src_perms != dst_perms:
@@ -188,11 +200,7 @@ class UserRoleMigrator(BaseMigrator):
             self.log(f"[DRY RUN] Would create custom role: {display_name}")
             return f"dry-run-{role['id']}"
 
-        payload = {
-            "display_name": display_name,
-            "description": role.get("description", ""),
-            "permissions": role.get("permissions", []),
-        }
+        payload = self._role_payload(role)
 
         try:
             response = self.dest.post("/orgs/current/roles", payload)
@@ -222,11 +230,7 @@ class UserRoleMigrator(BaseMigrator):
             self.log(f"[DRY RUN] Would update custom role: {display_name}")
             return
 
-        payload = {
-            "display_name": display_name,
-            "description": source_role.get("description", ""),
-            "permissions": source_role.get("permissions", []),
-        }
+        payload = self._role_payload(source_role)
 
         try:
             self.dest.patch(f"/orgs/current/roles/{dest_role_id}", payload)
@@ -247,14 +251,8 @@ class UserRoleMigrator(BaseMigrator):
 
         Returns ``(migrated, skipped, failed)`` counts.
         """
-        dest_members = self.list_dest_org_members()
-        dest_by_email: Dict[str, Dict[str, Any]] = {}
-        for m in dest_members:
-            email = (m.get("email") or "").lower()
-            if email:
-                dest_by_email[email] = m
-
-        self._dest_email_to_identity = dest_by_email
+        self.ensure_dest_org_index()
+        dest_by_email = self._dest_email_to_identity
 
         migrated = skipped = failed = 0
 
@@ -286,13 +284,11 @@ class UserRoleMigrator(BaseMigrator):
             dest_member = dest_by_email.get(email)
 
             if dest_member:
-                # Already exists on destination
                 if self.config.migration.skip_existing:
                     self.log(f"Org member '{email}' exists, skipping")
                     skipped += 1
                     continue
 
-                # Check if role needs updating
                 dest_role_id = dest_member.get("role_id")
                 if mapped_role_id and dest_role_id != mapped_role_id:
                     try:
@@ -310,7 +306,6 @@ class UserRoleMigrator(BaseMigrator):
                     self.log(f"Org member '{email}' already has correct role")
                     skipped += 1
             else:
-                # Invite new member
                 try:
                     self._invite_org_member(email, mapped_role_id)
                     migrated += 1
@@ -369,6 +364,8 @@ class UserRoleMigrator(BaseMigrator):
 
         Returns ``(migrated, skipped, failed)`` counts.
         """
+        self.ensure_dest_org_index()
+
         source_members = self.list_source_workspace_members()
         dest_members = self.list_dest_workspace_members()
 
@@ -423,7 +420,6 @@ class UserRoleMigrator(BaseMigrator):
                 else:
                     skipped += 1
             else:
-                # Find the dest org identity for this user
                 dest_org_member = self._dest_email_to_identity.get(email)
                 if not dest_org_member:
                     self.log(
@@ -499,7 +495,6 @@ class UserRoleMigrator(BaseMigrator):
             ("source", self.source, "source"),
             ("destination", self.dest, "dest"),
         ]:
-            # Roles endpoint
             try:
                 client.get("/orgs/current/roles")
                 self.record_capability(
@@ -514,7 +509,6 @@ class UserRoleMigrator(BaseMigrator):
                     probe="/orgs/current/roles",
                 )
 
-            # Members endpoint
             try:
                 client.get(
                     "/orgs/current/members/active", params={"limit": 1}
