@@ -278,6 +278,15 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 Contributions welcome! Fork, create a feature branch, and submit a Pull Request.
 
+### Release checklist
+
+For release changes, update all of:
+- `pyproject.toml` version
+- `CHANGELOG.md` release notes
+- `README.md` release-facing docs/examples
+
+CI enforces this on pull requests: if `pyproject.toml` or `CHANGELOG.md` changes, `README.md` must also be updated.
+
 ## Support
 
 For issues or questions: [GitHub repository](https://github.com/langchain-ai/langsmith-data-migration-tool)

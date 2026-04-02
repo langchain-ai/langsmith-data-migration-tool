@@ -26,6 +26,12 @@ jobs:
     - name: Install dependencies
       run: uv sync --extra test
 
+    - name: Ensure README updated for release changes
+      if: github.event_name == 'pull_request'
+      env:
+        BASE_REF: ${{ github.base_ref }}
+      run: bash .github/scripts/check_readme_release_sync.sh
+
     - name: Lint with ruff
       run: uv run ruff check langsmith_migrator
 
