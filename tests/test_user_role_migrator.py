@@ -386,45 +386,24 @@ class TestUserRoleMigrator:
         assert m == 0
         migrator.source.get_paginated.assert_called_once()
 
-    def test_migrate_workspace_members_from_csv_rows_filters_by_workspace(self, migrator):
-        """CSV workspace migration only processes rows for active source workspace."""
-        migrator.source.session.headers["X-Tenant-Id"] = "ws-src-1"
-        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
-        migrator._dest_email_to_identity = {
-            "alice@example.com": {"id": "dst-org-identity-1"},
-        }
-        migrator.dest.get_paginated.return_value = iter([])
-        migrator.dest.post.return_value = {"id": "dst-ws-identity-1"}
+    # ── Conditional dest fetch ──
 
-        rows = [
-            {
-                "email": "alice@example.com",
-                "role_id": "src-ws-role",
-                "workspace_id": "ws-src-1",
-            },
-            {
-                "email": "bob@example.com",
-                "role_id": "src-ws-role",
-                "workspace_id": "ws-src-2",
-            },
+    def test_migrate_org_members_skips_fetch_when_index_populated(self, migrator):
+        """migrate_org_members skips list_dest_org_members when index already set."""
+        migrator._role_id_map = {"src-role": "dst-role"}
+        migrator._dest_email_to_identity = {
+            "bob@example.com": {"id": "dst-bob"},
+        }
+        migrator.dest.post.return_value = {"id": "new-1"}
+
+        members = [
+            {"id": "src-m1", "email": "alice@example.com", "role_id": "src-role"},
         ]
 
-        m, s, f = migrator.migrate_workspace_members_from_csv_rows(rows)
+        migrator.migrate_org_members(members)
 
-        assert (m, s, f) == (1, 0, 0)
-        migrator.dest.post.assert_called_once_with(
-            "/tenants/current/members",
-            {"org_identity_id": "dst-org-identity-1", "role_id": "dst-ws-role"},
-        )
-
-    def test_migrate_workspace_members_from_csv_rows_requires_workspace_context(self, migrator):
-        """CSV workspace migration requires an active source workspace."""
-        migrator.source.session.headers = {}
-
-        with pytest.raises(APIError):
-            migrator.migrate_workspace_members_from_csv_rows(
-                [{"email": "alice@example.com", "role_id": "src-role", "workspace_id": "ws-1"}]
-            )
+        # dest.get_paginated should NOT be called — index was pre-populated
+        migrator.dest.get_paginated.assert_not_called()
 
     # ── Per-member state tracking ──
 
@@ -512,19 +491,6 @@ class TestUserRoleMigrator:
         # Can be set to a dict for resume
         migrator._dest_email_to_identity = {"alice@example.com": {"id": "dst-1"}}
         assert migrator._dest_email_to_identity["alice@example.com"]["id"] == "dst-1"
-
-    def test_migrate_workspace_members_from_csv_rows_rejects_conflicting_roles(
-        self, migrator
-    ):
-        """CSV workspace rows with conflicting role IDs for one email are rejected."""
-        migrator.source.session.headers["X-Tenant-Id"] = "ws-src-1"
-        rows = [
-            {"email": "alice@example.com", "role_id": "role-1", "workspace_id": "ws-src-1"},
-            {"email": "alice@example.com", "role_id": "role-2", "workspace_id": "ws-src-1"},
-        ]
-
-        with pytest.raises(APIError, match="Conflicting workspace role_id"):
-            migrator.migrate_workspace_members_from_csv_rows(rows)
 
     def test_ws_member_item_id_includes_workspace(self, migrator, migration_state):
         """ws_member item_id includes source workspace to avoid cross-workspace collision."""

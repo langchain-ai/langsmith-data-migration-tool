@@ -301,7 +301,7 @@ def test_users_command_without_csv_keeps_api_member_paths(cli_harness, monkeypat
 def test_users_command_always_refreshes_dest_org_identities_for_phase3(
     cli_harness, monkeypatch
 ):
-    """Workspace phase refreshes destination org identities even when cache is empty dict."""
+    """Workspace phase refreshes destination org identities via ensure_dest_email_index."""
     cli_harness.controls.workspace_result = WorkspaceProjectResult(
         workspace_mapping={"src-ws": "dst-ws"},
         project_mappings={},
@@ -313,9 +313,6 @@ def test_users_command_always_refreshes_dest_org_identities_for_phase3(
     user_role_migrator._dest_email_to_identity = {}
     user_role_migrator.list_source_org_members.return_value = []
     user_role_migrator.list_source_pending_org_members.return_value = []
-    user_role_migrator.list_dest_org_members.return_value = [
-        {"id": "dst-org-1", "email": "alice@example.com", "role_id": "dst-role"}
-    ]
     user_role_migrator.list_source_workspace_members.return_value = [
         {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-role"}
     ]
@@ -325,7 +322,7 @@ def test_users_command_always_refreshes_dest_org_identities_for_phase3(
     result = cli_harness.invoke(["users"])
 
     assert result.exit_code == 0
-    user_role_migrator.list_dest_org_members.assert_called_once()
+    user_role_migrator.ensure_dest_email_index.assert_called_once_with(force=True)
     user_role_migrator.migrate_workspace_members.assert_called_once()
 
 
@@ -342,7 +339,7 @@ def test_users_command_dest_org_refresh_failure_is_graceful(cli_harness, monkeyp
     user_role_migrator._dest_email_to_identity = {}
     user_role_migrator.list_source_org_members.return_value = []
     user_role_migrator.list_source_pending_org_members.return_value = []
-    user_role_migrator.list_dest_org_members.side_effect = Exception("dest lookup failed")
+    user_role_migrator.ensure_dest_email_index.side_effect = Exception("dest lookup failed")
     user_role_migrator.list_source_workspace_members.return_value = [
         {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-role"}
     ]
@@ -661,7 +658,7 @@ def test_migrate_all_supports_skipping_charts_via_flag_and_prompt(cli_harness):
     cli_harness.migrators.chart.list_charts.return_value = [
         {"id": "chart-1", "title": "Chart One"},
     ]
-    result_flag = cli_harness.invoke(["migrate-all", "--skip-charts"])
+    result_flag = cli_harness.invoke(["migrate-all", "--skip-charts", "--skip-users"])
     assert result_flag.exit_code == 0
     cli_harness.migrators.chart.list_charts.assert_not_called()
     assert "Skipping charts (--skip-charts)" in cli_harness.console.text
@@ -684,7 +681,7 @@ def test_migrate_all_supports_skipping_charts_via_flag_and_prompt(cli_harness):
     ]
     cli_harness.controls.confirm_answers = [False]
 
-    result_prompt = cli_harness.invoke(["migrate-all"])
+    result_prompt = cli_harness.invoke(["migrate-all", "--skip-users"])
     assert result_prompt.exit_code == 0
     cli_harness.migrators.chart.list_charts.assert_called_once()
     cli_harness.migrators.chart.migrate_all_charts.assert_not_called()

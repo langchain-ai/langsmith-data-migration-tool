@@ -1182,15 +1182,8 @@ def users(
         if has_ws_pairs:
             console.print("\n[bold]Phase 3: Migrating workspace members...[/bold]")
 
-            # Always refresh destination org identity index before workspace phase.
-            # Keep this best-effort so the run can continue gracefully.
             try:
-                dest_members = user_role_migrator.list_dest_org_members()
-                user_role_migrator._dest_email_to_identity = {
-                    (m.get("email") or "").lower(): m
-                    for m in dest_members
-                    if m.get("email")
-                }
+                user_role_migrator.ensure_dest_email_index(force=True)
             except Exception as e:
                 console.print(
                     f"  [yellow]Warning: failed to refresh destination org identities: {e}[/yellow]"
@@ -1806,6 +1799,7 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
     console.print("This wizard will guide you through migrating all your data.\n")
 
     # Step 0: Users & Roles (org-scoped, runs once before workspace loop)
+    user_role_migrator = None
     if not skip_users:
         console.print("[bold]Step 0: Users & Roles[/bold]")
 
@@ -1829,12 +1823,14 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
             console.print(f"[red]failed: {e}[/red]")
             role_mapping = {}
 
-        # Phase 2: Org members
+        # Phase 2: Org members (active + pending)
         if role_mapping:
             org_members = user_role_migrator.list_source_org_members()
-            if org_members:
-                if _confirm_action(config, f"Migrate {len(org_members)} org member(s)?", default=True, non_interactive_value=True):
-                    migrated, skipped, failed = user_role_migrator.migrate_org_members(org_members)
+            pending_members = user_role_migrator.list_source_pending_org_members()
+            all_org_members = org_members + [{**p, "_pending": True} for p in pending_members]
+            if all_org_members:
+                if _confirm_action(config, f"Migrate {len(all_org_members)} org member(s)?", default=True, non_interactive_value=True):
+                    migrated, skipped, failed = user_role_migrator.migrate_org_members(all_org_members)
                     console.print(
                         f"  Org members: [green]{migrated} migrated[/green], "
                         f"{skipped} skipped, [red]{failed} failed[/red]"
@@ -1855,6 +1851,23 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
         if src_ws and dst_ws:
             orchestrator.set_workspace_context(src_ws, dst_ws)
             console.print(f"\n[bold cyan]━━━ Workspace {ws_idx + 1}/{len(ws_pairs)}: {src_ws} -> {dst_ws} ━━━[/bold cyan]\n")
+
+        # Phase 3: Workspace members (runs per workspace pair)
+        if user_role_migrator and src_ws and dst_ws:
+            # force=True: phase 2 may have invited new org members not in the cache.
+            user_role_migrator.ensure_dest_email_index(force=True)
+            ws_members = user_role_migrator.list_source_workspace_members()
+            if ws_members:
+                if _confirm_action(config, f"Migrate {len(ws_members)} workspace member(s)?", default=True, non_interactive_value=True):
+                    m, s, f = user_role_migrator.migrate_workspace_members(
+                        selected_members=ws_members
+                    )
+                    console.print(
+                        f"  Workspace members: [green]{m} migrated[/green], "
+                        f"{s} skipped, [red]{f} failed[/red]"
+                    )
+                else:
+                    console.print("  [yellow]Skipped workspace members[/yellow]")
 
         preflight_resources = []
         if not skip_datasets:

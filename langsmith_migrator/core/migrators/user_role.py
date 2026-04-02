@@ -74,6 +74,23 @@ class UserRoleMigrator(BaseMigrator):
                 members.append(member)
         return members
 
+    def ensure_dest_email_index(self, force: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Fetch and cache the destination org-member email index.
+
+        Idempotent: returns the cached index on subsequent calls unless
+        ``force=True``.  Pass ``force=True`` after mutating destination
+        org membership (e.g. after phase 2 invites) so the cache reflects
+        newly added members.
+        """
+        if self._dest_email_to_identity is None or force:
+            dest_members = self.list_dest_org_members()
+            self._dest_email_to_identity = {
+                (m.get("email") or "").lower(): m
+                for m in dest_members
+                if m.get("email")
+            }
+        return self._dest_email_to_identity
+
     # ------------------------------------------------------------------
     # Phase 1: role synchronisation
     # ------------------------------------------------------------------
@@ -262,14 +279,7 @@ class UserRoleMigrator(BaseMigrator):
 
         Returns ``(migrated, skipped, failed)`` counts.
         """
-        dest_members = self.list_dest_org_members()
-        dest_by_email: Dict[str, Dict[str, Any]] = {}
-        for m in dest_members:
-            email = (m.get("email") or "").lower()
-            if email:
-                dest_by_email[email] = m
-
-        self._dest_email_to_identity = dest_by_email
+        dest_by_email = self.ensure_dest_email_index()
 
         migrated = skipped = failed = 0
 
@@ -394,52 +404,6 @@ class UserRoleMigrator(BaseMigrator):
     # Phase 3: workspace member migration
     # ------------------------------------------------------------------
 
-    def migrate_workspace_members_from_csv_rows(
-        self, csv_rows: List[Dict[str, Any]]
-    ) -> Tuple[int, int, int]:
-        """Migrate members for the active source workspace from CSV-shaped rows.
-
-        CSV rows must include ``email``, ``role_id``, and ``workspace_id`` fields.
-        The current source workspace is inferred from ``X-Tenant-Id``.
-        """
-        source_workspace_id = self.source.session.headers.get("X-Tenant-Id")
-        if not source_workspace_id:
-            raise APIError(
-                "Workspace context is required to migrate workspace members from CSV",
-                request_info={},
-            )
-
-        selected_by_email: Dict[str, Dict[str, Any]] = {}
-        for row in csv_rows:
-            if row.get("workspace_id") != source_workspace_id:
-                continue
-
-            email = (row.get("email") or "").strip().lower()
-            role_id = (row.get("role_id") or "").strip()
-            if not email:
-                continue
-
-            existing = selected_by_email.get(email)
-            if existing and existing["role_id"] != role_id:
-                raise APIError(
-                    (
-                        "Conflicting workspace role_id values in CSV rows for "
-                        f"{email} in workspace {source_workspace_id}"
-                    ),
-                    request_info={},
-                )
-            if not existing:
-                selected_by_email[email] = {
-                    "id": row.get("id") or f"{source_workspace_id}:{email}",
-                    "email": email,
-                    "role_id": role_id,
-                    "full_name": row.get("full_name", ""),
-                }
-
-        return self.migrate_workspace_members(
-            selected_members=list(selected_by_email.values())
-        )
-
     def migrate_workspace_members(
         self, selected_members: Optional[List[Dict[str, Any]]] = None
     ) -> Tuple[int, int, int]:
@@ -486,7 +450,7 @@ class UserRoleMigrator(BaseMigrator):
             self.ensure_item(
                 item_id, "ws_member", email,
                 member.get("id", email),
-                metadata={"member": member, "workspace_pair": ws_pair},
+                metadata={"member": member},
             )
 
             source_role_id = (member.get("role_id") or "").strip() or None

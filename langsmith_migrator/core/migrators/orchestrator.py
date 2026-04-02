@@ -695,30 +695,24 @@ class MigrationOrchestrator:
                             if migrated:
                                 results["resumed"].append(f"{item.type}:{item.source_id}")
                     else:  # ws_member
-                        if not ur_migrator._dest_email_to_identity:
-                            try:
-                                dest_org = ur_migrator.list_dest_org_members()
-                                ur_migrator._dest_email_to_identity = {
-                                    (m.get("email") or "").lower(): m
-                                    for m in dest_org
-                                    if m.get("email")
-                                }
-                            except Exception as e:  # noqa: BLE001
-                                self.state.mark_terminal(
-                                    item.id,
-                                    ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
-                                    "ws_member_dest_org_lookup_failed",
-                                    verification_state=VerificationState.BLOCKED,
-                                    next_action=(
-                                        "Verify destination org members API access and run "
-                                        "`langsmith-migrator resume` again."
-                                    ),
-                                    evidence={"error": str(e)},
-                                    error=str(e),
-                                )
-                                results["blocked"].append(f"{item.type}:{item.source_id}")
-                                self.state_manager.save()
-                                continue
+                        try:
+                            ur_migrator.ensure_dest_email_index()
+                        except Exception as e:  # noqa: BLE001
+                            self.state.mark_terminal(
+                                item.id,
+                                ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+                                "ws_member_dest_org_lookup_failed",
+                                verification_state=VerificationState.BLOCKED,
+                                next_action=(
+                                    "Verify destination org members API access and run "
+                                    "`langsmith-migrator resume` again."
+                                ),
+                                evidence={"error": str(e)},
+                                error=str(e),
+                            )
+                            results["blocked"].append(f"{item.type}:{item.source_id}")
+                            self.state_manager.save()
+                            continue
                         member_payload = item.metadata.get("member")
                         if member_payload:
                             migrated, _, _ = ur_migrator.migrate_workspace_members(
