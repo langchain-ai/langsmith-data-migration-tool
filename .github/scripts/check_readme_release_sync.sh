@@ -8,7 +8,10 @@ fi
 
 git fetch origin "${BASE_REF}" --depth=1
 
-changed_files="$(git diff --name-only "origin/${BASE_REF}...HEAD")"
+if ! changed_files="$(git diff --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null)"; then
+  echo "Three-dot diff failed; falling back to two-dot diff."
+  changed_files="$(git diff --name-only "origin/${BASE_REF}" "HEAD")"
+fi
 
 if [[ -z "${changed_files}" ]]; then
   echo "No changed files found."
