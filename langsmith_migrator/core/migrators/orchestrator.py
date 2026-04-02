@@ -569,6 +569,20 @@ class MigrationOrchestrator:
             self.config,
         )
 
+        # Pre-build user/role migrator if needed
+        ur_migrator = None
+        has_user_items = any(item.type in ("org_member", "ws_member") for item in items_to_process)
+        if has_user_items:
+            from .user_role import UserRoleMigrator
+            ur_migrator = UserRoleMigrator(
+                self.source_client,
+                self.dest_client,
+                self.state,
+                self.config,
+            )
+            role_mappings = self.state.id_mappings.get("roles", {})
+            ur_migrator._role_id_map = dict(role_mappings)
+
         for item in items_to_process:
             self._apply_item_workspace(item)
             try:
@@ -674,51 +688,48 @@ class MigrationOrchestrator:
                                 evidence={"destination_id": destination_id},
                             )
                 elif item.type in ("org_member", "ws_member"):
-                    from .user_role import UserRoleMigrator
-                    ur_migrator = UserRoleMigrator(
-                        self.source_client,
-                        self.dest_client,
-                        self.state,
-                        self.config,
-                    )
-                    # Restore role mapping from state
-                    role_mappings = self.state.id_mappings.get("roles", {})
-                    ur_migrator._role_id_map = dict(role_mappings)
-                    # Rebuild dest email index
-                    dest_org = ur_migrator.list_dest_org_members()
-                    for m in dest_org:
-                        email = (m.get("email") or "").lower()
-                        if email:
-                            ur_migrator._dest_email_to_identity[email] = m
                     if item.type == "org_member":
                         member_payload = item.metadata.get("member")
                         if member_payload:
                             migrated, _, _ = ur_migrator.migrate_org_members([member_payload])
                             if migrated:
-                                self.state.update_item_status(
-                                    item.id, MigrationStatus.COMPLETED,
-                                    stage="completed",
-                                )
+                                results["resumed"].append(f"{item.type}:{item.source_id}")
+                    else:  # ws_member
+                        if not ur_migrator._dest_email_to_identity:
+                            try:
+                                dest_org = ur_migrator.list_dest_org_members()
+                                ur_migrator._dest_email_to_identity = {
+                                    (m.get("email") or "").lower(): m
+                                    for m in dest_org
+                                    if m.get("email")
+                                }
+                            except Exception as e:  # noqa: BLE001
                                 self.state.mark_terminal(
                                     item.id,
-                                    ResolutionOutcome.MIGRATED,
-                                    "org_member_migrated",
-                                    verification_state=VerificationState.VERIFIED,
+                                    ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+                                    "ws_member_dest_org_lookup_failed",
+                                    verification_state=VerificationState.BLOCKED,
+                                    next_action=(
+                                        "Verify destination org members API access and run "
+                                        "`langsmith-migrator resume` again."
+                                    ),
+                                    evidence={"error": str(e)},
+                                    error=str(e),
                                 )
-                    else:  # ws_member
-                        # Workspace members are migrated per-workspace
-                        migrated, _, _ = ur_migrator.migrate_workspace_members()
+                                results["blocked"].append(f"{item.type}:{item.source_id}")
+                                self.state_manager.save()
+                                continue
+                        member_payload = item.metadata.get("member")
+                        if member_payload:
+                            migrated, _, _ = ur_migrator.migrate_workspace_members(
+                                selected_members=[member_payload]
+                            )
+                        else:
+                            # Backwards compatibility with older state items that
+                            # only tracked ws_member type without member payload.
+                            migrated, _, _ = ur_migrator.migrate_workspace_members()
                         if migrated:
-                            self.state.update_item_status(
-                                item.id, MigrationStatus.COMPLETED,
-                                stage="completed",
-                            )
-                            self.state.mark_terminal(
-                                item.id,
-                                ResolutionOutcome.MIGRATED,
-                                "ws_member_migrated",
-                                verification_state=VerificationState.VERIFIED,
-                            )
+                            results["resumed"].append(f"{item.type}:{item.source_id}")
                 else:
                     issue = self.state.add_issue(
                         "capability",

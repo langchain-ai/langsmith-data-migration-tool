@@ -17,12 +17,12 @@ class TestUserRoleMigrator:
         source = Mock(spec=EnhancedAPIClient)
         source.base_url = "https://source.api.test.com"
         source.session = Mock()
-        source.session.headers = {}
+        source.session.headers = {"X-Tenant-Id": "ws-default-src"}
 
         dest = Mock(spec=EnhancedAPIClient)
         dest.base_url = "https://dest.api.test.com"
         dest.session = Mock()
-        dest.session.headers = {}
+        dest.session.headers = {"X-Tenant-Id": "ws-default-dst"}
 
         return UserRoleMigrator(source, dest, migration_state, sample_config)
 
@@ -305,6 +305,280 @@ class TestUserRoleMigrator:
 
         assert m == 1
         migrator.dest.post.assert_not_called()
+
+    # ── Role update failure ──
+
+    def test_sync_custom_roles_update_failure_records_issue(self, migrator, source_roles, sample_config):
+        """When _update_custom_role fails, role is still mapped but issue is recorded."""
+        sample_config.migration.skip_existing = False
+
+        dest_roles_with_custom = [
+            {"id": "dst-custom-1", "name": "CUSTOM", "display_name": "Data Scientist",
+             "permissions": ["datasets:read"]},  # Different permissions
+        ]
+
+        migrator.dest.patch.side_effect = APIError("Permission denied", request_info={})
+
+        mapping = migrator._sync_custom_roles(source_roles, dest_roles_with_custom)
+
+        # Role should still be mapped (it exists on destination)
+        assert mapping["src-custom-1"] == "dst-custom-1"
+
+    def test_update_custom_role_returns_bool(self, migrator):
+        """_update_custom_role returns True on success, False on failure."""
+        role = {"display_name": "Test", "description": "", "permissions": ["read"]}
+
+        # Success case
+        result = migrator._update_custom_role("role-1", role)
+        assert result is True
+
+        # Failure case
+        migrator.dest.patch.side_effect = APIError("fail", request_info={})
+        result = migrator._update_custom_role("role-1", role)
+        assert result is False
+
+    # ── Pending member logging ──
+
+    def test_pending_member_logged(self, migrator):
+        """Pending members are logged distinctly."""
+        migrator._role_id_map = {"src-role": "dst-role"}
+        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.post.return_value = {"id": "new-1"}
+        migrator.config.migration.verbose = True
+
+        members = [
+            {"id": "src-m1", "email": "alice@example.com", "role_id": "src-role", "_pending": True},
+        ]
+
+        m, s, f = migrator.migrate_org_members(members)
+        assert m == 1
+
+    # ── Workspace member selection ──
+
+    def test_migrate_workspace_members_with_selected(self, migrator):
+        """When selected_members is provided, only those are processed."""
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
+        migrator._dest_email_to_identity = {
+            "alice@example.com": {"id": "dst-org-identity-1"},
+        }
+        # dest has no existing workspace members
+        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.post.return_value = {"id": "dst-ws-identity-1"}
+
+        selected = [
+            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+        ]
+
+        m, s, f = migrator.migrate_workspace_members(selected_members=selected)
+
+        assert m == 1
+        # source.get_paginated should NOT be called since we provided selected_members
+        migrator.source.get_paginated.assert_not_called()
+
+    def test_migrate_workspace_members_none_fetches_all(self, migrator):
+        """When selected_members is None, all source members are fetched."""
+        migrator._role_id_map = {}
+        migrator.source.get_paginated.return_value = iter([])
+        migrator.dest.get_paginated.return_value = iter([])
+
+        m, s, f = migrator.migrate_workspace_members(selected_members=None)
+
+        assert m == 0
+        migrator.source.get_paginated.assert_called_once()
+
+    def test_migrate_workspace_members_from_csv_rows_filters_by_workspace(self, migrator):
+        """CSV workspace migration only processes rows for active source workspace."""
+        migrator.source.session.headers["X-Tenant-Id"] = "ws-src-1"
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
+        migrator._dest_email_to_identity = {
+            "alice@example.com": {"id": "dst-org-identity-1"},
+        }
+        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.post.return_value = {"id": "dst-ws-identity-1"}
+
+        rows = [
+            {
+                "email": "alice@example.com",
+                "role_id": "src-ws-role",
+                "workspace_id": "ws-src-1",
+            },
+            {
+                "email": "bob@example.com",
+                "role_id": "src-ws-role",
+                "workspace_id": "ws-src-2",
+            },
+        ]
+
+        m, s, f = migrator.migrate_workspace_members_from_csv_rows(rows)
+
+        assert (m, s, f) == (1, 0, 0)
+        migrator.dest.post.assert_called_once_with(
+            "/tenants/current/members",
+            {"org_identity_id": "dst-org-identity-1", "role_id": "dst-ws-role"},
+        )
+
+    def test_migrate_workspace_members_from_csv_rows_requires_workspace_context(self, migrator):
+        """CSV workspace migration requires an active source workspace."""
+        migrator.source.session.headers = {}
+
+        with pytest.raises(APIError):
+            migrator.migrate_workspace_members_from_csv_rows(
+                [{"email": "alice@example.com", "role_id": "src-role", "workspace_id": "ws-1"}]
+            )
+
+    # ── Per-member state tracking ──
+
+    def test_org_member_ensure_item_called(self, migrator, migration_state):
+        """ensure_item is called for each org member."""
+        migrator.state = migration_state
+        migrator._role_id_map = {"src-role": "dst-role"}
+        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.post.return_value = {"id": "new-1"}
+
+        members = [
+            {"id": "src-m1", "email": "alice@example.com", "role_id": "src-role"},
+        ]
+
+        migrator.migrate_org_members(members)
+
+        item = migration_state.get_item("org_member_alice@example.com")
+        assert item is not None
+        assert item.type == "org_member"
+
+    def test_ws_member_ensure_item_called(self, migrator, migration_state):
+        """ensure_item is called for each workspace member."""
+        migrator.state = migration_state
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
+        migrator._dest_email_to_identity = {
+            "alice@example.com": {"id": "dst-org-1"},
+        }
+        migrator.source.get_paginated.return_value = iter([
+            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+        ])
+        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.post.return_value = {"id": "dst-ws-1"}
+
+        migrator.migrate_workspace_members()
+
+        item = migration_state.get_item("ws_member_ws-default-src_alice@example.com")
+        assert item is not None
+        assert item.type == "ws_member"
+
+    def test_migrate_workspace_members_requires_workspace_context(self, migrator):
+        """Workspace migration requires active workspace context."""
+        migrator.source.session.headers = {}
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
+        migrator._dest_email_to_identity = {
+            "alice@example.com": {"id": "dst-org-identity-1"},
+        }
+        migrator.dest.get_paginated.return_value = iter([])
+
+        with pytest.raises(APIError, match="Active source workspace"):
+            migrator.migrate_workspace_members(
+                selected_members=[
+                    {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"}
+                ]
+            )
+
+    def test_workspace_member_item_ids_do_not_collide_across_workspaces(self, migrator, migration_state):
+        """Same email in different source workspaces creates distinct state items."""
+        migrator.state = migration_state
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
+        migrator._dest_email_to_identity = {
+            "alice@example.com": {"id": "dst-org-identity-1"},
+        }
+        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.post.return_value = {"id": "dst-ws-identity-1"}
+
+        migrator.source.session.headers["X-Tenant-Id"] = "ws-src-1"
+        migrator.migrate_workspace_members(
+            selected_members=[
+                {"id": "src-ws-a", "email": "alice@example.com", "role_id": "src-ws-role"}
+            ]
+        )
+        migrator.source.session.headers["X-Tenant-Id"] = "ws-src-2"
+        migrator.migrate_workspace_members(
+            selected_members=[
+                {"id": "src-ws-b", "email": "alice@example.com", "role_id": "src-ws-role"}
+            ]
+        )
+
+        assert migration_state.get_item("ws_member_ws-src-1_alice@example.com") is not None
+        assert migration_state.get_item("ws_member_ws-src-2_alice@example.com") is not None
+
+    def test_dest_email_index_none_sentinel(self, migrator):
+        """Destination email index starts as None (not-yet-fetched sentinel)."""
+        assert migrator._dest_email_to_identity is None
+        # Can be set to a dict for resume
+        migrator._dest_email_to_identity = {"alice@example.com": {"id": "dst-1"}}
+        assert migrator._dest_email_to_identity["alice@example.com"]["id"] == "dst-1"
+
+    def test_migrate_workspace_members_from_csv_rows_rejects_conflicting_roles(
+        self, migrator
+    ):
+        """CSV workspace rows with conflicting role IDs for one email are rejected."""
+        migrator.source.session.headers["X-Tenant-Id"] = "ws-src-1"
+        rows = [
+            {"email": "alice@example.com", "role_id": "role-1", "workspace_id": "ws-src-1"},
+            {"email": "alice@example.com", "role_id": "role-2", "workspace_id": "ws-src-1"},
+        ]
+
+        with pytest.raises(APIError, match="Conflicting workspace role_id"):
+            migrator.migrate_workspace_members_from_csv_rows(rows)
+
+    def test_ws_member_item_id_includes_workspace(self, migrator, migration_state):
+        """ws_member item_id includes source workspace to avoid cross-workspace collision."""
+        migrator.state = migration_state
+        migrator.source.session.headers["X-Tenant-Id"] = "ws-abc-123"
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
+        migrator._dest_email_to_identity = {
+            "alice@example.com": {"id": "dst-org-1"},
+        }
+        migrator.source.get_paginated.return_value = iter([
+            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+        ])
+        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.post.return_value = {"id": "dst-ws-1"}
+
+        migrator.migrate_workspace_members()
+
+        item = migration_state.get_item("ws_member_ws-abc-123_alice@example.com")
+        assert item is not None
+        assert item.type == "ws_member"
+
+    def test_empty_role_id_treated_as_none(self, migrator):
+        """Empty-string role_id does not trigger unmapped_role failure."""
+        migrator._role_id_map = {}
+        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.post.return_value = {"id": "new-1"}
+
+        members = [
+            {"id": "src-m1", "email": "alice@example.com", "role_id": ""},
+        ]
+
+        m, s, f = migrator.migrate_org_members(members)
+
+        # Empty role_id → None → no role mapping needed → invited without role
+        assert m == 1
+        assert f == 0
+
+    def test_org_member_failed_marked_blocked(self, migrator, migration_state):
+        """Failed org members are marked blocked for remediation."""
+        migrator.state = migration_state
+        migrator._role_id_map = {}  # No mappings — will cause failure
+        migrator.dest.get_paginated.return_value = iter([])
+
+        members = [
+            {"id": "src-m1", "email": "alice@example.com", "role_id": "unknown-role"},
+        ]
+
+        m, s, f = migrator.migrate_org_members(members)
+
+        assert f == 1
+        item = migration_state.get_item("org_member_alice@example.com")
+        assert item is not None
+        assert item.terminal_state == "blocked_with_checkpoint"
+        assert item.outcome_code == "unmapped_role"
 
     # ── Capability probing ──
 

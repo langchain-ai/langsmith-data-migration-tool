@@ -142,6 +142,26 @@ langsmith-migrator resume  # Resume interrupted dataset migration
 langsmith-migrator clean
 ```
 
+### Users migration with CSV member input
+
+When running `users`, you can provide member details from CSV instead of source member list APIs:
+
+```bash
+langsmith-migrator users --members-csv examples/users_members_example.csv --map-workspaces
+```
+
+CSV schema:
+
+```csv
+email,role_id,workspace_id
+alice@example.com,role_org_user_abc123,ws_src_prod_us
+```
+
+Notes:
+- `email`, `role_id`, and `workspace_id` are required.
+- `role_id` must be consistent for each `email` across rows.
+- `workspace_id` should be the source workspace ID (used to filter workspace memberships per mapped workspace pair).
+
 ### CLI Options
 
 ```bash
@@ -257,6 +277,15 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Contributing
 
 Contributions welcome! Fork, create a feature branch, and submit a Pull Request.
+
+### Release checklist
+
+For release changes, update all of:
+- `pyproject.toml` version
+- `CHANGELOG.md` release notes
+- `README.md` release-facing docs/examples
+
+CI enforces this on pull requests: if `pyproject.toml` or `CHANGELOG.md` changes, `README.md` must also be updated.
 
 ## Support
 

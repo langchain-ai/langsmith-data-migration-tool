@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import Mock
 
 from langsmith_migrator.cli import main as cli_main
 from langsmith_migrator.cli.tui_workspace_mapper import WorkspaceProjectResult
@@ -182,6 +183,177 @@ def test_test_command_exits_nonzero_when_connections_fail(cli_harness):
     assert result.exit_code == 1
     assert "✗" in cli_harness.console.text
     assert cli_harness.orchestrator_factory.instances[0].cleanup_called is True
+
+
+def test_users_command_members_csv_replaces_source_member_apis(cli_harness, monkeypatch, tmp_path):
+    """users --members-csv should bypass source member listing APIs."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text("email,role_id,workspace_id\nalice@example.com,src-role,src-ws\n", encoding="utf-8")
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-role": "dst-role"}
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    user_role_migrator.list_source_org_members.side_effect = AssertionError("org API should not be used in CSV mode")
+    user_role_migrator.list_source_pending_org_members.side_effect = AssertionError(
+        "pending API should not be used in CSV mode"
+    )
+    user_role_migrator.list_source_workspace_members.side_effect = AssertionError(
+        "workspace API should not be used in CSV mode"
+    )
+
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    csv_rows = [{"email": "alice@example.com", "role_id": "src-role", "workspace_id": "src-ws"}]
+    org_members = [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-role"}]
+    ws_members = [{"id": "src-ws:alice@example.com", "email": "alice@example.com", "role_id": "src-role"}]
+    monkeypatch.setattr(cli_main, "_load_members_csv", lambda _: csv_rows)
+    monkeypatch.setattr(cli_main, "_csv_rows_to_org_members", lambda rows: org_members)
+    monkeypatch.setattr(cli_main, "_csv_rows_for_workspace", lambda rows, ws_id: ws_members)
+
+    result = cli_harness.invoke(["users", "--members-csv", str(csv_path)])
+
+    assert result.exit_code == 0
+    user_role_migrator.migrate_org_members.assert_called_once_with(org_members)
+    user_role_migrator.migrate_workspace_members.assert_called_once_with(
+        selected_members=ws_members
+    )
+
+
+def test_users_command_members_csv_supports_utf8_bom(cli_harness, monkeypatch, tmp_path):
+    """users --members-csv accepts UTF-8 BOM-prefixed CSV headers."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    csv_path = tmp_path / "members_bom.csv"
+    csv_path.write_text(
+        "email,role_id,workspace_id\nalice@example.com,src-role,src-ws\n",
+        encoding="utf-8-sig",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-role": "dst-role"}
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(["users", "--members-csv", str(csv_path)])
+
+    assert result.exit_code == 0
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-role", "full_name": ""}]
+    )
+    user_role_migrator.migrate_workspace_members.assert_called_once_with(
+        selected_members=[
+            {
+                "id": "src-ws:alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-role",
+                "full_name": "",
+            }
+        ]
+    )
+
+
+def test_users_command_without_csv_keeps_api_member_paths(cli_harness, monkeypatch):
+    """users without --members-csv should keep API-driven member discovery."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-role": "dst-role"}
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.list_source_org_members.return_value = [
+        {"id": "src-org-1", "email": "alice@example.com", "role_id": "src-role"}
+    ]
+    user_role_migrator.list_source_pending_org_members.return_value = []
+    user_role_migrator.list_source_workspace_members.return_value = [
+        {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-role"}
+    ]
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(["users"])
+
+    assert result.exit_code == 0
+    user_role_migrator.list_source_org_members.assert_called_once()
+    user_role_migrator.list_source_pending_org_members.assert_called_once()
+    user_role_migrator.list_source_workspace_members.assert_called_once()
+
+
+def test_users_command_always_refreshes_dest_org_identities_for_phase3(
+    cli_harness, monkeypatch
+):
+    """Workspace phase refreshes destination org identities even when cache is empty dict."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-role": "dst-role"}
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_source_org_members.return_value = []
+    user_role_migrator.list_source_pending_org_members.return_value = []
+    user_role_migrator.list_dest_org_members.return_value = [
+        {"id": "dst-org-1", "email": "alice@example.com", "role_id": "dst-role"}
+    ]
+    user_role_migrator.list_source_workspace_members.return_value = [
+        {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-role"}
+    ]
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(["users"])
+
+    assert result.exit_code == 0
+    user_role_migrator.list_dest_org_members.assert_called_once()
+    user_role_migrator.migrate_workspace_members.assert_called_once()
+
+
+def test_users_command_dest_org_refresh_failure_is_graceful(cli_harness, monkeypatch):
+    """Failure refreshing destination identities logs warning and continues."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-role": "dst-role"}
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_source_org_members.return_value = []
+    user_role_migrator.list_source_pending_org_members.return_value = []
+    user_role_migrator.list_dest_org_members.side_effect = Exception("dest lookup failed")
+    user_role_migrator.list_source_workspace_members.return_value = [
+        {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-role"}
+    ]
+    user_role_migrator.migrate_workspace_members.return_value = (0, 0, 1)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(["users"])
+
+    assert result.exit_code == 0
+    assert "failed to refresh destination org identities" in cli_harness.console.text
+    user_role_migrator.migrate_workspace_members.assert_called_once()
 
 
 def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_harness):

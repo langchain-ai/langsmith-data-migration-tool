@@ -20,7 +20,7 @@ class UserRoleMigrator(BaseMigrator):
     def __init__(self, source_client, dest_client, state, config):
         super().__init__(source_client, dest_client, state, config)
         self._role_id_map: Dict[str, str] = {}
-        self._dest_email_to_identity: Dict[str, Dict[str, Any]] = {}
+        self._dest_email_to_identity: Optional[Dict[str, Dict[str, Any]]] = None
 
     # ------------------------------------------------------------------
     # Phase 0: data fetching
@@ -171,7 +171,17 @@ class UserRoleMigrator(BaseMigrator):
                 src_perms = set(role.get("permissions", []))
                 dst_perms = set(existing.get("permissions", []))
                 if src_perms != dst_perms:
-                    self._update_custom_role(existing["id"], role)
+                    if not self._update_custom_role(existing["id"], role):
+                        self.log(
+                            f"Custom role '{display_name}' mapped but permissions may be stale",
+                            "warning",
+                        )
+                        self.record_issue(
+                            "data_integrity",
+                            "custom_role_update_failed",
+                            f"Failed to update permissions for custom role '{display_name}'",
+                            evidence={"role": role, "dest_role_id": existing["id"]},
+                        )
                 else:
                     self.log(f"Custom role '{display_name}' already up to date")
             else:
@@ -215,12 +225,15 @@ class UserRoleMigrator(BaseMigrator):
 
     def _update_custom_role(
         self, dest_role_id: str, source_role: Dict[str, Any]
-    ) -> None:
-        """Update a custom role's permissions on the destination."""
+    ) -> bool:
+        """Update a custom role's permissions on the destination.
+
+        Returns True on success, False on failure.
+        """
         display_name = source_role.get("display_name", "")
         if self.config.migration.dry_run:
             self.log(f"[DRY RUN] Would update custom role: {display_name}")
-            return
+            return True
 
         payload = {
             "display_name": display_name,
@@ -231,10 +244,12 @@ class UserRoleMigrator(BaseMigrator):
         try:
             self.dest.patch(f"/orgs/current/roles/{dest_role_id}", payload)
             self.log(f"Updated custom role: {display_name}", "success")
+            return True
         except APIError as e:
             self.log(
                 f"Failed to update custom role '{display_name}': {e}", "error"
             )
+            return False
 
     # ------------------------------------------------------------------
     # Phase 2: organisation member migration
@@ -265,7 +280,17 @@ class UserRoleMigrator(BaseMigrator):
                 skipped += 1
                 continue
 
-            source_role_id = member.get("role_id")
+            if member.get("_pending"):
+                self.log(f"Processing pending invite: {email}")
+
+            item_id = f"org_member_{email}"
+            self.ensure_item(
+                item_id, "org_member", email,
+                member.get("id", email),
+                metadata={"member": member},
+            )
+
+            source_role_id = (member.get("role_id") or "").strip() or None
             mapped_role_id = self._role_id_map.get(source_role_id) if source_role_id else None
 
             if source_role_id and not mapped_role_id:
@@ -273,11 +298,9 @@ class UserRoleMigrator(BaseMigrator):
                     f"No role mapping for {email} (role_id={source_role_id})",
                     "warning",
                 )
-                self.record_issue(
-                    "dependency",
-                    "unmapped_role",
-                    f"No role mapping for org member '{email}' "
-                    f"(source role_id={source_role_id})",
+                self.mark_blocked(
+                    item_id, "unmapped_role",
+                    next_action="Run phase 1 (role sync) and retry.",
                     evidence={"email": email, "source_role_id": source_role_id},
                 )
                 failed += 1
@@ -286,42 +309,54 @@ class UserRoleMigrator(BaseMigrator):
             dest_member = dest_by_email.get(email)
 
             if dest_member:
-                # Already exists on destination
                 if self.config.migration.skip_existing:
                     self.log(f"Org member '{email}' exists, skipping")
+                    self.mark_migrated(item_id, outcome_code="org_member_skipped_existing")
                     skipped += 1
                     continue
 
-                # Check if role needs updating
                 dest_role_id = dest_member.get("role_id")
                 if mapped_role_id and dest_role_id != mapped_role_id:
                     try:
                         self._update_org_member_role(
                             dest_member["id"], mapped_role_id
                         )
+                        self.mark_migrated(item_id, outcome_code="org_member_migrated")
                         migrated += 1
                     except (AuthenticationError, APIError) as e:
                         self.log(
                             f"Failed to update role for '{email}': {e}",
                             "error",
                         )
+                        self.mark_blocked(
+                            item_id, "org_member_role_update_failed",
+                            next_action="Re-run `langsmith-migrator users`.",
+                            evidence={"email": email, "error": str(e)},
+                        )
                         failed += 1
                 else:
                     self.log(f"Org member '{email}' already has correct role")
+                    self.mark_migrated(item_id, outcome_code="org_member_skipped_existing")
                     skipped += 1
             else:
-                # Invite new member
                 try:
                     self._invite_org_member(email, mapped_role_id)
+                    self.mark_migrated(item_id, outcome_code="org_member_migrated")
                     migrated += 1
                 except ConflictError:
                     self.log(
                         f"Invite for '{email}' already pending, skipping",
                         "warning",
                     )
+                    self.mark_migrated(item_id, outcome_code="org_member_skipped_existing")
                     skipped += 1
                 except (AuthenticationError, APIError) as e:
                     self.log(f"Failed to invite '{email}': {e}", "error")
+                    self.mark_blocked(
+                        item_id, "org_member_invite_failed",
+                        next_action="Re-run `langsmith-migrator users`.",
+                        evidence={"email": email, "error": str(e)},
+                    )
                     failed += 1
 
         return migrated, skipped, failed
@@ -359,7 +394,55 @@ class UserRoleMigrator(BaseMigrator):
     # Phase 3: workspace member migration
     # ------------------------------------------------------------------
 
-    def migrate_workspace_members(self) -> Tuple[int, int, int]:
+    def migrate_workspace_members_from_csv_rows(
+        self, csv_rows: List[Dict[str, Any]]
+    ) -> Tuple[int, int, int]:
+        """Migrate members for the active source workspace from CSV-shaped rows.
+
+        CSV rows must include ``email``, ``role_id``, and ``workspace_id`` fields.
+        The current source workspace is inferred from ``X-Tenant-Id``.
+        """
+        source_workspace_id = self.source.session.headers.get("X-Tenant-Id")
+        if not source_workspace_id:
+            raise APIError(
+                "Workspace context is required to migrate workspace members from CSV",
+                request_info={},
+            )
+
+        selected_by_email: Dict[str, Dict[str, Any]] = {}
+        for row in csv_rows:
+            if row.get("workspace_id") != source_workspace_id:
+                continue
+
+            email = (row.get("email") or "").strip().lower()
+            role_id = (row.get("role_id") or "").strip()
+            if not email:
+                continue
+
+            existing = selected_by_email.get(email)
+            if existing and existing["role_id"] != role_id:
+                raise APIError(
+                    (
+                        "Conflicting workspace role_id values in CSV rows for "
+                        f"{email} in workspace {source_workspace_id}"
+                    ),
+                    request_info={},
+                )
+            if not existing:
+                selected_by_email[email] = {
+                    "id": row.get("id") or f"{source_workspace_id}:{email}",
+                    "email": email,
+                    "role_id": role_id,
+                    "full_name": row.get("full_name", ""),
+                }
+
+        return self.migrate_workspace_members(
+            selected_members=list(selected_by_email.values())
+        )
+
+    def migrate_workspace_members(
+        self, selected_members: Optional[List[Dict[str, Any]]] = None
+    ) -> Tuple[int, int, int]:
         """Migrate workspace members for the currently scoped workspace pair.
 
         Assumes:
@@ -369,7 +452,10 @@ class UserRoleMigrator(BaseMigrator):
 
         Returns ``(migrated, skipped, failed)`` counts.
         """
-        source_members = self.list_source_workspace_members()
+        source_members = selected_members if selected_members is not None else self.list_source_workspace_members()
+        if not source_members:
+            return 0, 0, 0
+
         dest_members = self.list_dest_workspace_members()
 
         dest_by_email: Dict[str, Dict[str, Any]] = {}
@@ -377,6 +463,16 @@ class UserRoleMigrator(BaseMigrator):
             email = (m.get("email") or "").lower()
             if email:
                 dest_by_email[email] = m
+
+        dest_identity = self._dest_email_to_identity or {}
+
+        ws_pair = self.workspace_pair()
+        src_ws = ws_pair.get("source")
+        if not src_ws:
+            raise APIError(
+                "Active source workspace is required for workspace member migration",
+                request_info={},
+            )
 
         migrated = skipped = failed = 0
 
@@ -386,7 +482,14 @@ class UserRoleMigrator(BaseMigrator):
                 skipped += 1
                 continue
 
-            source_role_id = member.get("role_id")
+            item_id = f"ws_member_{src_ws}_{email}"
+            self.ensure_item(
+                item_id, "ws_member", email,
+                member.get("id", email),
+                metadata={"member": member, "workspace_pair": ws_pair},
+            )
+
+            source_role_id = (member.get("role_id") or "").strip() or None
             mapped_role_id = (
                 self._role_id_map.get(source_role_id)
                 if source_role_id
@@ -397,6 +500,11 @@ class UserRoleMigrator(BaseMigrator):
                 self.log(
                     f"No role mapping for workspace member {email}", "warning"
                 )
+                self.mark_blocked(
+                    item_id, "unmapped_role",
+                    next_action="Run phase 1 (role sync) and retry.",
+                    evidence={"email": email, "source_role_id": source_role_id},
+                )
                 failed += 1
                 continue
 
@@ -404,6 +512,7 @@ class UserRoleMigrator(BaseMigrator):
 
             if dest_member:
                 if self.config.migration.skip_existing:
+                    self.mark_migrated(item_id, outcome_code="ws_member_skipped_existing")
                     skipped += 1
                     continue
 
@@ -413,27 +522,32 @@ class UserRoleMigrator(BaseMigrator):
                         self._update_workspace_member_role(
                             dest_member["id"], mapped_role_id
                         )
+                        self.mark_migrated(item_id, outcome_code="ws_member_migrated")
                         migrated += 1
                     except (AuthenticationError, APIError) as e:
                         self.log(
                             f"Failed to update workspace role for '{email}': {e}",
                             "error",
                         )
+                        self.mark_blocked(
+                            item_id, "ws_member_role_update_failed",
+                            next_action="Re-run `langsmith-migrator users`.",
+                            evidence={"email": email, "error": str(e)},
+                        )
                         failed += 1
                 else:
+                    self.mark_migrated(item_id, outcome_code="ws_member_skipped_existing")
                     skipped += 1
             else:
-                # Find the dest org identity for this user
-                dest_org_member = self._dest_email_to_identity.get(email)
+                dest_org_member = dest_identity.get(email)
                 if not dest_org_member:
                     self.log(
                         f"Cannot add '{email}' to workspace: not an org member",
                         "warning",
                     )
-                    self.record_issue(
-                        "dependency",
-                        "ws_member_not_in_org",
-                        f"User '{email}' is not an org member on destination",
+                    self.mark_blocked(
+                        item_id, "ws_member_not_in_org",
+                        next_action="Migrate the user as an org member first, then retry.",
                         evidence={"email": email},
                     )
                     failed += 1
@@ -443,16 +557,23 @@ class UserRoleMigrator(BaseMigrator):
                     self._add_workspace_member(
                         dest_org_member["id"], mapped_role_id
                     )
+                    self.mark_migrated(item_id, outcome_code="ws_member_migrated")
                     migrated += 1
                 except ConflictError:
                     self.log(
                         f"Workspace member '{email}' already exists",
                         "warning",
                     )
+                    self.mark_migrated(item_id, outcome_code="ws_member_skipped_existing")
                     skipped += 1
                 except (AuthenticationError, APIError) as e:
                     self.log(
                         f"Failed to add '{email}' to workspace: {e}", "error"
+                    )
+                    self.mark_blocked(
+                        item_id, "ws_member_add_failed",
+                        next_action="Re-run `langsmith-migrator users`.",
+                        evidence={"email": email, "error": str(e)},
                     )
                     failed += 1
 

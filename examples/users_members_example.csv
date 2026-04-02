@@ -1,0 +1,7 @@
+email,role_id,workspace_id
+amelia.nguyen@example.com,role_org_user_3f6ab9d1,ws_src_prod_us
+amelia.nguyen@example.com,role_org_user_3f6ab9d1,ws_src_prod_eu
+jordan.lee@example.com,role_workspace_admin_91c2a7f4,ws_src_prod_us
+priya.patel@example.com,role_custom_data_steward_7e4d22c8,ws_src_ml_platform
+mateo.garcia@example.com,role_org_admin_b2e9f631,ws_src_shared_services
+sana.khan@example.com,role_workspace_user_0a8d6be5,ws_src_analytics
