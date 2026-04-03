@@ -1117,8 +1117,45 @@ def users(
     # ── Phase 1: Role synchronisation ──
     console.print("\n[bold]Phase 1: Synchronising roles...[/bold]")
 
+    # Step 1a: Let user select which custom roles to sync
+    custom_role_ids_to_sync = None  # None = handled after member selection
+    if roles_only:
+        # When --roles-only, select custom roles interactively
+        try:
+            custom_roles = user_role_migrator.get_source_custom_roles()
+        except Exception as e:
+            console.print(f"  [red]Failed to fetch roles: {e}[/red]")
+            return
+
+        if custom_roles:
+            role_items = [
+                {
+                    "id": r["id"],
+                    "name": r.get("display_name", r.get("name", "")),
+                    "description": r.get("description", ""),
+                }
+                for r in custom_roles
+            ]
+            selected_roles = _select_or_all(
+                config,
+                role_items,
+                select_all=config.migration.non_interactive,
+                title="Select Custom Roles to Sync",
+                columns=[
+                    {"key": "name", "title": "Role Name", "width": 40},
+                    {"key": "description", "title": "Description", "width": 50},
+                ],
+            )
+            custom_role_ids_to_sync = {r["id"] for r in selected_roles}
+            if not custom_role_ids_to_sync:
+                console.print("  [yellow]No custom roles selected[/yellow]")
+        else:
+            custom_role_ids_to_sync = set()
+
     try:
-        role_mapping = user_role_migrator.build_role_mapping()
+        role_mapping = user_role_migrator.build_role_mapping(
+            custom_role_ids=custom_role_ids_to_sync,
+        )
         console.print(f"  [green]{len(role_mapping)} role(s) mapped[/green]")
     except Exception as e:
         console.print(f"  [red]Failed to build role mapping: {e}[/red]")
@@ -1140,6 +1177,7 @@ def users(
         pending_members = user_role_migrator.list_source_pending_org_members()
         all_members = org_members + [{**p, "_pending": True} for p in pending_members]
 
+    selected_members = []
     if not all_members:
         console.print("  [yellow]No org members found[/yellow]")
     else:
@@ -1151,16 +1189,33 @@ def users(
             columns=_MEMBER_COLUMNS,
         )
 
-        if selected_members:
-            migrated, skipped, failed = user_role_migrator.migrate_org_members(
-                selected_members
-            )
-            console.print(
-                f"  Org members: [green]{migrated} migrated[/green], "
-                f"{skipped} skipped, [red]{failed} failed[/red]"
-            )
-        else:
+        if not selected_members:
             console.print("  [yellow]No members selected[/yellow]")
+
+    # Step 2b: Auto-sync custom roles needed by selected members
+    if selected_members:
+        needed_role_ids = set()
+        for m in selected_members:
+            role_id = (m.get("role_id") or "").strip()
+            if role_id and role_id not in role_mapping:
+                needed_role_ids.add(role_id)
+
+        if needed_role_ids:
+            console.print(f"  Syncing {len(needed_role_ids)} additional role(s) needed by selected members...")
+            try:
+                role_mapping = user_role_migrator.build_role_mapping(
+                    custom_role_ids=needed_role_ids,
+                )
+            except Exception as e:
+                console.print(f"  [yellow]Warning: failed to sync some roles: {e}[/yellow]")
+
+        migrated, skipped, failed = user_role_migrator.migrate_org_members(
+            selected_members
+        )
+        console.print(
+            f"  Org members: [green]{migrated} migrated[/green], "
+            f"{skipped} skipped, [red]{failed} failed[/red]"
+        )
 
     # ── Phase 3: Workspace member migration ──
     if skip_workspace_members:

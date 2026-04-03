@@ -95,13 +95,22 @@ class UserRoleMigrator(BaseMigrator):
     # Phase 1: role synchronisation
     # ------------------------------------------------------------------
 
-    def build_role_mapping(self) -> Dict[str, str]:
+    def build_role_mapping(
+        self,
+        custom_role_ids: Optional[set] = None,
+    ) -> Dict[str, str]:
         """Build source_role_id -> dest_role_id mapping.
 
         1. Fetches roles from both sides.
         2. Matches built-in roles by ``name``.
         3. Creates/updates custom roles on destination, matched by ``display_name``.
         4. Persists the mapping in ``state.id_mappings["roles"]``.
+
+        Args:
+            custom_role_ids: If provided, only sync custom roles whose source
+                ``id`` is in this set. Built-in roles are always matched
+                regardless.  Pass ``None`` to sync all custom roles
+                (legacy behaviour).
         """
         source_roles = self.list_source_roles()
         dest_roles = self.list_dest_roles()
@@ -110,11 +119,13 @@ class UserRoleMigrator(BaseMigrator):
             f"Found {len(source_roles)} source roles, {len(dest_roles)} destination roles"
         )
 
-        # Match built-in roles
+        # Match built-in roles (always)
         mapping = self._match_builtin_roles(source_roles, dest_roles)
 
-        # Sync custom roles
-        custom_mapping = self._sync_custom_roles(source_roles, dest_roles)
+        # Sync custom roles (filtered if custom_role_ids provided)
+        custom_mapping = self._sync_custom_roles(
+            source_roles, dest_roles, only_ids=custom_role_ids,
+        )
         mapping.update(custom_mapping)
 
         self._role_id_map = mapping
@@ -126,6 +137,10 @@ class UserRoleMigrator(BaseMigrator):
             self.persist_state()
 
         return mapping
+
+    def get_source_custom_roles(self) -> List[Dict[str, Any]]:
+        """Return only custom roles from the source, for interactive selection."""
+        return [r for r in self.list_source_roles() if r.get("name") == "CUSTOM"]
 
     def _match_builtin_roles(
         self,
@@ -158,11 +173,16 @@ class UserRoleMigrator(BaseMigrator):
         self,
         source_roles: List[Dict[str, Any]],
         dest_roles: List[Dict[str, Any]],
+        only_ids: Optional[set] = None,
     ) -> Dict[str, str]:
         """Sync custom roles by ``display_name``.
 
         Creates missing custom roles on the destination, or updates existing
         ones when permissions differ (unless skip_existing is set).
+
+        Args:
+            only_ids: If provided, only sync custom roles whose source ``id``
+                is in this set.  ``None`` means sync all.
         """
         dest_by_display: Dict[str, Dict[str, Any]] = {}
         for role in dest_roles:
@@ -173,6 +193,9 @@ class UserRoleMigrator(BaseMigrator):
 
         for role in source_roles:
             if role.get("name") != "CUSTOM":
+                continue
+
+            if only_ids is not None and role["id"] not in only_ids:
                 continue
 
             display_name = role.get("display_name", "")
