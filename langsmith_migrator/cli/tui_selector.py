@@ -191,8 +191,17 @@ class ItemSelector(App):
         self.exit()
 
     def action_quit(self) -> None:
-        self.result = None
-        self.exit()
+        search_input = self.query_one("#search-input", Input)
+        if search_input.has_focus:
+            search_input.value = ""
+            self.filter_text = ""
+            self._refresh_table()
+            self._update_stats()
+            table = self.query_one(DataTable)
+            self.set_focus(table)
+        else:
+            self.result = None
+            self.exit()
 
 
 def select_items(
