@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.59] - 2026-04-02
+
+### Fixed
+- **TUI: Enter confirms selection** — Enter key now correctly confirms the selection instead of toggling rows. Space remains the toggle key.
+- **TUI: Escape from search preserves filter** — Pressing Escape while in the search box returns focus to the table without clearing the search filter.
+- **Role sync no longer auto-creates all custom roles** — Phase 1 matches built-in roles only. Custom roles are auto-synced only for the members you select in Phase 2. Use `--roles-only` for interactive custom role selection.
+
 ## [0.0.58] - 2026-04-02
 
 ### Added
