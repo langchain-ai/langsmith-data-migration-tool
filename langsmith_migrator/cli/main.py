@@ -111,7 +111,13 @@ _WS_CANCELLED = "__cancelled__"
 _WS_ABORTED = "__aborted__"
 
 
-def _resolve_workspaces(orchestrator, source_workspace=None, dest_workspace=None, map_workspaces=False):
+def _resolve_workspaces(
+    orchestrator,
+    source_workspace=None,
+    dest_workspace=None,
+    map_workspaces=False,
+    non_interactive=False,
+):
     """Resolve workspace context from explicit IDs or auto-detection.
 
     Returns:
@@ -2737,83 +2743,86 @@ def resume(ctx):
         console.print(f"[red]Failed to load session {session_id}[/red]")
         return
 
-    # Create orchestrator and attach state
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+    orchestrator = MigrationOrchestrator(config, state_manager)
+    try:
+        # Test connections first
+        console.print("Testing connections... ", end="")
+        source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+        if not source_ok:
+            console.print("[red]✗ Source connection failed[/red]")
+            if source_error:
+                console.print(f"[red]  {source_error}[/red]")
+            return
+        if not dest_ok:
+            console.print("[yellow]⚠ Source OK, destination connection failed[/yellow]")
+            if dest_error:
+                console.print(f"[yellow]  {dest_error}[/yellow]")
+            console.print("Continuing with source-only operations...")
+        else:
+            console.print("[green]✓[/green]")
 
-    # Test connections first
-    console.print("Testing connections... ", end="")
-    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
-    if not source_ok:
-        console.print("[red]✗ Source connection failed[/red]")
-        if source_error:
-            console.print(f"[red]  {source_error}[/red]")
-        return
-    if not dest_ok:
-        console.print("[yellow]⚠ Source OK, destination connection failed[/yellow]")
-        if dest_error:
-            console.print(f"[yellow]  {dest_error}[/yellow]")
-        console.print("Continuing with source-only operations...")
-    else:
-        console.print("[green]✓[/green]")
+        # Attach state to orchestrator
+        orchestrator.state = state
+        orchestrator.state_manager.current_state = state
+        config.state_manager = state_manager
 
-    # Attach state to orchestrator
-    orchestrator.state = state
-    orchestrator.state_manager.current_state = state
-    config.state_manager = state_manager
+        # Get resumable items
+        resume_items = state.get_resume_items()
+        checkpoint_items = state.get_checkpoint_items()
 
-    # Get resumable items
-    resume_items = state.get_resume_items()
-    checkpoint_items = state.get_checkpoint_items()
+        console.print(f"\nResumable items: {len(resume_items)}")
+        console.print(f"Checkpoint/manual items: {len(checkpoint_items)}")
 
-    console.print(f"\nResumable items: {len(resume_items)}")
-    console.print(f"Checkpoint/manual items: {len(checkpoint_items)}")
-
-    if checkpoint_items:
-        console.print("\n[bold]Items requiring manual attention:[/bold]")
-        for item in checkpoint_items[:10]:
-            console.print(f"  • {item.name}: {item.next_action or item.outcome_code or 'needs attention'}")
-
-    if not resume_items:
-        console.print("\n[yellow]No items to resume automatically.[/yellow]")
         if checkpoint_items:
-            console.print("[dim]Review the checkpoint items above and resolve them manually.[/dim]")
-        return
+            console.print("\n[bold]Items requiring manual attention:[/bold]")
+            for item in checkpoint_items[:10]:
+                console.print(f"  • {item.name}: {item.next_action or item.outcome_code or 'needs attention'}")
 
-    # Show what will be resumed
-    console.print(f"\n[bold]Items to resume ({len(resume_items)}):[/bold]")
-    type_counts: dict[str, int] = {}
-    for item in resume_items:
-        type_counts[item.type] = type_counts.get(item.type, 0) + 1
-    for item_type, count in sorted(type_counts.items()):
-        console.print(f"  {item_type}: {count}")
+        if not resume_items:
+            console.print("\n[yellow]No items to resume automatically.[/yellow]")
+            if checkpoint_items:
+                console.print("[dim]Review the checkpoint items above and resolve them manually.[/dim]")
+            return
 
-    if not _confirm_action(config, "\nProceed with resume?", default=True, non_interactive_value=True):
-        console.print("[yellow]Cancelled[/yellow]")
-        return
+        # Show what will be resumed
+        console.print(f"\n[bold]Items to resume ({len(resume_items)}):[/bold]")
+        type_counts: dict[str, int] = {}
+        for item in resume_items:
+            type_counts[item.type] = type_counts.get(item.type, 0) + 1
+        for item_type, count in sorted(type_counts.items()):
+            console.print(f"  {item_type}: {count}")
 
-    # Run resume
-    console.print(f"\n[bold]Resuming migration of {len(resume_items)} items[/bold]")
-    results = orchestrator.resume_items(resume_items)
+        if not _confirm_action(config, "\nProceed with resume?", default=True, non_interactive_value=True):
+            console.print("[yellow]Cancelled[/yellow]")
+            return
 
-    # Save state
-    state_manager.save()
+        # Run resume
+        console.print(f"\n[bold]Resuming migration of {len(resume_items)} items[/bold]")
+        results = orchestrator.resume_items(resume_items)
 
-    console.print("[green]Resume processing completed[/green]")
+        # Save state
+        state_manager.save()
 
-    # Report results
-    resumed = results.get("resumed", [])
-    blocked = results.get("blocked", [])
-    console.print(f"\n[bold]Resume Results:[/bold]")
-    console.print(f"  [green]Resumed successfully: {len(resumed)}[/green]")
-    console.print(f"  [yellow]Blocked/needs attention: {len(blocked)}[/yellow]")
+        console.print("[green]Resume processing completed[/green]")
 
-    if blocked and config.migration.verbose:
-        console.print("\n[dim]Blocked items:[/dim]")
-        for item_ref in blocked[:20]:
-            console.print(f"  • {item_ref}")
+        # Report results
+        resumed = results.get("resumed", [])
+        blocked = results.get("blocked", [])
+        console.print(f"\n[bold]Resume Results:[/bold]")
+        console.print(f"  [green]Resumed successfully: {len(resumed)}[/green]")
+        console.print(f"  [yellow]Blocked/needs attention: {len(blocked)}[/yellow]")
 
-    _display_resolution_summary(orchestrator)
-    _exit_for_remediation_if_needed(ctx, config, orchestrator)
+        if blocked and config.migration.verbose:
+            console.print("\n[dim]Blocked items:[/dim]")
+            for item_ref in blocked[:20]:
+                console.print(f"  • {item_ref}")
+
+        _display_resolution_summary(orchestrator)
+        _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    finally:
+        orchestrator.cleanup()
+
+
 def main():
     """Main entry point."""
     try:
