@@ -150,6 +150,52 @@ When running `users`, you can provide member details from CSV instead of source 
 langsmith-migrator users --members-csv examples/users_members_example.csv --map-workspaces
 ```
 
+For a single deployed LangSmith instance, `users` can also run as an access-sync command instead of a source→destination migration.
+
+Safe default: add or update access from the CSV without removing anyone:
+
+```bash
+langsmith-migrator users \
+  --api-key "$LANGSMITH_API_KEY" \
+  --url "https://your-langsmith-instance.example.com" \
+  --csv examples/users_members_example.csv
+```
+
+Preview the same run without making changes:
+
+```bash
+langsmith-migrator users \
+  --dry-run \
+  --api-key "$LANGSMITH_API_KEY" \
+  --url "https://your-langsmith-instance.example.com" \
+  --csv examples/users_members_example.csv
+```
+
+Authoritative mode: make the CSV the source of truth for access and remove anything not present:
+
+```bash
+langsmith-migrator users \
+  --api-key "$LANGSMITH_API_KEY" \
+  --url "https://your-langsmith-instance.example.com" \
+  --csv examples/users_members_example.csv \
+  --sync
+```
+
+Equivalent explicit form:
+
+```bash
+langsmith-migrator \
+  --dest-key "$LANGSMITH_API_KEY" \
+  --dest-url "https://your-langsmith-instance.example.com" \
+  users \
+  --single-instance \
+  --members-csv examples/users_members_example.csv \
+  --csv-source-of-truth
+```
+
+In `--single-instance` mode, the command mirrors the provided instance configuration onto both internal clients, so you only need one working LangSmith connection. Workspace rows use the target workspace IDs directly; there is no workspace mapping step. All CSV rows are applied automatically after a single confirmation summary; there is no row-selection step in this mode. `--api-key`/`--url` imply `--single-instance`, `--csv` is a short alias for `--members-csv`, and `--sync` is a short alias for `--csv-source-of-truth`.
+`users --dry-run` is also supported as a command-local preview flag if you prefer to put dry-run after the subcommand instead of before it.
+
 CSV schema:
 
 ```csv
@@ -164,6 +210,25 @@ Notes:
 - `workspace_name` is optional and informational only.
 - `langsmith_role` should be a built-in LangSmith role name (for example `Organization Admin`, `Organization User`, `Workspace Admin`) or a custom role `display_name`.
 - Users who only appear in workspace rows are invited to the org with the source `ORGANIZATION_USER` role before workspace membership is applied.
+- `Organization Admin` on a workspace row is treated as org-level admin access only. No explicit workspace membership is created because org admins already have workspace access.
+- Other org-scoped roles cannot be used on workspace rows. If you want org-level access, leave `workspace_id` empty.
+- Workspace-scoped roles such as `Workspace Admin` cannot be used on org-level rows.
+- `--sync` / `--csv-source-of-truth` is the only mode that removes access. Without it, single-instance CSV mode only adds or updates access.
+- `--csv-source-of-truth` is available with `--single-instance` and makes the CSV authoritative for access:
+  - users missing from the CSV are removed from the org
+  - pending org invites missing from the CSV are cancelled
+  - workspace memberships missing from the CSV are removed
+  - workspaces omitted from the CSV are treated as having no desired memberships
+
+Guardrails:
+- `--api-key` and `--url` must be provided together when either is used.
+- `--single-instance` requires `--csv` / `--members-csv`.
+- `--sync` requires `--csv` and cannot be combined with `--skip-existing` or `--skip-workspace-members`.
+- `--single-instance` cannot be combined with workspace mapping flags.
+- `--roles-only` cannot be combined with `--single-instance` or `--members-csv`.
+- If the CSV contains workspace rows and `--skip-workspace-members` is set, the command fails instead of silently ignoring those rows.
+- If the CSV contains workspace-only users, the target instance must have an `ORGANIZATION_USER` role available or the command fails before applying member changes.
+- If the CSV references unknown `workspace_id` values, the command fails before any membership changes are applied.
 
 ### CLI Options
 
@@ -217,9 +282,20 @@ The prompt default is `No` (rules are created disabled).
 ### Users Options
 
 ```bash
+--dry-run                  Preview this users sync without making POST/PATCH/DELETE changes
 --roles-only               Only sync custom roles (skip member migration)
 --skip-workspace-members   Skip workspace member migration (phases 1-2 only)
---members-csv PATH         CSV file with member details (email, langsmith_role, workspace_id, workspace_name)
+--single-instance, --instance
+                           Use one target LangSmith instance for CSV-driven access sync instead of source→destination migration
+--csv-source-of-truth, --sync
+                           Make the CSV authoritative for single-instance sync: remove org users, pending invites, and
+                           workspace memberships not present in the CSV. Without this flag, CSV mode only adds or updates
+                           access.
+--members-csv, --csv PATH  CSV file with member details (email, langsmith_role, workspace_id, workspace_name)
+                           Replaces source member API lookups. In --single-instance mode, all CSV rows are applied
+                           automatically.
+--api-key TEXT             API key for the single-instance CSV sync target. Must be provided together with --url.
+--url TEXT                 Base URL for the single-instance CSV sync target. Must be provided together with --api-key.
 ```
 
 Migration proceeds in three phases:

@@ -384,6 +384,8 @@ _BUILTIN_ROLE_ALIASES: dict[str, str] = {
     "organization user": "ORGANIZATION_USER",
     "workspace admin": "WORKSPACE_ADMIN",
 }
+_ORG_SCOPED_BUILTIN_ROLE_NAMES = {"ORGANIZATION_ADMIN", "ORGANIZATION_USER"}
+_WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES = {"WORKSPACE_ADMIN"}
 
 
 def _resolve_csv_role_names(
@@ -453,11 +455,18 @@ def _resolve_csv_role_names(
                 ambiguous.add(row["langsmith_role"])
                 continue
             role_id = next(iter(unique_role_ids))
+        resolved_role_name = next(
+            candidate_role_name
+            for candidate_role_id, candidate_role_name in candidates
+            if candidate_role_id == role_id
+        )
 
         resolved_rows.append(
             {
                 "email": row["email"],
+                "langsmith_role": row["langsmith_role"],
                 "role_id": role_id,
+                "role_name": resolved_role_name,
                 "workspace_id": row.get("workspace_id", ""),
             }
         )
@@ -476,6 +485,60 @@ def _resolve_csv_role_names(
         raise click.ClickException(". ".join(errors))
 
     return resolved_rows, org_user_role_id
+
+
+def _normalize_csv_role_scopes(
+    csv_rows: list[dict],
+) -> tuple[list[dict], int]:
+    """Validate role scope usage and normalize supported org-role workspace rows.
+
+    `Organization Admin` is the one supported org-scoped role on a workspace
+    row. Those rows are treated as org-level admin access because org admins
+    already have access across workspaces and do not need explicit workspace
+    memberships. Other org-scoped roles on workspace rows are rejected so the
+    CSV cannot silently grant less access than the operator intended.
+    """
+    normalized_rows: list[dict] = []
+    org_admin_workspace_rows = 0
+    errors: list[str] = []
+
+    for row in csv_rows:
+        workspace_id = (row.get("workspace_id") or "").strip()
+        role_name = (row.get("role_name") or "").strip().upper()
+        role_label = row.get("langsmith_role") or role_name or row.get("role_id") or "<unknown>"
+        email = row["email"]
+
+        if not workspace_id:
+            if role_name in _WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES:
+                errors.append(
+                    f"{email}: '{role_label}' is workspace-scoped and cannot be used "
+                    "on an org-level row; add a workspace_id or choose an org-scoped role"
+                )
+                continue
+            normalized_rows.append(row)
+            continue
+
+        if role_name == "ORGANIZATION_ADMIN":
+            normalized_rows.append({**row, "workspace_id": ""})
+            org_admin_workspace_rows += 1
+            continue
+
+        if role_name in _ORG_SCOPED_BUILTIN_ROLE_NAMES:
+            errors.append(
+                f"{email} in workspace {workspace_id}: '{role_label}' is org-scoped "
+                "and cannot be used on a workspace row; leave workspace_id empty for "
+                "org access or choose a workspace-scoped role"
+            )
+            continue
+
+        normalized_rows.append(row)
+
+    if errors:
+        raise click.ClickException(
+            "Members CSV has invalid role scope assignments: " + "; ".join(errors)
+        )
+
+    return normalized_rows, org_admin_workspace_rows
 
 
 def _csv_rows_to_org_members(
@@ -543,6 +606,109 @@ def _csv_rows_for_workspace(csv_rows: list[dict], source_workspace_id: str) -> l
                 "full_name": "",
             }
     return list(members_by_email.values())
+
+
+def _normalize_single_instance_url(url: str) -> str:
+    """Normalize base URLs before validating single-instance mode."""
+    normalized = (url or "").rstrip("/").lower()
+    for suffix in ("/api/v1", "/api/v2"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized.rstrip("/")
+
+
+def _configure_single_instance(config: Config) -> None:
+    """Mirror one resolved connection config onto both clients for single-instance runs."""
+    candidates: list[tuple[str, str, str]] = []
+    if config.source.api_key:
+        candidates.append(("source", config.source.api_key, config.source.base_url))
+    if config.destination.api_key:
+        candidates.append(("destination", config.destination.api_key, config.destination.base_url))
+
+    if not candidates:
+        raise click.ClickException(
+            "Single-instance mode requires a target API key and URL. "
+            "Pass --api-key and --url, or provide one unambiguous configured connection."
+        )
+
+    unique_candidates = {
+        (api_key, _normalize_single_instance_url(base_url)): base_url
+        for _, api_key, base_url in candidates
+    }
+    if len(unique_candidates) != 1:
+        raise click.ClickException(
+            "Single-instance mode found multiple configured LangSmith targets. "
+            "Pass --api-key and --url to choose the target instance explicitly."
+        )
+
+    canonical_key, _ = next(iter(unique_candidates))
+    canonical_url = next(iter(unique_candidates.values()))
+
+    config.source.api_key = canonical_key
+    config.destination.api_key = canonical_key
+    config.source.base_url = canonical_url
+    config.destination.base_url = canonical_url
+
+
+def _resolve_single_instance_workspace_ids(
+    csv_rows: list[dict],
+    available_workspace_ids: set[str],
+    *,
+    source_of_truth: bool,
+) -> list[str]:
+    """Return workspace IDs to reconcile for a single-instance CSV sync."""
+    csv_workspace_ids = {
+        (row.get("workspace_id") or "").strip()
+        for row in csv_rows
+        if (row.get("workspace_id") or "").strip()
+    }
+    unknown_workspace_ids = sorted(csv_workspace_ids - available_workspace_ids)
+    if unknown_workspace_ids:
+        raise click.ClickException(
+            "Members CSV references unknown workspace_id value(s): "
+            + ", ".join(unknown_workspace_ids)
+        )
+
+    workspace_ids = available_workspace_ids | csv_workspace_ids if source_of_truth else csv_workspace_ids
+    return sorted(workspace_ids)
+
+
+def _print_single_instance_users_summary(
+    config: Config,
+    *,
+    csv_rows: list[dict],
+    workspace_ids: list[str],
+    csv_source_of_truth: bool,
+    skip_workspace_members: bool,
+) -> None:
+    """Print a concise, high-signal summary for single-instance CSV sync runs."""
+    org_rows = sum(1 for row in csv_rows if not row.get("workspace_id"))
+    workspace_rows = len(csv_rows) - org_rows
+
+    console.print("\n[bold]Single-Instance User Sync[/bold]")
+    console.print(f"  Target: {config.destination.base_url}")
+    console.print(f"  CSV rows: {len(csv_rows)} total ({org_rows} org-level, {workspace_rows} workspace-level)")
+    console.print(
+        f"  Execution: {'dry run (no changes will be sent)' if config.migration.dry_run else 'live apply'}"
+    )
+    console.print(
+        f"  Removals: {'enabled (authoritative CSV sync)' if csv_source_of_truth else 'disabled (add/update only)'}"
+    )
+    console.print("  Row selection: disabled (all CSV rows will be applied)")
+    if skip_workspace_members:
+        console.print("  Workspace access: skipped")
+    elif csv_source_of_truth:
+        console.print(
+            f"  Workspace access: authoritative across {len(workspace_ids)} target workspace(s); "
+            "memberships missing from the CSV will be removed"
+        )
+    elif workspace_ids:
+        console.print(
+            f"  Workspace access: direct target workspace IDs from CSV ({len(workspace_ids)} workspace(s) in scope)"
+        )
+    else:
+        console.print("  Workspace access: no workspace rows in the CSV")
 
 
 def _workspace_scope_key(orchestrator) -> str:
@@ -1143,33 +1309,136 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
 
 @cli.command()
 @ssl_option
+@click.option(
+    '--dry-run',
+    'users_dry_run',
+    is_flag=True,
+    help='Preview this users sync without making POST/PATCH/DELETE changes. Same as the global --dry-run.',
+)
 @click.option('--roles-only', is_flag=True, help='Only migrate custom roles (skip members)')
 @click.option('--skip-workspace-members', is_flag=True, help='Skip workspace member migration')
 @click.option(
+    '--single-instance',
+    '--instance',
+    is_flag=True,
+    help='Use one target LangSmith instance for CSV-driven access sync instead of source→destination migration',
+)
+@click.option(
+    '--csv-source-of-truth',
+    '--sync',
+    is_flag=True,
+    help=(
+        'Make the CSV authoritative for single-instance sync: remove org users, '
+        'pending invites, and workspace memberships not present in the CSV. '
+        'Without this flag, CSV mode only adds or updates access.'
+    ),
+)
+@click.option(
     '--members-csv',
+    '--csv',
+    'members_csv',
     type=click.Path(exists=True, dir_okay=False, path_type=str),
     help=(
         "CSV file with member details (email, langsmith_role, workspace_id, "
         "workspace_name). Replaces source member API lookups. Rows with an "
-        "empty workspace_id are org-level role assignments."
+        "empty workspace_id are org-level role assignments. Organization "
+        "Admin on a workspace row is treated as org-level access only. In "
+        "--single-instance mode, all CSV rows are applied automatically."
     ),
+)
+@click.option(
+    '--api-key',
+    'instance_key',
+    help='API key for the single-instance CSV sync target. Must be provided together with --url.',
+)
+@click.option(
+    '--url',
+    'instance_url',
+    help='Base URL for the single-instance CSV sync target. Must be provided together with --api-key.',
 )
 @workspace_options
 @click.pass_context
 def users(
     ctx,
+    users_dry_run,
     roles_only,
     skip_workspace_members,
+    single_instance,
+    csv_source_of_truth,
     members_csv,
+    instance_key,
+    instance_url,
     source_workspace,
     dest_workspace,
     map_workspaces,
 ):
-    """Migrate users, roles, and workspace memberships."""
+    """Migrate users and roles, or sync one LangSmith instance from a CSV."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
 
     display_banner()
+
+    if users_dry_run:
+        config.migration.dry_run = True
+
+    if bool(instance_key) != bool(instance_url):
+        raise click.ClickException(
+            "--api-key and --url must be provided together for single-instance CSV sync"
+        )
+
+    if instance_key and instance_url:
+        config.source.api_key = instance_key
+        config.destination.api_key = instance_key
+        config.source.base_url = instance_url
+        config.destination.base_url = instance_url
+
+    if instance_key or instance_url or csv_source_of_truth:
+        single_instance = True
+
+    if single_instance and roles_only:
+        raise click.ClickException(
+            "--roles-only cannot be combined with --single-instance because "
+            "single-instance mode only supports CSV-driven member access sync"
+        )
+    if roles_only and members_csv:
+        raise click.ClickException(
+            "--roles-only cannot be combined with --members-csv because CSV "
+            "input only applies to member migration"
+        )
+    if csv_source_of_truth and not members_csv:
+        raise click.ClickException(
+            "--csv-source-of-truth requires --members-csv"
+        )
+    if csv_source_of_truth and config.migration.skip_existing:
+        raise click.ClickException(
+            "--csv-source-of-truth cannot be combined with --skip-existing"
+        )
+    if csv_source_of_truth and skip_workspace_members:
+        raise click.ClickException(
+            "--csv-source-of-truth cannot be combined with "
+            "--skip-workspace-members because authoritative sync must reconcile "
+            "workspace access"
+        )
+    if single_instance:
+        if not members_csv:
+            raise click.ClickException("--single-instance requires --members-csv")
+        if map_workspaces or source_workspace or dest_workspace:
+            raise click.ClickException(
+                "--single-instance cannot be combined with workspace mapping flags"
+            )
+        _configure_single_instance(config)
+
+    csv_member_rows = _load_members_csv(members_csv) if members_csv else None
+    apply_all_csv_rows = bool(single_instance and csv_member_rows is not None)
+    csv_has_workspace_rows = bool(
+        csv_member_rows and any(row.get("workspace_id") for row in csv_member_rows)
+    )
+    if skip_workspace_members and csv_has_workspace_rows:
+        raise click.ClickException(
+            "--skip-workspace-members cannot be used when the CSV contains "
+            "workspace_id values. Remove the flag to apply workspace access, "
+            "or remove workspace rows from the CSV."
+        )
 
     if not ensure_config(config):
         return
@@ -1181,17 +1450,32 @@ def users(
         orchestrator.cleanup()
         return
 
-    # Resolve workspace context (needed for phase 3)
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
-    if ws_result is _WS_ABORTED:
-        ctx.exit(1)
-        return
-    if ws_result is _WS_CANCELLED:
-        console.print("[yellow]Cancelled[/yellow]")
-        orchestrator.cleanup()
-        return
-
-    ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+    available_workspace_ids: set[str] = set()
+    ws_result = None
+    if single_instance:
+        available_workspace_ids = {
+            ws.get("id", "")
+            for ws in _list_workspaces(orchestrator.dest_client)
+            if ws.get("id")
+        }
+        ws_pairs = [(None, None)]
+    else:
+        # Resolve workspace context (needed for phase 3)
+        ws_result = _resolve_workspaces(
+            orchestrator,
+            source_workspace,
+            dest_workspace,
+            map_workspaces,
+            non_interactive=config.migration.non_interactive,
+        )
+        if ws_result is _WS_ABORTED:
+            ctx.exit(1)
+            return
+        if ws_result is _WS_CANCELLED:
+            console.print("[yellow]Cancelled[/yellow]")
+            orchestrator.cleanup()
+            return
+        ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
 
     # Clear workspace context for org-scoped phases 1-2
     orchestrator.clear_workspace_context()
@@ -1223,26 +1507,76 @@ def users(
         orchestrator.cleanup()
         return
 
-    csv_member_rows = _load_members_csv(members_csv) if members_csv else None
     default_org_role_id: str | None = None
+    ws_only_emails: set[str] = set()
+    org_admin_workspace_row_count = 0
 
     if csv_member_rows is not None:
         source_roles = user_role_migrator.list_source_roles()
         csv_member_rows, default_org_role_id = _resolve_csv_role_names(
             csv_member_rows, source_roles
         )
+        csv_member_rows, org_admin_workspace_row_count = _normalize_csv_role_scopes(
+            csv_member_rows
+        )
+        org_emails: set[str] = set()
+        ws_emails: set[str] = set()
+        for row in csv_member_rows:
+            (ws_emails if row.get("workspace_id") else org_emails).add(row["email"])
+        ws_only_emails = ws_emails - org_emails
+
         if default_org_role_id is None:
-            org_emails: set[str] = set()
-            ws_emails: set[str] = set()
-            for r in csv_member_rows:
-                (ws_emails if r.get("workspace_id") else org_emails).add(r["email"])
-            ws_only_emails = ws_emails - org_emails
             if ws_only_emails:
+                if single_instance:
+                    raise click.ClickException(
+                        "Single-instance CSV sync requires an ORGANIZATION_USER "
+                        "role when the CSV contains workspace-only users"
+                    )
                 console.print(
                     f"  [yellow]Warning: no ORGANIZATION_USER role found on source; "
                     f"{len(ws_only_emails)} workspace-only user(s) will not be "
                     f"invited to the org.[/yellow]"
                 )
+
+        if single_instance:
+            workspace_ids = _resolve_single_instance_workspace_ids(
+                csv_member_rows,
+                available_workspace_ids,
+                source_of_truth=csv_source_of_truth,
+            )
+            ws_pairs = [(workspace_id, workspace_id) for workspace_id in workspace_ids]
+
+        if org_admin_workspace_row_count:
+            console.print(
+                "  [cyan]Note:[/cyan] "
+                f"{org_admin_workspace_row_count} workspace row(s) used "
+                "Organization Admin and were treated as org-level admin access only."
+            )
+
+    if apply_all_csv_rows:
+        _print_single_instance_users_summary(
+            config,
+            csv_rows=csv_member_rows,
+            workspace_ids=[dst_ws for _, dst_ws in ws_pairs if dst_ws],
+            csv_source_of_truth=csv_source_of_truth,
+            skip_workspace_members=skip_workspace_members,
+        )
+        confirm_prompt = (
+            "Proceed with authoritative single-instance CSV sync? This will "
+            "remove access that is not present in the CSV."
+            if csv_source_of_truth
+            else "Proceed with single-instance CSV apply? This will add or "
+            "update access for every CSV row."
+        )
+        if not _confirm_action(
+            config,
+            confirm_prompt,
+            default=True,
+            non_interactive_value=True,
+        ):
+            console.print("[yellow]Cancelled[/yellow]")
+            orchestrator.cleanup()
+            return
 
     # ── Phase 2: Org member migration ──
     console.print("\n[bold]Phase 2: Migrating organisation members...[/bold]")
@@ -1259,21 +1593,31 @@ def users(
     if not all_members:
         console.print("  [yellow]No org members found[/yellow]")
     else:
-        selected_members = _select_or_all(
-            config,
-            all_members,
-            select_all=config.migration.non_interactive,
-            title="Select Organisation Members to Migrate",
-            columns=_MEMBER_COLUMNS,
-        )
+        if apply_all_csv_rows:
+            selected_members = all_members
+        else:
+            selected_members = _select_or_all(
+                config,
+                all_members,
+                select_all=config.migration.non_interactive,
+                title="Select Organisation Members to Migrate",
+                columns=_MEMBER_COLUMNS,
+            )
 
         if selected_members:
             migrated, skipped, failed = user_role_migrator.migrate_org_members(
-                selected_members
+                selected_members,
+                remove_missing=csv_source_of_truth,
+                remove_pending=csv_source_of_truth,
             )
+            removal_note = ""
+            if csv_source_of_truth:
+                removal_note = (
+                    f" [dim](includes {user_role_migrator._last_org_member_removals} removed)[/dim]"
+                )
             console.print(
                 f"  Org members: [green]{migrated} migrated[/green], "
-                f"{skipped} skipped, [red]{failed} failed[/red]"
+                f"{skipped} skipped, [red]{failed} failed[/red]{removal_note}"
             )
         else:
             console.print("  [yellow]No members selected[/yellow]")
@@ -1310,29 +1654,38 @@ def users(
                     ws_members = _csv_rows_for_workspace(csv_member_rows, src_ws)
                 else:
                     ws_members = user_role_migrator.list_source_workspace_members()
-                if not ws_members:
+                if not ws_members and not csv_source_of_truth:
                     console.print("    [yellow]No workspace members found[/yellow]")
                     continue
 
-                selected_ws_members = _select_or_all(
-                    config,
-                    ws_members,
-                    select_all=config.migration.non_interactive,
-                    title="Select Workspace Members to Migrate",
-                    columns=_MEMBER_COLUMNS,
-                )
+                if apply_all_csv_rows:
+                    selected_ws_members = ws_members
+                else:
+                    selected_ws_members = _select_or_all(
+                        config,
+                        ws_members,
+                        select_all=config.migration.non_interactive,
+                        title="Select Workspace Members to Migrate",
+                        columns=_MEMBER_COLUMNS,
+                    )
 
-                if not selected_ws_members:
+                if not selected_ws_members and not csv_source_of_truth:
                     console.print("    [yellow]No members selected[/yellow]")
                     continue
 
                 try:
                     m, s, f = user_role_migrator.migrate_workspace_members(
-                        selected_members=selected_ws_members
+                        selected_members=selected_ws_members,
+                        remove_missing=csv_source_of_truth,
                     )
+                    removal_note = ""
+                    if csv_source_of_truth:
+                        removal_note = (
+                            f" [dim](includes {user_role_migrator._last_workspace_member_removals} removed)[/dim]"
+                        )
                     console.print(
                         f"    [green]{m} migrated[/green], {s} skipped, "
-                        f"[red]{f} failed[/red]"
+                        f"[red]{f} failed[/red]{removal_note}"
                     )
                 except Exception as e:
                     console.print(f"    [red]Failed: {e}[/red]")
