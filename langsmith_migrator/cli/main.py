@@ -49,7 +49,11 @@ from ..utils.workspace import (
     list_projects as _list_projects,
     list_workspaces as _list_workspaces,
 )
-from ..utils.workspace_resolver import resolve_workspace_context, display_workspaces
+from ..utils.workspace_resolver import (
+    WorkspaceResolutionError,
+    display_workspaces,
+    resolve_workspace_context,
+)
 
 
 console = Console()
@@ -104,15 +108,23 @@ def _name_mapping_to_id_mapping(
 
 
 _WS_CANCELLED = "__cancelled__"
+_WS_ABORTED = "__aborted__"
 
 
-def _resolve_workspaces(orchestrator, source_workspace=None, dest_workspace=None, map_workspaces=False):
+def _resolve_workspaces(
+    orchestrator,
+    source_workspace=None,
+    dest_workspace=None,
+    map_workspaces=False,
+    non_interactive=False,
+):
     """Resolve workspace context from explicit IDs or auto-detection.
 
     Returns:
         - WorkspaceProjectResult if workspace scoping is active
         - None if no workspace scoping is needed (single-workspace or none found)
         - _WS_CANCELLED sentinel if the user explicitly cancelled the TUI
+        - _WS_ABORTED sentinel if workspace resolution failed safely
     """
     # Explicit single-pair override
     if source_workspace and dest_workspace:
@@ -129,12 +141,16 @@ def _resolve_workspaces(orchestrator, source_workspace=None, dest_workspace=None
         return _WS_CANCELLED
 
     # Auto-detect (config is lazy-loaded inside resolve_workspace_context)
-    result = resolve_workspace_context(
-        orchestrator.source_client,
-        orchestrator.dest_client,
-        console,
-        force_tui=map_workspaces,
-    )
+    try:
+        result = resolve_workspace_context(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            console,
+            force_tui=map_workspaces,
+            non_interactive=non_interactive,
+        )
+    except WorkspaceResolutionError:
+        return _WS_ABORTED
 
     # If force_tui was set and user cancelled, treat as abort
     if result is None and map_workspaces:
@@ -307,11 +323,15 @@ def _select_or_all(config: Config, items: list, *, select_all: bool, title: str,
 def _load_members_csv(path: str) -> list[dict]:
     """Load and validate a members CSV file.
 
+    Expected columns: ``email``, ``langsmith_role``.
+    Optional columns: ``workspace_id`` (empty for org-level rows),
+    ``workspace_name`` (informational, ignored).
+
     Click's ``type=click.Path(exists=True, dir_okay=False)`` already
     validates existence and file-type before this function is called.
     """
     csv_path = Path(path)
-    required_columns = {"email", "role_id", "workspace_id"}
+    required_columns = {"email", "langsmith_role"}
 
     try:
         # utf-8-sig allows BOM-prefixed files exported by spreadsheet tools.
@@ -328,26 +348,22 @@ def _load_members_csv(path: str) -> list[dict]:
             rows: list[dict] = []
             for index, row in enumerate(reader, start=2):
                 email = (row.get("email") or "").strip().lower()
-                role_id = (row.get("role_id") or "").strip()
+                langsmith_role = (row.get("langsmith_role") or "").strip()
                 workspace_id = (row.get("workspace_id") or "").strip()
 
                 if not email:
                     raise click.ClickException(
                         f"Members CSV row {index} has an empty email value"
                     )
-                if not role_id:
+                if not langsmith_role:
                     raise click.ClickException(
-                        f"Members CSV row {index} has an empty role_id value"
-                    )
-                if not workspace_id:
-                    raise click.ClickException(
-                        f"Members CSV row {index} has an empty workspace_id value"
+                        f"Members CSV row {index} has an empty langsmith_role value"
                     )
 
                 rows.append(
                     {
                         "email": email,
-                        "role_id": role_id,
+                        "langsmith_role": langsmith_role,
                         "workspace_id": workspace_id,
                     }
                 )
@@ -363,19 +379,126 @@ def _load_members_csv(path: str) -> list[dict]:
     return rows
 
 
-def _csv_rows_to_org_members(csv_rows: list[dict]) -> list[dict]:
+_BUILTIN_ROLE_ALIASES: dict[str, str] = {
+    "organization admin": "ORGANIZATION_ADMIN",
+    "organization user": "ORGANIZATION_USER",
+    "workspace admin": "WORKSPACE_ADMIN",
+}
+
+
+def _resolve_csv_role_names(
+    csv_rows: list[dict], source_roles: list[dict]
+) -> tuple[list[dict], str | None]:
+    """Resolve human-readable role names to source role IDs.
+
+    Returns ``(resolved_rows, org_user_role_id)`` where each resolved row
+    has ``role_id`` instead of ``langsmith_role``, and *org_user_role_id*
+    is the source role ID for ORGANIZATION_USER (used as the default org
+    role for users who only appear in workspace rows). Built-in role
+    identifiers and documented aliases take precedence over colliding
+    custom role display names.
+    """
+    role_lookup: dict[str, list[tuple[str, str]]] = {}
+    builtin_by_name: dict[str, str] = {}
+    preferred_builtin_by_label: dict[str, str] = {}
+    org_user_role_id: str | None = None
+
+    def register_role_label(label: str, role_id: str, role_name: str) -> None:
+        candidates = role_lookup.setdefault(label, [])
+        if not any(existing_role_id == role_id for existing_role_id, _ in candidates):
+            candidates.append((role_id, role_name))
+
+    for role in source_roles:
+        role_name = role.get("name", "")
+        role_id = role["id"]
+        dn = (role.get("display_name") or "").strip().lower()
+
+        if role_name != "CUSTOM":
+            builtin_by_name[role_name] = role_id
+            if dn:
+                register_role_label(dn, role_id, role_name)
+            builtin_label = role_name.lower()
+            register_role_label(builtin_label, role_id, role_name)
+            preferred_builtin_by_label[builtin_label] = role_id
+            if role_name == "ORGANIZATION_USER":
+                org_user_role_id = role_id
+        elif dn:
+            register_role_label(dn, role_id, role_name)
+
+    for alias, builtin_name in _BUILTIN_ROLE_ALIASES.items():
+        builtin_role_id = builtin_by_name.get(builtin_name)
+        if builtin_role_id:
+            register_role_label(alias, builtin_role_id, builtin_name)
+            preferred_builtin_by_label[alias] = builtin_role_id
+
+    ambiguous: set[str] = set()
+    unresolved: set[str] = set()
+    resolved_rows: list[dict] = []
+    for row in csv_rows:
+        label = row["langsmith_role"].strip().lower()
+        candidates = role_lookup.get(label, [])
+        if not candidates:
+            unresolved.add(row["langsmith_role"])
+            continue
+
+        preferred_role_id = preferred_builtin_by_label.get(label)
+        if preferred_role_id and any(
+            candidate_role_id == preferred_role_id
+            for candidate_role_id, _ in candidates
+        ):
+            role_id = preferred_role_id
+        else:
+            unique_role_ids = {candidate_role_id for candidate_role_id, _ in candidates}
+            if len(unique_role_ids) != 1:
+                ambiguous.add(row["langsmith_role"])
+                continue
+            role_id = next(iter(unique_role_ids))
+
+        resolved_rows.append(
+            {
+                "email": row["email"],
+                "role_id": role_id,
+                "workspace_id": row.get("workspace_id", ""),
+            }
+        )
+
+    if ambiguous or unresolved:
+        available = sorted(role_lookup.keys())
+        errors: list[str] = []
+        if ambiguous:
+            errors.append("Ambiguous role name(s): " + ", ".join(sorted(ambiguous)))
+        if unresolved:
+            errors.append(
+                "Could not resolve role name(s): "
+                + ", ".join(sorted(unresolved))
+            )
+        errors.append("Available roles: " + ", ".join(available))
+        raise click.ClickException(". ".join(errors))
+
+    return resolved_rows, org_user_role_id
+
+
+def _csv_rows_to_org_members(
+    csv_rows: list[dict], default_org_role_id: str | None = None
+) -> list[dict]:
     """Build org member payloads from CSV rows.
 
-    A single org role is applied per email, so conflicting role_id values
-    for the same email across workspaces are rejected.
+    Rows with an empty ``workspace_id`` are org-level assignments whose
+    ``role_id`` is used directly.  Users who only appear in workspace
+    rows (non-empty ``workspace_id``) are assigned *default_org_role_id*
+    (typically ORGANIZATION_USER) so they can be invited to the org.
     """
+    org_rows = [r for r in csv_rows if not r.get("workspace_id")]
+    ws_rows = [r for r in csv_rows if r.get("workspace_id")]
+
     members_by_email: dict[str, dict] = {}
-    for row in csv_rows:
+
+    for row in org_rows:
         email = row["email"]
         existing = members_by_email.get(email)
         if existing and existing["role_id"] != row["role_id"]:
             raise click.ClickException(
-                "Members CSV has conflicting role_id values for "
+                "Members CSV has conflicting org-level roles for "
                 f"{email}: '{existing['role_id']}' vs '{row['role_id']}'"
             )
         if not existing:
@@ -385,6 +508,17 @@ def _csv_rows_to_org_members(csv_rows: list[dict]) -> list[dict]:
                 "role_id": row["role_id"],
                 "full_name": "",
             }
+
+    for row in ws_rows:
+        email = row["email"]
+        if email not in members_by_email and default_org_role_id:
+            members_by_email[email] = {
+                "id": email,
+                "email": email,
+                "role_id": default_org_role_id,
+                "full_name": "",
+            }
+
     return list(members_by_email.values())
 
 
@@ -732,7 +866,10 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
         console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
         return
@@ -840,23 +977,14 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
         orchestrator.cleanup()
 
 
-@cli.command()
-@ssl_option
-@click.pass_context
-def resume(ctx):
-    """Resume a previous migration session."""
-    state_manager = ctx.obj['state_manager']
-
-    display_banner()
-
-    # List available sessions
+def _select_resume_session(config: Config, state_manager: StateManager):
+    """Return the selected migration session, or None if the user cancels."""
     sessions = state_manager.list_sessions()
 
     if not sessions:
         console.print("[yellow]No previous migration sessions found[/yellow]")
-        return
+        return None
 
-    # Display sessions
     table = Table(title="Available Migration Sessions", show_header=True)
     table.add_column("#", style="cyan", width=3)
     table.add_column("Session ID", style="dim")
@@ -875,79 +1003,27 @@ def resume(ctx):
             session["session_id"],
             started,
             status,
-            progress
+            progress,
         )
 
     console.print(table)
 
-    # Select session
-    if ctx.obj["config"].migration.non_interactive:
-        choice = "1"
-    else:
-        choice = console.input("\nEnter session number to resume (or 'q' to quit): ")
+    if config.migration.non_interactive:
+        return sessions[0]
 
+    choice = console.input("\nEnter session number to resume (or 'q' to quit): ")
     if choice.lower() == 'q':
-        return
+        return None
 
     try:
         session_idx = int(choice) - 1
         if 0 <= session_idx < len(sessions):
-            selected_session = sessions[session_idx]
-        else:
-            console.print("[red]Invalid selection[/red]")
-            return
+            return sessions[session_idx]
+        console.print("[red]Invalid selection[/red]")
+        return None
     except ValueError:
         console.print("[red]Invalid input[/red]")
-        return
-
-    # Load session
-    state = state_manager.load_session(selected_session["session_id"])
-
-    if not state:
-        console.print("[red]Failed to load session[/red]")
-        return
-
-    # Display resume info
-    resume_info = state_manager.get_resume_info(state)
-
-    console.print("\n[bold]Resume Information:[/bold]")
-    console.print(f"  Session: {resume_info['session_id']}")
-    console.print(f"  Pending: {resume_info['pending']}")
-    console.print(f"  Failed: {resume_info['failed']}")
-    console.print(f"  Blocked: {resume_info['blocked']}")
-    console.print(f"  Exported: {resume_info['exported']}")
-    if resume_info.get("remediation_bundle_path"):
-        console.print(f"  Remediation bundle: {resume_info['remediation_bundle_path']}")
-    console.print(f"  Can resume: {'Yes' if resume_info['can_resume'] else 'No'}")
-
-    if not resume_info['can_resume']:
-        console.print("[yellow]Nothing to resume in this session[/yellow]")
-        return
-
-    if not _confirm_action(ctx.obj["config"], "Resume this migration?", default=True, non_interactive_value=True):
-        return
-
-    # Resume migration
-    config = ctx.obj['config']
-    orchestrator = MigrationOrchestrator(config, state_manager)
-    orchestrator.state = state
-    config.state_manager = state_manager
-
-    # Get items that need processing
-    items_to_process = state.get_resume_items()
-
-    console.print(f"\n[bold]Resuming migration of {len(items_to_process)} items...[/bold]")
-    if not items_to_process:
-        console.print("[yellow]No resumable items to process[/yellow]")
-    else:
-        results = orchestrator.resume_items(items_to_process)
-        console.print("\n[green]✓ Resume processing completed[/green]")
-        console.print(f"  Resumed: {len(results['resumed'])}")
-        console.print(f"  Remaining blocked/exported: {len(results['blocked'])}")
-
-    _display_resolution_summary(orchestrator)
-    _exit_for_remediation_if_needed(ctx, config, orchestrator)
-    orchestrator.cleanup()
+        return None
 
 
 @cli.command()
@@ -973,7 +1049,10 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
         return
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
         orchestrator.cleanup()
@@ -1070,8 +1149,9 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
     '--members-csv',
     type=click.Path(exists=True, dir_okay=False, path_type=str),
     help=(
-        "CSV file with member details (email, role_id, workspace_id). "
-        "Replaces source member API lookups; role_id must be consistent per email."
+        "CSV file with member details (email, langsmith_role, workspace_id, "
+        "workspace_name). Replaces source member API lookups. Rows with an "
+        "empty workspace_id are org-level role assignments."
     ),
 )
 @workspace_options
@@ -1102,7 +1182,10 @@ def users(
         return
 
     # Resolve workspace context (needed for phase 3)
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
         orchestrator.cleanup()
@@ -1141,12 +1224,33 @@ def users(
         return
 
     csv_member_rows = _load_members_csv(members_csv) if members_csv else None
+    default_org_role_id: str | None = None
+
+    if csv_member_rows is not None:
+        source_roles = user_role_migrator.list_source_roles()
+        csv_member_rows, default_org_role_id = _resolve_csv_role_names(
+            csv_member_rows, source_roles
+        )
+        if default_org_role_id is None:
+            org_emails: set[str] = set()
+            ws_emails: set[str] = set()
+            for r in csv_member_rows:
+                (ws_emails if r.get("workspace_id") else org_emails).add(r["email"])
+            ws_only_emails = ws_emails - org_emails
+            if ws_only_emails:
+                console.print(
+                    f"  [yellow]Warning: no ORGANIZATION_USER role found on source; "
+                    f"{len(ws_only_emails)} workspace-only user(s) will not be "
+                    f"invited to the org.[/yellow]"
+                )
 
     # ── Phase 2: Org member migration ──
     console.print("\n[bold]Phase 2: Migrating organisation members...[/bold]")
 
     if csv_member_rows is not None:
-        all_members = _csv_rows_to_org_members(csv_member_rows)
+        all_members = _csv_rows_to_org_members(
+            csv_member_rows, default_org_role_id=default_org_role_id
+        )
     else:
         org_members = user_role_migrator.list_source_org_members()
         pending_members = user_role_migrator.list_source_pending_org_members()
@@ -1273,7 +1377,10 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
         orchestrator.cleanup()
@@ -1515,7 +1622,10 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
         orchestrator.cleanup()
@@ -1796,7 +1906,10 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
     console.print("[green]✓[/green]\n")
 
     # Resolve workspace context (runs before asset discovery)
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
         orchestrator.cleanup()
@@ -2349,7 +2462,10 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces)
+    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
         orchestrator.cleanup()
@@ -2600,6 +2716,111 @@ def clean(ctx):
         console.print("[green]✓ All sessions deleted[/green]")
     else:
         console.print("[yellow]Cleanup cancelled[/yellow]")
+
+
+@cli.command()
+@ssl_option
+@click.pass_context
+def resume(ctx):
+    """Resume a previous migration session (retry pending/failed items)."""
+    config = ctx.obj['config']
+    state_manager = ctx.obj['state_manager']
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    selected_session = _select_resume_session(config, state_manager)
+    if not selected_session:
+        return
+
+    session_id = selected_session["session_id"]
+    console.print(f"\nLoading session: {session_id[:16]}...")
+
+    state = state_manager.load_session(session_id)
+    if not state:
+        console.print(f"[red]Failed to load session {session_id}[/red]")
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+    try:
+        # Test connections first
+        console.print("Testing connections... ", end="")
+        source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+        if not source_ok:
+            console.print("[red]✗ Source connection failed[/red]")
+            if source_error:
+                console.print(f"[red]  {source_error}[/red]")
+            return
+        if not dest_ok:
+            console.print("[yellow]⚠ Source OK, destination connection failed[/yellow]")
+            if dest_error:
+                console.print(f"[yellow]  {dest_error}[/yellow]")
+            console.print("Continuing with source-only operations...")
+        else:
+            console.print("[green]✓[/green]")
+
+        # Attach state to orchestrator
+        orchestrator.state = state
+        orchestrator.state_manager.current_state = state
+        config.state_manager = state_manager
+
+        # Get resumable items
+        resume_items = state.get_resume_items()
+        checkpoint_items = state.get_checkpoint_items()
+
+        console.print(f"\nResumable items: {len(resume_items)}")
+        console.print(f"Checkpoint/manual items: {len(checkpoint_items)}")
+
+        if checkpoint_items:
+            console.print("\n[bold]Items requiring manual attention:[/bold]")
+            for item in checkpoint_items[:10]:
+                console.print(f"  • {item.name}: {item.next_action or item.outcome_code or 'needs attention'}")
+
+        if not resume_items:
+            console.print("\n[yellow]No items to resume automatically.[/yellow]")
+            if checkpoint_items:
+                console.print("[dim]Review the checkpoint items above and resolve them manually.[/dim]")
+            return
+
+        # Show what will be resumed
+        console.print(f"\n[bold]Items to resume ({len(resume_items)}):[/bold]")
+        type_counts: dict[str, int] = {}
+        for item in resume_items:
+            type_counts[item.type] = type_counts.get(item.type, 0) + 1
+        for item_type, count in sorted(type_counts.items()):
+            console.print(f"  {item_type}: {count}")
+
+        if not _confirm_action(config, "\nProceed with resume?", default=True, non_interactive_value=True):
+            console.print("[yellow]Cancelled[/yellow]")
+            return
+
+        # Run resume
+        console.print(f"\n[bold]Resuming migration of {len(resume_items)} items[/bold]")
+        results = orchestrator.resume_items(resume_items)
+
+        # Save state
+        state_manager.save()
+
+        console.print("[green]Resume processing completed[/green]")
+
+        # Report results
+        resumed = results.get("resumed", [])
+        blocked = results.get("blocked", [])
+        console.print(f"\n[bold]Resume Results:[/bold]")
+        console.print(f"  [green]Resumed successfully: {len(resumed)}[/green]")
+        console.print(f"  [yellow]Blocked/needs attention: {len(blocked)}[/yellow]")
+
+        if blocked and config.migration.verbose:
+            console.print("\n[dim]Blocked items:[/dim]")
+            for item_ref in blocked[:20]:
+                console.print(f"  • {item_ref}")
+
+        _display_resolution_summary(orchestrator)
+        _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    finally:
+        orchestrator.cleanup()
 
 
 def main():

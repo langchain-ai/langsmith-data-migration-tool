@@ -41,6 +41,8 @@ class MigrationFileConfig:
     destination_workspace: Optional[WorkspaceConfig] = None
     project_name_mapping: Dict[str, str] = field(default_factory=dict)
     workspace_mapping: Dict[str, str] = field(default_factory=dict)  # source_ws_id -> dest_ws_id
+    workspace_mapping_source_url: str = ""
+    workspace_mapping_destination_url: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -52,6 +54,8 @@ class MigrationFileConfig:
             "destination_workspace": asdict(self.destination_workspace) if self.destination_workspace else None,
             "project_name_mapping": self.project_name_mapping,
             "workspace_mapping": self.workspace_mapping,
+            "workspace_mapping_source_url": self.workspace_mapping_source_url,
+            "workspace_mapping_destination_url": self.workspace_mapping_destination_url,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -63,6 +67,8 @@ class MigrationFileConfig:
         config.version = data.get("version", CONFIG_VERSION)
         config.project_name_mapping = data.get("project_name_mapping", {})
         config.workspace_mapping = data.get("workspace_mapping", {})
+        config.workspace_mapping_source_url = data.get("workspace_mapping_source_url", "")
+        config.workspace_mapping_destination_url = data.get("workspace_mapping_destination_url", "")
         config.created_at = data.get("created_at", "")
         config.updated_at = data.get("updated_at", "")
         config.source_workspace = _parse_workspace(data.get("source_workspace"))

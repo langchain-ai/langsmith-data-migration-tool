@@ -437,7 +437,14 @@ class ExperimentMigrator(BaseMigrator):
 
                     # Map reference_example_id if present
                     source_example_id = run.get("reference_example_id")
-                    mapped_example_id = example_mapping.get(source_example_id) if source_example_id else None
+                    mapped_example_id = None
+                    if source_example_id:
+                        mapped_example_id = example_mapping.get(source_example_id)
+                        if not mapped_example_id:
+                            self.log(
+                                f"Warning: run references unmapped example {source_example_id}, dropping example link",
+                                "warning",
+                            )
 
                     # Deterministic IDs make interrupted batches safe to replay.
                     new_run_id = self._deterministic_run_id(source_run_id)

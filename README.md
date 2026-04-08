@@ -153,14 +153,17 @@ langsmith-migrator users --members-csv examples/users_members_example.csv --map-
 CSV schema:
 
 ```csv
-email,role_id,workspace_id
-alice@example.com,role_org_user_abc123,ws_src_prod_us
+email,langsmith_role,workspace_id,workspace_name
+alice@example.com,Organization Admin,,
+alice@example.com,Workspace Admin,ws_src_prod_us,Production US
 ```
 
 Notes:
-- `email`, `role_id`, and `workspace_id` are required.
-- `role_id` must be consistent for each `email` across rows.
-- `workspace_id` should be the source workspace ID (used to filter workspace memberships per mapped workspace pair).
+- `email` and `langsmith_role` are required.
+- `workspace_id` is optional. Leave it empty for org-level role assignments.
+- `workspace_name` is optional and informational only.
+- `langsmith_role` should be a built-in LangSmith role name (for example `Organization Admin`, `Organization User`, `Workspace Admin`) or a custom role `display_name`.
+- Users who only appear in workspace rows are invited to the org with the source `ORGANIZATION_USER` role before workspace membership is applied.
 
 ### CLI Options
 
@@ -211,6 +214,28 @@ The prompt default is `No` (rules are created disabled).
 --same-instance         Reuse source project/session IDs on destination
 ```
 
+### Users Options
+
+```bash
+--roles-only               Only sync custom roles (skip member migration)
+--skip-workspace-members   Skip workspace member migration (phases 1-2 only)
+--members-csv PATH         CSV file with member details (email, langsmith_role, workspace_id, workspace_name)
+```
+
+Migration proceeds in three phases:
+1. **Role sync** (org-scoped): match built-in roles by name, create/update custom roles
+2. **Org members** (org-scoped): invite missing members, update roles for existing ones
+3. **Workspace members** (per workspace pair): add members to workspaces with correct roles
+
+Rules are created disabled by default. Use `--create-enabled` on the `rules` command to override.
+
+### Migrate-All Users Options
+
+```bash
+--skip-users               Skip user and role migration in migrate-all wizard
+```
+
+When `--skip-users` is omitted, `migrate-all` runs user/role migration as Step 0 before all other resources. Phases 1-2 (roles + org members) run once; phase 3 (workspace members) runs per workspace pair.
 ### Project Mapping
 
 Rules and charts reference projects by ID. When migrating between instances, project IDs differ.

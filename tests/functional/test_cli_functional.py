@@ -136,6 +136,26 @@ def test_resolve_workspaces_returns_cancelled_when_forced_tui_is_cancelled(monke
     assert result == cli_main._WS_CANCELLED
 
 
+def test_resolve_workspaces_returns_aborted_when_headless_resolution_fails(monkeypatch):
+    """Headless workspace-resolution failures should map to the abort sentinel."""
+
+    class StubOrchestrator:
+        source_client = object()
+        dest_client = object()
+
+    def _raise(*args, **kwargs):
+        raise cli_main.WorkspaceResolutionError("workspace mapping required")
+
+    monkeypatch.setattr(cli_main, "resolve_workspace_context", _raise)
+
+    result = cli_main._resolve_workspaces(
+        StubOrchestrator(),
+        non_interactive=True,
+    )
+
+    assert result == cli_main._WS_ABORTED
+
+
 def test_test_command_uses_global_options_and_lists_workspaces(cli_harness):
     """The smoke-test command should honor global config flags and verbose workspace listing."""
 
@@ -193,7 +213,10 @@ def test_users_command_members_csv_replaces_source_member_apis(cli_harness, monk
         workspaces_to_create=[],
     )
     csv_path = tmp_path / "members.csv"
-    csv_path.write_text("email,role_id,workspace_id\nalice@example.com,src-role,src-ws\n", encoding="utf-8")
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Workspace Admin,src-ws\n",
+        encoding="utf-8",
+    )
 
     user_role_migrator = Mock()
     user_role_migrator.build_role_mapping.return_value = {"src-role": "dst-role"}
@@ -211,11 +234,12 @@ def test_users_command_members_csv_replaces_source_member_apis(cli_harness, monk
 
     monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
 
-    csv_rows = [{"email": "alice@example.com", "role_id": "src-role", "workspace_id": "src-ws"}]
+    resolved_rows = [{"email": "alice@example.com", "role_id": "src-role", "workspace_id": "src-ws"}]
     org_members = [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-role"}]
     ws_members = [{"id": "src-ws:alice@example.com", "email": "alice@example.com", "role_id": "src-role"}]
-    monkeypatch.setattr(cli_main, "_load_members_csv", lambda _: csv_rows)
-    monkeypatch.setattr(cli_main, "_csv_rows_to_org_members", lambda rows: org_members)
+    monkeypatch.setattr(cli_main, "_load_members_csv", lambda _: resolved_rows)
+    monkeypatch.setattr(cli_main, "_resolve_csv_role_names", lambda rows, roles: (resolved_rows, "src-user"))
+    monkeypatch.setattr(cli_main, "_csv_rows_to_org_members", lambda rows, **kw: org_members)
     monkeypatch.setattr(cli_main, "_csv_rows_for_workspace", lambda rows, ws_id: ws_members)
 
     result = cli_harness.invoke(["users", "--members-csv", str(csv_path)])
@@ -236,30 +260,36 @@ def test_users_command_members_csv_supports_utf8_bom(cli_harness, monkeypatch, t
     )
     csv_path = tmp_path / "members_bom.csv"
     csv_path.write_text(
-        "email,role_id,workspace_id\nalice@example.com,src-role,src-ws\n",
+        "email,langsmith_role,workspace_id\nalice@example.com,Workspace Admin,src-ws\n",
         encoding="utf-8-sig",
     )
 
     user_role_migrator = Mock()
-    user_role_migrator.build_role_mapping.return_value = {"src-role": "dst-role"}
+    user_role_migrator.build_role_mapping.return_value = {"src-ws-admin": "dst-ws-admin"}
     user_role_migrator._dest_email_to_identity = {}
     user_role_migrator.list_dest_org_members.return_value = []
     user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
     user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
     monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
 
     result = cli_harness.invoke(["users", "--members-csv", str(csv_path)])
 
     assert result.exit_code == 0
+    # alice only appears in a workspace row, so she gets the default org role (ORGANIZATION_USER)
     user_role_migrator.migrate_org_members.assert_called_once_with(
-        [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-role", "full_name": ""}]
+        [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-user", "full_name": ""}]
     )
     user_role_migrator.migrate_workspace_members.assert_called_once_with(
         selected_members=[
             {
                 "id": "src-ws:alice@example.com",
                 "email": "alice@example.com",
-                "role_id": "src-role",
+                "role_id": "src-ws-admin",
                 "full_name": "",
             }
         ]
@@ -388,6 +418,17 @@ def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_ha
     ]
     assert orchestrator.clear_workspace_called is True
     assert "Migration completed" in cli_harness.console.text
+
+
+def test_datasets_command_exits_nonzero_when_workspace_resolution_aborts(cli_harness):
+    """Commands should stop instead of migrating unscoped after workspace-resolution errors."""
+
+    cli_harness.controls.workspace_result = cli_main._WS_ABORTED
+
+    result = cli_harness.invoke(["datasets"])
+
+    assert result.exit_code == 1
+    assert cli_harness.orchestrator_factory.instances[0].migrate_dataset_calls == []
 
 
 def test_prompts_command_surfaces_unavailable_prompts_api(cli_harness):
@@ -916,6 +957,51 @@ def test_resume_command_non_interactive_uses_latest_session_without_console_inpu
         include_all_commits=True,
     )
     assert "Resume processing completed" in cli_harness.console.text
+
+
+def test_resume_command_interactive_can_select_non_latest_session(cli_harness):
+    """Interactive resume should honor the user's chosen session, not always pick the latest."""
+
+    latest = build_state("migration_resume_latest")
+    latest.updated_at = 20.0
+    latest.add_item(
+        MigrationItem(
+            id="prompt_default_latest",
+            type="prompt",
+            name="team/latest",
+            source_id="team/latest",
+            status=MigrationStatus.PENDING,
+            metadata={"include_all_commits": False},
+        )
+    )
+    latest.updated_at = 20.0
+    older = build_state("migration_resume_older")
+    older.add_item(
+        MigrationItem(
+            id="prompt_default_older",
+            type="prompt",
+            name="team/older",
+            source_id="team/older",
+            status=MigrationStatus.PENDING,
+            metadata={"include_all_commits": True},
+        )
+    )
+    older.updated_at = 10.0
+    save_session(cli_harness.state_manager, latest)
+    save_session(cli_harness.state_manager, older)
+    cli_harness.console.inputs = ["2"]
+    cli_harness.controls.confirm_answers = [True]
+    cli_harness.migrators.prompt.migrate_prompt.return_value = "team/older"
+
+    result = cli_harness.invoke(["resume"])
+
+    assert result.exit_code == 0
+    orchestrator = cli_harness.orchestrator_factory.instances[0]
+    assert orchestrator.state.session_id == "migration_resume_older"
+    cli_harness.migrators.prompt.migrate_prompt.assert_called_once_with(
+        "team/older",
+        include_all_commits=True,
+    )
 
 
 def test_queues_command_non_interactive_exits_with_code_2_for_blocked_items(cli_harness):

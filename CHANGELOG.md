@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.60] - 2026-04-08
+
+### Added
+- **Role-name CSV input for user migration**: `users --members-csv` now accepts human-readable `langsmith_role` values with optional `workspace_id` / `workspace_name`, making org-scoped and workspace-scoped membership imports easier to author.
+- **Role-name resolution safeguards**: Built-in LangSmith roles and custom role display names are resolved deterministically, with clear validation for ambiguous or unknown CSV role labels.
+
+### Fixed
+- **Headless workspace safety**: Non-interactive multi-workspace runs now fail safely when no valid workspace mapping is available instead of falling through unscoped.
+- **Saved workspace mapping validation**: Persisted workspace mappings now record source/destination instance URLs and are ignored when they no longer match the current migration context.
+- **Experiment reference example migration**: Unmapped `reference_example_id` values are now dropped with a warning instead of replaying invalid source IDs into the destination instance.
+- **Resume session selection**: Interactive `resume` once again honors the selected saved session, while non-interactive runs keep latest-session behavior.
+- **Resume command cleanup**: Resume execution now uses explicit orchestrator cleanup without depending on context-manager support, preserving CLI reliability in tests and real runs.
+
 ## [0.0.57] - 2026-03-31
 
 ### Added
