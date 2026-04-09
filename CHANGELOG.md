@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.61] - 2026-04-09
+
+### Added
+- **Single-instance CSV sync mode**: `users --single-instance` / `--instance` now supports applying CSV-driven access changes directly to one LangSmith target, with workspace-ID validation and an explicit preflight summary.
+- **Authoritative CSV reconciliation**: `users --csv-source-of-truth` / `--sync` can now remove org users, pending invites, and workspace memberships that are missing from the CSV during single-instance runs.
+
+### Fixed
+- **Selective custom-role syncing**: custom roles are now created only when they are selected directly or required by the chosen org or workspace members, avoiding unnecessary destination role creation during user migration.
+- **Workspace identity refresh**: workspace member sync now refreshes destination org identities through a shared cache helper before applying workspace memberships.
+- **Release install snippets**: README install commands now point at the current release wheel filename.
+
+### Changed
+- **Dependencies**: refreshed the pinned Python dependency set and bumped `langchain-core` to `1.2.28`.
+- **CI**: bumped `codecov/codecov-action` to `v6`.
+
 ## [0.0.60] - 2026-04-08
 
 ### Added
@@ -234,7 +249,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.51...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.61...HEAD
+[0.0.61]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.60...v0.0.61
+[0.0.60]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.59...v0.0.60
+[0.0.59]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.58...v0.0.59
+[0.0.58]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.57...v0.0.58
+[0.0.57]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.56...v0.0.57
+[0.0.56]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.55...v0.0.56
+[0.0.55]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.54...v0.0.55
+[0.0.54]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.53...v0.0.54
+[0.0.53]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.52...v0.0.53
+[0.0.52]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.51...v0.0.52
 [0.0.51]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.50...v0.0.51
 [0.0.41]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.4...v0.0.41
 [0.0.4]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.3...v0.0.4
