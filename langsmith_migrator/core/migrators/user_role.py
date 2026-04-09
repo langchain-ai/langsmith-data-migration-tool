@@ -21,6 +21,8 @@ class UserRoleMigrator(BaseMigrator):
         super().__init__(source_client, dest_client, state, config)
         self._role_id_map: Dict[str, str] = {}
         self._dest_email_to_identity: Optional[Dict[str, Dict[str, Any]]] = None
+        self._last_org_member_removals = 0
+        self._last_workspace_member_removals = 0
 
     # ------------------------------------------------------------------
     # Phase 0: data fetching
@@ -54,6 +56,14 @@ class UserRoleMigrator(BaseMigrator):
         """Fetch pending org invites from source (paginated)."""
         members = []
         for member in self.source.get_paginated("/orgs/current/members/pending"):
+            if isinstance(member, dict):
+                members.append(member)
+        return members
+
+    def list_dest_pending_org_members(self) -> List[Dict[str, Any]]:
+        """Fetch pending org invites from destination (paginated)."""
+        members = []
+        for member in self.dest.get_paginated("/orgs/current/members/pending"):
             if isinstance(member, dict):
                 members.append(member)
         return members
@@ -256,22 +266,38 @@ class UserRoleMigrator(BaseMigrator):
     # ------------------------------------------------------------------
 
     def migrate_org_members(
-        self, selected_members: List[Dict[str, Any]]
+        self,
+        selected_members: List[Dict[str, Any]],
+        *,
+        remove_missing: bool = False,
+        remove_pending: bool = False,
     ) -> Tuple[int, int, int]:
         """Migrate selected org members from source to destination.
 
         Returns ``(migrated, skipped, failed)`` counts.
         """
         dest_members = self.list_dest_org_members()
+        pending_dest_members = (
+            self.list_dest_pending_org_members() if remove_pending else []
+        )
+
         dest_by_email: Dict[str, Dict[str, Any]] = {}
         for m in dest_members:
             email = (m.get("email") or "").lower()
             if email:
                 dest_by_email[email] = m
 
+        pending_by_email: Dict[str, Dict[str, Any]] = {}
+        for m in pending_dest_members:
+            email = (m.get("email") or "").lower()
+            if email:
+                pending_by_email[email] = m
+
         self._dest_email_to_identity = dest_by_email
 
         migrated = skipped = failed = 0
+        removed = 0
+        desired_emails: set[str] = set()
 
         for member in selected_members:
             email = (member.get("email") or "").lower()
@@ -279,6 +305,7 @@ class UserRoleMigrator(BaseMigrator):
                 self.log("Skipping member with no email", "warning")
                 skipped += 1
                 continue
+            desired_emails.add(email)
 
             if member.get("_pending"):
                 self.log(f"Processing pending invite: {email}")
@@ -307,6 +334,7 @@ class UserRoleMigrator(BaseMigrator):
                 continue
 
             dest_member = dest_by_email.get(email)
+            pending_member = pending_by_email.get(email)
 
             if dest_member:
                 if self.config.migration.skip_existing:
@@ -338,6 +366,54 @@ class UserRoleMigrator(BaseMigrator):
                     self.log(f"Org member '{email}' already has correct role")
                     self.mark_migrated(item_id, outcome_code="org_member_skipped_existing")
                     skipped += 1
+            elif pending_member:
+                dest_role_id = pending_member.get("role_id")
+                if mapped_role_id and dest_role_id != mapped_role_id:
+                    if self.config.migration.skip_existing:
+                        self.log(
+                            f"Org invite for '{email}' exists, skipping role update",
+                            "warning",
+                        )
+                        self.mark_migrated(
+                            item_id,
+                            outcome_code="org_member_skipped_existing",
+                        )
+                        skipped += 1
+                        continue
+
+                    try:
+                        self._remove_org_member(
+                            pending_member["id"],
+                            pending=True,
+                        )
+                        self._invite_org_member(email, mapped_role_id)
+                        self.mark_migrated(
+                            item_id,
+                            outcome_code="org_member_migrated",
+                        )
+                        migrated += 1
+                    except (AuthenticationError, APIError) as e:
+                        self.log(
+                            f"Failed to replace pending invite for '{email}': {e}",
+                            "error",
+                        )
+                        self.mark_blocked(
+                            item_id,
+                            "org_member_pending_invite_replace_failed",
+                            next_action="Re-run `langsmith-migrator users`.",
+                            evidence={"email": email, "error": str(e)},
+                        )
+                        failed += 1
+                else:
+                    self.log(
+                        f"Invite for '{email}' already pending, skipping",
+                        "warning",
+                    )
+                    self.mark_migrated(
+                        item_id,
+                        outcome_code="org_member_skipped_existing",
+                    )
+                    skipped += 1
             else:
                 try:
                     self._invite_org_member(email, mapped_role_id)
@@ -359,6 +435,59 @@ class UserRoleMigrator(BaseMigrator):
                     )
                     failed += 1
 
+        if remove_missing:
+            extra_members = [
+                member
+                for email, member in dest_by_email.items()
+                if email not in desired_emails
+            ]
+            extra_members.extend(
+                member
+                for email, member in pending_by_email.items()
+                if email not in desired_emails
+            )
+            extra_members.sort(key=lambda member: (member.get("email") or "").lower())
+
+            pending_extra_ids = {
+                member.get("id")
+                for email, member in pending_by_email.items()
+                if email not in desired_emails
+            }
+            for member in extra_members:
+                email = (member.get("email") or "").lower()
+                item_id = f"org_member_{email}"
+                self.ensure_item(
+                    item_id,
+                    "org_member",
+                    email,
+                    member.get("id", email),
+                    metadata={"member": member},
+                )
+                try:
+                    self._remove_org_member(
+                        member["id"],
+                        pending=member.get("id") in pending_extra_ids,
+                    )
+                    self.mark_migrated(
+                        item_id,
+                        outcome_code="org_member_removed_from_source_of_truth",
+                    )
+                    migrated += 1
+                    removed += 1
+                except (AuthenticationError, APIError) as e:
+                    self.log(
+                        f"Failed to remove org member '{email}': {e}",
+                        "error",
+                    )
+                    self.mark_blocked(
+                        item_id,
+                        "org_member_remove_failed",
+                        next_action="Re-run `langsmith-migrator users`.",
+                        evidence={"email": email, "error": str(e)},
+                    )
+                    failed += 1
+
+        self._last_org_member_removals = removed
         return migrated, skipped, failed
 
     def _invite_org_member(
@@ -389,6 +518,22 @@ class UserRoleMigrator(BaseMigrator):
             f"/orgs/current/members/{identity_id}", {"role_id": role_id}
         )
         self.log(f"Updated org member role: {identity_id}", "success")
+
+    def _remove_org_member(
+        self,
+        identity_id: str,
+        *,
+        pending: bool = False,
+    ) -> None:
+        """Remove an active org member or cancel a pending invite."""
+        if self.config.migration.dry_run:
+            action = "cancel org invite" if pending else "remove org member"
+            self.log(f"[DRY RUN] Would {action}: {identity_id}")
+            return
+
+        self.dest.delete(f"/orgs/current/members/{identity_id}")
+        action = "Cancelled org invite" if pending else "Removed org member"
+        self.log(f"{action}: {identity_id}", "success")
 
     # ------------------------------------------------------------------
     # Phase 3: workspace member migration
@@ -441,7 +586,10 @@ class UserRoleMigrator(BaseMigrator):
         )
 
     def migrate_workspace_members(
-        self, selected_members: Optional[List[Dict[str, Any]]] = None
+        self,
+        selected_members: Optional[List[Dict[str, Any]]] = None,
+        *,
+        remove_missing: bool = False,
     ) -> Tuple[int, int, int]:
         """Migrate workspace members for the currently scoped workspace pair.
 
@@ -452,9 +600,11 @@ class UserRoleMigrator(BaseMigrator):
 
         Returns ``(migrated, skipped, failed)`` counts.
         """
-        source_members = selected_members if selected_members is not None else self.list_source_workspace_members()
-        if not source_members:
-            return 0, 0, 0
+        source_members = (
+            selected_members
+            if selected_members is not None
+            else self.list_source_workspace_members()
+        )
 
         dest_members = self.list_dest_workspace_members()
 
@@ -474,13 +624,20 @@ class UserRoleMigrator(BaseMigrator):
                 request_info={},
             )
 
+        if not source_members and not remove_missing:
+            self._last_workspace_member_removals = 0
+            return 0, 0, 0
+
         migrated = skipped = failed = 0
+        removed = 0
+        desired_emails: set[str] = set()
 
         for member in source_members:
             email = (member.get("email") or "").lower()
             if not email:
                 skipped += 1
                 continue
+            desired_emails.add(email)
 
             item_id = f"ws_member_{src_ws}_{email}"
             self.ensure_item(
@@ -577,6 +734,46 @@ class UserRoleMigrator(BaseMigrator):
                     )
                     failed += 1
 
+        if remove_missing:
+            extra_members = [
+                member
+                for email, member in dest_by_email.items()
+                if email not in desired_emails
+            ]
+            extra_members.sort(key=lambda member: (member.get("email") or "").lower())
+
+            for member in extra_members:
+                email = (member.get("email") or "").lower()
+                item_id = f"ws_member_{src_ws}_{email}"
+                self.ensure_item(
+                    item_id,
+                    "ws_member",
+                    email,
+                    member.get("id", email),
+                    metadata={"member": member, "workspace_pair": ws_pair},
+                )
+                try:
+                    self._remove_workspace_member(member["id"])
+                    self.mark_migrated(
+                        item_id,
+                        outcome_code="ws_member_removed_from_source_of_truth",
+                    )
+                    migrated += 1
+                    removed += 1
+                except (AuthenticationError, APIError) as e:
+                    self.log(
+                        f"Failed to remove workspace member '{email}': {e}",
+                        "error",
+                    )
+                    self.mark_blocked(
+                        item_id,
+                        "ws_member_remove_failed",
+                        next_action="Re-run `langsmith-migrator users`.",
+                        evidence={"email": email, "error": str(e)},
+                    )
+                    failed += 1
+
+        self._last_workspace_member_removals = removed
         return migrated, skipped, failed
 
     def _add_workspace_member(
@@ -609,6 +806,15 @@ class UserRoleMigrator(BaseMigrator):
             f"/tenants/current/members/{identity_id}", {"role_id": role_id}
         )
         self.log(f"Updated workspace member role: {identity_id}", "success")
+
+    def _remove_workspace_member(self, identity_id: str) -> None:
+        """Remove a workspace member from the current workspace."""
+        if self.config.migration.dry_run:
+            self.log(f"[DRY RUN] Would remove workspace member: {identity_id}")
+            return
+
+        self.dest.delete(f"/tenants/current/members/{identity_id}")
+        self.log(f"Removed workspace member: {identity_id}", "success")
 
     # ------------------------------------------------------------------
     # Capability probing
