@@ -587,6 +587,28 @@ def test_users_command_single_instance_rejects_workspace_flags(cli_harness, tmp_
     assert "cannot be combined with workspace mapping flags" in result.output
 
 
+def test_users_command_single_instance_rejects_roles_only(cli_harness):
+    """Single-instance mode should fail before pretending roles-only is supported."""
+    result = cli_harness.invoke(["users", "--single-instance", "--roles-only"])
+
+    assert result.exit_code != 0
+    assert "--roles-only cannot be combined with --single-instance" in result.output
+
+
+def test_users_command_rejects_roles_only_with_members_csv(cli_harness, tmp_path):
+    """CSV input is member-only and should not be accepted with --roles-only."""
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Organization Admin,\n",
+        encoding="utf-8",
+    )
+
+    result = cli_harness.invoke(["users", "--roles-only", "--members-csv", str(csv_path)])
+
+    assert result.exit_code != 0
+    assert "--roles-only cannot be combined with --members-csv" in result.output
+
+
 def test_users_command_single_instance_rejects_ambiguous_configured_targets(cli_harness, tmp_path):
     """Single-instance sync should fail instead of guessing between configured source/dest targets."""
     csv_path = tmp_path / "members.csv"
@@ -616,6 +638,40 @@ def test_users_command_single_instance_requires_api_key_and_url_together(cli_har
         result = cli_harness.invoke(args, add_base_args=False)
         assert result.exit_code != 0
         assert "--api-key and --url must be provided together" in result.output
+
+
+def test_users_command_rejects_sync_without_members_csv(cli_harness):
+    """Authoritative single-instance sync must always be driven by a CSV."""
+    result = cli_harness.invoke(["users", "--sync"])
+
+    assert result.exit_code != 0
+    assert "--csv-source-of-truth requires --members-csv" in result.output
+
+
+def test_users_command_rejects_sync_with_skip_existing(cli_harness, tmp_path):
+    """Authoritative CSV sync should not combine with global skip-existing mode."""
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Organization Admin,\n",
+        encoding="utf-8",
+    )
+
+    result = cli_harness.invoke(
+        [
+            "--skip-existing",
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+            "--sync",
+        ]
+    )
+
+    assert result.exit_code != 0
+    assert "--csv-source-of-truth cannot be combined with --skip-existing" in result.output
 
 
 def test_users_command_single_instance_csv_apply_auto_applies_all_rows(
@@ -697,6 +753,87 @@ def test_users_command_single_instance_csv_apply_auto_applies_all_rows(
                 "id": "ws-1:bob@example.com",
                 "email": "bob@example.com",
                 "role_id": "src-ws-admin",
+                "full_name": "",
+            }
+        ],
+        remove_missing=False,
+    )
+
+
+def test_users_command_single_instance_syncs_custom_roles_only_when_csv_rows_need_them(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Single-instance CSV mode should defer custom-role syncing until org/workspace rows require it."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Data Scientist,\n"
+        "alice@example.com,Workspace Steward,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.side_effect = [
+        {
+            "src-admin": "dst-admin",
+            "src-user": "dst-user",
+            "src-ws-admin": "dst-ws-admin",
+        },
+        {"src-org-custom": "dst-org-custom"},
+        {"src-ws-custom": "dst-ws-custom"},
+    ]
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+        {"id": "src-org-custom", "name": "CUSTOM", "display_name": "Data Scientist"},
+        {"id": "src-ws-custom", "name": "CUSTOM", "display_name": "Workspace Steward"},
+    ]
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert user_role_migrator.build_role_mapping.call_args_list == [
+        call(custom_role_ids=set()),
+        call(custom_role_ids={"src-org-custom"}),
+        call(custom_role_ids={"src-ws-custom"}),
+    ]
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-org-custom",
+                "full_name": "",
+            }
+        ],
+        remove_missing=False,
+        remove_pending=False,
+    )
+    user_role_migrator.migrate_workspace_members.assert_called_once_with(
+        selected_members=[
+            {
+                "id": "ws-1:alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-ws-custom",
                 "full_name": "",
             }
         ],

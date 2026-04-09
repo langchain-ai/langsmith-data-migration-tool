@@ -10,6 +10,7 @@ from langsmith_migrator.cli.main import (
     _csv_rows_for_workspace,
     _csv_rows_to_org_members,
     _load_members_csv,
+    _normalize_single_instance_url,
     _normalize_csv_role_scopes,
     _resolve_single_instance_workspace_ids,
     _resolve_csv_role_names,
@@ -386,6 +387,21 @@ def test_csv_rows_for_workspace_ignores_org_rows():
 
     assert len(selected) == 1
     assert selected[0]["role_id"] == "role-ws"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://same.example/api/v1", "https://same.example"),
+        ("https://same.example/api/v2/", "https://same.example"),
+        ("HTTPS://Same.Example/API/V2///", "https://same.example"),
+        ("https://same.example/custom/path/", "https://same.example/custom/path"),
+    ],
+)
+def test_normalize_single_instance_url_strips_api_suffixes_and_normalizes_case(
+    url: str, expected: str
+):
+    assert _normalize_single_instance_url(url) == expected
 
 
 def test_configure_single_instance_uses_destination_when_available():
