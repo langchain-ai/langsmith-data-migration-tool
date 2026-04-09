@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import Mock
 from langsmith_migrator.core.migrators import UserRoleMigrator
-from langsmith_migrator.utils.retry import APIError, AuthenticationError, ConflictError
+from langsmith_migrator.utils.retry import APIError, ConflictError
 
 
 class TestUserRoleMigrator:
@@ -131,6 +131,67 @@ class TestUserRoleMigrator:
 
         assert migration_state.id_mappings.get("roles", {}).get("src-admin") == "dst-admin"
         assert migration_state.id_mappings.get("roles", {}).get("src-custom-1") == "dst-custom-1"
+
+    def test_build_role_mapping_can_skip_custom_roles(self, migrator, source_roles, dest_roles):
+        """Selective sync can leave custom roles untouched until they are needed."""
+        migrator.source.get.return_value = source_roles
+        migrator.dest.get.return_value = dest_roles
+
+        mapping = migrator.build_role_mapping(custom_role_ids=set())
+
+        assert mapping["src-admin"] == "dst-admin"
+        assert "src-custom-1" not in mapping
+        migrator.dest.post.assert_not_called()
+
+    def test_build_role_mapping_accumulates_requested_custom_roles(self, migrator, dest_roles):
+        """Repeated selective sync calls preserve custom roles already mapped earlier."""
+        source_roles = [
+            {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin", "permissions": []},
+            {
+                "id": "src-custom-1",
+                "name": "CUSTOM",
+                "display_name": "Data Scientist",
+                "description": "Custom DS role",
+                "permissions": ["datasets:read"],
+            },
+            {
+                "id": "src-custom-2",
+                "name": "CUSTOM",
+                "display_name": "Reviewer",
+                "description": "Custom reviewer role",
+                "permissions": ["runs:read"],
+            },
+        ]
+        migrator.source.get.return_value = source_roles
+        migrator.dest.get.return_value = dest_roles
+        migrator.dest.post.side_effect = [
+            {"id": "dst-custom-1"},
+            {"id": "dst-custom-2"},
+        ]
+
+        first = migrator.build_role_mapping(custom_role_ids={"src-custom-1"})
+        second = migrator.build_role_mapping(custom_role_ids={"src-custom-2"})
+
+        assert first["src-custom-1"] == "dst-custom-1"
+        assert "src-custom-2" not in first
+        assert second["src-custom-1"] == "dst-custom-1"
+        assert second["src-custom-2"] == "dst-custom-2"
+
+    def test_ensure_dest_email_index_caches_until_forced(self, migrator):
+        """Destination org identities are cached unless a refresh is requested."""
+        migrator.dest.get_paginated.side_effect = [
+            iter([{"id": "dst-1", "email": "alice@example.com"}]),
+            iter([{"id": "dst-2", "email": "bob@example.com"}]),
+        ]
+
+        first = migrator.ensure_dest_email_index()
+        second = migrator.ensure_dest_email_index()
+        refreshed = migrator.ensure_dest_email_index(force=True)
+
+        assert first is second
+        assert first["alice@example.com"]["id"] == "dst-1"
+        assert refreshed["bob@example.com"]["id"] == "dst-2"
+        assert migrator.dest.get_paginated.call_count == 2
 
     # ── Phase 2: Org member migration ──
 

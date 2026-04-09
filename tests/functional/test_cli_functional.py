@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 from langsmith_migrator.cli import main as cli_main
 from langsmith_migrator.cli.tui_workspace_mapper import WorkspaceProjectResult
@@ -336,10 +336,80 @@ def test_users_command_without_csv_keeps_api_member_paths(cli_harness, monkeypat
     user_role_migrator.list_source_workspace_members.assert_called_once()
 
 
+def test_users_command_defers_custom_role_sync_until_members_are_selected(
+    cli_harness, monkeypatch
+):
+    """Default users flow syncs custom roles only for selected org members."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.side_effect = [
+        {"src-admin": "dst-admin"},
+        {"src-admin": "dst-admin", "src-custom": "dst-custom"},
+    ]
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_source_org_members.return_value = [
+        {"id": "src-org-1", "email": "alice@example.com", "role_id": "src-custom"}
+    ]
+    user_role_migrator.list_source_pending_org_members.return_value = []
+    user_role_migrator.list_source_workspace_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(
+        cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator
+    )
+
+    result = cli_harness.invoke(["users"])
+
+    assert result.exit_code == 0
+    assert user_role_migrator.build_role_mapping.call_args_list == [
+        call(custom_role_ids=set()),
+        call(custom_role_ids={"src-custom"}),
+    ]
+
+
+def test_users_command_syncs_workspace_custom_roles_after_workspace_selection(
+    cli_harness, monkeypatch
+):
+    """Workspace-only custom roles are synced after workspace member selection."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.side_effect = [
+        {"src-admin": "dst-admin"},
+        {"src-admin": "dst-admin", "src-ws-custom": "dst-ws-custom"},
+    ]
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_source_org_members.return_value = []
+    user_role_migrator.list_source_pending_org_members.return_value = []
+    user_role_migrator.list_source_workspace_members.return_value = [
+        {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-ws-custom"}
+    ]
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(
+        cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator
+    )
+
+    result = cli_harness.invoke(["users"])
+
+    assert result.exit_code == 0
+    assert user_role_migrator.build_role_mapping.call_args_list == [
+        call(custom_role_ids=set()),
+        call(custom_role_ids={"src-ws-custom"}),
+    ]
+
+
 def test_users_command_always_refreshes_dest_org_identities_for_phase3(
     cli_harness, monkeypatch
 ):
-    """Workspace phase refreshes destination org identities even when cache is empty dict."""
+    """Workspace phase refreshes destination org identities via the cache helper."""
     cli_harness.controls.workspace_result = WorkspaceProjectResult(
         workspace_mapping={"src-ws": "dst-ws"},
         project_mappings={},
@@ -351,9 +421,6 @@ def test_users_command_always_refreshes_dest_org_identities_for_phase3(
     user_role_migrator._dest_email_to_identity = {}
     user_role_migrator.list_source_org_members.return_value = []
     user_role_migrator.list_source_pending_org_members.return_value = []
-    user_role_migrator.list_dest_org_members.return_value = [
-        {"id": "dst-org-1", "email": "alice@example.com", "role_id": "dst-role"}
-    ]
     user_role_migrator.list_source_workspace_members.return_value = [
         {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-role"}
     ]
@@ -363,7 +430,7 @@ def test_users_command_always_refreshes_dest_org_identities_for_phase3(
     result = cli_harness.invoke(["users"])
 
     assert result.exit_code == 0
-    user_role_migrator.list_dest_org_members.assert_called_once()
+    user_role_migrator.ensure_dest_email_index.assert_called_once_with(force=True)
     user_role_migrator.migrate_workspace_members.assert_called_once()
 
 
@@ -380,7 +447,9 @@ def test_users_command_dest_org_refresh_failure_is_graceful(cli_harness, monkeyp
     user_role_migrator._dest_email_to_identity = {}
     user_role_migrator.list_source_org_members.return_value = []
     user_role_migrator.list_source_pending_org_members.return_value = []
-    user_role_migrator.list_dest_org_members.side_effect = Exception("dest lookup failed")
+    user_role_migrator.ensure_dest_email_index.side_effect = Exception(
+        "dest lookup failed"
+    )
     user_role_migrator.list_source_workspace_members.return_value = [
         {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-role"}
     ]

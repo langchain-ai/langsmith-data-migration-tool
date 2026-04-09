@@ -84,17 +84,36 @@ class UserRoleMigrator(BaseMigrator):
                 members.append(member)
         return members
 
+    def ensure_dest_email_index(self, force: bool = False) -> Dict[str, Dict[str, Any]]:
+        """Fetch and cache the destination org-member email index."""
+        if self._dest_email_to_identity is None or force:
+            dest_members = self.list_dest_org_members()
+            self._dest_email_to_identity = {
+                (member.get("email") or "").lower(): member
+                for member in dest_members
+                if member.get("email")
+            }
+        return self._dest_email_to_identity
+
     # ------------------------------------------------------------------
     # Phase 1: role synchronisation
     # ------------------------------------------------------------------
 
-    def build_role_mapping(self) -> Dict[str, str]:
+    def build_role_mapping(
+        self,
+        custom_role_ids: set[str] | None = None,
+    ) -> Dict[str, str]:
         """Build source_role_id -> dest_role_id mapping.
 
         1. Fetches roles from both sides.
         2. Matches built-in roles by ``name``.
         3. Creates/updates custom roles on destination, matched by ``display_name``.
         4. Persists the mapping in ``state.id_mappings["roles"]``.
+
+        Args:
+            custom_role_ids: Restrict custom-role syncing to this set of source
+                role IDs. Pass ``None`` to retain the legacy sync-all behavior.
+                Passing an empty set will only map built-in roles.
         """
         source_roles = self.list_source_roles()
         dest_roles = self.list_dest_roles()
@@ -103,11 +122,14 @@ class UserRoleMigrator(BaseMigrator):
             f"Found {len(source_roles)} source roles, {len(dest_roles)} destination roles"
         )
 
-        # Match built-in roles
-        mapping = self._match_builtin_roles(source_roles, dest_roles)
+        mapping = dict(self._role_id_map)
+        mapping.update(self._match_builtin_roles(source_roles, dest_roles))
 
-        # Sync custom roles
-        custom_mapping = self._sync_custom_roles(source_roles, dest_roles)
+        custom_mapping = self._sync_custom_roles(
+            source_roles,
+            dest_roles,
+            only_ids=custom_role_ids,
+        )
         mapping.update(custom_mapping)
 
         self._role_id_map = mapping
@@ -119,6 +141,12 @@ class UserRoleMigrator(BaseMigrator):
             self.persist_state()
 
         return mapping
+
+    def get_source_custom_roles(self) -> List[Dict[str, Any]]:
+        """Return only custom roles from the source organisation."""
+        return [
+            role for role in self.list_source_roles() if role.get("name") == "CUSTOM"
+        ]
 
     def _match_builtin_roles(
         self,
@@ -151,6 +179,7 @@ class UserRoleMigrator(BaseMigrator):
         self,
         source_roles: List[Dict[str, Any]],
         dest_roles: List[Dict[str, Any]],
+        only_ids: set[str] | None = None,
     ) -> Dict[str, str]:
         """Sync custom roles by ``display_name``.
 
@@ -166,6 +195,8 @@ class UserRoleMigrator(BaseMigrator):
 
         for role in source_roles:
             if role.get("name") != "CUSTOM":
+                continue
+            if only_ids is not None and role["id"] not in only_ids:
                 continue
 
             display_name = role.get("display_name", "")
