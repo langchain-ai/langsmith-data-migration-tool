@@ -1117,8 +1117,8 @@ def users(
     # ── Phase 1: Role synchronisation ──
     console.print("\n[bold]Phase 1: Synchronising roles...[/bold]")
 
-    # Step 1a: Let user select which custom roles to sync
-    custom_role_ids_to_sync = None  # None = handled after member selection
+    # Step 1a: Defer custom-role creation until member selection unless --roles-only.
+    custom_role_ids_to_sync = set()
     if roles_only:
         # When --roles-only, select custom roles interactively
         try:

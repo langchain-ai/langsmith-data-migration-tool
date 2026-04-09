@@ -69,7 +69,7 @@ class ConflictError(APIError):
 
 def _jittered_sleep(wait_time: float) -> None:
     """Sleep with jitter to avoid thundering herd."""
-    jitter = random.uniform(0, 0.25 * wait_time)
+    jitter = random.uniform(0, 0.25 * wait_time)  # noqa: S311 - backoff jitter is not security-sensitive
     time.sleep(wait_time + jitter)
 
 

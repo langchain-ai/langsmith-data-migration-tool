@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 from langsmith_migrator.cli import main as cli_main
 from langsmith_migrator.cli.tui_workspace_mapper import WorkspaceProjectResult
@@ -296,6 +296,39 @@ def test_users_command_without_csv_keeps_api_member_paths(cli_harness, monkeypat
     user_role_migrator.list_source_org_members.assert_called_once()
     user_role_migrator.list_source_pending_org_members.assert_called_once()
     user_role_migrator.list_source_workspace_members.assert_called_once()
+
+
+def test_users_command_defers_custom_role_sync_until_members_are_selected(
+    cli_harness, monkeypatch
+):
+    """Default users flow should sync built-ins first, then only needed custom roles."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.side_effect = [
+        {"src-admin": "dst-admin"},
+        {"src-admin": "dst-admin", "src-custom": "dst-custom"},
+    ]
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_source_org_members.return_value = [
+        {"id": "src-org-1", "email": "alice@example.com", "role_id": "src-custom"}
+    ]
+    user_role_migrator.list_source_pending_org_members.return_value = []
+    user_role_migrator.list_source_workspace_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(["users"])
+
+    assert result.exit_code == 0
+    assert user_role_migrator.build_role_mapping.call_args_list == [
+        call(custom_role_ids=set()),
+        call(custom_role_ids={"src-custom"}),
+    ]
 
 
 def test_users_command_always_refreshes_dest_org_identities_for_phase3(
