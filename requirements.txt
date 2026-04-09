@@ -45,7 +45,7 @@ platformdirs==4.9.4
     # via textual
 pydantic==2.12.5
     # via langsmith
-pydantic-core==2.45.0
+pydantic-core==2.41.5
     # via pydantic
 pygments==2.20.0
     # via
