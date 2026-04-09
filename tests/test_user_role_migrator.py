@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import Mock
 from langsmith_migrator.core.migrators import UserRoleMigrator
-from langsmith_migrator.utils.retry import APIError, AuthenticationError, ConflictError
+from langsmith_migrator.utils.retry import APIError, ConflictError
 
 
 class TestUserRoleMigrator:
@@ -132,6 +132,67 @@ class TestUserRoleMigrator:
         assert migration_state.id_mappings.get("roles", {}).get("src-admin") == "dst-admin"
         assert migration_state.id_mappings.get("roles", {}).get("src-custom-1") == "dst-custom-1"
 
+    def test_build_role_mapping_can_skip_custom_roles(self, migrator, source_roles, dest_roles):
+        """Selective sync can leave custom roles untouched until they are needed."""
+        migrator.source.get.return_value = source_roles
+        migrator.dest.get.return_value = dest_roles
+
+        mapping = migrator.build_role_mapping(custom_role_ids=set())
+
+        assert mapping["src-admin"] == "dst-admin"
+        assert "src-custom-1" not in mapping
+        migrator.dest.post.assert_not_called()
+
+    def test_build_role_mapping_accumulates_requested_custom_roles(self, migrator, dest_roles):
+        """Repeated selective sync calls preserve custom roles already mapped earlier."""
+        source_roles = [
+            {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin", "permissions": []},
+            {
+                "id": "src-custom-1",
+                "name": "CUSTOM",
+                "display_name": "Data Scientist",
+                "description": "Custom DS role",
+                "permissions": ["datasets:read"],
+            },
+            {
+                "id": "src-custom-2",
+                "name": "CUSTOM",
+                "display_name": "Reviewer",
+                "description": "Custom reviewer role",
+                "permissions": ["runs:read"],
+            },
+        ]
+        migrator.source.get.return_value = source_roles
+        migrator.dest.get.return_value = dest_roles
+        migrator.dest.post.side_effect = [
+            {"id": "dst-custom-1"},
+            {"id": "dst-custom-2"},
+        ]
+
+        first = migrator.build_role_mapping(custom_role_ids={"src-custom-1"})
+        second = migrator.build_role_mapping(custom_role_ids={"src-custom-2"})
+
+        assert first["src-custom-1"] == "dst-custom-1"
+        assert "src-custom-2" not in first
+        assert second["src-custom-1"] == "dst-custom-1"
+        assert second["src-custom-2"] == "dst-custom-2"
+
+    def test_ensure_dest_email_index_caches_until_forced(self, migrator):
+        """Destination org identities are cached unless a refresh is requested."""
+        migrator.dest.get_paginated.side_effect = [
+            iter([{"id": "dst-1", "email": "alice@example.com"}]),
+            iter([{"id": "dst-2", "email": "bob@example.com"}]),
+        ]
+
+        first = migrator.ensure_dest_email_index()
+        second = migrator.ensure_dest_email_index()
+        refreshed = migrator.ensure_dest_email_index(force=True)
+
+        assert first is second
+        assert first["alice@example.com"]["id"] == "dst-1"
+        assert refreshed["bob@example.com"]["id"] == "dst-2"
+        assert migrator.dest.get_paginated.call_count == 2
+
     # ── Phase 2: Org member migration ──
 
     def test_migrate_org_members_invite_new(self, migrator):
@@ -223,6 +284,61 @@ class TestUserRoleMigrator:
         assert f == 1
         assert m == 0
 
+    def test_migrate_org_members_reinvites_pending_when_role_differs(self, migrator):
+        """Pending invites with the wrong role are replaced in authoritative mode."""
+        migrator._role_id_map = {"src-role": "dst-role-new"}
+        migrator.dest.get_paginated.side_effect = [
+            iter([]),
+            iter([
+                {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
+            ]),
+        ]
+        migrator.dest.post.return_value = {"id": "new-identity-1"}
+
+        members = [
+            {"id": "src-m1", "email": "alice@example.com", "role_id": "src-role"},
+        ]
+
+        m, s, f = migrator.migrate_org_members(
+            members,
+            remove_pending=True,
+        )
+
+        assert (m, s, f) == (1, 0, 0)
+        migrator.dest.delete.assert_called_once_with("/orgs/current/members/pending-1")
+        migrator.dest.post.assert_called_once_with(
+            "/orgs/current/members",
+            {"email": "alice@example.com", "role_id": "dst-role-new"},
+        )
+
+    def test_migrate_org_members_remove_missing_active_and_pending(self, migrator):
+        """Authoritative mode removes extra active members and pending invites."""
+        migrator._role_id_map = {"src-role": "dst-role"}
+        migrator.dest.get_paginated.side_effect = [
+            iter([
+                {"id": "dst-keep", "email": "keep@example.com", "role_id": "dst-role"},
+                {"id": "dst-remove", "email": "remove@example.com", "role_id": "dst-role"},
+            ]),
+            iter([
+                {"id": "pending-remove", "email": "pending@example.com", "role_id": "dst-role"},
+            ]),
+        ]
+
+        members = [
+            {"id": "src-keep", "email": "keep@example.com", "role_id": "src-role"},
+        ]
+
+        m, s, f = migrator.migrate_org_members(
+            members,
+            remove_missing=True,
+            remove_pending=True,
+        )
+
+        assert (m, s, f) == (2, 1, 0)
+        assert migrator._last_org_member_removals == 2
+        migrator.dest.delete.assert_any_call("/orgs/current/members/dst-remove")
+        migrator.dest.delete.assert_any_call("/orgs/current/members/pending-remove")
+
     # ── Phase 3: Workspace member migration ──
 
     def test_migrate_workspace_members_add(self, migrator):
@@ -277,6 +393,51 @@ class TestUserRoleMigrator:
         assert f == 1
         assert m == 0
 
+    def test_migrate_workspace_members_remove_missing(self, migrator):
+        """Authoritative workspace sync removes extra memberships."""
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
+        migrator._dest_email_to_identity = {
+            "keep@example.com": {"id": "dst-org-identity-1"},
+        }
+        migrator.dest.get_paginated.return_value = iter([
+            {"id": "dst-ws-keep", "email": "keep@example.com", "role_id": "dst-ws-role"},
+            {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
+        ])
+
+        selected = [
+            {"id": "src-ws-m1", "email": "keep@example.com", "role_id": "src-ws-role"},
+        ]
+
+        m, s, f = migrator.migrate_workspace_members(
+            selected_members=selected,
+            remove_missing=True,
+        )
+
+        assert (m, s, f) == (1, 1, 0)
+        assert migrator._last_workspace_member_removals == 1
+        migrator.dest.delete.assert_called_once_with(
+            "/tenants/current/members/dst-ws-remove"
+        )
+
+    def test_migrate_workspace_members_remove_missing_with_empty_selection(self, migrator):
+        """Authoritative workspace sync can clear a workspace omitted from the CSV."""
+        migrator._role_id_map = {}
+        migrator._dest_email_to_identity = {}
+        migrator.dest.get_paginated.return_value = iter([
+            {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
+        ])
+
+        m, s, f = migrator.migrate_workspace_members(
+            selected_members=[],
+            remove_missing=True,
+        )
+
+        assert (m, s, f) == (1, 0, 0)
+        assert migrator._last_workspace_member_removals == 1
+        migrator.dest.delete.assert_called_once_with(
+            "/tenants/current/members/dst-ws-remove"
+        )
+
     # ── Dry run ──
 
     def test_dry_run_no_mutations(self, migrator, sample_config, source_roles, dest_roles):
@@ -305,6 +466,76 @@ class TestUserRoleMigrator:
 
         assert m == 1
         migrator.dest.post.assert_not_called()
+
+    def test_dry_run_org_member_removals(self, migrator, sample_config):
+        """Dry run records authoritative org removals without issuing DELETEs."""
+        sample_config.migration.dry_run = True
+        migrator._role_id_map = {"src-role": "dst-role"}
+        migrator.dest.get_paginated.side_effect = [
+            iter([
+                {"id": "dst-keep", "email": "keep@example.com", "role_id": "dst-role"},
+                {"id": "dst-remove", "email": "remove@example.com", "role_id": "dst-role"},
+            ]),
+            iter([
+                {"id": "pending-remove", "email": "pending@example.com", "role_id": "dst-role"},
+            ]),
+        ]
+
+        members = [
+            {"id": "src-keep", "email": "keep@example.com", "role_id": "src-role"},
+        ]
+
+        m, s, f = migrator.migrate_org_members(
+            members,
+            remove_missing=True,
+            remove_pending=True,
+        )
+
+        assert (m, s, f) == (2, 1, 0)
+        assert migrator._last_org_member_removals == 2
+        migrator.dest.delete.assert_not_called()
+
+    def test_dry_run_workspace_member_update(self, migrator, sample_config):
+        """Dry run skips workspace role PATCH requests."""
+        sample_config.migration.dry_run = True
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role-new"}
+        migrator.dest.get_paginated.return_value = iter([
+            {"id": "dst-ws-m1", "email": "alice@example.com", "role_id": "dst-ws-role-old"},
+        ])
+
+        members = [
+            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+        ]
+
+        m, s, f = migrator.migrate_workspace_members(selected_members=members)
+
+        assert (m, s, f) == (1, 0, 0)
+        migrator.dest.patch.assert_not_called()
+
+    def test_dry_run_workspace_member_removals(self, migrator, sample_config):
+        """Dry run records authoritative workspace removals without issuing DELETEs."""
+        sample_config.migration.dry_run = True
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
+        migrator._dest_email_to_identity = {
+            "keep@example.com": {"id": "dst-org-identity-1"},
+        }
+        migrator.dest.get_paginated.return_value = iter([
+            {"id": "dst-ws-keep", "email": "keep@example.com", "role_id": "dst-ws-role"},
+            {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
+        ])
+
+        selected = [
+            {"id": "src-ws-m1", "email": "keep@example.com", "role_id": "src-ws-role"},
+        ]
+
+        m, s, f = migrator.migrate_workspace_members(
+            selected_members=selected,
+            remove_missing=True,
+        )
+
+        assert (m, s, f) == (1, 1, 0)
+        assert migrator._last_workspace_member_removals == 1
+        migrator.dest.delete.assert_not_called()
 
     # ── Role update failure ──
 
@@ -386,24 +617,45 @@ class TestUserRoleMigrator:
         assert m == 0
         migrator.source.get_paginated.assert_called_once()
 
-    # ── Conditional dest fetch ──
-
-    def test_migrate_org_members_skips_fetch_when_index_populated(self, migrator):
-        """migrate_org_members skips list_dest_org_members when index already set."""
-        migrator._role_id_map = {"src-role": "dst-role"}
+    def test_migrate_workspace_members_from_csv_rows_filters_by_workspace(self, migrator):
+        """CSV workspace migration only processes rows for active source workspace."""
+        migrator.source.session.headers["X-Tenant-Id"] = "ws-src-1"
+        migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
         migrator._dest_email_to_identity = {
-            "bob@example.com": {"id": "dst-bob"},
+            "alice@example.com": {"id": "dst-org-identity-1"},
         }
-        migrator.dest.post.return_value = {"id": "new-1"}
+        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.post.return_value = {"id": "dst-ws-identity-1"}
 
-        members = [
-            {"id": "src-m1", "email": "alice@example.com", "role_id": "src-role"},
+        rows = [
+            {
+                "email": "alice@example.com",
+                "role_id": "src-ws-role",
+                "workspace_id": "ws-src-1",
+            },
+            {
+                "email": "bob@example.com",
+                "role_id": "src-ws-role",
+                "workspace_id": "ws-src-2",
+            },
         ]
 
-        migrator.migrate_org_members(members)
+        m, s, f = migrator.migrate_workspace_members_from_csv_rows(rows)
 
-        # dest.get_paginated should NOT be called — index was pre-populated
-        migrator.dest.get_paginated.assert_not_called()
+        assert (m, s, f) == (1, 0, 0)
+        migrator.dest.post.assert_called_once_with(
+            "/tenants/current/members",
+            {"org_identity_id": "dst-org-identity-1", "role_id": "dst-ws-role"},
+        )
+
+    def test_migrate_workspace_members_from_csv_rows_requires_workspace_context(self, migrator):
+        """CSV workspace migration requires an active source workspace."""
+        migrator.source.session.headers = {}
+
+        with pytest.raises(APIError):
+            migrator.migrate_workspace_members_from_csv_rows(
+                [{"email": "alice@example.com", "role_id": "src-role", "workspace_id": "ws-1"}]
+            )
 
     # ── Per-member state tracking ──
 
@@ -491,6 +743,19 @@ class TestUserRoleMigrator:
         # Can be set to a dict for resume
         migrator._dest_email_to_identity = {"alice@example.com": {"id": "dst-1"}}
         assert migrator._dest_email_to_identity["alice@example.com"]["id"] == "dst-1"
+
+    def test_migrate_workspace_members_from_csv_rows_rejects_conflicting_roles(
+        self, migrator
+    ):
+        """CSV workspace rows with conflicting role IDs for one email are rejected."""
+        migrator.source.session.headers["X-Tenant-Id"] = "ws-src-1"
+        rows = [
+            {"email": "alice@example.com", "role_id": "role-1", "workspace_id": "ws-src-1"},
+            {"email": "alice@example.com", "role_id": "role-2", "workspace_id": "ws-src-1"},
+        ]
+
+        with pytest.raises(APIError, match="Conflicting workspace role_id"):
+            migrator.migrate_workspace_members_from_csv_rows(rows)
 
     def test_ws_member_item_id_includes_workspace(self, migrator, migration_state):
         """ws_member item_id includes source workspace to avoid cross-workspace collision."""

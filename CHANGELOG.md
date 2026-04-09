@@ -7,46 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.59] - 2026-04-02
-
-### Fixed
-- **TUI: Enter confirms selection** — Enter key now correctly confirms the selection instead of toggling rows. Space remains the toggle key.
-- **TUI: Escape from search preserves filter** — Pressing Escape while in the search box returns focus to the table without clearing the search filter.
-- **Role sync no longer auto-creates all custom roles** — Phase 1 matches built-in roles only. Custom roles are auto-synced only for the members you select in Phase 2. Use `--roles-only` for interactive custom role selection.
-
-## [0.0.58] - 2026-04-02
+## [0.0.60] - 2026-04-08
 
 ### Added
-- **`resume` CLI command**: New command to resume interrupted migrations. Loads the latest session, displays resumable items, and dispatches each to the correct migrator.
-- **Prompt state tracking**: Both standalone `prompts` command and `migrate_all` now create state items for each prompt, enabling resume on failure.
-- **`request_with_retry` utility**: New retry-aware wrapper for raw `requests.Session` calls used by prompt, rules, and dataset migrators.
-- **Feedback source remapping**: `feedback_source` and `source_run_id` fields now have embedded run IDs remapped to destination IDs.
-- **URL sanitization in errors**: `APIError.__str__` now redacts query parameters from URLs to prevent API key leakage in logs and state files.
-- **Non-interactive guards**: `--map-projects` and `--map-workspaces` now error clearly in `--non-interactive` mode instead of hanging.
-- **311 tests** (up from 205) with new test files for API client, retry, pagination, config, state transitions, dataset migrator, and feedback migrator.
+- **Role-name CSV input for user migration**: `users --members-csv` now accepts human-readable `langsmith_role` values with optional `workspace_id` / `workspace_name`, making org-scoped and workspace-scoped membership imports easier to author.
+- **Role-name resolution safeguards**: Built-in LangSmith roles and custom role display names are resolved deterministically, with clear validation for ambiguous or unknown CSV role labels.
 
 ### Fixed
-- **Thread safety**: Parallel dataset migration now creates per-worker API clients instead of sharing a single `requests.Session` across threads.
-- **Atomic state writes**: `StateManager.save()` and `save_config()` now use temp file + `os.replace()` to prevent data loss on interruption.
-- **Attempt counting**: `update_item_status` only increments attempts on `FAILED` transitions, fixing inflated counts that prevented resume.
-- **Resume infinite loop**: `get_resume_items()` now excludes items that already have a terminal state.
-- **Terminal state guard**: `mark_terminal` prevents overwriting successful terminal states (MIGRATED cannot be demoted to BLOCKED).
-- **Feedback data fidelity**: Switched from allowlist to denylist approach, preserving `feedback_config`, `extra`, `source_run_id`, and `source_info` fields.
-- **Reference example ID**: Unmapped `reference_example_id` now preserved with warning instead of silently dropped.
-- **Deterministic evaluator keys**: Replaced Python's process-salted `hash()` with stable `hashlib.sha256` for evaluator feedback keys.
-- **O(n²) run mapping**: Replaced per-run `{**dict_a, **dict_b}` merge with `ChainMap` for large experiment migrations.
-- **Session cleanup**: All 11 CLI commands now use `ctx.with_resource(orchestrator)` for guaranteed HTTP session cleanup on any exit path.
-- **Pagination safety**: `PaginationHelper` only catches `NotFoundError` instead of silently swallowing all exceptions. Caller's `params` dict is no longer mutated.
-- **Config validation**: Added bounds checks for `timeout`, `chunk_size`, and `rate_limit_delay`. Fixed `batch_size=0` falling through to env var default.
-- **Silent exception swallowing**: `list_projects` and `create_workspace` now propagate auth/network errors instead of returning empty results.
-- **Rules data correctness**: `_clean_none_values` preserves positional `None`s in lists; `alerts`/`webhooks` now cleaned; unmapped `add_to_dataset_id` no longer falls back to source ID; rule update failures now mark terminal state; symmetric verification normalization.
-- **Multi-session charts**: Charts with multiple sessions now map each session ID individually instead of collapsing to a single session.
-- **Org/workspace member resume**: `resume_items` now properly marks terminal state and saves after successful org/ws member migration.
-- **`migrate_all` prompt guard**: Added `check_prompts_api_available` before prompt migration in `migrate_all`.
-- **Request body removed from errors**: 404 error info no longer includes `response.request.body` which could contain secrets.
-
-### Removed
-- Dead `CustomNameScreen` class from `tui_project_mapper.py`.
+- **Headless workspace safety**: Non-interactive multi-workspace runs now fail safely when no valid workspace mapping is available instead of falling through unscoped.
+- **Saved workspace mapping validation**: Persisted workspace mappings now record source/destination instance URLs and are ignored when they no longer match the current migration context.
+- **Experiment reference example migration**: Unmapped `reference_example_id` values are now dropped with a warning instead of replaying invalid source IDs into the destination instance.
+- **Resume session selection**: Interactive `resume` once again honors the selected saved session, while non-interactive runs keep latest-session behavior.
+- **Resume command cleanup**: Resume execution now uses explicit orchestrator cleanup without depending on context-manager support, preserving CLI reliability in tests and real runs.
 
 ## [0.0.57] - 2026-03-31
 

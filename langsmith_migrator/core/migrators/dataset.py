@@ -10,7 +10,6 @@ import urllib3
 
 from .base import BaseMigrator
 from ..api_client import APIError, NotFoundError
-from ...utils.retry import request_with_retry
 
 
 # Maximum attachment size in bytes (100 MB)
@@ -215,9 +214,11 @@ class DatasetMigrator(BaseMigrator):
 
                 # First, make a HEAD request to check size and content-type
                 try:
-                    head_response = request_with_retry(
-                        requests.Session(), "HEAD", presigned_url,
-                        max_retries=2, verify=self.source.verify_ssl, timeout=30, allow_redirects=True
+                    head_response = requests.head(
+                        presigned_url,
+                        verify=self.source.verify_ssl,
+                        timeout=30,
+                        allow_redirects=True
                     )
                     head_response.raise_for_status()
 
@@ -377,10 +378,12 @@ class DatasetMigrator(BaseMigrator):
                             self.log("SSL verification disabled for attachment uploads", "warning")
                             self._ssl_warning_shown = True
 
-                    upload_response = request_with_retry(
-                        requests.Session(), "PUT", presigned_url,
-                        max_retries=2, data=data, headers={"Content-Type": mime_type},
-                        verify=self.dest.verify_ssl, timeout=300
+                    upload_response = requests.put(
+                        presigned_url,
+                        data=data,
+                        headers={"Content-Type": mime_type},
+                        verify=self.dest.verify_ssl,
+                        timeout=300  # 5 minute timeout for large attachments
                     )
                     upload_response.raise_for_status()
 

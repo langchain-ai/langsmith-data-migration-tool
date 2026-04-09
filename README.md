@@ -1,12 +1,12 @@
 # LangSmith Data Migration Tool
 
-A Python CLI for migrating datasets, experiments, annotation queues, project rules, prompts, charts, users, and roles between LangSmith instances.
+A Python CLI for migrating datasets, experiments, annotation queues, project rules, prompts, and charts between LangSmith instances.
 
 ## Quick Start
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/download/v0.0.59/langsmith_data_migration_tool-0.0.59-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -28,7 +28,6 @@ langsmith-migrator datasets
 - **Project Rules**: Copy automation rules with project mapping and optional project creation in interactive flows
 - **Prompts**: Migrate prompts (latest by default, full history with `--include-all-commits`)
 - **Charts**: Migrate monitoring charts with filter preservation
-- **Users & Roles**: Sync custom roles, invite org members, add workspace members
 - **Interactive CLI**: TUI-based selection with search/filter
 
 ## Limitations
@@ -42,7 +41,6 @@ This tool **does not support migrating trace data**. It migrates:
 - Project rules
 - Prompts
 - Charts
-- Users, roles, and workspace memberships
 
 For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
 
@@ -52,20 +50,20 @@ For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk E
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/download/v0.0.59/langsmith_data_migration_tool-0.0.59-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/download/v0.0.59/langsmith_data_migration_tool-0.0.59-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/download/v0.0.59/langsmith_data_migration_tool-0.0.59-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/download/v0.0.59/langsmith_data_migration_tool-0.0.59-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.51-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -107,7 +105,6 @@ langsmith-migrator test
 # Interactive wizard for all resources
 langsmith-migrator migrate-all
 langsmith-migrator migrate-all --rules-create-enabled   # Create migrated rules as enabled
-langsmith-migrator migrate-all --skip-users              # Skip user/role migration
 
 # Datasets
 langsmith-migrator datasets                    # Interactive selection
@@ -138,13 +135,6 @@ langsmith-migrator charts --session "project-name"
 langsmith-migrator charts --map-projects        # Interactive TUI project mapping
 langsmith-migrator charts --same-instance       # Reuse source project/session IDs on destination
 
-# Users & roles
-langsmith-migrator users                        # Sync roles, invite org members, add workspace members
-langsmith-migrator users --roles-only           # Only sync custom roles (skip members)
-langsmith-migrator users --skip-workspace-members  # Skip workspace member migration
-langsmith-migrator users --map-workspaces       # Interactive workspace mapping for phase 3
-langsmith-migrator users --members-csv members.csv --map-workspaces  # CSV-driven member input
-
 # Utilities
 langsmith-migrator list-projects --source
 langsmith-migrator list_workspaces --source --dest
@@ -160,17 +150,85 @@ When running `users`, you can provide member details from CSV instead of source 
 langsmith-migrator users --members-csv examples/users_members_example.csv --map-workspaces
 ```
 
+For a single deployed LangSmith instance, `users` can also run as an access-sync command instead of a source→destination migration.
+
+Safe default: add or update access from the CSV without removing anyone:
+
+```bash
+langsmith-migrator users \
+  --api-key "$LANGSMITH_API_KEY" \
+  --url "https://your-langsmith-instance.example.com" \
+  --csv examples/users_members_example.csv
+```
+
+Preview the same run without making changes:
+
+```bash
+langsmith-migrator users \
+  --dry-run \
+  --api-key "$LANGSMITH_API_KEY" \
+  --url "https://your-langsmith-instance.example.com" \
+  --csv examples/users_members_example.csv
+```
+
+Authoritative mode: make the CSV the source of truth for access and remove anything not present:
+
+```bash
+langsmith-migrator users \
+  --api-key "$LANGSMITH_API_KEY" \
+  --url "https://your-langsmith-instance.example.com" \
+  --csv examples/users_members_example.csv \
+  --sync
+```
+
+Equivalent explicit form:
+
+```bash
+langsmith-migrator \
+  --dest-key "$LANGSMITH_API_KEY" \
+  --dest-url "https://your-langsmith-instance.example.com" \
+  users \
+  --single-instance \
+  --members-csv examples/users_members_example.csv \
+  --csv-source-of-truth
+```
+
+In `--single-instance` mode, the command mirrors the provided instance configuration onto both internal clients, so you only need one working LangSmith connection. Workspace rows use the target workspace IDs directly; there is no workspace mapping step. All CSV rows are applied automatically after a single confirmation summary; there is no row-selection step in this mode. `--api-key`/`--url` imply `--single-instance`, `--csv` is a short alias for `--members-csv`, and `--sync` is a short alias for `--csv-source-of-truth`.
+`users --dry-run` is also supported as a command-local preview flag if you prefer to put dry-run after the subcommand instead of before it.
+
 CSV schema:
 
 ```csv
-email,role_id,workspace_id
-alice@example.com,role_org_user_abc123,ws_src_prod_us
+email,langsmith_role,workspace_id,workspace_name
+alice@example.com,Organization Admin,,
+alice@example.com,Workspace Admin,ws_src_prod_us,Production US
 ```
 
 Notes:
-- `email`, `role_id`, and `workspace_id` are required.
-- `role_id` must be consistent for each `email` across rows.
-- `workspace_id` should be the source workspace ID (used to filter workspace memberships per mapped workspace pair).
+- `email` and `langsmith_role` are required.
+- `workspace_id` is optional. Leave it empty for org-level role assignments.
+- `workspace_name` is optional and informational only.
+- `langsmith_role` should be a built-in LangSmith role name (for example `Organization Admin`, `Organization User`, `Workspace Admin`) or a custom role `display_name`.
+- Users who only appear in workspace rows are invited to the org with the source `ORGANIZATION_USER` role before workspace membership is applied.
+- `Organization Admin` on a workspace row is treated as org-level admin access only. No explicit workspace membership is created because org admins already have workspace access.
+- Other org-scoped roles cannot be used on workspace rows. If you want org-level access, leave `workspace_id` empty.
+- Workspace-scoped roles such as `Workspace Admin` cannot be used on org-level rows.
+- `--sync` / `--csv-source-of-truth` is the only mode that removes access. Without it, single-instance CSV mode only adds or updates access.
+- `--csv-source-of-truth` is available with `--single-instance` and makes the CSV authoritative for access:
+  - users missing from the CSV are removed from the org
+  - pending org invites missing from the CSV are cancelled
+  - workspace memberships missing from the CSV are removed
+  - workspaces omitted from the CSV are treated as having no desired memberships
+
+Guardrails:
+- `--api-key` and `--url` must be provided together when either is used.
+- `--single-instance` requires `--csv` / `--members-csv`.
+- `--sync` requires `--csv` and cannot be combined with `--skip-existing` or `--skip-workspace-members`.
+- `--single-instance` cannot be combined with workspace mapping flags.
+- `--roles-only` cannot be combined with `--single-instance` or `--members-csv`.
+- If the CSV contains workspace rows and `--skip-workspace-members` is set, the command fails instead of silently ignoring those rows.
+- If the CSV contains workspace-only users, the target instance must have an `ORGANIZATION_USER` role available or the command fails before applying member changes.
+- If the CSV references unknown `workspace_id` values, the command fails before any membership changes are applied.
 
 ### CLI Options
 
@@ -224,9 +282,20 @@ The prompt default is `No` (rules are created disabled).
 ### Users Options
 
 ```bash
+--dry-run                  Preview this users sync without making POST/PATCH/DELETE changes
 --roles-only               Only sync custom roles (skip member migration)
 --skip-workspace-members   Skip workspace member migration (phases 1-2 only)
---members-csv PATH         CSV file with member details (email, role_id, workspace_id)
+--single-instance, --instance
+                           Use one target LangSmith instance for CSV-driven access sync instead of source→destination migration
+--csv-source-of-truth, --sync
+                           Make the CSV authoritative for single-instance sync: remove org users, pending invites, and
+                           workspace memberships not present in the CSV. Without this flag, CSV mode only adds or updates
+                           access.
+--members-csv, --csv PATH  CSV file with member details (email, langsmith_role, workspace_id, workspace_name)
+                           Replaces source member API lookups. In --single-instance mode, all CSV rows are applied
+                           automatically.
+--api-key TEXT             API key for the single-instance CSV sync target. Must be provided together with --url.
+--url TEXT                 Base URL for the single-instance CSV sync target. Must be provided together with --api-key.
 ```
 
 Migration proceeds in three phases:
@@ -243,7 +312,6 @@ Rules are created disabled by default. Use `--create-enabled` on the `rules` com
 ```
 
 When `--skip-users` is omitted, `migrate-all` runs user/role migration as Step 0 before all other resources. Phases 1-2 (roles + org members) run once; phase 3 (workspace members) runs per workspace pair.
-
 ### Project Mapping
 
 Rules and charts reference projects by ID. When migrating between instances, project IDs differ.
@@ -279,7 +347,6 @@ langsmith-migrator queues --map-workspaces
 langsmith-migrator prompts --map-workspaces
 langsmith-migrator rules --map-workspaces --map-projects
 langsmith-migrator charts --map-workspaces --map-projects
-langsmith-migrator users --map-workspaces
 langsmith-migrator migrate-all --map-workspaces
 
 # Explicit workspace pair
@@ -288,9 +355,9 @@ langsmith-migrator datasets --source-workspace WS_ID --dest-workspace WS_ID
 
 When using `--map-workspaces`, each command iterates all mapped workspace pairs, running the full fetch/select/migrate flow per pair. For `rules` and `charts` with `--map-projects`, the project mapping TUI is shown per workspace pair so projects are correctly scoped.
 
-### Resume
+### Resume Scope
 
-`langsmith-migrator resume` resumes any interrupted migration. It loads the latest session, shows resumable items by type, and dispatches each to the correct migrator. Supports all resource types: datasets, experiments, prompts, queues, rules, charts, org members, and workspace members.
+`resume` currently resumes interrupted dataset migration flows. Experiment-only resume is not yet supported.
 
 ## SSL Certificate Issues
 
@@ -320,11 +387,6 @@ For release changes, update all of:
 - `README.md` release-facing docs/examples
 
 CI enforces this on pull requests: if `pyproject.toml` or `CHANGELOG.md` changes, `README.md` must also be updated.
-
-## Support
-
-For issues or questions: [GitHub repository](https://github.com/langchain-ai/langsmith-data-migration-tool)
-G.md` changes, `README.md` must also be updated.
 
 ## Support
 

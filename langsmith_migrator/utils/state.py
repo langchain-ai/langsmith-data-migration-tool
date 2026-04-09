@@ -357,8 +357,7 @@ class MigrationState:
         item = self.items[item_id]
         item.status = status
         item.last_attempt = _now()
-        if status == MigrationStatus.FAILED:
-            item.attempts += 1
+        item.attempts += 1
 
         if destination_id:
             item.destination_id = destination_id
@@ -422,12 +421,6 @@ class MigrationState:
         if not item:
             return
 
-        if item.terminal_state in (
-            ResolutionOutcome.MIGRATED.value,
-            ResolutionOutcome.MIGRATED_WITH_VERIFIED_DOWNGRADE.value,
-        ):
-            return
-
         item.terminal_state = terminal_state.value
         item.outcome_code = outcome_code
         item.verification_state = verification_state.value
@@ -479,7 +472,7 @@ class MigrationState:
         """Return items that should be reconsidered by resume."""
         items = self.get_pending_items(include_in_progress=True)
         items.extend(self.get_failed_items(max_attempts=max_attempts))
-        return [i for i in items if i.terminal_state is None]
+        return items
 
     def get_checkpoint_items(self) -> List[MigrationItem]:
         """Return items that landed in a checkpoint/export terminal state."""

@@ -25,7 +25,8 @@ class PaginationHelper:
         Yields:
             Individual items from paginated results
         """
-        params = dict(params) if params else {}
+        if params is None:
+            params = {}
 
         params["limit"] = page_size
         offset = 0
@@ -37,11 +38,10 @@ class PaginationHelper:
             iterations += 1
             params["offset"] = offset
 
-            from ..core.api_client import NotFoundError
-
             try:
                 response = fetch_fn(endpoint, params)
-            except NotFoundError:
+            except Exception:
+                # No more results or error
                 break
 
             # Handle different response formats
@@ -87,9 +87,10 @@ class PaginationHelper:
         if isinstance(response, list):
             return response
         elif isinstance(response, dict):
-            for key in ("items", "data", "results"):
-                val = response.get(key)
-                if isinstance(val, list):
-                    return val
-            return []
+            # Try common keys for paginated data
+            items = response.get("items", response.get("data", response.get("results", [])))
+            if not items and not isinstance(items, list):
+                # Might be a single item response
+                items = [response]
+            return items if isinstance(items, list) else []
         return []

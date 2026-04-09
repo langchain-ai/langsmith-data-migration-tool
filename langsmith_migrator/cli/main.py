@@ -49,7 +49,11 @@ from ..utils.workspace import (
     list_projects as _list_projects,
     list_workspaces as _list_workspaces,
 )
-from ..utils.workspace_resolver import resolve_workspace_context, display_workspaces
+from ..utils.workspace_resolver import (
+    WorkspaceResolutionError,
+    display_workspaces,
+    resolve_workspace_context,
+)
 
 
 console = Console()
@@ -104,15 +108,23 @@ def _name_mapping_to_id_mapping(
 
 
 _WS_CANCELLED = "__cancelled__"
+_WS_ABORTED = "__aborted__"
 
 
-def _resolve_workspaces(orchestrator, source_workspace=None, dest_workspace=None, map_workspaces=False, non_interactive=False):
+def _resolve_workspaces(
+    orchestrator,
+    source_workspace=None,
+    dest_workspace=None,
+    map_workspaces=False,
+    non_interactive=False,
+):
     """Resolve workspace context from explicit IDs or auto-detection.
 
     Returns:
         - WorkspaceProjectResult if workspace scoping is active
         - None if no workspace scoping is needed (single-workspace or none found)
         - _WS_CANCELLED sentinel if the user explicitly cancelled the TUI
+        - _WS_ABORTED sentinel if workspace resolution failed safely
     """
     # Explicit single-pair override
     if source_workspace and dest_workspace:
@@ -129,13 +141,16 @@ def _resolve_workspaces(orchestrator, source_workspace=None, dest_workspace=None
         return _WS_CANCELLED
 
     # Auto-detect (config is lazy-loaded inside resolve_workspace_context)
-    result = resolve_workspace_context(
-        orchestrator.source_client,
-        orchestrator.dest_client,
-        console,
-        force_tui=map_workspaces,
-        non_interactive=non_interactive,
-    )
+    try:
+        result = resolve_workspace_context(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            console,
+            force_tui=map_workspaces,
+            non_interactive=non_interactive,
+        )
+    except WorkspaceResolutionError:
+        return _WS_ABORTED
 
     # If force_tui was set and user cancelled, treat as abort
     if result is None and map_workspaces:
@@ -308,11 +323,15 @@ def _select_or_all(config: Config, items: list, *, select_all: bool, title: str,
 def _load_members_csv(path: str) -> list[dict]:
     """Load and validate a members CSV file.
 
+    Expected columns: ``email``, ``langsmith_role``.
+    Optional columns: ``workspace_id`` (empty for org-level rows),
+    ``workspace_name`` (informational, ignored).
+
     Click's ``type=click.Path(exists=True, dir_okay=False)`` already
     validates existence and file-type before this function is called.
     """
     csv_path = Path(path)
-    required_columns = {"email", "role_id", "workspace_id"}
+    required_columns = {"email", "langsmith_role"}
 
     try:
         # utf-8-sig allows BOM-prefixed files exported by spreadsheet tools.
@@ -329,26 +348,22 @@ def _load_members_csv(path: str) -> list[dict]:
             rows: list[dict] = []
             for index, row in enumerate(reader, start=2):
                 email = (row.get("email") or "").strip().lower()
-                role_id = (row.get("role_id") or "").strip()
+                langsmith_role = (row.get("langsmith_role") or "").strip()
                 workspace_id = (row.get("workspace_id") or "").strip()
 
                 if not email:
                     raise click.ClickException(
                         f"Members CSV row {index} has an empty email value"
                     )
-                if not role_id:
+                if not langsmith_role:
                     raise click.ClickException(
-                        f"Members CSV row {index} has an empty role_id value"
-                    )
-                if not workspace_id:
-                    raise click.ClickException(
-                        f"Members CSV row {index} has an empty workspace_id value"
+                        f"Members CSV row {index} has an empty langsmith_role value"
                     )
 
                 rows.append(
                     {
                         "email": email,
-                        "role_id": role_id,
+                        "langsmith_role": langsmith_role,
                         "workspace_id": workspace_id,
                     }
                 )
@@ -364,19 +379,189 @@ def _load_members_csv(path: str) -> list[dict]:
     return rows
 
 
-def _csv_rows_to_org_members(csv_rows: list[dict]) -> list[dict]:
+_BUILTIN_ROLE_ALIASES: dict[str, str] = {
+    "organization admin": "ORGANIZATION_ADMIN",
+    "organization user": "ORGANIZATION_USER",
+    "workspace admin": "WORKSPACE_ADMIN",
+}
+_ORG_SCOPED_BUILTIN_ROLE_NAMES = {"ORGANIZATION_ADMIN", "ORGANIZATION_USER"}
+_WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES = {"WORKSPACE_ADMIN"}
+
+
+def _resolve_csv_role_names(
+    csv_rows: list[dict], source_roles: list[dict]
+) -> tuple[list[dict], str | None]:
+    """Resolve human-readable role names to source role IDs.
+
+    Returns ``(resolved_rows, org_user_role_id)`` where each resolved row
+    has ``role_id`` instead of ``langsmith_role``, and *org_user_role_id*
+    is the source role ID for ORGANIZATION_USER (used as the default org
+    role for users who only appear in workspace rows). Built-in role
+    identifiers and documented aliases take precedence over colliding
+    custom role display names.
+    """
+    role_lookup: dict[str, list[tuple[str, str]]] = {}
+    builtin_by_name: dict[str, str] = {}
+    preferred_builtin_by_label: dict[str, str] = {}
+    org_user_role_id: str | None = None
+
+    def register_role_label(label: str, role_id: str, role_name: str) -> None:
+        candidates = role_lookup.setdefault(label, [])
+        if not any(existing_role_id == role_id for existing_role_id, _ in candidates):
+            candidates.append((role_id, role_name))
+
+    for role in source_roles:
+        role_name = role.get("name", "")
+        role_id = role["id"]
+        dn = (role.get("display_name") or "").strip().lower()
+
+        if role_name != "CUSTOM":
+            builtin_by_name[role_name] = role_id
+            if dn:
+                register_role_label(dn, role_id, role_name)
+            builtin_label = role_name.lower()
+            register_role_label(builtin_label, role_id, role_name)
+            preferred_builtin_by_label[builtin_label] = role_id
+            if role_name == "ORGANIZATION_USER":
+                org_user_role_id = role_id
+        elif dn:
+            register_role_label(dn, role_id, role_name)
+
+    for alias, builtin_name in _BUILTIN_ROLE_ALIASES.items():
+        builtin_role_id = builtin_by_name.get(builtin_name)
+        if builtin_role_id:
+            register_role_label(alias, builtin_role_id, builtin_name)
+            preferred_builtin_by_label[alias] = builtin_role_id
+
+    ambiguous: set[str] = set()
+    unresolved: set[str] = set()
+    resolved_rows: list[dict] = []
+    for row in csv_rows:
+        label = row["langsmith_role"].strip().lower()
+        candidates = role_lookup.get(label, [])
+        if not candidates:
+            unresolved.add(row["langsmith_role"])
+            continue
+
+        preferred_role_id = preferred_builtin_by_label.get(label)
+        if preferred_role_id and any(
+            candidate_role_id == preferred_role_id
+            for candidate_role_id, _ in candidates
+        ):
+            role_id = preferred_role_id
+        else:
+            unique_role_ids = {candidate_role_id for candidate_role_id, _ in candidates}
+            if len(unique_role_ids) != 1:
+                ambiguous.add(row["langsmith_role"])
+                continue
+            role_id = next(iter(unique_role_ids))
+        resolved_role_name = next(
+            candidate_role_name
+            for candidate_role_id, candidate_role_name in candidates
+            if candidate_role_id == role_id
+        )
+
+        resolved_rows.append(
+            {
+                "email": row["email"],
+                "langsmith_role": row["langsmith_role"],
+                "role_id": role_id,
+                "role_name": resolved_role_name,
+                "workspace_id": row.get("workspace_id", ""),
+            }
+        )
+
+    if ambiguous or unresolved:
+        available = sorted(role_lookup.keys())
+        errors: list[str] = []
+        if ambiguous:
+            errors.append("Ambiguous role name(s): " + ", ".join(sorted(ambiguous)))
+        if unresolved:
+            errors.append(
+                "Could not resolve role name(s): "
+                + ", ".join(sorted(unresolved))
+            )
+        errors.append("Available roles: " + ", ".join(available))
+        raise click.ClickException(". ".join(errors))
+
+    return resolved_rows, org_user_role_id
+
+
+def _normalize_csv_role_scopes(
+    csv_rows: list[dict],
+) -> tuple[list[dict], int]:
+    """Validate role scope usage and normalize supported org-role workspace rows.
+
+    `Organization Admin` is the one supported org-scoped role on a workspace
+    row. Those rows are treated as org-level admin access because org admins
+    already have access across workspaces and do not need explicit workspace
+    memberships. Other org-scoped roles on workspace rows are rejected so the
+    CSV cannot silently grant less access than the operator intended.
+    """
+    normalized_rows: list[dict] = []
+    org_admin_workspace_rows = 0
+    errors: list[str] = []
+
+    for row in csv_rows:
+        workspace_id = (row.get("workspace_id") or "").strip()
+        role_name = (row.get("role_name") or "").strip().upper()
+        role_label = row.get("langsmith_role") or role_name or row.get("role_id") or "<unknown>"
+        email = row["email"]
+
+        if not workspace_id:
+            if role_name in _WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES:
+                errors.append(
+                    f"{email}: '{role_label}' is workspace-scoped and cannot be used "
+                    "on an org-level row; add a workspace_id or choose an org-scoped role"
+                )
+                continue
+            normalized_rows.append(row)
+            continue
+
+        if role_name == "ORGANIZATION_ADMIN":
+            normalized_rows.append({**row, "workspace_id": ""})
+            org_admin_workspace_rows += 1
+            continue
+
+        if role_name in _ORG_SCOPED_BUILTIN_ROLE_NAMES:
+            errors.append(
+                f"{email} in workspace {workspace_id}: '{role_label}' is org-scoped "
+                "and cannot be used on a workspace row; leave workspace_id empty for "
+                "org access or choose a workspace-scoped role"
+            )
+            continue
+
+        normalized_rows.append(row)
+
+    if errors:
+        raise click.ClickException(
+            "Members CSV has invalid role scope assignments: " + "; ".join(errors)
+        )
+
+    return normalized_rows, org_admin_workspace_rows
+
+
+def _csv_rows_to_org_members(
+    csv_rows: list[dict], default_org_role_id: str | None = None
+) -> list[dict]:
     """Build org member payloads from CSV rows.
 
-    A single org role is applied per email, so conflicting role_id values
-    for the same email across workspaces are rejected.
+    Rows with an empty ``workspace_id`` are org-level assignments whose
+    ``role_id`` is used directly.  Users who only appear in workspace
+    rows (non-empty ``workspace_id``) are assigned *default_org_role_id*
+    (typically ORGANIZATION_USER) so they can be invited to the org.
     """
+    org_rows = [r for r in csv_rows if not r.get("workspace_id")]
+    ws_rows = [r for r in csv_rows if r.get("workspace_id")]
+
     members_by_email: dict[str, dict] = {}
-    for row in csv_rows:
+
+    for row in org_rows:
         email = row["email"]
         existing = members_by_email.get(email)
         if existing and existing["role_id"] != row["role_id"]:
             raise click.ClickException(
-                "Members CSV has conflicting role_id values for "
+                "Members CSV has conflicting org-level roles for "
                 f"{email}: '{existing['role_id']}' vs '{row['role_id']}'"
             )
         if not existing:
@@ -386,6 +571,17 @@ def _csv_rows_to_org_members(csv_rows: list[dict]) -> list[dict]:
                 "role_id": row["role_id"],
                 "full_name": "",
             }
+
+    for row in ws_rows:
+        email = row["email"]
+        if email not in members_by_email and default_org_role_id:
+            members_by_email[email] = {
+                "id": email,
+                "email": email,
+                "role_id": default_org_role_id,
+                "full_name": "",
+            }
+
     return list(members_by_email.values())
 
 
@@ -410,6 +606,109 @@ def _csv_rows_for_workspace(csv_rows: list[dict], source_workspace_id: str) -> l
                 "full_name": "",
             }
     return list(members_by_email.values())
+
+
+def _normalize_single_instance_url(url: str) -> str:
+    """Normalize base URLs before validating single-instance mode."""
+    normalized = (url or "").rstrip("/").lower()
+    for suffix in ("/api/v1", "/api/v2"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized.rstrip("/")
+
+
+def _configure_single_instance(config: Config) -> None:
+    """Mirror one resolved connection config onto both clients for single-instance runs."""
+    candidates: list[tuple[str, str, str]] = []
+    if config.source.api_key:
+        candidates.append(("source", config.source.api_key, config.source.base_url))
+    if config.destination.api_key:
+        candidates.append(("destination", config.destination.api_key, config.destination.base_url))
+
+    if not candidates:
+        raise click.ClickException(
+            "Single-instance mode requires a target API key and URL. "
+            "Pass --api-key and --url, or provide one unambiguous configured connection."
+        )
+
+    unique_candidates = {
+        (api_key, _normalize_single_instance_url(base_url)): base_url
+        for _, api_key, base_url in candidates
+    }
+    if len(unique_candidates) != 1:
+        raise click.ClickException(
+            "Single-instance mode found multiple configured LangSmith targets. "
+            "Pass --api-key and --url to choose the target instance explicitly."
+        )
+
+    canonical_key, _ = next(iter(unique_candidates))
+    canonical_url = next(iter(unique_candidates.values()))
+
+    config.source.api_key = canonical_key
+    config.destination.api_key = canonical_key
+    config.source.base_url = canonical_url
+    config.destination.base_url = canonical_url
+
+
+def _resolve_single_instance_workspace_ids(
+    csv_rows: list[dict],
+    available_workspace_ids: set[str],
+    *,
+    source_of_truth: bool,
+) -> list[str]:
+    """Return workspace IDs to reconcile for a single-instance CSV sync."""
+    csv_workspace_ids = {
+        (row.get("workspace_id") or "").strip()
+        for row in csv_rows
+        if (row.get("workspace_id") or "").strip()
+    }
+    unknown_workspace_ids = sorted(csv_workspace_ids - available_workspace_ids)
+    if unknown_workspace_ids:
+        raise click.ClickException(
+            "Members CSV references unknown workspace_id value(s): "
+            + ", ".join(unknown_workspace_ids)
+        )
+
+    workspace_ids = available_workspace_ids | csv_workspace_ids if source_of_truth else csv_workspace_ids
+    return sorted(workspace_ids)
+
+
+def _print_single_instance_users_summary(
+    config: Config,
+    *,
+    csv_rows: list[dict],
+    workspace_ids: list[str],
+    csv_source_of_truth: bool,
+    skip_workspace_members: bool,
+) -> None:
+    """Print a concise, high-signal summary for single-instance CSV sync runs."""
+    org_rows = sum(1 for row in csv_rows if not row.get("workspace_id"))
+    workspace_rows = len(csv_rows) - org_rows
+
+    console.print("\n[bold]Single-Instance User Sync[/bold]")
+    console.print(f"  Target: {config.destination.base_url}")
+    console.print(f"  CSV rows: {len(csv_rows)} total ({org_rows} org-level, {workspace_rows} workspace-level)")
+    console.print(
+        f"  Execution: {'dry run (no changes will be sent)' if config.migration.dry_run else 'live apply'}"
+    )
+    console.print(
+        f"  Removals: {'enabled (authoritative CSV sync)' if csv_source_of_truth else 'disabled (add/update only)'}"
+    )
+    console.print("  Row selection: disabled (all CSV rows will be applied)")
+    if skip_workspace_members:
+        console.print("  Workspace access: skipped")
+    elif csv_source_of_truth:
+        console.print(
+            f"  Workspace access: authoritative across {len(workspace_ids)} target workspace(s); "
+            "memberships missing from the CSV will be removed"
+        )
+    elif workspace_ids:
+        console.print(
+            f"  Workspace access: direct target workspace IDs from CSV ({len(workspace_ids)} workspace(s) in scope)"
+        )
+    else:
+        console.print("  Workspace access: no workspace rows in the CSV")
 
 
 def _workspace_scope_key(orchestrator) -> str:
@@ -674,12 +973,13 @@ def test(ctx):
     config.display_summary(console)
 
     console.print("Testing connections... ", end="")
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, ctx.obj['state_manager']))
+    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
 
     if orchestrator.test_connections():
         console.print("[green]✓[/green]")
     else:
         console.print("[red]✗[/red]")
+        orchestrator.cleanup()
         ctx.exit(1)
         return
 
@@ -693,6 +993,8 @@ def test(ctx):
                 display_workspaces(console, source_ws, "Source")
             if dest_ws:
                 display_workspaces(console, dest_ws, "Destination")
+
+    orchestrator.cleanup()
 
 
 @cli.command()
@@ -711,7 +1013,7 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
     if not ensure_config(config):
         return
 
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+    orchestrator = MigrationOrchestrator(config, state_manager)
 
     # Test connections first
     console.print("Testing connections... ", end="")
@@ -731,6 +1033,9 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
 
     # Resolve workspace context
     ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
         return
@@ -834,25 +1139,18 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
     except Exception as e:
         console.print(f"\n[red]Migration failed: {e}[/red]")
         ctx.exit(1)
+    finally:
+        orchestrator.cleanup()
 
 
-@cli.command()
-@ssl_option
-@click.pass_context
-def resume(ctx):
-    """Resume a previous migration session."""
-    state_manager = ctx.obj['state_manager']
-
-    display_banner()
-
-    # List available sessions
+def _select_resume_session(config: Config, state_manager: StateManager):
+    """Return the selected migration session, or None if the user cancels."""
     sessions = state_manager.list_sessions()
 
     if not sessions:
         console.print("[yellow]No previous migration sessions found[/yellow]")
-        return
+        return None
 
-    # Display sessions
     table = Table(title="Available Migration Sessions", show_header=True)
     table.add_column("#", style="cyan", width=3)
     table.add_column("Session ID", style="dim")
@@ -871,78 +1169,27 @@ def resume(ctx):
             session["session_id"],
             started,
             status,
-            progress
+            progress,
         )
 
     console.print(table)
 
-    # Select session
-    if ctx.obj["config"].migration.non_interactive:
-        choice = "1"
-    else:
-        choice = console.input("\nEnter session number to resume (or 'q' to quit): ")
+    if config.migration.non_interactive:
+        return sessions[0]
 
+    choice = console.input("\nEnter session number to resume (or 'q' to quit): ")
     if choice.lower() == 'q':
-        return
+        return None
 
     try:
         session_idx = int(choice) - 1
         if 0 <= session_idx < len(sessions):
-            selected_session = sessions[session_idx]
-        else:
-            console.print("[red]Invalid selection[/red]")
-            return
+            return sessions[session_idx]
+        console.print("[red]Invalid selection[/red]")
+        return None
     except ValueError:
         console.print("[red]Invalid input[/red]")
-        return
-
-    # Load session
-    state = state_manager.load_session(selected_session["session_id"])
-
-    if not state:
-        console.print("[red]Failed to load session[/red]")
-        return
-
-    # Display resume info
-    resume_info = state_manager.get_resume_info(state)
-
-    console.print("\n[bold]Resume Information:[/bold]")
-    console.print(f"  Session: {resume_info['session_id']}")
-    console.print(f"  Pending: {resume_info['pending']}")
-    console.print(f"  Failed: {resume_info['failed']}")
-    console.print(f"  Blocked: {resume_info['blocked']}")
-    console.print(f"  Exported: {resume_info['exported']}")
-    if resume_info.get("remediation_bundle_path"):
-        console.print(f"  Remediation bundle: {resume_info['remediation_bundle_path']}")
-    console.print(f"  Can resume: {'Yes' if resume_info['can_resume'] else 'No'}")
-
-    if not resume_info['can_resume']:
-        console.print("[yellow]Nothing to resume in this session[/yellow]")
-        return
-
-    if not _confirm_action(ctx.obj["config"], "Resume this migration?", default=True, non_interactive_value=True):
-        return
-
-    # Resume migration
-    config = ctx.obj['config']
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
-    orchestrator.state = state
-    config.state_manager = state_manager
-
-    # Get items that need processing
-    items_to_process = state.get_resume_items()
-
-    console.print(f"\n[bold]Resuming migration of {len(items_to_process)} items...[/bold]")
-    if not items_to_process:
-        console.print("[yellow]No resumable items to process[/yellow]")
-    else:
-        results = orchestrator.resume_items(items_to_process)
-        console.print("\n[green]✓ Resume processing completed[/green]")
-        console.print(f"  Resumed: {len(results['resumed'])}")
-        console.print(f"  Remaining blocked/exported: {len(results['blocked'])}")
-
-    _display_resolution_summary(orchestrator)
-    _exit_for_remediation_if_needed(ctx, config, orchestrator)
+        return None
 
 
 @cli.command()
@@ -959,17 +1206,22 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
     if not ensure_config(config):
         return
 
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+    orchestrator = MigrationOrchestrator(config, state_manager)
 
     # Test connections
     if not orchestrator.test_connections():
         console.print("\n[red]Cannot proceed without valid connections[/red]")
+        orchestrator.cleanup()
         return
 
     # Resolve workspace context
     ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
@@ -1052,53 +1304,178 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
 
 
 @cli.command()
 @ssl_option
+@click.option(
+    '--dry-run',
+    'users_dry_run',
+    is_flag=True,
+    help='Preview this users sync without making POST/PATCH/DELETE changes. Same as the global --dry-run.',
+)
 @click.option('--roles-only', is_flag=True, help='Only migrate custom roles (skip members)')
 @click.option('--skip-workspace-members', is_flag=True, help='Skip workspace member migration')
 @click.option(
+    '--single-instance',
+    '--instance',
+    is_flag=True,
+    help='Use one target LangSmith instance for CSV-driven access sync instead of source→destination migration',
+)
+@click.option(
+    '--csv-source-of-truth',
+    '--sync',
+    is_flag=True,
+    help=(
+        'Make the CSV authoritative for single-instance sync: remove org users, '
+        'pending invites, and workspace memberships not present in the CSV. '
+        'Without this flag, CSV mode only adds or updates access.'
+    ),
+)
+@click.option(
     '--members-csv',
+    '--csv',
+    'members_csv',
     type=click.Path(exists=True, dir_okay=False, path_type=str),
     help=(
-        "CSV file with member details (email, role_id, workspace_id). "
-        "Replaces source member API lookups; role_id must be consistent per email."
+        "CSV file with member details (email, langsmith_role, workspace_id, "
+        "workspace_name). Replaces source member API lookups. Rows with an "
+        "empty workspace_id are org-level role assignments. Organization "
+        "Admin on a workspace row is treated as org-level access only. In "
+        "--single-instance mode, all CSV rows are applied automatically."
     ),
+)
+@click.option(
+    '--api-key',
+    'instance_key',
+    help='API key for the single-instance CSV sync target. Must be provided together with --url.',
+)
+@click.option(
+    '--url',
+    'instance_url',
+    help='Base URL for the single-instance CSV sync target. Must be provided together with --api-key.',
 )
 @workspace_options
 @click.pass_context
 def users(
     ctx,
+    users_dry_run,
     roles_only,
     skip_workspace_members,
+    single_instance,
+    csv_source_of_truth,
     members_csv,
+    instance_key,
+    instance_url,
     source_workspace,
     dest_workspace,
     map_workspaces,
 ):
-    """Migrate users, roles, and workspace memberships."""
+    """Migrate users and roles, or sync one LangSmith instance from a CSV."""
     config = ctx.obj['config']
     state_manager = ctx.obj['state_manager']
 
     display_banner()
 
+    if users_dry_run:
+        config.migration.dry_run = True
+
+    if bool(instance_key) != bool(instance_url):
+        raise click.ClickException(
+            "--api-key and --url must be provided together for single-instance CSV sync"
+        )
+
+    if instance_key and instance_url:
+        config.source.api_key = instance_key
+        config.destination.api_key = instance_key
+        config.source.base_url = instance_url
+        config.destination.base_url = instance_url
+
+    if instance_key or instance_url or csv_source_of_truth:
+        single_instance = True
+
+    if single_instance and roles_only:
+        raise click.ClickException(
+            "--roles-only cannot be combined with --single-instance because "
+            "single-instance mode only supports CSV-driven member access sync"
+        )
+    if roles_only and members_csv:
+        raise click.ClickException(
+            "--roles-only cannot be combined with --members-csv because CSV "
+            "input only applies to member migration"
+        )
+    if csv_source_of_truth and not members_csv:
+        raise click.ClickException(
+            "--csv-source-of-truth requires --members-csv"
+        )
+    if csv_source_of_truth and config.migration.skip_existing:
+        raise click.ClickException(
+            "--csv-source-of-truth cannot be combined with --skip-existing"
+        )
+    if csv_source_of_truth and skip_workspace_members:
+        raise click.ClickException(
+            "--csv-source-of-truth cannot be combined with "
+            "--skip-workspace-members because authoritative sync must reconcile "
+            "workspace access"
+        )
+    if single_instance:
+        if not members_csv:
+            raise click.ClickException("--single-instance requires --members-csv")
+        if map_workspaces or source_workspace or dest_workspace:
+            raise click.ClickException(
+                "--single-instance cannot be combined with workspace mapping flags"
+            )
+        _configure_single_instance(config)
+
+    csv_member_rows = _load_members_csv(members_csv) if members_csv else None
+    apply_all_csv_rows = bool(single_instance and csv_member_rows is not None)
+    csv_has_workspace_rows = bool(
+        csv_member_rows and any(row.get("workspace_id") for row in csv_member_rows)
+    )
+    if skip_workspace_members and csv_has_workspace_rows:
+        raise click.ClickException(
+            "--skip-workspace-members cannot be used when the CSV contains "
+            "workspace_id values. Remove the flag to apply workspace access, "
+            "or remove workspace rows from the CSV."
+        )
+
     if not ensure_config(config):
         return
 
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+    orchestrator = MigrationOrchestrator(config, state_manager)
 
     if not orchestrator.test_connections():
         console.print("\n[red]Cannot proceed without valid connections[/red]")
+        orchestrator.cleanup()
         return
 
-    # Resolve workspace context (needed for phase 3)
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
-    if ws_result is _WS_CANCELLED:
-        console.print("[yellow]Cancelled[/yellow]")
-        return
-
-    ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+    available_workspace_ids: set[str] = set()
+    ws_result = None
+    if single_instance:
+        available_workspace_ids = {
+            ws.get("id", "")
+            for ws in _list_workspaces(orchestrator.dest_client)
+            if ws.get("id")
+        }
+        ws_pairs = [(None, None)]
+    else:
+        # Resolve workspace context (needed for phase 3)
+        ws_result = _resolve_workspaces(
+            orchestrator,
+            source_workspace,
+            dest_workspace,
+            map_workspaces,
+            non_interactive=config.migration.non_interactive,
+        )
+        if ws_result is _WS_ABORTED:
+            ctx.exit(1)
+            return
+        if ws_result is _WS_CANCELLED:
+            console.print("[yellow]Cancelled[/yellow]")
+            orchestrator.cleanup()
+            return
+        ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
 
     # Clear workspace context for org-scoped phases 1-2
     orchestrator.clear_workspace_context()
@@ -1117,24 +1494,23 @@ def users(
     # ── Phase 1: Role synchronisation ──
     console.print("\n[bold]Phase 1: Synchronising roles...[/bold]")
 
-    # Step 1a: Defer custom-role creation until member selection unless --roles-only.
-    custom_role_ids_to_sync = set()
+    custom_role_ids_to_sync: set[str] | None = set()
     if roles_only:
-        # When --roles-only, select custom roles interactively
         try:
             custom_roles = user_role_migrator.get_source_custom_roles()
         except Exception as e:
             console.print(f"  [red]Failed to fetch roles: {e}[/red]")
+            orchestrator.cleanup()
             return
 
         if custom_roles:
             role_items = [
                 {
-                    "id": r["id"],
-                    "name": r.get("display_name", r.get("name", "")),
-                    "description": r.get("description", ""),
+                    "id": role["id"],
+                    "name": role.get("display_name", role.get("name", "")),
+                    "description": role.get("description", ""),
                 }
-                for r in custom_roles
+                for role in custom_roles
             ]
             selected_roles = _select_or_all(
                 config,
@@ -1146,11 +1522,9 @@ def users(
                     {"key": "description", "title": "Description", "width": 50},
                 ],
             )
-            custom_role_ids_to_sync = {r["id"] for r in selected_roles}
+            custom_role_ids_to_sync = {role["id"] for role in selected_roles}
             if not custom_role_ids_to_sync:
                 console.print("  [yellow]No custom roles selected[/yellow]")
-        else:
-            custom_role_ids_to_sync = set()
 
     try:
         role_mapping = user_role_migrator.build_role_mapping(
@@ -1159,19 +1533,92 @@ def users(
         console.print(f"  [green]{len(role_mapping)} role(s) mapped[/green]")
     except Exception as e:
         console.print(f"  [red]Failed to build role mapping: {e}[/red]")
+        orchestrator.cleanup()
         return
 
     if roles_only:
         console.print("\n[dim]--roles-only: skipping member migration[/dim]")
+        orchestrator.cleanup()
         return
 
-    csv_member_rows = _load_members_csv(members_csv) if members_csv else None
+    default_org_role_id: str | None = None
+    ws_only_emails: set[str] = set()
+    org_admin_workspace_row_count = 0
+
+    if csv_member_rows is not None:
+        source_roles = user_role_migrator.list_source_roles()
+        csv_member_rows, default_org_role_id = _resolve_csv_role_names(
+            csv_member_rows, source_roles
+        )
+        csv_member_rows, org_admin_workspace_row_count = _normalize_csv_role_scopes(
+            csv_member_rows
+        )
+        org_emails: set[str] = set()
+        ws_emails: set[str] = set()
+        for row in csv_member_rows:
+            (ws_emails if row.get("workspace_id") else org_emails).add(row["email"])
+        ws_only_emails = ws_emails - org_emails
+
+        if default_org_role_id is None:
+            if ws_only_emails:
+                if single_instance:
+                    raise click.ClickException(
+                        "Single-instance CSV sync requires an ORGANIZATION_USER "
+                        "role when the CSV contains workspace-only users"
+                    )
+                console.print(
+                    f"  [yellow]Warning: no ORGANIZATION_USER role found on source; "
+                    f"{len(ws_only_emails)} workspace-only user(s) will not be "
+                    f"invited to the org.[/yellow]"
+                )
+
+        if single_instance:
+            workspace_ids = _resolve_single_instance_workspace_ids(
+                csv_member_rows,
+                available_workspace_ids,
+                source_of_truth=csv_source_of_truth,
+            )
+            ws_pairs = [(workspace_id, workspace_id) for workspace_id in workspace_ids]
+
+        if org_admin_workspace_row_count:
+            console.print(
+                "  [cyan]Note:[/cyan] "
+                f"{org_admin_workspace_row_count} workspace row(s) used "
+                "Organization Admin and were treated as org-level admin access only."
+            )
+
+    if apply_all_csv_rows:
+        _print_single_instance_users_summary(
+            config,
+            csv_rows=csv_member_rows,
+            workspace_ids=[dst_ws for _, dst_ws in ws_pairs if dst_ws],
+            csv_source_of_truth=csv_source_of_truth,
+            skip_workspace_members=skip_workspace_members,
+        )
+        confirm_prompt = (
+            "Proceed with authoritative single-instance CSV sync? This will "
+            "remove access that is not present in the CSV."
+            if csv_source_of_truth
+            else "Proceed with single-instance CSV apply? This will add or "
+            "update access for every CSV row."
+        )
+        if not _confirm_action(
+            config,
+            confirm_prompt,
+            default=True,
+            non_interactive_value=True,
+        ):
+            console.print("[yellow]Cancelled[/yellow]")
+            orchestrator.cleanup()
+            return
 
     # ── Phase 2: Org member migration ──
     console.print("\n[bold]Phase 2: Migrating organisation members...[/bold]")
 
     if csv_member_rows is not None:
-        all_members = _csv_rows_to_org_members(csv_member_rows)
+        all_members = _csv_rows_to_org_members(
+            csv_member_rows, default_org_role_id=default_org_role_id
+        )
     else:
         org_members = user_role_migrator.list_source_org_members()
         pending_members = user_role_migrator.list_source_pending_org_members()
@@ -1181,41 +1628,55 @@ def users(
     if not all_members:
         console.print("  [yellow]No org members found[/yellow]")
     else:
-        selected_members = _select_or_all(
-            config,
-            all_members,
-            select_all=config.migration.non_interactive,
-            title="Select Organisation Members to Migrate",
-            columns=_MEMBER_COLUMNS,
-        )
+        if apply_all_csv_rows:
+            selected_members = all_members
+        else:
+            selected_members = _select_or_all(
+                config,
+                all_members,
+                select_all=config.migration.non_interactive,
+                title="Select Organisation Members to Migrate",
+                columns=_MEMBER_COLUMNS,
+            )
 
-        if not selected_members:
-            console.print("  [yellow]No members selected[/yellow]")
-
-    # Step 2b: Auto-sync custom roles needed by selected members
-    if selected_members:
-        needed_role_ids = set()
-        for m in selected_members:
-            role_id = (m.get("role_id") or "").strip()
-            if role_id and role_id not in role_mapping:
-                needed_role_ids.add(role_id)
-
-        if needed_role_ids:
-            console.print(f"  Syncing {len(needed_role_ids)} additional role(s) needed by selected members...")
-            try:
-                role_mapping = user_role_migrator.build_role_mapping(
-                    custom_role_ids=needed_role_ids,
+        if selected_members:
+            needed_role_ids = {
+                role_id
+                for member in selected_members
+                if (role_id := (member.get("role_id") or "").strip())
+                and role_id not in role_mapping
+            }
+            if needed_role_ids:
+                console.print(
+                    f"  Syncing {len(needed_role_ids)} additional role(s) needed by selected members..."
                 )
-            except Exception as e:
-                console.print(f"  [yellow]Warning: failed to sync some roles: {e}[/yellow]")
+                try:
+                    role_mapping.update(
+                        user_role_migrator.build_role_mapping(
+                            custom_role_ids=needed_role_ids,
+                        )
+                    )
+                except Exception as e:
+                    console.print(
+                        f"  [yellow]Warning: failed to sync some roles: {e}[/yellow]"
+                    )
 
-        migrated, skipped, failed = user_role_migrator.migrate_org_members(
-            selected_members
-        )
-        console.print(
-            f"  Org members: [green]{migrated} migrated[/green], "
-            f"{skipped} skipped, [red]{failed} failed[/red]"
-        )
+            migrated, skipped, failed = user_role_migrator.migrate_org_members(
+                selected_members,
+                remove_missing=csv_source_of_truth,
+                remove_pending=csv_source_of_truth,
+            )
+            removal_note = ""
+            if csv_source_of_truth:
+                removal_note = (
+                    f" [dim](includes {user_role_migrator._last_org_member_removals} removed)[/dim]"
+                )
+            console.print(
+                f"  Org members: [green]{migrated} migrated[/green], "
+                f"{skipped} skipped, [red]{failed} failed[/red]{removal_note}"
+            )
+        else:
+            console.print("  [yellow]No members selected[/yellow]")
 
     # ── Phase 3: Workspace member migration ──
     if skip_workspace_members:
@@ -1242,29 +1703,61 @@ def users(
                     ws_members = _csv_rows_for_workspace(csv_member_rows, src_ws)
                 else:
                     ws_members = user_role_migrator.list_source_workspace_members()
-                if not ws_members:
+                if not ws_members and not csv_source_of_truth:
                     console.print("    [yellow]No workspace members found[/yellow]")
                     continue
 
-                selected_ws_members = _select_or_all(
-                    config,
-                    ws_members,
-                    select_all=config.migration.non_interactive,
-                    title="Select Workspace Members to Migrate",
-                    columns=_MEMBER_COLUMNS,
-                )
+                if apply_all_csv_rows:
+                    selected_ws_members = ws_members
+                else:
+                    selected_ws_members = _select_or_all(
+                        config,
+                        ws_members,
+                        select_all=config.migration.non_interactive,
+                        title="Select Workspace Members to Migrate",
+                        columns=_MEMBER_COLUMNS,
+                    )
 
-                if not selected_ws_members:
+                if not selected_ws_members and not csv_source_of_truth:
                     console.print("    [yellow]No members selected[/yellow]")
                     continue
 
+                needed_workspace_role_ids = {
+                    role_id
+                    for member in selected_ws_members
+                    if (role_id := (member.get("role_id") or "").strip())
+                    and role_id not in role_mapping
+                }
+                if needed_workspace_role_ids:
+                    console.print(
+                        "    "
+                        f"Syncing {len(needed_workspace_role_ids)} additional role(s) needed by selected workspace members..."
+                    )
+                    try:
+                        role_mapping.update(
+                            user_role_migrator.build_role_mapping(
+                                custom_role_ids=needed_workspace_role_ids,
+                            )
+                        )
+                    except Exception as e:
+                        console.print(
+                            "    [yellow]Warning: failed to sync some workspace "
+                            f"roles: {e}[/yellow]"
+                        )
+
                 try:
                     m, s, f = user_role_migrator.migrate_workspace_members(
-                        selected_members=selected_ws_members
+                        selected_members=selected_ws_members,
+                        remove_missing=csv_source_of_truth,
                     )
+                    removal_note = ""
+                    if csv_source_of_truth:
+                        removal_note = (
+                            f" [dim](includes {user_role_migrator._last_workspace_member_removals} removed)[/dim]"
+                        )
                     console.print(
                         f"    [green]{m} migrated[/green], {s} skipped, "
-                        f"[red]{f} failed[/red]"
+                        f"[red]{f} failed[/red]{removal_note}"
                     )
                 except Exception as e:
                     console.print(f"    [red]Failed: {e}[/red]")
@@ -1275,6 +1768,7 @@ def users(
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
 
 
 @cli.command()
@@ -1293,22 +1787,28 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
     if not ensure_config(config):
         return
 
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+    orchestrator = MigrationOrchestrator(config, state_manager)
 
     console.print("Testing connections... ", end="")
     source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
+        orchestrator.cleanup()
         return
     if not dest_ok:
         console.print("[red]✗ Destination connection failed[/red]")
+        orchestrator.cleanup()
         return
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
     ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
@@ -1395,29 +1895,20 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
         with Progress(console=console) as progress:
             task = progress.add_task("Migrating prompts...", total=len(selected_prompts))
             for prompt in selected_prompts:
-                handle = prompt['repo_handle']
-                item_id = _ensure_state_item(
-                    orchestrator, config, "prompt", handle, handle,
-                    metadata={"include_all_commits": include_all_commits},
-                )
                 try:
-                    _mark_state_item_started(orchestrator, item_id)
                     result = prompt_migrator.migrate_prompt(
-                        handle,
+                        prompt['repo_handle'],
                         include_all_commits=include_all_commits
                     )
                     if result:
                         success_count += 1
-                        _mark_state_item_completed(orchestrator, item_id)
                     else:
-                        failed_items.append((handle, "migration returned None"))
-                        _mark_state_item_failed(orchestrator, item_id, "migration returned None")
+                        failed_items.append((prompt['repo_handle'], "migration returned None"))
                 except Exception as e:
                     error_msg = str(e)
                     if "405" in error_msg or "Not Allowed" in error_msg:
                         has_405_error = True
-                    failed_items.append((handle, error_msg))
-                    _mark_state_item_failed(orchestrator, item_id, e)
+                    failed_items.append((prompt['repo_handle'], error_msg))
                 progress.advance(task)
 
         console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
@@ -1437,6 +1928,7 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
 
 
 @cli.command()
@@ -1455,7 +1947,7 @@ def list_projects(ctx, source, dest):
     if not ensure_config(config):
         return
     
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, ctx.obj['state_manager']))
+    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
     
     from rich.table import Table
     
@@ -1488,6 +1980,8 @@ def list_projects(ctx, source, dest):
             console.print(table)
         except Exception as e:
             console.print(f"[red]Failed to list destination projects: {e}[/red]")
+    
+    orchestrator.cleanup()
 
 
 @cli.command(name='list_workspaces')
@@ -1506,7 +2000,7 @@ def list_workspaces_cmd(ctx, source, dest):
     if not ensure_config(config):
         return
 
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, ctx.obj['state_manager']))
+    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
 
     if source:
         workspaces = _list_workspaces(orchestrator.source_client)
@@ -1515,6 +2009,8 @@ def list_workspaces_cmd(ctx, source, dest):
     if dest:
         workspaces = _list_workspaces(orchestrator.dest_client)
         display_workspaces(console, workspaces, "Destination")
+
+    orchestrator.cleanup()
 
 
 @cli.command()
@@ -1536,22 +2032,28 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
     if not ensure_config(config):
         return
 
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+    orchestrator = MigrationOrchestrator(config, state_manager)
 
     console.print("Testing connections... ", end="")
     source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
+        orchestrator.cleanup()
         return
     if not dest_ok:
         console.print("[red]✗ Destination connection failed[/red]")
+        orchestrator.cleanup()
         return
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
     ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
@@ -1559,6 +2061,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
     # --map-projects and --project-mapping are mutually exclusive
     if map_projects and project_mapping:
         console.print("[red]Error: --map-projects and --project-mapping are mutually exclusive[/red]")
+        orchestrator.cleanup()
         return
 
     # Parse custom project mapping once (outside loop, not workspace-scoped)
@@ -1608,9 +2111,6 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
         # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
         if map_projects and not ws_project_id_map:
-            if config.migration.non_interactive:
-                console.print("[red]Error: --map-projects requires interactive mode[/red]")
-                raise click.Abort()
             console.print("Fetching projects from both instances... ", end="")
             source_projects = _list_projects(orchestrator.source_client)
             dest_projects = _list_projects(orchestrator.dest_client)
@@ -1781,6 +2281,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
 
 
 @cli.command()
@@ -1814,30 +2315,35 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
     if not ensure_config(config):
         return
 
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+    orchestrator = MigrationOrchestrator(config, state_manager)
 
     # Test connections first
     console.print("Testing connections... ", end="")
     source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
+        orchestrator.cleanup()
         return
     if not dest_ok:
         console.print("[red]✗ Destination connection failed[/red]")
+        orchestrator.cleanup()
         return
     console.print("[green]✓[/green]\n")
 
     # Resolve workspace context (runs before asset discovery)
     ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
         return
 
     console.print("[bold cyan]LangSmith Data Migration Wizard[/bold cyan]\n")
     console.print("This wizard will guide you through migrating all your data.\n")
 
     # Step 0: Users & Roles (org-scoped, runs once before workspace loop)
-    user_role_migrator = None
     if not skip_users:
         console.print("[bold]Step 0: Users & Roles[/bold]")
 
@@ -1861,14 +2367,12 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
             console.print(f"[red]failed: {e}[/red]")
             role_mapping = {}
 
-        # Phase 2: Org members (active + pending)
+        # Phase 2: Org members
         if role_mapping:
             org_members = user_role_migrator.list_source_org_members()
-            pending_members = user_role_migrator.list_source_pending_org_members()
-            all_org_members = org_members + [{**p, "_pending": True} for p in pending_members]
-            if all_org_members:
-                if _confirm_action(config, f"Migrate {len(all_org_members)} org member(s)?", default=True, non_interactive_value=True):
-                    migrated, skipped, failed = user_role_migrator.migrate_org_members(all_org_members)
+            if org_members:
+                if _confirm_action(config, f"Migrate {len(org_members)} org member(s)?", default=True, non_interactive_value=True):
+                    migrated, skipped, failed = user_role_migrator.migrate_org_members(org_members)
                     console.print(
                         f"  Org members: [green]{migrated} migrated[/green], "
                         f"{skipped} skipped, [red]{failed} failed[/red]"
@@ -1889,23 +2393,6 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
         if src_ws and dst_ws:
             orchestrator.set_workspace_context(src_ws, dst_ws)
             console.print(f"\n[bold cyan]━━━ Workspace {ws_idx + 1}/{len(ws_pairs)}: {src_ws} -> {dst_ws} ━━━[/bold cyan]\n")
-
-        # Phase 3: Workspace members (runs per workspace pair)
-        if user_role_migrator and src_ws and dst_ws:
-            # force=True: phase 2 may have invited new org members not in the cache.
-            user_role_migrator.ensure_dest_email_index(force=True)
-            ws_members = user_role_migrator.list_source_workspace_members()
-            if ws_members:
-                if _confirm_action(config, f"Migrate {len(ws_members)} workspace member(s)?", default=True, non_interactive_value=True):
-                    m, s, f = user_role_migrator.migrate_workspace_members(
-                        selected_members=ws_members
-                    )
-                    console.print(
-                        f"  Workspace members: [green]{m} migrated[/green], "
-                        f"{s} skipped, [red]{f} failed[/red]"
-                    )
-                else:
-                    console.print("  [yellow]Skipped workspace members[/yellow]")
 
         preflight_resources = []
         if not skip_datasets:
@@ -1937,6 +2424,7 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
     console.print("\n[bold green]Migration wizard completed![/bold green]")
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
 
 
 def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
@@ -1962,9 +2450,6 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
         project_id_map = _name_mapping_to_id_mapping(ws_project_mapping, source_projects, dest_projects)
         console.print(f"Using workspace-scoped project mapping with {len(project_id_map)} project(s)\n")
     elif map_projects:
-        if config.migration.non_interactive:
-            console.print("[red]Error: --map-projects requires interactive mode[/red]")
-            raise click.Abort()
         console.print("Fetching projects from both instances... ", end="")
         source_projects = _list_projects(orchestrator.source_client)
         dest_projects = _list_projects(orchestrator.dest_client)
@@ -2023,6 +2508,7 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
     # 2. Prompts
     if not skip_prompts:
         console.print("[bold]Step 2: Prompts[/bold]")
+        console.print("Fetching prompts... ", end="")
         from ..core.migrators import PromptMigrator
         prompt_migrator = PromptMigrator(
             orchestrator.source_client,
@@ -2030,69 +2516,50 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
             None,
             config
         )
+        prompts = prompt_migrator.list_prompts()
 
-        console.print("Checking prompts API availability... ", end="")
-        api_available, error_msg = prompt_migrator.check_prompts_api_available()
-        if not api_available:
-            console.print("[red]✗[/red]")
-            console.print(f"\n[red]Error:[/red] {error_msg}")
-            console.print("[yellow]Skipping prompts — destination does not support the prompts API.[/yellow]\n")
-        else:
-            console.print("[green]✓[/green]")
-            console.print("Fetching prompts... ", end="")
-            prompts = prompt_migrator.list_prompts()
+        if prompts:
+            console.print(f"found {len(prompts)}")
+            console.print("[dim]Note: Prompt migration uses the SDK. API-created prompts may not be accessible.[/dim]")
 
-            if prompts:
-                console.print(f"found {len(prompts)}")
-                console.print("[dim]Note: Prompt migration uses the SDK. API-created prompts may not be accessible.[/dim]")
+            if _confirm_action(config, f"Migrate {len(prompts)} prompt(s)?", default=True, non_interactive_value=True):
+                include_history = include_all_commits or _confirm_action(
+                    config,
+                    "Include full commit history?",
+                    default=False,
+                    non_interactive_value=include_all_commits,
+                )
+                _ensure_migration_session(orchestrator, config)
+                prompt_migrator.state = orchestrator.state
 
-                if _confirm_action(config, f"Migrate {len(prompts)} prompt(s)?", default=True, non_interactive_value=True):
-                    include_history = include_all_commits or _confirm_action(
-                        config,
-                        "Include full commit history?",
-                        default=False,
-                        non_interactive_value=include_all_commits,
-                    )
-                    _ensure_migration_session(orchestrator, config)
-                    prompt_migrator.state = orchestrator.state
+                success_count = 0
+                failed_items = []
 
-                    success_count = 0
-                    failed_items = []
-
-                    with Progress(console=console) as progress:
-                        task = progress.add_task("Migrating prompts...", total=len(prompts))
-                        for prompt in prompts:
-                            handle = prompt['repo_handle']
-                            item_id = _ensure_state_item(
-                                orchestrator, config, "prompt", handle, handle,
-                                metadata={"include_all_commits": include_history},
+                with Progress(console=console) as progress:
+                    task = progress.add_task("Migrating prompts...", total=len(prompts))
+                    for prompt in prompts:
+                        try:
+                            result = prompt_migrator.migrate_prompt(
+                                prompt['repo_handle'],
+                                include_all_commits=include_history
                             )
-                            try:
-                                _mark_state_item_started(orchestrator, item_id)
-                                result = prompt_migrator.migrate_prompt(
-                                    handle,
-                                    include_all_commits=include_history
-                                )
-                                if result:
-                                    success_count += 1
-                                    _mark_state_item_completed(orchestrator, item_id)
-                                else:
-                                    failed_items.append((handle, "migration returned None"))
-                                    _mark_state_item_failed(orchestrator, item_id, "migration returned None")
-                            except Exception as e:
-                                failed_items.append((handle, str(e)))
-                                _mark_state_item_failed(orchestrator, item_id, e)
-                            progress.advance(task)
+                            if result:
+                                success_count += 1
+                            else:
+                                failed_items.append((prompt['repo_handle'], "migration returned None"))
+                        except Exception as e:
+                            failed_items.append((prompt['repo_handle'], str(e)))
+                        progress.advance(task)
 
-                    console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
-                    if failed_items and config.migration.verbose:
-                        for name, err in failed_items:
-                            console.print(f"  [red]✗[/red] {name}: {err}")
-                    console.print()
-                else:
-                    console.print("[yellow]Skipped prompts[/yellow]\n")
+                console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
+                if failed_items and config.migration.verbose:
+                    for name, err in failed_items:
+                        console.print(f"  [red]✗[/red] {name}: {err}")
+                console.print()
             else:
-                console.print("[yellow]none found[/yellow]\n")
+                console.print("[yellow]Skipped prompts[/yellow]\n")
+        else:
+            console.print("[yellow]none found[/yellow]\n")
     else:
         console.print("[dim]Skipping prompts (--skip-prompts)[/dim]\n")
 
@@ -2405,22 +2872,28 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
     if not ensure_config(config):
         return
 
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+    orchestrator = MigrationOrchestrator(config, state_manager)
 
     console.print("Testing connections... ", end="")
     source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
     if not source_ok:
         console.print("[red]✗ Source connection failed[/red]")
+        orchestrator.cleanup()
         return
     if not dest_ok:
         console.print("[red]✗ Destination connection failed[/red]")
+        orchestrator.cleanup()
         return
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
     ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
@@ -2457,9 +2930,6 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
         # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
         if map_projects and not ws_project_id_map:
-            if config.migration.non_interactive:
-                console.print("[red]Error: --map-projects requires interactive mode[/red]")
-                raise click.Abort()
             console.print("Fetching projects from both instances... ", end="")
             source_projects = _list_projects(orchestrator.source_client)
             dest_projects = _list_projects(orchestrator.dest_client)
@@ -2648,6 +3118,7 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
 
 
 @cli.command()
@@ -2685,117 +3156,96 @@ def resume(ctx):
     if not ensure_config(config):
         return
 
-    # List available sessions
-    sessions = state_manager.list_sessions()
-    if not sessions:
-        console.print("[yellow]No migration sessions found. Nothing to resume.[/yellow]")
+    selected_session = _select_resume_session(config, state_manager)
+    if not selected_session:
         return
 
-    # Show available sessions
-    console.print(f"Found {len(sessions)} migration session(s):\n")
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("#", width=4)
-    table.add_column("Session ID", width=20)
-    table.add_column("Source", width=30)
-    table.add_column("Destination", width=30)
-    table.add_column("Updated", width=22)
-    for idx, session in enumerate(sessions, 1):
-        table.add_row(
-            str(idx),
-            session["session_id"][:16] + "...",
-            str(session["source_url"]),
-            str(session["destination_url"]),
-            str(session["updated_at"]),
-        )
-    console.print(table)
-    console.print()
-
-    # Load the latest session (first in the sorted list)
-    session_id = sessions[0]["session_id"]
-    console.print(f"Loading latest session: {session_id[:16]}...")
+    session_id = selected_session["session_id"]
+    console.print(f"\nLoading session: {session_id[:16]}...")
 
     state = state_manager.load_session(session_id)
     if not state:
         console.print(f"[red]Failed to load session {session_id}[/red]")
         return
 
-    # Create orchestrator and attach state
-    orchestrator = ctx.with_resource(MigrationOrchestrator(config, state_manager))
+    orchestrator = MigrationOrchestrator(config, state_manager)
+    try:
+        # Test connections first
+        console.print("Testing connections... ", end="")
+        source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+        if not source_ok:
+            console.print("[red]✗ Source connection failed[/red]")
+            if source_error:
+                console.print(f"[red]  {source_error}[/red]")
+            return
+        if not dest_ok:
+            console.print("[yellow]⚠ Source OK, destination connection failed[/yellow]")
+            if dest_error:
+                console.print(f"[yellow]  {dest_error}[/yellow]")
+            console.print("Continuing with source-only operations...")
+        else:
+            console.print("[green]✓[/green]")
 
-    # Test connections first
-    console.print("Testing connections... ", end="")
-    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
-    if not source_ok:
-        console.print("[red]✗ Source connection failed[/red]")
-        if source_error:
-            console.print(f"[red]  {source_error}[/red]")
-        return
-    if not dest_ok:
-        console.print("[yellow]⚠ Source OK, destination connection failed[/yellow]")
-        if dest_error:
-            console.print(f"[yellow]  {dest_error}[/yellow]")
-        console.print("Continuing with source-only operations...")
-    else:
-        console.print("[green]✓[/green]")
+        # Attach state to orchestrator
+        orchestrator.state = state
+        orchestrator.state_manager.current_state = state
+        config.state_manager = state_manager
 
-    # Attach state to orchestrator
-    orchestrator.state = state
-    orchestrator.state_manager.current_state = state
-    config.state_manager = state_manager
+        # Get resumable items
+        resume_items = state.get_resume_items()
+        checkpoint_items = state.get_checkpoint_items()
 
-    # Get resumable items
-    resume_items = state.get_resume_items()
-    checkpoint_items = state.get_checkpoint_items()
+        console.print(f"\nResumable items: {len(resume_items)}")
+        console.print(f"Checkpoint/manual items: {len(checkpoint_items)}")
 
-    console.print(f"\nResumable items: {len(resume_items)}")
-    console.print(f"Checkpoint/manual items: {len(checkpoint_items)}")
-
-    if checkpoint_items:
-        console.print("\n[bold]Items requiring manual attention:[/bold]")
-        for item in checkpoint_items[:10]:
-            console.print(f"  • {item.name}: {item.next_action or item.outcome_code or 'needs attention'}")
-
-    if not resume_items:
-        console.print("\n[yellow]No items to resume automatically.[/yellow]")
         if checkpoint_items:
-            console.print("[dim]Review the checkpoint items above and resolve them manually.[/dim]")
-        return
+            console.print("\n[bold]Items requiring manual attention:[/bold]")
+            for item in checkpoint_items[:10]:
+                console.print(f"  • {item.name}: {item.next_action or item.outcome_code or 'needs attention'}")
 
-    # Show what will be resumed
-    console.print(f"\n[bold]Items to resume ({len(resume_items)}):[/bold]")
-    type_counts: dict[str, int] = {}
-    for item in resume_items:
-        type_counts[item.type] = type_counts.get(item.type, 0) + 1
-    for item_type, count in sorted(type_counts.items()):
-        console.print(f"  {item_type}: {count}")
+        if not resume_items:
+            console.print("\n[yellow]No items to resume automatically.[/yellow]")
+            if checkpoint_items:
+                console.print("[dim]Review the checkpoint items above and resolve them manually.[/dim]")
+            return
 
-    if not _confirm_action(config, "\nProceed with resume?", default=True, non_interactive_value=True):
-        console.print("[yellow]Cancelled[/yellow]")
-        return
+        # Show what will be resumed
+        console.print(f"\n[bold]Items to resume ({len(resume_items)}):[/bold]")
+        type_counts: dict[str, int] = {}
+        for item in resume_items:
+            type_counts[item.type] = type_counts.get(item.type, 0) + 1
+        for item_type, count in sorted(type_counts.items()):
+            console.print(f"  {item_type}: {count}")
 
-    # Run resume
-    console.print(f"\n[bold]Resuming migration of {len(resume_items)} items[/bold]")
-    results = orchestrator.resume_items(resume_items)
+        if not _confirm_action(config, "\nProceed with resume?", default=True, non_interactive_value=True):
+            console.print("[yellow]Cancelled[/yellow]")
+            return
 
-    # Save state
-    state_manager.save()
+        # Run resume
+        console.print(f"\n[bold]Resuming migration of {len(resume_items)} items[/bold]")
+        results = orchestrator.resume_items(resume_items)
 
-    console.print("[green]Resume processing completed[/green]")
+        # Save state
+        state_manager.save()
 
-    # Report results
-    resumed = results.get("resumed", [])
-    blocked = results.get("blocked", [])
-    console.print(f"\n[bold]Resume Results:[/bold]")
-    console.print(f"  [green]Resumed successfully: {len(resumed)}[/green]")
-    console.print(f"  [yellow]Blocked/needs attention: {len(blocked)}[/yellow]")
+        console.print("[green]Resume processing completed[/green]")
 
-    if blocked and config.migration.verbose:
-        console.print("\n[dim]Blocked items:[/dim]")
-        for item_ref in blocked[:20]:
-            console.print(f"  • {item_ref}")
+        # Report results
+        resumed = results.get("resumed", [])
+        blocked = results.get("blocked", [])
+        console.print(f"\n[bold]Resume Results:[/bold]")
+        console.print(f"  [green]Resumed successfully: {len(resumed)}[/green]")
+        console.print(f"  [yellow]Blocked/needs attention: {len(blocked)}[/yellow]")
 
-    _display_resolution_summary(orchestrator)
-    _exit_for_remediation_if_needed(ctx, config, orchestrator)
+        if blocked and config.migration.verbose:
+            console.print("\n[dim]Blocked items:[/dim]")
+            for item_ref in blocked[:20]:
+                console.print(f"  • {item_ref}")
+
+        _display_resolution_summary(orchestrator)
+        _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    finally:
+        orchestrator.cleanup()
 
 
 def main():

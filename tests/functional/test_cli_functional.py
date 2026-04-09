@@ -136,6 +136,26 @@ def test_resolve_workspaces_returns_cancelled_when_forced_tui_is_cancelled(monke
     assert result == cli_main._WS_CANCELLED
 
 
+def test_resolve_workspaces_returns_aborted_when_headless_resolution_fails(monkeypatch):
+    """Headless workspace-resolution failures should map to the abort sentinel."""
+
+    class StubOrchestrator:
+        source_client = object()
+        dest_client = object()
+
+    def _raise(*args, **kwargs):
+        raise cli_main.WorkspaceResolutionError("workspace mapping required")
+
+    monkeypatch.setattr(cli_main, "resolve_workspace_context", _raise)
+
+    result = cli_main._resolve_workspaces(
+        StubOrchestrator(),
+        non_interactive=True,
+    )
+
+    assert result == cli_main._WS_ABORTED
+
+
 def test_test_command_uses_global_options_and_lists_workspaces(cli_harness):
     """The smoke-test command should honor global config flags and verbose workspace listing."""
 
@@ -193,7 +213,10 @@ def test_users_command_members_csv_replaces_source_member_apis(cli_harness, monk
         workspaces_to_create=[],
     )
     csv_path = tmp_path / "members.csv"
-    csv_path.write_text("email,role_id,workspace_id\nalice@example.com,src-role,src-ws\n", encoding="utf-8")
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Workspace Admin,src-ws\n",
+        encoding="utf-8",
+    )
 
     user_role_migrator = Mock()
     user_role_migrator.build_role_mapping.return_value = {"src-role": "dst-role"}
@@ -211,19 +234,25 @@ def test_users_command_members_csv_replaces_source_member_apis(cli_harness, monk
 
     monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
 
-    csv_rows = [{"email": "alice@example.com", "role_id": "src-role", "workspace_id": "src-ws"}]
+    resolved_rows = [{"email": "alice@example.com", "role_id": "src-role", "workspace_id": "src-ws"}]
     org_members = [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-role"}]
     ws_members = [{"id": "src-ws:alice@example.com", "email": "alice@example.com", "role_id": "src-role"}]
-    monkeypatch.setattr(cli_main, "_load_members_csv", lambda _: csv_rows)
-    monkeypatch.setattr(cli_main, "_csv_rows_to_org_members", lambda rows: org_members)
+    monkeypatch.setattr(cli_main, "_load_members_csv", lambda _: resolved_rows)
+    monkeypatch.setattr(cli_main, "_resolve_csv_role_names", lambda rows, roles: (resolved_rows, "src-user"))
+    monkeypatch.setattr(cli_main, "_csv_rows_to_org_members", lambda rows, **kw: org_members)
     monkeypatch.setattr(cli_main, "_csv_rows_for_workspace", lambda rows, ws_id: ws_members)
 
     result = cli_harness.invoke(["users", "--members-csv", str(csv_path)])
 
     assert result.exit_code == 0
-    user_role_migrator.migrate_org_members.assert_called_once_with(org_members)
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        org_members,
+        remove_missing=False,
+        remove_pending=False,
+    )
     user_role_migrator.migrate_workspace_members.assert_called_once_with(
-        selected_members=ws_members
+        selected_members=ws_members,
+        remove_missing=False,
     )
 
 
@@ -236,33 +265,42 @@ def test_users_command_members_csv_supports_utf8_bom(cli_harness, monkeypatch, t
     )
     csv_path = tmp_path / "members_bom.csv"
     csv_path.write_text(
-        "email,role_id,workspace_id\nalice@example.com,src-role,src-ws\n",
+        "email,langsmith_role,workspace_id\nalice@example.com,Workspace Admin,src-ws\n",
         encoding="utf-8-sig",
     )
 
     user_role_migrator = Mock()
-    user_role_migrator.build_role_mapping.return_value = {"src-role": "dst-role"}
+    user_role_migrator.build_role_mapping.return_value = {"src-ws-admin": "dst-ws-admin"}
     user_role_migrator._dest_email_to_identity = {}
     user_role_migrator.list_dest_org_members.return_value = []
     user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
     user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
     monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
 
     result = cli_harness.invoke(["users", "--members-csv", str(csv_path)])
 
     assert result.exit_code == 0
+    # alice only appears in a workspace row, so she gets the default org role (ORGANIZATION_USER)
     user_role_migrator.migrate_org_members.assert_called_once_with(
-        [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-role", "full_name": ""}]
+        [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-user", "full_name": ""}],
+        remove_missing=False,
+        remove_pending=False,
     )
     user_role_migrator.migrate_workspace_members.assert_called_once_with(
         selected_members=[
             {
                 "id": "src-ws:alice@example.com",
                 "email": "alice@example.com",
-                "role_id": "src-role",
+                "role_id": "src-ws-admin",
                 "full_name": "",
             }
-        ]
+        ],
+        remove_missing=False,
     )
 
 
@@ -301,7 +339,7 @@ def test_users_command_without_csv_keeps_api_member_paths(cli_harness, monkeypat
 def test_users_command_defers_custom_role_sync_until_members_are_selected(
     cli_harness, monkeypatch
 ):
-    """Default users flow should sync built-ins first, then only needed custom roles."""
+    """Default users flow syncs custom roles only for selected org members."""
     cli_harness.controls.workspace_result = WorkspaceProjectResult(
         workspace_mapping={"src-ws": "dst-ws"},
         project_mappings={},
@@ -320,7 +358,9 @@ def test_users_command_defers_custom_role_sync_until_members_are_selected(
     user_role_migrator.list_source_pending_org_members.return_value = []
     user_role_migrator.list_source_workspace_members.return_value = []
     user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
-    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    monkeypatch.setattr(
+        cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator
+    )
 
     result = cli_harness.invoke(["users"])
 
@@ -331,10 +371,45 @@ def test_users_command_defers_custom_role_sync_until_members_are_selected(
     ]
 
 
+def test_users_command_syncs_workspace_custom_roles_after_workspace_selection(
+    cli_harness, monkeypatch
+):
+    """Workspace-only custom roles are synced after workspace member selection."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.side_effect = [
+        {"src-admin": "dst-admin"},
+        {"src-admin": "dst-admin", "src-ws-custom": "dst-ws-custom"},
+    ]
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_source_org_members.return_value = []
+    user_role_migrator.list_source_pending_org_members.return_value = []
+    user_role_migrator.list_source_workspace_members.return_value = [
+        {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-ws-custom"}
+    ]
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(
+        cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator
+    )
+
+    result = cli_harness.invoke(["users"])
+
+    assert result.exit_code == 0
+    assert user_role_migrator.build_role_mapping.call_args_list == [
+        call(custom_role_ids=set()),
+        call(custom_role_ids={"src-ws-custom"}),
+    ]
+
+
 def test_users_command_always_refreshes_dest_org_identities_for_phase3(
     cli_harness, monkeypatch
 ):
-    """Workspace phase refreshes destination org identities via ensure_dest_email_index."""
+    """Workspace phase refreshes destination org identities via the cache helper."""
     cli_harness.controls.workspace_result = WorkspaceProjectResult(
         workspace_mapping={"src-ws": "dst-ws"},
         project_mappings={},
@@ -372,7 +447,9 @@ def test_users_command_dest_org_refresh_failure_is_graceful(cli_harness, monkeyp
     user_role_migrator._dest_email_to_identity = {}
     user_role_migrator.list_source_org_members.return_value = []
     user_role_migrator.list_source_pending_org_members.return_value = []
-    user_role_migrator.ensure_dest_email_index.side_effect = Exception("dest lookup failed")
+    user_role_migrator.ensure_dest_email_index.side_effect = Exception(
+        "dest lookup failed"
+    )
     user_role_migrator.list_source_workspace_members.return_value = [
         {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-role"}
     ]
@@ -384,6 +461,695 @@ def test_users_command_dest_org_refresh_failure_is_graceful(cli_harness, monkeyp
     assert result.exit_code == 0
     assert "failed to refresh destination org identities" in cli_harness.console.text
     user_role_migrator.migrate_workspace_members.assert_called_once()
+
+
+def test_users_command_single_instance_source_of_truth_uses_identity_workspace_pairs(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Single-instance CSV sync derives workspace scope from the target instance."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+        {"id": "ws-2", "display_name": "Workspace 2"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Organization Admin,\n"
+        "bob@example.com,Workspace Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {
+        "src-admin": "dst-admin",
+        "src-user": "dst-user",
+        "src-ws-admin": "dst-ws-admin",
+    }
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (2, 0, 0)
+    user_role_migrator.migrate_workspace_members.side_effect = [(1, 0, 0), (0, 0, 0)]
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "dest-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-key",
+            "dest-key",
+            "--dest-url",
+            "https://same.example",
+            "users",
+            "--single-instance",
+            "--members-csv",
+            str(csv_path),
+            "--csv-source-of-truth",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    orchestrator = cli_harness.orchestrator_factory.instances[0]
+    assert orchestrator.workspace_calls == [("ws-1", "ws-1"), ("ws-2", "ws-2")]
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-admin",
+                "full_name": "",
+            },
+            {
+                "id": "bob@example.com",
+                "email": "bob@example.com",
+                "role_id": "src-user",
+                "full_name": "",
+            },
+        ],
+        remove_missing=True,
+        remove_pending=True,
+    )
+    assert len(user_role_migrator.migrate_workspace_members.call_args_list) == 2
+    assert (
+        user_role_migrator.migrate_workspace_members.call_args_list[0].kwargs
+        == {
+            "selected_members": [
+                {
+                    "id": "ws-1:bob@example.com",
+                    "email": "bob@example.com",
+                    "role_id": "src-ws-admin",
+                    "full_name": "",
+                }
+            ],
+            "remove_missing": True,
+        }
+    )
+    assert (
+        user_role_migrator.migrate_workspace_members.call_args_list[1].kwargs
+        == {"selected_members": [], "remove_missing": True}
+    )
+
+
+def test_users_command_single_instance_rejects_workspace_flags(cli_harness, tmp_path):
+    """Single-instance sync should not accept source/dest workspace mapping flags."""
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Organization Admin,\n",
+        encoding="utf-8",
+    )
+
+    result = cli_harness.invoke(
+        [
+            "--dest-key",
+            "dest-key",
+            "--dest-url",
+            "https://same.example",
+            "users",
+            "--single-instance",
+            "--members-csv",
+            str(csv_path),
+            "--source-workspace",
+            "ws-1",
+            "--dest-workspace",
+            "ws-1",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code != 0
+    assert "cannot be combined with workspace mapping flags" in result.output
+
+
+def test_users_command_single_instance_rejects_ambiguous_configured_targets(cli_harness, tmp_path):
+    """Single-instance sync should fail instead of guessing between configured source/dest targets."""
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Organization Admin,\n",
+        encoding="utf-8",
+    )
+
+    result = cli_harness.invoke(["users", "--single-instance", "--members-csv", str(csv_path)])
+
+    assert result.exit_code != 0
+    assert "found multiple configured LangSmith targets" in result.output
+
+
+def test_users_command_single_instance_requires_api_key_and_url_together(cli_harness, tmp_path):
+    """Shorthand single-instance target args should fail fast if only one is provided."""
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Organization Admin,\n",
+        encoding="utf-8",
+    )
+
+    for args in (
+        ["users", "--api-key", "sync-key", "--csv", str(csv_path)],
+        ["users", "--url", "https://sync.example", "--csv", str(csv_path)],
+    ):
+        result = cli_harness.invoke(args, add_base_args=False)
+        assert result.exit_code != 0
+        assert "--api-key and --url must be provided together" in result.output
+
+
+def test_users_command_single_instance_csv_apply_auto_applies_all_rows(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Single-instance CSV apply should skip row selection and apply every CSV row."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Organization Admin,\n"
+        "bob@example.com,Workspace Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {
+        "src-admin": "dst-admin",
+        "src-user": "dst-user",
+        "src-ws-admin": "dst-ws-admin",
+    }
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (2, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    monkeypatch.setattr(
+        cli_main,
+        "select_items",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("selection UI should not be used in single-instance CSV mode")
+        ),
+    )
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert "Single-Instance User Sync" in cli_harness.console.text
+    assert "Row selection: disabled" in cli_harness.console.text
+    assert "Removals: disabled (add/update only)" in cli_harness.console.text
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-admin",
+                "full_name": "",
+            },
+            {
+                "id": "bob@example.com",
+                "email": "bob@example.com",
+                "role_id": "src-user",
+                "full_name": "",
+            },
+        ],
+        remove_missing=False,
+        remove_pending=False,
+    )
+    user_role_migrator.migrate_workspace_members.assert_called_once_with(
+        selected_members=[
+            {
+                "id": "ws-1:bob@example.com",
+                "email": "bob@example.com",
+                "role_id": "src-ws-admin",
+                "full_name": "",
+            }
+        ],
+        remove_missing=False,
+    )
+
+
+def test_users_command_single_instance_workspace_org_admin_becomes_org_access_only(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Organization Admin on a workspace row should be treated as org access, not a workspace role."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Organization Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-admin": "dst-admin"}
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert "treated as org-level admin access only" in cli_harness.console.text
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-admin",
+                "full_name": "",
+            }
+        ],
+        remove_missing=False,
+        remove_pending=False,
+    )
+    user_role_migrator.migrate_workspace_members.assert_not_called()
+
+
+def test_users_command_local_dry_run_flag_sets_preview_mode(
+    cli_harness, monkeypatch, tmp_path
+):
+    """users --dry-run should enable preview mode even when passed after the subcommand."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Organization Admin,\n"
+        "bob@example.com,Workspace Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {
+        "src-admin": "dst-admin",
+        "src-user": "dst-user",
+        "src-ws-admin": "dst-ws-admin",
+    }
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (2, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--dry-run",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code == 0
+    orchestrator = cli_harness.orchestrator_factory.instances[0]
+    assert orchestrator.config.migration.dry_run is True
+    assert "Execution: dry run (no changes will be sent)" in cli_harness.console.text
+
+
+def test_users_command_single_instance_csv_apply_can_be_cancelled(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Single-instance CSV mode should stop cleanly when the confirmation is declined."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Organization Admin,\n"
+        "bob@example.com,Workspace Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {
+        "src-admin": "dst-admin",
+        "src-user": "dst-user",
+        "src-ws-admin": "dst-ws-admin",
+    }
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [False]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert "Single-Instance User Sync" in cli_harness.console.text
+    assert "Cancelled" in cli_harness.console.text
+    user_role_migrator.migrate_org_members.assert_not_called()
+    user_role_migrator.migrate_workspace_members.assert_not_called()
+    assert cli_harness.orchestrator_factory.instances[0].cleanup_called is True
+
+
+def test_users_command_single_instance_sync_dry_run_keeps_safe_apply_behavior(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Dry-run single-instance sync should still use the deterministic CSV apply path."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Organization Admin,\n"
+        "bob@example.com,Workspace Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {
+        "src-admin": "dst-admin",
+        "src-user": "dst-user",
+        "src-ws-admin": "dst-ws-admin",
+    }
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (2, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    monkeypatch.setattr(
+        cli_main,
+        "select_items",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("selection UI should not be used in single-instance dry-run mode")
+        ),
+    )
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--dry-run",
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+            "--sync",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    orchestrator = cli_harness.orchestrator_factory.instances[0]
+    assert orchestrator.config.migration.dry_run is True
+    assert "Single-Instance User Sync" in cli_harness.console.text
+    assert "Removals: enabled (authoritative CSV sync)" in cli_harness.console.text
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-admin",
+                "full_name": "",
+            },
+            {
+                "id": "bob@example.com",
+                "email": "bob@example.com",
+                "role_id": "src-user",
+                "full_name": "",
+            },
+        ],
+        remove_missing=True,
+        remove_pending=True,
+    )
+    user_role_migrator.migrate_workspace_members.assert_called_once_with(
+        selected_members=[
+            {
+                "id": "ws-1:bob@example.com",
+                "email": "bob@example.com",
+                "role_id": "src-ws-admin",
+                "full_name": "",
+            }
+        ],
+        remove_missing=True,
+    )
+
+
+def test_users_command_rejects_org_scoped_role_on_workspace_row(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Workspace rows should fail fast when they use org-scoped roles other than Organization Admin."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Organization User,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-user": "dst-user"}
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code != 0
+    assert "org-scoped and cannot be used on a workspace row" in result.output
+    user_role_migrator.migrate_org_members.assert_not_called()
+    user_role_migrator.migrate_workspace_members.assert_not_called()
+
+
+def test_users_command_single_instance_rejects_sync_with_skip_workspace_members(
+    cli_harness, tmp_path
+):
+    """Authoritative sync should fail instead of skipping workspace reconciliation."""
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Organization Admin,\n",
+        encoding="utf-8",
+    )
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+            "--sync",
+            "--skip-workspace-members",
+        ]
+    )
+
+    assert result.exit_code != 0
+    assert "authoritative sync must reconcile workspace access" in result.output
+
+
+def test_users_command_rejects_skip_workspace_members_with_workspace_csv_rows(
+    cli_harness, tmp_path
+):
+    """Workspace rows in the CSV should not be silently ignored."""
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nbob@example.com,Workspace Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+            "--skip-workspace-members",
+        ]
+    )
+
+    assert result.exit_code != 0
+    assert "cannot be used when the CSV contains workspace_id values" in result.output
+
+
+def test_users_command_single_instance_requires_org_user_role_for_workspace_only_csv_rows(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Single-instance CSV mode should fail if workspace-only users cannot be invited safely."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nbob@example.com,Workspace Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {
+        "src-admin": "dst-admin",
+        "src-ws-admin": "dst-ws-admin",
+    }
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code != 0
+    assert "requires an ORGANIZATION_USER role" in result.output
+
+
+def test_users_command_sync_alias_implies_single_instance(cli_harness, monkeypatch, tmp_path):
+    """Shorthand sync flags should infer single-instance mode automatically."""
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,Organization Admin,\n",
+        encoding="utf-8",
+    )
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = []
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-admin": "dst-admin"}
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+    ]
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+            "--sync",
+        ]
+    )
+
+    assert result.exit_code == 0
+    orchestrator = cli_harness.orchestrator_factory.instances[0]
+    assert orchestrator.config.source.api_key == "sync-key"
+    assert orchestrator.config.destination.api_key == "sync-key"
+    assert orchestrator.config.source.base_url == "https://sync.example"
+    assert orchestrator.config.destination.base_url == "https://sync.example"
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-admin",
+                "full_name": "",
+            }
+        ],
+        remove_missing=True,
+        remove_pending=True,
+    )
+
+
+def test_users_help_describes_single_instance_csv_guardrails(cli_harness):
+    """The help output should describe the safer single-instance CSV flow."""
+    result = cli_harness.invoke(["users", "--help"], add_base_args=False)
+
+    assert result.exit_code == 0
+    normalized_output = " ".join(result.output.split())
+    assert "Preview this users sync without making POST/PATCH/DELETE changes." in normalized_output
+    assert "Use one target LangSmith instance" in normalized_output
+    assert "access sync instead of" in normalized_output
+    assert "Without this flag, CSV mode only adds or updates access." in normalized_output
+    assert "all CSV rows are applied automatically" in normalized_output
+    assert "Organization Admin on a workspace row is treated as org-level access only." in normalized_output
+    assert "Must be provided together with --url." in normalized_output
+    assert "Base URL for the single-instance CSV sync target." in normalized_output
+    assert "provided together with --api-" in normalized_output
 
 
 def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_harness):
@@ -418,6 +1184,17 @@ def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_ha
     ]
     assert orchestrator.clear_workspace_called is True
     assert "Migration completed" in cli_harness.console.text
+
+
+def test_datasets_command_exits_nonzero_when_workspace_resolution_aborts(cli_harness):
+    """Commands should stop instead of migrating unscoped after workspace-resolution errors."""
+
+    cli_harness.controls.workspace_result = cli_main._WS_ABORTED
+
+    result = cli_harness.invoke(["datasets"])
+
+    assert result.exit_code == 1
+    assert cli_harness.orchestrator_factory.instances[0].migrate_dataset_calls == []
 
 
 def test_prompts_command_surfaces_unavailable_prompts_api(cli_harness):
@@ -691,7 +1468,7 @@ def test_migrate_all_supports_skipping_charts_via_flag_and_prompt(cli_harness):
     cli_harness.migrators.chart.list_charts.return_value = [
         {"id": "chart-1", "title": "Chart One"},
     ]
-    result_flag = cli_harness.invoke(["migrate-all", "--skip-charts", "--skip-users"])
+    result_flag = cli_harness.invoke(["migrate-all", "--skip-charts"])
     assert result_flag.exit_code == 0
     cli_harness.migrators.chart.list_charts.assert_not_called()
     assert "Skipping charts (--skip-charts)" in cli_harness.console.text
@@ -714,7 +1491,7 @@ def test_migrate_all_supports_skipping_charts_via_flag_and_prompt(cli_harness):
     ]
     cli_harness.controls.confirm_answers = [False]
 
-    result_prompt = cli_harness.invoke(["migrate-all", "--skip-users"])
+    result_prompt = cli_harness.invoke(["migrate-all"])
     assert result_prompt.exit_code == 0
     cli_harness.migrators.chart.list_charts.assert_called_once()
     cli_harness.migrators.chart.migrate_all_charts.assert_not_called()
@@ -946,6 +1723,51 @@ def test_resume_command_non_interactive_uses_latest_session_without_console_inpu
         include_all_commits=True,
     )
     assert "Resume processing completed" in cli_harness.console.text
+
+
+def test_resume_command_interactive_can_select_non_latest_session(cli_harness):
+    """Interactive resume should honor the user's chosen session, not always pick the latest."""
+
+    latest = build_state("migration_resume_latest")
+    latest.updated_at = 20.0
+    latest.add_item(
+        MigrationItem(
+            id="prompt_default_latest",
+            type="prompt",
+            name="team/latest",
+            source_id="team/latest",
+            status=MigrationStatus.PENDING,
+            metadata={"include_all_commits": False},
+        )
+    )
+    latest.updated_at = 20.0
+    older = build_state("migration_resume_older")
+    older.add_item(
+        MigrationItem(
+            id="prompt_default_older",
+            type="prompt",
+            name="team/older",
+            source_id="team/older",
+            status=MigrationStatus.PENDING,
+            metadata={"include_all_commits": True},
+        )
+    )
+    older.updated_at = 10.0
+    save_session(cli_harness.state_manager, latest)
+    save_session(cli_harness.state_manager, older)
+    cli_harness.console.inputs = ["2"]
+    cli_harness.controls.confirm_answers = [True]
+    cli_harness.migrators.prompt.migrate_prompt.return_value = "team/older"
+
+    result = cli_harness.invoke(["resume"])
+
+    assert result.exit_code == 0
+    orchestrator = cli_harness.orchestrator_factory.instances[0]
+    assert orchestrator.state.session_id == "migration_resume_older"
+    cli_harness.migrators.prompt.migrate_prompt.assert_called_once_with(
+        "team/older",
+        include_all_commits=True,
+    )
 
 
 def test_queues_command_non_interactive_exits_with_code_2_for_blocked_items(cli_harness):

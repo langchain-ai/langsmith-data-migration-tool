@@ -244,6 +244,10 @@ class EnhancedAPIClient:
                 request_info=request_info
             )
 
+        # Successful DELETE-style responses commonly return no content.
+        if response.status_code in (204, 205) or not response.content:
+            return {}
+
         # Success - parse JSON response
         try:
             json_response = response.json()
@@ -328,6 +332,28 @@ class EnhancedAPIClient:
 
         # Use shorter timeout for PATCH - if it's slow, server is likely overloaded
         response = self.session.patch(url, json=data, timeout=15)
+        return self._handle_response(response, endpoint)
+
+    @retry_on_failure(max_retries=1)
+    def delete(self, endpoint: str) -> Dict[str, Any]:
+        """
+        Make a DELETE request.
+
+        Args:
+            endpoint: API endpoint
+
+        Returns:
+            JSON response as dictionary, or ``{}`` for empty successful responses.
+        """
+        url = self._prepare_url(endpoint)
+
+        if self.verbose:
+            self.console.print(f"[dim]DELETE {url}[/dim]")
+
+        if self.rate_limit_delay > 0:
+            time.sleep(self.rate_limit_delay)
+
+        response = self.session.delete(url, timeout=15)
         return self._handle_response(response, endpoint)
 
     def get_paginated(

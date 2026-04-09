@@ -182,6 +182,75 @@ class DestinationPickerScreen(ModalScreen[Optional[str]]):
 
 
 # ---------------------------------------------------------------------------
+# Modal: Custom Name Input
+# ---------------------------------------------------------------------------
+
+class CustomNameScreen(ModalScreen[Optional[str]]):
+    """Modal screen for entering a custom destination project name."""
+
+    CSS = """
+    CustomNameScreen {
+        align: center middle;
+    }
+
+    #custom-dialog {
+        width: 60;
+        height: auto;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+
+    #custom-title {
+        text-align: center;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #custom-hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+
+    #custom-help {
+        text-align: center;
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, source_name: str) -> None:
+        super().__init__()
+        self.source_name = source_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="custom-dialog"):
+            yield Static(f"Custom Destination Name for: [bold]{self.source_name}[/bold]", id="custom-title")
+            yield Input(value=self.source_name, id="custom-input")
+            yield Static("(This project will be created in the destination)", id="custom-hint")
+            yield Static("Enter: confirm | Esc: cancel", id="custom-help")
+
+    def on_mount(self) -> None:
+        inp = self.query_one("#custom-input", Input)
+        inp.focus()
+        # Select all text so user can easily replace
+        inp.action_select_all()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if value:
+            self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ---------------------------------------------------------------------------
 # Main App: Project Mapper
 # ---------------------------------------------------------------------------
 

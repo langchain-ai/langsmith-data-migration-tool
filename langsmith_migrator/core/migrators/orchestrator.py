@@ -693,32 +693,32 @@ class MigrationOrchestrator:
                         if member_payload:
                             migrated, _, _ = ur_migrator.migrate_org_members([member_payload])
                             if migrated:
+                                results["resumed"].append(f"{item.type}:{item.source_id}")
+                    else:  # ws_member
+                        if not ur_migrator._dest_email_to_identity:
+                            try:
+                                dest_org = ur_migrator.list_dest_org_members()
+                                ur_migrator._dest_email_to_identity = {
+                                    (m.get("email") or "").lower(): m
+                                    for m in dest_org
+                                    if m.get("email")
+                                }
+                            except Exception as e:  # noqa: BLE001
                                 self.state.mark_terminal(
                                     item.id,
-                                    ResolutionOutcome.MIGRATED,
-                                    "org_member_migrated",
-                                    verification_state=VerificationState.VERIFIED,
+                                    ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+                                    "ws_member_dest_org_lookup_failed",
+                                    verification_state=VerificationState.BLOCKED,
+                                    next_action=(
+                                        "Verify destination org members API access and run "
+                                        "`langsmith-migrator resume` again."
+                                    ),
+                                    evidence={"error": str(e)},
+                                    error=str(e),
                                 )
+                                results["blocked"].append(f"{item.type}:{item.source_id}")
                                 self.state_manager.save()
-                    else:  # ws_member
-                        try:
-                            ur_migrator.ensure_dest_email_index()
-                        except Exception as e:  # noqa: BLE001
-                            self.state.mark_terminal(
-                                item.id,
-                                ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
-                                "ws_member_dest_org_lookup_failed",
-                                verification_state=VerificationState.BLOCKED,
-                                next_action=(
-                                    "Verify destination org members API access and run "
-                                    "`langsmith-migrator resume` again."
-                                ),
-                                evidence={"error": str(e)},
-                                error=str(e),
-                            )
-                            results["blocked"].append(f"{item.type}:{item.source_id}")
-                            self.state_manager.save()
-                            continue
+                                continue
                         member_payload = item.metadata.get("member")
                         if member_payload:
                             migrated, _, _ = ur_migrator.migrate_workspace_members(
@@ -729,13 +729,7 @@ class MigrationOrchestrator:
                             # only tracked ws_member type without member payload.
                             migrated, _, _ = ur_migrator.migrate_workspace_members()
                         if migrated:
-                            self.state.mark_terminal(
-                                item.id,
-                                ResolutionOutcome.MIGRATED,
-                                "ws_member_migrated",
-                                verification_state=VerificationState.VERIFIED,
-                            )
-                            self.state_manager.save()
+                            results["resumed"].append(f"{item.type}:{item.source_id}")
                 else:
                     issue = self.state.add_issue(
                         "capability",
@@ -812,13 +806,3 @@ class MigrationOrchestrator:
         """Clean up resources."""
         self.source_client.close()
         self.dest_client.close()
-
-    # Context-manager support so callers can use:
-    #   with MigrationOrchestrator(...) as orchestrator:
-    # and guarantee cleanup() runs even on exceptions.
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cleanup()
-        return False

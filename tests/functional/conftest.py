@@ -221,13 +221,6 @@ class FakeOrchestratorInstance:
         self.source_client.close()
         self.dest_client.close()
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cleanup()
-        return False
-
 
 class FakeOrchestratorFactory:
     """Configurable orchestrator factory for CLI tests."""

@@ -3,7 +3,6 @@
 import json
 import logging
 import os
-import tempfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +41,8 @@ class MigrationFileConfig:
     destination_workspace: Optional[WorkspaceConfig] = None
     project_name_mapping: Dict[str, str] = field(default_factory=dict)
     workspace_mapping: Dict[str, str] = field(default_factory=dict)  # source_ws_id -> dest_ws_id
+    workspace_mapping_source_url: str = ""
+    workspace_mapping_destination_url: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -53,6 +54,8 @@ class MigrationFileConfig:
             "destination_workspace": asdict(self.destination_workspace) if self.destination_workspace else None,
             "project_name_mapping": self.project_name_mapping,
             "workspace_mapping": self.workspace_mapping,
+            "workspace_mapping_source_url": self.workspace_mapping_source_url,
+            "workspace_mapping_destination_url": self.workspace_mapping_destination_url,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -64,6 +67,8 @@ class MigrationFileConfig:
         config.version = data.get("version", CONFIG_VERSION)
         config.project_name_mapping = data.get("project_name_mapping", {})
         config.workspace_mapping = data.get("workspace_mapping", {})
+        config.workspace_mapping_source_url = data.get("workspace_mapping_source_url", "")
+        config.workspace_mapping_destination_url = data.get("workspace_mapping_destination_url", "")
         config.created_at = data.get("created_at", "")
         config.updated_at = data.get("updated_at", "")
         config.source_workspace = _parse_workspace(data.get("source_workspace"))
@@ -106,21 +111,11 @@ def save_config(config: MigrationFileConfig, path: Optional[str] = None) -> Path
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc).isoformat()
-    data = config.to_dict()
-    if not data.get("created_at"):
-        data["created_at"] = now
-    data["updated_at"] = now
+    if not config.created_at:
+        config.created_at = now
+    config.updated_at = now
 
-    fd, tmp_path = tempfile.mkstemp(dir=str(config_path.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp_path, str(config_path))
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    with open(config_path, "w") as f:
+        json.dump(config.to_dict(), f, indent=2)
 
     return config_path

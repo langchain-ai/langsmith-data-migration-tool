@@ -1,10 +1,7 @@
 """Experiment migration logic."""
 
-from collections import ChainMap
 from typing import Dict, List, Any, Optional, Tuple
 import copy
-import hashlib
-import json
 import uuid
 
 from .base import BaseMigrator
@@ -113,6 +110,7 @@ class ExperimentMigrator(BaseMigrator):
 
                     # Log full evaluator structure for debugging
                     if self.config.migration.verbose:
+                        import json
                         self.log(f"  Raw evaluator data: {json.dumps(evaluator, indent=2, default=str)}", "info")
 
                     # Ensure 'type' field exists
@@ -149,6 +147,7 @@ class ExperimentMigrator(BaseMigrator):
                             # Default to Code if we can't determine
                             evaluator['type'] = 'Code'
                             self.log(f"Warning: Evaluator missing type, defaulting to 'Code': {evaluator.get('name', 'unknown')}", "warning")
+                            import json
                             self.log(f"  Full evaluator data: {json.dumps(evaluator, indent=2, default=str)}", "warning")
 
                     # Ensure 'feedback_key' field exists
@@ -179,8 +178,9 @@ class ExperimentMigrator(BaseMigrator):
                             if 'name' in evaluator:
                                 evaluator['feedback_key'] = f"{evaluator['name']}_key"
                             else:
-                                evaluator['feedback_key'] = f"evaluator_{hashlib.sha256(json.dumps(evaluator, sort_keys=True, default=str).encode()).hexdigest()[:12]}"
+                                evaluator['feedback_key'] = f"evaluator_{hash(str(evaluator))}"
                             self.log(f"Warning: Evaluator missing feedback_key, generated: {evaluator['feedback_key']}", "warning")
+                            import json
                             self.log(f"  Full evaluator data: {json.dumps(evaluator, indent=2, default=str)}", "warning")
 
                     # Always log evaluator details (not just in verbose mode) so user can see they're being migrated
@@ -363,7 +363,6 @@ class ExperimentMigrator(BaseMigrator):
             experiment_item = self.state.get_item(experiment_item_id) if self.state else None
             start_cursor = experiment_item.metadata.get("run_cursor") if experiment_item else None
             pending_run_mapping: Dict[str, str] = {}
-            combined_mapping = ChainMap(pending_run_mapping, run_id_mapping)
             batch: List[Dict[str, Any]] = []
             experiment_runs_created = 0
             experiment_failed_runs = 0
@@ -443,10 +442,9 @@ class ExperimentMigrator(BaseMigrator):
                         mapped_example_id = example_mapping.get(source_example_id)
                         if not mapped_example_id:
                             self.log(
-                                f"Warning: run references unmapped example {source_example_id}, preserving source ID",
+                                f"Warning: run references unmapped example {source_example_id}, dropping example link",
                                 "warning",
                             )
-                            mapped_example_id = source_example_id
 
                     # Deterministic IDs make interrupted batches safe to replay.
                     new_run_id = self._deterministic_run_id(source_run_id)
@@ -457,6 +455,8 @@ class ExperimentMigrator(BaseMigrator):
                         else new_run_id
                     )
                     pending_run_mapping[source_run_id] = new_run_id
+
+                    combined_mapping = {**run_id_mapping, **pending_run_mapping}
 
                     # Regenerate dotted_order with new IDs
                     new_dotted_order = self._regenerate_dotted_order(

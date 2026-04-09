@@ -12,6 +12,63 @@ from .migration_config import MigrationFileConfig, load_config, save_config
 from ..cli.tui_workspace_mapper import WorkspaceProjectResult, build_workspace_mapping_tui
 
 
+class WorkspaceResolutionError(RuntimeError):
+    """Workspace resolution could not complete safely."""
+
+
+def _normalize_base_url(url: str) -> str:
+    """Normalize instance URLs before comparing persisted mapping context."""
+    return (url or "").rstrip("/").lower()
+
+
+def _validate_saved_mapping(
+    saved_config: MigrationFileConfig,
+    source_workspaces: List[Dict],
+    dest_workspaces: List[Dict],
+    source_client: EnhancedAPIClient,
+    dest_client: EnhancedAPIClient,
+) -> tuple[Optional[Dict[str, str]], List[str]]:
+    """Return a reusable saved mapping, or validation errors explaining why not."""
+    mapping = saved_config.workspace_mapping
+    if not mapping:
+        return None, []
+
+    errors: List[str] = []
+
+    saved_source_url = _normalize_base_url(saved_config.workspace_mapping_source_url)
+    current_source_url = _normalize_base_url(getattr(source_client, "base_url", ""))
+    if saved_source_url and saved_source_url != current_source_url:
+        errors.append("saved source instance does not match the current source URL")
+
+    saved_dest_url = _normalize_base_url(saved_config.workspace_mapping_destination_url)
+    current_dest_url = _normalize_base_url(getattr(dest_client, "base_url", ""))
+    if saved_dest_url and saved_dest_url != current_dest_url:
+        errors.append(
+            "saved destination instance does not match the current destination URL"
+        )
+
+    source_ids = {ws.get("id", "") for ws in source_workspaces if ws.get("id")}
+    invalid_source_ids = sorted(src_id for src_id in mapping if src_id not in source_ids)
+    if invalid_source_ids:
+        errors.append(
+            "saved source workspace IDs were not found: "
+            + ", ".join(invalid_source_ids)
+        )
+
+    dest_ids = {ws.get("id", "") for ws in dest_workspaces if ws.get("id")}
+    invalid_dest_ids = sorted({dst_id for dst_id in mapping.values() if dst_id not in dest_ids})
+    if invalid_dest_ids:
+        errors.append(
+            "saved destination workspace IDs were not found: "
+            + ", ".join(invalid_dest_ids)
+        )
+
+    if errors:
+        return None, errors
+
+    return mapping, []
+
+
 def resolve_workspace_context(
     source_client: EnhancedAPIClient,
     dest_client: EnhancedAPIClient,
@@ -49,21 +106,45 @@ def resolve_workspace_context(
     if saved_config is None:
         saved_config = load_config()
 
+    reusable_mapping: Optional[Dict[str, str]] = None
     # Check for saved mapping
     if saved_config and saved_config.workspace_mapping:
-        _display_saved_mapping(console, saved_config.workspace_mapping, source_workspaces, dest_workspaces)
-        if non_interactive or Confirm.ask("Reuse this workspace mapping?", default=True):
-            return WorkspaceProjectResult(
-                workspace_mapping=saved_config.workspace_mapping,
-                project_mappings={},
-                workspaces_to_create=[],
+        reusable_mapping, validation_errors = _validate_saved_mapping(
+            saved_config,
+            source_workspaces,
+            dest_workspaces,
+            source_client,
+            dest_client,
+        )
+        if reusable_mapping is None:
+            console.print(
+                "[yellow]Saved workspace mapping does not match the current instances; ignoring it.[/yellow]"
             )
+            for error in validation_errors:
+                console.print(f"  [yellow]- {error}[/yellow]")
+        else:
+            _display_saved_mapping(
+                console,
+                reusable_mapping,
+                source_workspaces,
+                dest_workspaces,
+            )
+            if non_interactive or Confirm.ask("Reuse this workspace mapping?", default=True):
+                return WorkspaceProjectResult(
+                    workspace_mapping=reusable_mapping,
+                    project_mappings={},
+                    workspaces_to_create=[],
+                )
 
     # In non-interactive mode, we cannot launch the TUI
     if non_interactive:
-        console.print("[red]Error: --map-workspaces requires interactive mode (no saved mapping found)[/red]")
-        return None
-
+        message = (
+            "Workspace mapping is required in non-interactive mode for "
+            "multi-workspace instances. Provide --source-workspace and "
+            "--dest-workspace together, or create a saved mapping first."
+        )
+        console.print(f"[red]Error: {message}[/red]")
+        raise WorkspaceResolutionError(message)
     # Build a callback for fetching projects scoped to a workspace
     def fetch_projects(ws_id: str, side: str) -> List[Dict]:
         client = source_client if side == "source" else dest_client
@@ -83,7 +164,7 @@ def resolve_workspace_context(
         source_workspaces,
         dest_workspaces,
         fetch_projects=fetch_projects,
-        existing_mapping=(saved_config.workspace_mapping if saved_config else None),
+        existing_mapping=reusable_mapping,
     )
 
     if tui_result is None:
@@ -105,6 +186,8 @@ def resolve_workspace_context(
     if tui_result.workspace_mapping:
         config = saved_config or load_config() or MigrationFileConfig()
         config.workspace_mapping = tui_result.workspace_mapping
+        config.workspace_mapping_source_url = getattr(source_client, "base_url", "")
+        config.workspace_mapping_destination_url = getattr(dest_client, "base_url", "")
         path = save_config(config)
         console.print(f"[dim]Workspace mapping saved to {path}[/dim]")
 
