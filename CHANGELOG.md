@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.62] - 2026-04-09
+
+### Changed
+- **User sync release confidence**: expanded unit and mocked functional coverage for the single-instance `users` sync flow, including stricter CLI guardrail validation and selective custom-role syncing from CSV input.
+- **LangSmith API boundary coverage**: added request-layer tests for auth failures, rate-limit retry metadata, workspace scoping headers, and invalid JSON handling to make real-instance user sync regressions easier to catch before release.
+
 ## [0.0.61] - 2026-04-09
 
 ### Added
@@ -249,7 +255,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.61...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.62...HEAD
+[0.0.62]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.61...v0.0.62
 [0.0.61]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.60...v0.0.61
 [0.0.60]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.59...v0.0.60
 [0.0.59]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.58...v0.0.59
