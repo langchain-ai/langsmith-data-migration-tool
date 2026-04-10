@@ -1,12 +1,12 @@
 # LangSmith Data Migration Tool
 
-A Python CLI for migrating datasets, experiments, annotation queues, project rules, prompts, and charts between LangSmith instances.
+A Python CLI for migrating users and roles, datasets, experiments, annotation queues, project rules, prompts, and charts between LangSmith instances, plus CSV-driven access sync for a single LangSmith deployment.
 
 ## Quick Start
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.62-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -22,13 +22,17 @@ langsmith-migrator datasets
 ## Features
 
 - **All-in-One Wizard**: Interactive migration of all resources (`migrate-all`)
+- **Users & Roles**: Migrate custom roles, org members, and workspace memberships between instances
+- **Single-Instance Access Sync**: Apply CSV-driven add/update or authoritative access sync to one LangSmith instance (`users --csv ... [--sync]`)
 - **Datasets**: Migrate datasets with examples and file attachments
-- **Experiments**: Migrate experiments with runs and feedback (`--include-experiments`)
+- **Experiments**: Include experiments, runs, and feedback during dataset migration (`datasets --include-experiments`) or through `migrate-all`
 - **Annotation Queues**: Transfer queue configurations
 - **Project Rules**: Copy automation rules with project mapping and optional project creation in interactive flows
 - **Prompts**: Migrate prompts (latest by default, full history with `--include-all-commits`)
 - **Charts**: Migrate monitoring charts with filter preservation
-- **Interactive CLI**: TUI-based selection with search/filter
+- **Workspace Scoping**: Run resource migrations per workspace pair with explicit IDs or interactive workspace mapping
+- **Remediation & Resume**: Persist migration state, write remediation bundles, print grouped actionable next steps, and retry pending/failed work with `resume`
+- **Interactive CLI**: TUI-based selection with search/filter, plus `--non-interactive` mode for automation
 
 ## Limitations
 
@@ -50,20 +54,20 @@ For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk E
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.62-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.62-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.62-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.62-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -138,9 +142,23 @@ langsmith-migrator charts --same-instance       # Reuse source project/session I
 # Utilities
 langsmith-migrator list-projects --source
 langsmith-migrator list_workspaces --source --dest
-langsmith-migrator resume  # Resume interrupted dataset migration
+langsmith-migrator resume  # Resume pending/failed items from a prior migration session
 langsmith-migrator clean
 ```
+
+### Command Overview
+
+- `test`: verify source and destination connectivity before running a migration
+- `migrate-all`: guided end-to-end wizard for users, datasets, prompts, queues, rules, and charts
+- `datasets`: migrate datasets; optionally include experiments, runs, and feedback
+- `queues`: migrate annotation queues
+- `prompts`: migrate prompts, optionally with full commit history
+- `rules`: migrate automation rules with project mapping controls
+- `charts`: migrate monitoring charts, either all sessions or one named session/project
+- `users`: migrate users/roles between instances, or run single-instance CSV access sync
+- `resume`: retry resumable items from a prior session and show grouped manual blockers
+- `list-projects` / `list_workspaces`: inspect project and workspace IDs for mapping
+- `clean`: remove saved migration sessions
 
 ### Users migration with CSV member input
 
@@ -208,7 +226,7 @@ Notes:
 - `email` and `langsmith_role` are required.
 - `workspace_id` is optional. Leave it empty for org-level role assignments.
 - `workspace_name` is optional and informational only.
-- `langsmith_role` should be a built-in LangSmith role name (for example `Organization Admin`, `Organization User`, `Workspace Admin`) or a custom role `display_name`.
+- `langsmith_role` should be a built-in LangSmith role name (for example `Organization Admin`, `Organization Operator`, `Organization User`, `Organization Viewer`, `Workspace Admin`, `Workspace User`, or `Workspace Viewer`) or a custom role `display_name`.
 - Users who only appear in workspace rows are invited to the org with the source `ORGANIZATION_USER` role before workspace membership is applied.
 - `Organization Admin` on a workspace row is treated as org-level admin access only. No explicit workspace membership is created because org admins already have workspace access.
 - Other org-scoped roles cannot be used on workspace rows. If you want org-level access, leave `workspace_id` empty.
@@ -238,25 +256,33 @@ Guardrails:
 --source-url TEXT       Source base URL
 --dest-url TEXT         Destination base URL
 --no-ssl                Disable SSL verification
---batch-size INTEGER    Batch size (default: 100)
---workers INTEGER       Concurrent workers (default: 4)
+--batch-size INTEGER    Batch size for operations (1-1000, default: 100)
+--workers INTEGER       Number of concurrent workers (1-10, default: 4)
 --dry-run               Run without making changes
 --skip-existing         Skip existing resources instead of updating them
+--non-interactive       Disable prompts and exit with code 2 when remediation is required
 --verbose, -v           Verbose output
 ```
 
 ### Dataset Options
 
 ```bash
---include-experiments   Include experiments, runs, and feedback (prompts if not specified)
---all                   Migrate all datasets without interactive selection
+--include-experiments   Include experiments with datasets
+--all                   Migrate all datasets
+```
+
+### Prompt Options
+
+```bash
+--all                   Migrate all prompts
+--include-all-commits   Include all commit history
 ```
 
 ### Rules Options
 
 ```bash
 --strip-projects        Strip project associations and create as global rules
---project-mapping TEXT  JSON string or file path mapping source project IDs to destination
+--project-mapping TEXT  JSON string or file path with project ID mapping (e.g., '{"old-id": "new-id"}')
 --map-projects          Launch interactive TUI to map source projects to destination projects
 --create-enabled        Create rules as enabled (default: disabled to bypass secrets validation)
 --all                   Migrate all rules without interactive selection
@@ -271,31 +297,60 @@ Guardrails:
 If `--rules-create-enabled` is omitted, `migrate-all` asks interactively whether to create rules enabled.
 The prompt default is `No` (rules are created disabled).
 
+### Migrate-All Options
+
+```bash
+--skip-users            Skip user and role migration
+--skip-datasets         Skip dataset migration
+--skip-experiments      Skip experiment migration
+--skip-prompts          Skip prompt migration
+--skip-queues           Skip annotation queue migration
+--skip-rules            Skip rules migration
+--skip-charts           Skip chart migration
+--include-all-commits   Include all prompt commit history
+--strip-projects        Strip project associations from rules
+--map-projects          Launch interactive TUI to map source projects to destination projects
+--rules-create-enabled  Create migrated rules as enabled instead of asking interactively
+```
+
 ### Chart Options
 
 ```bash
 --session TEXT          Migrate charts for a specific session/project (by name or ID)
 --map-projects          Launch interactive TUI to map source projects to destination projects
---same-instance         Reuse source project/session IDs on destination
+--same-instance         Source and destination are the same instance (use same session IDs)
 ```
 
 ### Users Options
 
 ```bash
 --dry-run                  Preview this users sync without making POST/PATCH/DELETE changes
---roles-only               Only sync custom roles (skip member migration)
---skip-workspace-members   Skip workspace member migration (phases 1-2 only)
+--roles-only               Only migrate custom roles (skip member migration)
+--skip-workspace-members   Skip workspace member migration
 --single-instance, --instance
                            Use one target LangSmith instance for CSV-driven access sync instead of source→destination migration
 --csv-source-of-truth, --sync
-                           Make the CSV authoritative for single-instance sync: remove org users, pending invites, and
-                           workspace memberships not present in the CSV. Without this flag, CSV mode only adds or updates
-                           access.
+                           Make the CSV authoritative for single-instance sync: any active org user or pending invite not
+                           present in the CSV will be removed, and workspace memberships not present in the CSV will also
+                           be removed. Without this flag, CSV mode only adds or updates access.
 --members-csv, --csv PATH  CSV file with member details (email, langsmith_role, workspace_id, workspace_name)
                            Replaces source member API lookups. In --single-instance mode, all CSV rows are applied
                            automatically.
 --api-key TEXT             API key for the single-instance CSV sync target. Must be provided together with --url.
 --url TEXT                 Base URL for the single-instance CSV sync target. Must be provided together with --api-key.
+--source-workspace TEXT    Source workspace ID (skip auto-detection)
+--dest-workspace TEXT      Destination workspace ID (skip auto-detection)
+--map-workspaces           Force workspace mapping TUI even for single-workspace instances
+```
+
+### Common Workspace Options
+
+These flags are available on `datasets`, `queues`, `prompts`, `rules`, `charts`, `migrate-all`, and `users`:
+
+```bash
+--source-workspace TEXT    Source workspace ID (skip auto-detection)
+--dest-workspace TEXT      Destination workspace ID (skip auto-detection)
+--map-workspaces           Force workspace mapping TUI even for single-workspace instances
 ```
 
 Migration proceeds in three phases:
@@ -355,9 +410,27 @@ langsmith-migrator datasets --source-workspace WS_ID --dest-workspace WS_ID
 
 When using `--map-workspaces`, each command iterates all mapped workspace pairs, running the full fetch/select/migrate flow per pair. For `rules` and `charts` with `--map-projects`, the project mapping TUI is shown per workspace pair so projects are correctly scoped.
 
-### Resume Scope
+### Resume and Remediation
 
-`resume` currently resumes interrupted dataset migration flows. Experiment-only resume is not yet supported.
+Every migration session persists state and writes a remediation bundle when there are blocked or manual-follow-up items.
+
+- Session state is stored under `~/.langsmith-migrator/state`.
+- Remediation bundles are written under `./.langsmith-migrator/remediation/<session_id>` by default.
+- The CLI prints a **Resolution Summary** with grouped **Actionable Next Steps** instead of one repeated line per failed item.
+- `--non-interactive` disables prompts and exits with status code `2` if manual remediation is still required.
+
+`langsmith-migrator resume` retries pending or failed items from a previous session. Today that includes:
+
+- datasets
+- experiments
+- prompts
+- annotation queues
+- rules
+- charts
+- org members
+- workspace members
+
+Use `langsmith-migrator clean` to remove saved sessions once you no longer need their state or remediation bundles.
 
 ## SSL Certificate Issues
 

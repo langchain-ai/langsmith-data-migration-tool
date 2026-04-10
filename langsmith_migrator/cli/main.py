@@ -356,8 +356,22 @@ def _load_members_csv(path: str) -> list[dict]:
                         f"Members CSV row {index} has an empty email value"
                     )
                 if not langsmith_role:
+                    if workspace_id:
+                        raise click.ClickException(
+                            "Members CSV row "
+                            f"{index} for {email} in workspace {workspace_id} "
+                            "has an empty langsmith_role value. Set a "
+                            "workspace-scoped role such as 'Workspace Admin' "
+                            "or a custom workspace role. If this row is only "
+                            "meant to grant org access, leave workspace_id "
+                            "empty and use an org-scoped role such as "
+                            "'Organization User'."
+                        )
                     raise click.ClickException(
-                        f"Members CSV row {index} has an empty langsmith_role value"
+                        "Members CSV row "
+                        f"{index} for {email} has an empty langsmith_role "
+                        "value. Set a valid org-level LangSmith role, for "
+                        "example 'Organization User' or 'Organization Admin'."
                     )
 
                 rows.append(
@@ -381,11 +395,24 @@ def _load_members_csv(path: str) -> list[dict]:
 
 _BUILTIN_ROLE_ALIASES: dict[str, str] = {
     "organization admin": "ORGANIZATION_ADMIN",
+    "organization operator": "ORGANIZATION_OPERATOR",
     "organization user": "ORGANIZATION_USER",
+    "organization viewer": "ORGANIZATION_VIEWER",
     "workspace admin": "WORKSPACE_ADMIN",
+    "workspace user": "WORKSPACE_USER",
+    "workspace viewer": "WORKSPACE_VIEWER",
 }
-_ORG_SCOPED_BUILTIN_ROLE_NAMES = {"ORGANIZATION_ADMIN", "ORGANIZATION_USER"}
-_WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES = {"WORKSPACE_ADMIN"}
+_ORG_SCOPED_BUILTIN_ROLE_NAMES = {
+    "ORGANIZATION_ADMIN",
+    "ORGANIZATION_OPERATOR",
+    "ORGANIZATION_USER",
+    "ORGANIZATION_VIEWER",
+}
+_WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES = {
+    "WORKSPACE_ADMIN",
+    "WORKSPACE_USER",
+    "WORKSPACE_VIEWER",
+}
 
 
 def _resolve_csv_role_names(
@@ -401,39 +428,74 @@ def _resolve_csv_role_names(
     custom role display names.
     """
     role_lookup: dict[str, list[tuple[str, str]]] = {}
+    role_descriptions_by_label: dict[str, dict[str, str]] = {}
     builtin_by_name: dict[str, str] = {}
     preferred_builtin_by_label: dict[str, str] = {}
     org_user_role_id: str | None = None
+    available_role_labels: set[str] = set()
 
-    def register_role_label(label: str, role_id: str, role_name: str) -> None:
-        candidates = role_lookup.setdefault(label, [])
+    def register_role_label(
+        label: str, role_id: str, role_name: str, *, display_label: str = ""
+    ) -> None:
+        normalized_label = label.strip().lower()
+        candidates = role_lookup.setdefault(normalized_label, [])
         if not any(existing_role_id == role_id for existing_role_id, _ in candidates):
             candidates.append((role_id, role_name))
+        descriptions = role_descriptions_by_label.setdefault(normalized_label, {})
+        preferred_label = (display_label or label or role_name).strip()
+        if role_name != "CUSTOM" and preferred_label.lower() != role_name.lower():
+            descriptions[role_id] = f"{preferred_label} [{role_name}] ({role_id})"
+        else:
+            descriptions[role_id] = f"{preferred_label} ({role_id})"
 
     for role in source_roles:
         role_name = role.get("name", "")
         role_id = role["id"]
-        dn = (role.get("display_name") or "").strip().lower()
+        display_name = (role.get("display_name") or "").strip()
+        dn = display_name.lower()
 
         if role_name != "CUSTOM":
             builtin_by_name[role_name] = role_id
+            available_role_labels.add(role_name)
             if dn:
-                register_role_label(dn, role_id, role_name)
+                available_role_labels.add(display_name)
+                register_role_label(
+                    dn,
+                    role_id,
+                    role_name,
+                    display_label=display_name,
+                )
             builtin_label = role_name.lower()
-            register_role_label(builtin_label, role_id, role_name)
+            register_role_label(
+                builtin_label,
+                role_id,
+                role_name,
+                display_label=role_name,
+            )
             preferred_builtin_by_label[builtin_label] = role_id
             if role_name == "ORGANIZATION_USER":
                 org_user_role_id = role_id
         elif dn:
-            register_role_label(dn, role_id, role_name)
+            available_role_labels.add(display_name)
+            register_role_label(
+                dn,
+                role_id,
+                role_name,
+                display_label=display_name,
+            )
 
     for alias, builtin_name in _BUILTIN_ROLE_ALIASES.items():
         builtin_role_id = builtin_by_name.get(builtin_name)
         if builtin_role_id:
-            register_role_label(alias, builtin_role_id, builtin_name)
+            register_role_label(
+                alias,
+                builtin_role_id,
+                builtin_name,
+                display_label=builtin_name,
+            )
             preferred_builtin_by_label[alias] = builtin_role_id
 
-    ambiguous: set[str] = set()
+    ambiguous: dict[str, list[str]] = {}
     unresolved: set[str] = set()
     resolved_rows: list[dict] = []
     for row in csv_rows:
@@ -452,7 +514,10 @@ def _resolve_csv_role_names(
         else:
             unique_role_ids = {candidate_role_id for candidate_role_id, _ in candidates}
             if len(unique_role_ids) != 1:
-                ambiguous.add(row["langsmith_role"])
+                ambiguous[row["langsmith_role"]] = sorted(
+                    role_descriptions_by_label.get(label, {}).values(),
+                    key=str.lower,
+                )
                 continue
             role_id = next(iter(unique_role_ids))
         resolved_role_name = next(
@@ -472,16 +537,21 @@ def _resolve_csv_role_names(
         )
 
     if ambiguous or unresolved:
-        available = sorted(role_lookup.keys())
+        available = sorted(available_role_labels, key=str.lower)
         errors: list[str] = []
         if ambiguous:
-            errors.append("Ambiguous role name(s): " + ", ".join(sorted(ambiguous)))
+            ambiguity_details = "; ".join(
+                f"'{input_label}' matched multiple roles case-insensitively: "
+                + ", ".join(candidates)
+                for input_label, candidates in sorted(ambiguous.items(), key=lambda item: item[0].lower())
+            )
+            errors.append("Ambiguous role name(s): " + ambiguity_details)
         if unresolved:
             errors.append(
                 "Could not resolve role name(s): "
                 + ", ".join(sorted(unresolved))
             )
-        errors.append("Available roles: " + ", ".join(available))
+        errors.append("Available roles (case-insensitive): " + ", ".join(available))
         raise click.ClickException(". ".join(errors))
 
     return resolved_rows, org_user_role_id
@@ -542,7 +612,10 @@ def _normalize_csv_role_scopes(
 
 
 def _csv_rows_to_org_members(
-    csv_rows: list[dict], default_org_role_id: str | None = None
+    csv_rows: list[dict],
+    default_org_role_id: str | None = None,
+    *,
+    direct_workspace_invites: bool = False,
 ) -> list[dict]:
     """Build org member payloads from CSV rows.
 
@@ -550,11 +623,20 @@ def _csv_rows_to_org_members(
     ``role_id`` is used directly.  Users who only appear in workspace
     rows (non-empty ``workspace_id``) are assigned *default_org_role_id*
     (typically ORGANIZATION_USER) so they can be invited to the org.
+
+    When ``direct_workspace_invites`` is true, workspace-only users also
+    carry through ``workspace_ids`` and ``workspace_role_id`` when all of
+    their workspace rows share the same workspace role. This is used by
+    single-instance CSV sync so a new org invite can include initial
+    workspace access in the same API call.
     """
     org_rows = [r for r in csv_rows if not r.get("workspace_id")]
     ws_rows = [r for r in csv_rows if r.get("workspace_id")]
 
     members_by_email: dict[str, dict] = {}
+    ws_rows_by_email: dict[str, list[dict]] = {}
+    for row in ws_rows:
+        ws_rows_by_email.setdefault(row["email"], []).append(row)
 
     for row in org_rows:
         email = row["email"]
@@ -575,12 +657,29 @@ def _csv_rows_to_org_members(
     for row in ws_rows:
         email = row["email"]
         if email not in members_by_email and default_org_role_id:
-            members_by_email[email] = {
+            member = {
                 "id": email,
                 "email": email,
                 "role_id": default_org_role_id,
                 "full_name": "",
             }
+            if direct_workspace_invites:
+                workspace_rows = ws_rows_by_email.get(email, [])
+                workspace_role_ids = {
+                    (workspace_row.get("role_id") or "").strip()
+                    for workspace_row in workspace_rows
+                    if (workspace_row.get("role_id") or "").strip()
+                }
+                if len(workspace_role_ids) == 1:
+                    member["workspace_ids"] = sorted(
+                        {
+                            workspace_row["workspace_id"]
+                            for workspace_row in workspace_rows
+                            if workspace_row.get("workspace_id")
+                        }
+                    )
+                    member["workspace_role_id"] = next(iter(workspace_role_ids))
+            members_by_email[email] = member
 
     return list(members_by_email.values())
 
@@ -857,11 +956,24 @@ def _display_resolution_summary(orchestrator) -> None:
         console.print(f"  Remediation bundle: {bundle_display}")
     console.print("  Resume command: langsmith-migrator resume")
 
-    actionable_items = orchestrator.state.get_checkpoint_items()
-    if actionable_items:
+    actionable_groups = orchestrator.state.get_actionable_groups()
+    if actionable_groups:
         console.print("\n[bold]Actionable Next Steps[/bold]")
-        for item in actionable_items[:5]:
-            console.print(f"  • {item.name}: {item.next_action or item.outcome_code or 'needs attention'}")
+        for group in actionable_groups[:5]:
+            item_count = len(group["items"])
+            if item_count == 1:
+                console.print(
+                    f"  • {group['subjects'][0]}: {group['next_action']}"
+                )
+            else:
+                affected = orchestrator.state.format_actionable_subjects(
+                    group["subjects"],
+                    max_items=3,
+                )
+                console.print(
+                    f"  • {group['label']} ({item_count} items: {affected}): "
+                    f"{group['next_action']}"
+                )
 
 
 def _needs_operator_action(state) -> bool:
@@ -1328,8 +1440,9 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
     '--sync',
     is_flag=True,
     help=(
-        'Make the CSV authoritative for single-instance sync: remove org users, '
-        'pending invites, and workspace memberships not present in the CSV. '
+        'Make the CSV authoritative for single-instance sync: any active org '
+        'user or pending invite not present in the CSV will be removed, and '
+        'workspace memberships not present in the CSV will also be removed. '
         'Without this flag, CSV mode only adds or updates access.'
     ),
 )
@@ -1617,7 +1730,9 @@ def users(
 
     if csv_member_rows is not None:
         all_members = _csv_rows_to_org_members(
-            csv_member_rows, default_org_role_id=default_org_role_id
+            csv_member_rows,
+            default_org_role_id=default_org_role_id,
+            direct_workspace_invites=single_instance,
         )
     else:
         org_members = user_role_migrator.list_source_org_members()
@@ -1643,8 +1758,11 @@ def users(
             needed_role_ids = {
                 role_id
                 for member in selected_members
-                if (role_id := (member.get("role_id") or "").strip())
-                and role_id not in role_mapping
+                for role_id in (
+                    (member.get("role_id") or "").strip(),
+                    (member.get("workspace_role_id") or "").strip(),
+                )
+                if role_id and role_id not in role_mapping
             }
             if needed_role_ids:
                 console.print(
@@ -3193,19 +3311,34 @@ def resume(ctx):
 
         # Get resumable items
         resume_items = state.get_resume_items()
-        checkpoint_items = state.get_checkpoint_items()
+        actionable_groups = state.get_actionable_groups()
 
         console.print(f"\nResumable items: {len(resume_items)}")
-        console.print(f"Checkpoint/manual items: {len(checkpoint_items)}")
+        console.print(
+            f"Checkpoint/manual items: {sum(len(group['items']) for group in actionable_groups)}"
+        )
 
-        if checkpoint_items:
+        if actionable_groups:
             console.print("\n[bold]Items requiring manual attention:[/bold]")
-            for item in checkpoint_items[:10]:
-                console.print(f"  • {item.name}: {item.next_action or item.outcome_code or 'needs attention'}")
+            for group in actionable_groups[:10]:
+                item_count = len(group["items"])
+                if item_count == 1:
+                    console.print(
+                        f"  • {group['subjects'][0]}: {group['next_action']}"
+                    )
+                else:
+                    affected = state.format_actionable_subjects(
+                        group["subjects"],
+                        max_items=3,
+                    )
+                    console.print(
+                        f"  • {group['label']} ({item_count} items: {affected}): "
+                        f"{group['next_action']}"
+                    )
 
         if not resume_items:
             console.print("\n[yellow]No items to resume automatically.[/yellow]")
-            if checkpoint_items:
+            if actionable_groups:
                 console.print("[dim]Review the checkpoint items above and resolve them manually.[/dim]")
             return
 

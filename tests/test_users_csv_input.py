@@ -29,15 +29,40 @@ def test_load_members_csv_requires_columns(tmp_path: Path):
         _load_members_csv(str(csv_path))
 
 
-def test_load_members_csv_rejects_empty_langsmith_role(tmp_path: Path):
+def test_load_members_csv_rejects_empty_langsmith_role_with_workspace_guidance(tmp_path: Path):
     csv_path = tmp_path / "members.csv"
     csv_path.write_text(
         "email,langsmith_role,workspace_id\nalice@example.com,,ws-1\n",
         encoding="utf-8",
     )
 
-    with pytest.raises(click.ClickException, match="empty langsmith_role"):
+    with pytest.raises(click.ClickException) as exc_info:
         _load_members_csv(str(csv_path))
+
+    message = str(exc_info.value)
+    assert "row 2 for alice@example.com in workspace ws-1" in message
+    assert "empty langsmith_role" in message
+    assert "Workspace Admin" in message
+    assert "leave workspace_id empty" in message
+
+
+def test_load_members_csv_rejects_empty_langsmith_role_on_org_row_with_org_guidance(
+    tmp_path: Path,
+):
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\nalice@example.com,,\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _load_members_csv(str(csv_path))
+
+    message = str(exc_info.value)
+    assert "row 2 for alice@example.com" in message
+    assert "empty langsmith_role" in message
+    assert "Organization User" in message
+    assert "Organization Admin" in message
 
 
 def test_load_members_csv_rejects_empty_file(tmp_path: Path):
@@ -109,8 +134,12 @@ def test_load_members_csv_strips_whitespace(tmp_path: Path):
 
 SOURCE_ROLES = [
     {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin", "permissions": []},
+    {"id": "src-operator", "name": "ORGANIZATION_OPERATOR", "display_name": "Operator", "permissions": []},
     {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User", "permissions": []},
+    {"id": "src-viewer", "name": "ORGANIZATION_VIEWER", "display_name": "Viewer", "permissions": []},
     {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin", "permissions": []},
+    {"id": "src-ws-user", "name": "WORKSPACE_USER", "display_name": "Collaborator", "permissions": []},
+    {"id": "src-ws-viewer", "name": "WORKSPACE_VIEWER", "display_name": "Workspace Read-only", "permissions": []},
     {"id": "src-custom-1", "name": "CUSTOM", "display_name": "Data Scientist", "permissions": []},
     {"id": "src-custom-2", "name": "CUSTOM", "display_name": "maintainer-dl-general", "permissions": []},
 ]
@@ -129,6 +158,20 @@ def test_resolve_csv_role_names_builtin_roles():
     assert org_user_id == "src-user"
 
 
+def test_resolve_csv_role_names_extended_builtin_aliases():
+    rows = [
+        {"email": "a@example.com", "langsmith_role": "Organization Viewer", "workspace_id": ""},
+        {"email": "b@example.com", "langsmith_role": "Workspace User", "workspace_id": "ws-1"},
+        {"email": "c@example.com", "langsmith_role": "WORKSPACE_VIEWER", "workspace_id": "ws-1"},
+    ]
+
+    resolved, _ = _resolve_csv_role_names(rows, SOURCE_ROLES)
+
+    assert resolved[0]["role_id"] == "src-viewer"
+    assert resolved[1]["role_id"] == "src-ws-user"
+    assert resolved[2]["role_id"] == "src-ws-viewer"
+
+
 def test_resolve_csv_role_names_custom_roles():
     rows = [
         {"email": "a@example.com", "langsmith_role": "Data Scientist", "workspace_id": "ws-1"},
@@ -143,7 +186,7 @@ def test_resolve_csv_role_names_case_insensitive():
     rows = [
         {"email": "a@example.com", "langsmith_role": "organization admin", "workspace_id": ""},
         {"email": "b@example.com", "langsmith_role": "ORGANIZATION_ADMIN", "workspace_id": ""},
-        {"email": "c@example.com", "langsmith_role": "data scientist", "workspace_id": "ws-1"},
+        {"email": "c@example.com", "langsmith_role": "DATA SCIENTIST", "workspace_id": "ws-1"},
     ]
 
     resolved, _ = _resolve_csv_role_names(rows, SOURCE_ROLES)
@@ -201,6 +244,25 @@ def test_resolve_csv_role_names_ambiguous_display_name_rejected_regardless_of_or
 
     with pytest.raises(click.ClickException, match="Ambiguous role name"):
         _resolve_csv_role_names(rows, source_roles)
+
+
+def test_resolve_csv_role_names_case_insensitive_conflict_calls_out_candidates():
+    rows = [
+        {"email": "a@example.com", "langsmith_role": "DATA SCIENTIST", "workspace_id": "ws-1"},
+    ]
+    source_roles = [
+        {"id": "src-custom-1", "name": "CUSTOM", "display_name": "Data Scientist", "permissions": []},
+        {"id": "src-custom-2", "name": "CUSTOM", "display_name": "DATA SCIENTIST", "permissions": []},
+    ]
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _resolve_csv_role_names(rows, source_roles)
+
+    message = str(exc_info.value)
+    assert "matched multiple roles case-insensitively" in message
+    assert "Data Scientist (src-custom-1)" in message
+    assert "DATA SCIENTIST (src-custom-2)" in message
+    assert "Available roles (case-insensitive)" in message
 
 
 def test_resolve_csv_role_names_builtin_identifier_preferred_over_custom_collision():
@@ -269,9 +331,9 @@ def test_normalize_csv_role_scopes_rejects_workspace_role_on_org_row():
     rows = [
         {
             "email": "alice@example.com",
-            "langsmith_role": "Workspace Admin",
-            "role_id": "src-ws-admin",
-            "role_name": "WORKSPACE_ADMIN",
+            "langsmith_role": "Workspace User",
+            "role_id": "src-ws-user",
+            "role_name": "WORKSPACE_USER",
             "workspace_id": "",
         }
     ]
@@ -284,9 +346,9 @@ def test_normalize_csv_role_scopes_rejects_org_user_on_workspace_row():
     rows = [
         {
             "email": "alice@example.com",
-            "langsmith_role": "Organization User",
-            "role_id": "src-user",
-            "role_name": "ORGANIZATION_USER",
+            "langsmith_role": "Organization Viewer",
+            "role_id": "src-viewer",
+            "role_name": "ORGANIZATION_VIEWER",
             "workspace_id": "ws-1",
         }
     ]
@@ -321,6 +383,52 @@ def test_csv_rows_to_org_members_workspace_only_gets_default():
 
     assert len(members) == 1
     assert members[0]["role_id"] == "role-user"
+
+
+def test_csv_rows_to_org_members_single_instance_workspace_only_carries_workspace_invite():
+    rows = [
+        {"email": "alice@example.com", "role_id": "role-ws-admin", "workspace_id": "ws-2"},
+        {"email": "alice@example.com", "role_id": "role-ws-admin", "workspace_id": "ws-1"},
+    ]
+
+    members = _csv_rows_to_org_members(
+        rows,
+        default_org_role_id="role-user",
+        direct_workspace_invites=True,
+    )
+
+    assert members == [
+        {
+            "id": "alice@example.com",
+            "email": "alice@example.com",
+            "role_id": "role-user",
+            "full_name": "",
+            "workspace_ids": ["ws-1", "ws-2"],
+            "workspace_role_id": "role-ws-admin",
+        }
+    ]
+
+
+def test_csv_rows_to_org_members_single_instance_mixed_workspace_roles_omit_direct_invite():
+    rows = [
+        {"email": "alice@example.com", "role_id": "role-ws-admin", "workspace_id": "ws-1"},
+        {"email": "alice@example.com", "role_id": "role-ws-viewer", "workspace_id": "ws-2"},
+    ]
+
+    members = _csv_rows_to_org_members(
+        rows,
+        default_org_role_id="role-user",
+        direct_workspace_invites=True,
+    )
+
+    assert members == [
+        {
+            "id": "alice@example.com",
+            "email": "alice@example.com",
+            "role_id": "role-user",
+            "full_name": "",
+        }
+    ]
 
 
 def test_csv_rows_to_org_members_conflicting_org_roles_rejected():
