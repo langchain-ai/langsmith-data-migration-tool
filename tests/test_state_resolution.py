@@ -95,3 +95,45 @@ def test_loading_v1_state_upgrades_to_schema_v2(tmp_path):
     assert loaded is not None
     assert loaded.schema_version == 2
     assert loaded.verification_summary["total"] == 1
+
+
+def test_remediation_summary_groups_duplicate_actionable_items(tmp_path):
+    """Remediation summaries should collapse repeated user-role failures into one actionable step."""
+
+    state = MigrationState(
+        session_id="migration_grouped_actions",
+        started_at=time.time(),
+        updated_at=time.time(),
+        source_url="https://source.example",
+        destination_url="https://dest.example",
+        remediation_bundle_path=str(
+            (tmp_path / "remediation" / "migration_grouped_actions").resolve()
+        ),
+    )
+
+    for email in ("alice@example.com", "bob@example.com"):
+        item = state.ensure_item(
+            f"ws_member_ws-1_{email}",
+            "ws_member",
+            email,
+            email,
+        )
+        state.mark_terminal(
+            item.id,
+            ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+            "ws_member_add_failed",
+            verification_state=VerificationState.BLOCKED,
+            next_action="Re-run `langsmith-migrator users`.",
+            evidence={"email": email},
+        )
+
+    bundle_dir = state.write_remediation_bundle()
+
+    assert bundle_dir is not None
+    summary = (bundle_dir / "summary.md").read_text(encoding="utf-8")
+    assert "Workspace memberships failed to add (2 items)" in summary
+    assert "Affected: alice@example.com, bob@example.com" in summary
+    assert (
+        "Next: Review the workspace membership create error in the remediation "
+        "bundle, then re-run `langsmith-migrator users`."
+    ) in summary

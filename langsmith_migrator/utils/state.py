@@ -63,6 +63,52 @@ REPAIR_POLICIES = {
 }
 
 
+_ACTIONABLE_GROUP_LABELS = {
+    "unmapped_role": "Roles are missing from the mapping",
+    "unmapped_workspace_role": "Workspace roles are missing from the mapping",
+    "org_member_role_update_failed": "Org role updates failed",
+    "org_member_pending_invite_replace_failed": "Pending org invites could not be refreshed",
+    "org_member_invite_failed": "Org invites failed",
+    "org_member_remove_failed": "Extra org users or pending invites could not be removed",
+    "ws_member_role_update_failed": "Workspace role updates failed",
+    "ws_member_not_in_org": "Workspace users are missing org access",
+    "ws_member_add_failed": "Workspace memberships failed to add",
+    "ws_member_remove_failed": "Extra workspace memberships could not be removed",
+}
+
+
+_ACTIONABLE_NEXT_ACTION_OVERRIDES = {
+    "org_member_role_update_failed": (
+        "Review the org role update error in the remediation bundle, "
+        "then re-run `langsmith-migrator users`."
+    ),
+    "org_member_pending_invite_replace_failed": (
+        "Cancel or replace the pending org invite on the target, "
+        "then re-run `langsmith-migrator users`."
+    ),
+    "org_member_invite_failed": (
+        "Review the org invite error in the remediation bundle, "
+        "then re-run `langsmith-migrator users`."
+    ),
+    "org_member_remove_failed": (
+        "Remove the extra org user or pending invite manually if needed, "
+        "then re-run `langsmith-migrator users --sync`."
+    ),
+    "ws_member_role_update_failed": (
+        "Review the workspace role update error in the remediation bundle, "
+        "then re-run `langsmith-migrator users`."
+    ),
+    "ws_member_add_failed": (
+        "Review the workspace membership create error in the remediation bundle, "
+        "then re-run `langsmith-migrator users`."
+    ),
+    "ws_member_remove_failed": (
+        "Remove the extra workspace membership manually if needed, "
+        "then re-run `langsmith-migrator users --sync`."
+    ),
+}
+
+
 def _now() -> float:
     return time.time()
 
@@ -485,6 +531,97 @@ class MigrationState:
                 items.append(item)
         return items
 
+    @staticmethod
+    def _humanize_outcome_code(code: str) -> str:
+        text = code.replace("_", " ").strip()
+        if not text:
+            return "Items need attention"
+        return text[:1].upper() + text[1:]
+
+    def _actionable_subject(self, item: MigrationItem) -> str:
+        return str(
+            item.evidence.get("email")
+            or item.name
+            or item.source_id
+            or item.id
+        )
+
+    def _actionable_label(self, item: MigrationItem) -> str:
+        code = item.outcome_code or item.error or ""
+        if code in _ACTIONABLE_GROUP_LABELS:
+            return _ACTIONABLE_GROUP_LABELS[code]
+        if code:
+            return self._humanize_outcome_code(code)
+        return self._humanize_outcome_code(item.type)
+
+    def _actionable_next_action(self, item: MigrationItem) -> str:
+        code = item.outcome_code or item.error or ""
+        if code in _ACTIONABLE_NEXT_ACTION_OVERRIDES:
+            return _ACTIONABLE_NEXT_ACTION_OVERRIDES[code]
+        if item.next_action:
+            return item.next_action
+        return (
+            "Review the remediation bundle for the specific error and retry "
+            "once the issue is resolved."
+        )
+
+    @staticmethod
+    def format_actionable_subjects(
+        subjects: List[str],
+        *,
+        max_items: Optional[int] = None,
+    ) -> str:
+        unique_subjects: List[str] = []
+        seen: set[str] = set()
+        for subject in subjects:
+            if subject and subject not in seen:
+                unique_subjects.append(subject)
+                seen.add(subject)
+
+        if max_items is not None and len(unique_subjects) > max_items:
+            preview = ", ".join(unique_subjects[:max_items])
+            return f"{preview}, +{len(unique_subjects) - max_items} more"
+        return ", ".join(unique_subjects)
+
+    def get_actionable_groups(self) -> List[Dict[str, Any]]:
+        """Group blocked/exported items into higher-signal remediation steps."""
+        grouped: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
+
+        for item in sorted(
+            self.get_checkpoint_items(),
+            key=lambda current: (
+                current.outcome_code or "",
+                current.type,
+                self._actionable_subject(current).lower(),
+            ),
+        ):
+            label = self._actionable_label(item)
+            next_action = self._actionable_next_action(item)
+            key = (
+                item.outcome_code or "",
+                item.type,
+                label,
+                next_action,
+            )
+            group = grouped.setdefault(
+                key,
+                {
+                    "label": label,
+                    "next_action": next_action,
+                    "subjects": [],
+                    "items": [],
+                    "artifacts": [],
+                },
+            )
+            subject = self._actionable_subject(item)
+            if subject not in group["subjects"]:
+                group["subjects"].append(subject)
+            group["items"].append(item)
+            if item.export_path and item.export_path not in group["artifacts"]:
+                group["artifacts"].append(item.export_path)
+
+        return list(grouped.values())
+
     def record_capability(
         self,
         scope: str,
@@ -702,7 +839,7 @@ class MigrationState:
         )
 
         stats = self.get_statistics()
-        checkpoint_items = self.get_checkpoint_items()
+        actionable_groups = self.get_actionable_groups()
         resume_command = "langsmith-migrator resume"
         lines = [
             f"# Remediation Summary: {self.session_id}",
@@ -720,15 +857,33 @@ class MigrationState:
             "",
         ]
 
-        if checkpoint_items:
+        if actionable_groups:
             lines.append("## Actionable Items")
             lines.append("")
-            for item in checkpoint_items:
-                lines.append(f"- `{item.id}` ({item.type}): {item.outcome_code or 'needs_attention'}")
-                if item.next_action:
-                    lines.append(f"  Next: {item.next_action}")
-                if item.export_path:
-                    lines.append(f"  Artifact: `{item.export_path}`")
+            for group in actionable_groups:
+                item_count = len(group["items"])
+                if item_count == 1:
+                    lines.append(
+                        f"- {group['subjects'][0]}: {group['label']}"
+                    )
+                else:
+                    lines.append(
+                        f"- {group['label']} ({item_count} items)"
+                    )
+                    lines.append(
+                        "  Affected: "
+                        + self.format_actionable_subjects(
+                            group["subjects"],
+                            max_items=10,
+                        )
+                    )
+                lines.append(f"  Next: {group['next_action']}")
+                for artifact_path in group["artifacts"][:3]:
+                    lines.append(f"  Artifact: `{artifact_path}`")
+                if len(group["artifacts"]) > 3:
+                    lines.append(
+                        f"  Artifacts: {len(group['artifacts'])} files in the remediation bundle"
+                    )
             lines.append("")
 
         if self.remediation_queue:

@@ -7,7 +7,13 @@ from unittest.mock import Mock, call
 
 from langsmith_migrator.cli import main as cli_main
 from langsmith_migrator.cli.tui_workspace_mapper import WorkspaceProjectResult
-from langsmith_migrator.utils.state import MigrationItem, MigrationState, MigrationStatus
+from langsmith_migrator.utils.state import (
+    MigrationItem,
+    MigrationState,
+    MigrationStatus,
+    ResolutionOutcome,
+    VerificationState,
+)
 
 
 def build_state(
@@ -69,6 +75,54 @@ def test_name_mapping_to_id_mapping_ignores_unknown_project_names():
     )
 
     assert result == {"src-a": "dst-a"}
+
+
+def test_display_resolution_summary_groups_duplicate_user_failures(monkeypatch, tmp_path):
+    """Resolution summaries should collapse repeated user-role blockers into a grouped next step."""
+
+    state = build_state("migration_grouped_summary")
+    state.remediation_bundle_path = str(
+        (tmp_path / "remediation" / state.session_id).resolve()
+    )
+    for email in ("alice@example.com", "bob@example.com"):
+        item = state.ensure_item(
+            f"ws_member_ws-1_{email}",
+            "ws_member",
+            email,
+            email,
+        )
+        state.mark_terminal(
+            item.id,
+            ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+            "ws_member_add_failed",
+            verification_state=VerificationState.BLOCKED,
+            next_action="Re-run `langsmith-migrator users`.",
+            evidence={"email": email},
+        )
+
+    class StubOrchestrator:
+        def __init__(self, state):
+            self.state = state
+
+    class SimpleConsole:
+        def __init__(self):
+            self.text = ""
+
+        def print(self, *args, end="\n", **kwargs):
+            self.text += "".join(str(arg) for arg in args) + end
+
+    console = SimpleConsole()
+    monkeypatch.setattr(cli_main, "console", console)
+
+    cli_main._display_resolution_summary(StubOrchestrator(state))
+
+    normalized_output = " ".join(console.text.split())
+    assert "Actionable Next Steps" in normalized_output
+    assert (
+        "Workspace memberships failed to add (2 items: alice@example.com, "
+        "bob@example.com): Review the workspace membership create error in the "
+        "remediation bundle, then re-run `langsmith-migrator users`."
+    ) in normalized_output
 
 
 def test_resolve_workspaces_with_explicit_pair_sets_context(monkeypatch):
@@ -531,6 +585,8 @@ def test_users_command_single_instance_source_of_truth_uses_identity_workspace_p
                 "email": "bob@example.com",
                 "role_id": "src-user",
                 "full_name": "",
+                "workspace_ids": ["ws-1"],
+                "workspace_role_id": "src-ws-admin",
             },
         ],
         remove_missing=True,
@@ -742,6 +798,8 @@ def test_users_command_single_instance_csv_apply_auto_applies_all_rows(
                 "email": "bob@example.com",
                 "role_id": "src-user",
                 "full_name": "",
+                "workspace_ids": ["ws-1"],
+                "workspace_role_id": "src-ws-admin",
             },
         ],
         remove_missing=False,
@@ -838,6 +896,74 @@ def test_users_command_single_instance_syncs_custom_roles_only_when_csv_rows_nee
             }
         ],
         remove_missing=False,
+    )
+
+
+def test_users_command_single_instance_syncs_workspace_only_custom_roles_before_org_invites(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Workspace-only users should sync custom workspace roles before direct org invites."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,write-no-read,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.side_effect = [
+        {
+            "src-admin": "dst-admin",
+            "src-user": "dst-user",
+            "src-ws-admin": "dst-ws-admin",
+        },
+        {"src-ws-custom": "dst-ws-custom"},
+    ]
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+        {"id": "src-ws-custom", "name": "CUSTOM", "display_name": "write-no-read"},
+    ]
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (0, 1, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert user_role_migrator.build_role_mapping.call_args_list == [
+        call(custom_role_ids=set()),
+        call(custom_role_ids={"src-ws-custom"}),
+    ]
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-user",
+                "full_name": "",
+                "workspace_ids": ["ws-1"],
+                "workspace_role_id": "src-ws-custom",
+            }
+        ],
+        remove_missing=False,
+        remove_pending=False,
     )
 
 
@@ -1066,6 +1192,8 @@ def test_users_command_single_instance_sync_dry_run_keeps_safe_apply_behavior(
                 "email": "bob@example.com",
                 "role_id": "src-user",
                 "full_name": "",
+                "workspace_ids": ["ws-1"],
+                "workspace_role_id": "src-ws-admin",
             },
         ],
         remove_missing=True,
@@ -1281,6 +1409,8 @@ def test_users_help_describes_single_instance_csv_guardrails(cli_harness):
     assert "Preview this users sync without making POST/PATCH/DELETE changes." in normalized_output
     assert "Use one target LangSmith instance" in normalized_output
     assert "access sync instead of" in normalized_output
+    assert "any active org user or pending invite not present in the CSV will be removed" in normalized_output
+    assert "workspace memberships not present in the CSV will also be removed" in normalized_output
     assert "Without this flag, CSV mode only adds or updates access." in normalized_output
     assert "all CSV rows are applied automatically" in normalized_output
     assert "Organization Admin on a workspace row is treated as org-level access only." in normalized_output

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.63] - 2026-04-10
+
+### Added
+- **Expanded CSV role-name support**: `users --members-csv` now recognizes `Organization Operator`, `Organization Viewer`, `Workspace User`, and `Workspace Viewer`, and ambiguous case-insensitive matches now call out the exact candidate roles.
+- **Grouped remediation guidance**: Resolution summaries, `resume`, and remediation bundles now collapse repeated blockers into grouped actionable next steps.
+
+### Fixed
+- **Single-instance workspace invites**: Workspace-only CSV rows now sync required custom workspace roles before org invites and attach initial workspace access directly to the org invite when the target instance supports it.
+- **Pending invite reconciliation**: Existing pending org invites are now reused only when they already include the requested workspace access, and otherwise are refreshed so phase 3 does not fail on missing workspace state.
+- **Workspace membership endpoint compatibility**: Workspace membership create, update, and delete operations now prefer workspace-scoped endpoints and fall back to legacy tenant endpoints when needed.
+- **CSV validation guidance**: Empty `langsmith_role` errors now explain whether the row expects an org-scoped or workspace-scoped role.
+
+### Changed
+- **README parity**: Updated release snippets, command coverage, users sync docs, workspace scoping, and remediation/resume documentation to match the current CLI surface.
+
 ## [0.0.62] - 2026-04-09
 
 ### Changed
@@ -255,7 +270,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.62...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.63...HEAD
+[0.0.63]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.62...v0.0.63
 [0.0.62]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.61...v0.0.62
 [0.0.61]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.60...v0.0.61
 [0.0.60]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.59...v0.0.60
