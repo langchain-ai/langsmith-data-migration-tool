@@ -1011,7 +1011,7 @@ def ensure_config(config: Config) -> bool:
         # Check if we're missing credentials specifically
         missing_creds = any("API key is required" in error for error in errors)
 
-        if missing_creds:
+        if missing_creds and not config.migration.non_interactive:
             # Prompt for missing credentials
             config.prompt_for_credentials(console)
 
@@ -1023,6 +1023,21 @@ def ensure_config(config: Config) -> bool:
                 for error in errors:
                     console.print(f"  • {error}")
                 return False
+
+        if config.migration.non_interactive:
+            guidance: list[str] = []
+            if missing_creds:
+                guidance.append(
+                    "Provide credentials via CLI flags or environment variables "
+                    "before running in --non-interactive mode."
+                )
+            error_lines = [f"  • {error}" for error in errors]
+            if guidance:
+                error_lines.extend(f"  • {line}" for line in guidance)
+            raise click.ClickException(
+                "Configuration is invalid in --non-interactive mode:\n"
+                + "\n".join(error_lines)
+            )
         else:
             # Non-credential errors
             for error in errors:
@@ -1469,6 +1484,12 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
     'instance_url',
     help='Base URL for the single-instance CSV sync target. Must be provided together with --api-key.',
 )
+@click.option(
+    '--non-interactive',
+    'users_non_interactive',
+    is_flag=True,
+    help='Disable prompts for this users run. Same behavior as the global --non-interactive.',
+)
 @workspace_options
 @click.pass_context
 def users(
@@ -1481,6 +1502,7 @@ def users(
     members_csv,
     instance_key,
     instance_url,
+    users_non_interactive,
     source_workspace,
     dest_workspace,
     map_workspaces,
@@ -1493,6 +1515,9 @@ def users(
 
     if users_dry_run:
         config.migration.dry_run = True
+    if users_non_interactive:
+        config.migration.non_interactive = True
+        config.migration.interactive = False
 
     if bool(instance_key) != bool(instance_url):
         raise click.ClickException(

@@ -6,7 +6,7 @@ A Python CLI for migrating users and roles, datasets, experiments, annotation qu
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -54,20 +54,20 @@ For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk E
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.63-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -213,6 +213,7 @@ langsmith-migrator \
 
 In `--single-instance` mode, the command mirrors the provided instance configuration onto both internal clients, so you only need one working LangSmith connection. Workspace rows use the target workspace IDs directly; there is no workspace mapping step. All CSV rows are applied automatically after a single confirmation summary; there is no row-selection step in this mode. `--api-key`/`--url` imply `--single-instance`, `--csv` is a short alias for `--members-csv`, and `--sync` is a short alias for `--csv-source-of-truth`.
 `users --dry-run` is also supported as a command-local preview flag if you prefer to put dry-run after the subcommand instead of before it.
+For cron jobs and other headless runs, `users --non-interactive` is also supported as a command-local alias for the global `langsmith-migrator --non-interactive users ...` form. In headless mode, missing credentials fail fast instead of prompting.
 
 CSV schema:
 
@@ -325,6 +326,7 @@ The prompt default is `No` (rules are created disabled).
 
 ```bash
 --dry-run                  Preview this users sync without making POST/PATCH/DELETE changes
+--non-interactive          Disable prompts for this users run. Same as the global --non-interactive.
 --roles-only               Only migrate custom roles (skip member migration)
 --skip-workspace-members   Skip workspace member migration
 --single-instance, --instance
