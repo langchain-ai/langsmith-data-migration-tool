@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.64] - 2026-04-10
+
+### Added
+- **Command-local headless users mode**: `users --non-interactive` now works as a subcommand-local alias for the global `--non-interactive` flag, making cron-style single-instance CSV sync runs easier to schedule.
+
+### Fixed
+- **Headless credential handling**: `users` now fails fast with a clear non-interactive configuration error instead of trying to prompt for API keys when running headless.
+
+### Changed
+- **README release parity**: Updated the release install snippets and `users` documentation to show the command-local headless mode and the new `0.0.64` wheel URLs.
+
 ## [0.0.63] - 2026-04-10
 
 ### Added
@@ -270,7 +281,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.63...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.64...HEAD
+[0.0.64]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.63...v0.0.64
 [0.0.63]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.62...v0.0.63
 [0.0.62]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.61...v0.0.62
 [0.0.61]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.60...v0.0.61

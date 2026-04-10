@@ -1212,6 +1212,61 @@ def test_users_command_single_instance_sync_dry_run_keeps_safe_apply_behavior(
     )
 
 
+def test_users_command_local_non_interactive_runs_headless_single_instance_csv_apply(
+    cli_harness, monkeypatch, tmp_path
+):
+    """users --non-interactive should bypass confirmation prompts for cron-friendly runs."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Organization Admin,\n"
+        "bob@example.com,Workspace Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {
+        "src-admin": "dst-admin",
+        "src-user": "dst-user",
+        "src-ws-admin": "dst-ws-admin",
+    }
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin"},
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+    ]
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (2, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(
+        cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator
+    )
+    cli_harness.controls.confirm_answers = [False]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--non-interactive",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert cli_harness.controls.confirm_answers == [False]
+    orchestrator = cli_harness.orchestrator_factory.instances[0]
+    assert orchestrator.config.migration.non_interactive is True
+    user_role_migrator.migrate_org_members.assert_called_once()
+    user_role_migrator.migrate_workspace_members.assert_called_once()
+
+
 def test_users_command_rejects_org_scoped_role_on_workspace_row(
     cli_harness, monkeypatch, tmp_path
 ):
@@ -1417,6 +1472,38 @@ def test_users_help_describes_single_instance_csv_guardrails(cli_harness):
     assert "Must be provided together with --url." in normalized_output
     assert "Base URL for the single-instance CSV sync target." in normalized_output
     assert "provided together with --api-" in normalized_output
+    assert "Disable prompts for this users run." in normalized_output
+
+
+def test_users_command_non_interactive_missing_credentials_fails_without_prompt(
+    cli_harness, monkeypatch
+):
+    """Headless users runs should fail fast instead of prompting for credentials."""
+
+    monkeypatch.delenv("LANGSMITH_OLD_API_KEY", raising=False)
+    monkeypatch.delenv("LANGSMITH_NEW_API_KEY", raising=False)
+    monkeypatch.delenv("LANGSMITH_OLD_BASE_URL", raising=False)
+    monkeypatch.delenv("LANGSMITH_NEW_BASE_URL", raising=False)
+
+    prompted = False
+
+    def _unexpected_prompt(self, console=None):
+        nonlocal prompted
+        prompted = True
+        raise AssertionError("prompt_for_credentials should not be called")
+
+    monkeypatch.setattr(cli_main.Config, "prompt_for_credentials", _unexpected_prompt)
+
+    result = cli_harness.invoke(
+        ["users", "--non-interactive"],
+        add_base_args=False,
+    )
+
+    assert result.exit_code != 0
+    assert prompted is False
+    assert "Configuration is invalid in --non-interactive mode" in result.output
+    assert "Source API key is required" in result.output
+    assert "Destination API key is required" in result.output
 
 
 def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_harness):
