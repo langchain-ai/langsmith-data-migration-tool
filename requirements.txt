@@ -24,7 +24,7 @@ idna==3.11
     #   anyio
     #   httpx
     #   requests
-langsmith==0.7.27
+langsmith==0.7.31
     # via langsmith-data-migration-tool (pyproject.toml)
 linkify-it-py==2.1.0
     # via markdown-it-py
