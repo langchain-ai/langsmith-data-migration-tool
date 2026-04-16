@@ -24,7 +24,7 @@ idna==3.11
     #   anyio
     #   httpx
     #   requests
-langsmith==0.7.31
+langsmith==0.7.32
     # via langsmith-data-migration-tool (pyproject.toml)
 linkify-it-py==2.1.0
     # via markdown-it-py
@@ -39,13 +39,13 @@ mdurl==0.1.2
     # via markdown-it-py
 orjson==3.11.8
     # via langsmith
-packaging==26.0
+packaging==26.1
     # via langsmith
-platformdirs==4.9.4
+platformdirs==4.9.6
     # via textual
-pydantic==2.12.5
+pydantic==2.13.1
     # via langsmith
-pydantic-core==2.41.5
+pydantic-core==2.46.1
     # via pydantic
 pygments==2.20.0
     # via
@@ -60,7 +60,7 @@ requests==2.33.1
     #   requests-toolbelt
 requests-toolbelt==1.0.0
     # via langsmith
-rich==14.3.3
+rich==15.0.0
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   textual
