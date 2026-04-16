@@ -461,7 +461,7 @@ For release changes, update all of:
 - `CHANGELOG.md` release notes
 - `README.md` release-facing docs/examples
 
-CI enforces this on pull requests: if `pyproject.toml` or `CHANGELOG.md` changes, `README.md` must also be updated.
+CI enforces this on pull requests: if `pyproject.toml` or `CHANGELOG.md` changes, `README.md` must also be updated (including dependency-only bumps).
 
 ## Support
 
