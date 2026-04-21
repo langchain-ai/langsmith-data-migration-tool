@@ -210,6 +210,7 @@ class FakeOrchestratorInstance:
                 self.migrators.chart.migrate_chart(
                     item.metadata.get("chart"),
                     item.metadata.get("dest_session_id"),
+                    same_instance=item.metadata.get("same_instance", False),
                 )
                 results["resumed"].append(f"chart:{item.source_id}")
             else:
@@ -301,6 +302,7 @@ class MigratorRegistry:
         self.prompt.list_prompts.return_value = []
         self.rules.probe_capabilities.return_value = {}
         self.rules.list_rules.return_value = []
+        self.chart._project_id_map = None
         self.chart.probe_capabilities.return_value = {}
         self.chart.list_charts.return_value = []
         self.chart.list_sessions.return_value = []
@@ -356,6 +358,22 @@ def cli_harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> CliHarness:
     monkeypatch.setattr(cli_main, "build_project_mapping_tui", controls.build_project_mapping)
     monkeypatch.setattr(cli_main, "StateManager", lambda: state_manager)
     monkeypatch.setattr(cli_main, "MigrationOrchestrator", orchestrator_factory)
+
+    def _resolve_destination_session_id(source_session_id: str | None, *, same_instance: bool = False):
+        if not source_session_id:
+            return None
+        if same_instance:
+            return source_session_id
+
+        project_id_map = getattr(migrators.chart, "_project_id_map", None) or {}
+        if source_session_id in project_id_map:
+            return project_id_map[source_session_id]
+
+        if orchestrator_factory.state is not None:
+            return orchestrator_factory.state.get_mapped_id("project", source_session_id)
+        return None
+
+    migrators.chart.resolve_destination_session_id.side_effect = _resolve_destination_session_id
 
     def patch_migrator(name: str, instance: Mock) -> None:
         factory = lambda *args, **kwargs: instance

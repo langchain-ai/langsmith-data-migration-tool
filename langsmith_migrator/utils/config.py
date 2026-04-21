@@ -27,6 +27,7 @@ class MigrationConfig:
     concurrent_workers: int = 4
     dry_run: bool = False
     skip_existing: bool = False
+    auto_merge_custom_roles: bool = False
     resume_on_error: bool = True
     verbose: bool = False
     interactive: bool = True

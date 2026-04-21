@@ -107,6 +107,77 @@ def _name_mapping_to_id_mapping(
     return id_map
 
 
+def _normalize_deployment_url(base_url: str) -> str:
+    """Normalize a LangSmith deployment URL for same-deployment comparisons."""
+    normalized = (base_url or "").strip().rstrip("/").lower()
+    for suffix in ("/api/v1", "/api/v2"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized
+
+
+def _is_same_deployment(config: Config) -> bool:
+    """Return True when source and destination point at the same deployment."""
+    return _normalize_deployment_url(config.source.base_url) == _normalize_deployment_url(
+        config.destination.base_url
+    )
+
+
+def _workspace_pair_allows_same_instance(source_workspace_id=None, dest_workspace_id=None) -> bool:
+    """Return True when chart IDs can safely be reused across the active workspace scope."""
+    if not source_workspace_id and not dest_workspace_id:
+        return True
+    return bool(source_workspace_id) and source_workspace_id == dest_workspace_id
+
+
+def _auto_detect_chart_same_instance(
+    config: Config,
+    source_workspace_id=None,
+    dest_workspace_id=None,
+) -> bool:
+    """Auto-detect safe same-instance chart mode for the current workspace scope."""
+    if not _is_same_deployment(config):
+        return False
+
+    same_workspace_scope = (
+        bool(source_workspace_id)
+        and source_workspace_id == dest_workspace_id
+    )
+    if _workspace_pair_allows_same_instance(source_workspace_id, dest_workspace_id) and (
+        config.source.api_key == config.destination.api_key
+        or same_workspace_scope
+    ):
+        if same_workspace_scope and config.source.api_key != config.destination.api_key:
+            console.print(
+                "[dim]Detected the same deployment with an identical workspace scope "
+                "(IDs can be reused even though API keys differ).[/dim]"
+            )
+            return True
+        console.print(
+            "[dim]Detected same source and destination deployment "
+            "(same normalized URL and API key)[/dim]"
+        )
+        return True
+
+    if config.source.api_key == config.destination.api_key:
+        console.print(
+            "[dim]Detected the same deployment URL and API key but different workspaces.[/dim]"
+        )
+    else:
+        console.print(
+            "[dim]Detected the same deployment URL but different API keys/workspaces.[/dim]"
+        )
+
+    console.print(
+        "[dim]Will auto-remap projects and sessions instead of reusing source IDs.[/dim]"
+    )
+    console.print(
+        "[dim]Use --map-projects if automatic project resolution is not enough.[/dim]"
+    )
+    return False
+
+
 _WS_CANCELLED = "__cancelled__"
 _WS_ABORTED = "__aborted__"
 
@@ -413,6 +484,23 @@ _WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES = {
     "WORKSPACE_USER",
     "WORKSPACE_VIEWER",
 }
+_WORKSPACE_ROLE_PRECEDENCE = {
+    "WORKSPACE_ADMIN": 3,
+    "WORKSPACE_USER": 2,
+    "WORKSPACE_VIEWER": 1,
+}
+
+
+def _build_workspace_role_union_signature(role_ids: Iterable[str]) -> str:
+    """Build a stable signature for a merged workspace-role set."""
+    normalized_role_ids = sorted(
+        {
+            (role_id or "").strip()
+            for role_id in role_ids
+            if (role_id or "").strip()
+        }
+    )
+    return "|".join(normalized_role_ids)
 
 
 def _resolve_csv_role_names(
@@ -609,6 +697,168 @@ def _normalize_csv_role_scopes(
         )
 
     return normalized_rows, org_admin_workspace_rows
+
+
+def _normalize_workspace_csv_rows(
+    csv_rows: list[dict],
+    *,
+    auto_merge_custom_roles: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """Normalize duplicate workspace rows to one effective row per user/workspace.
+
+    Returns ``(normalized_rows, union_specs)``. ``union_specs`` contains the
+    source role IDs for any synthetic union roles emitted into the normalized rows.
+    """
+    normalized_rows: list[dict] = []
+    workspace_rows_by_key: dict[tuple[str, str], list[dict]] = {}
+    errors: list[str] = []
+    union_specs: list[dict] = []
+
+    for row in csv_rows:
+        workspace_id = (row.get("workspace_id") or "").strip()
+        if not workspace_id:
+            normalized_rows.append(dict(row))
+            continue
+        key = (row["email"], workspace_id)
+        workspace_rows_by_key.setdefault(key, []).append(row)
+
+    for (email, workspace_id), rows in workspace_rows_by_key.items():
+        unique_rows_by_role_id: dict[str, dict] = {}
+        for row in rows:
+            role_id = (row.get("role_id") or "").strip()
+            if role_id and role_id not in unique_rows_by_role_id:
+                unique_rows_by_role_id[role_id] = row
+
+        unique_rows = list(unique_rows_by_role_id.values())
+        if len(unique_rows) <= 1:
+            if unique_rows:
+                normalized_rows.append(dict(unique_rows[0]))
+            continue
+
+        role_names = {
+            (row.get("role_name") or "").strip().upper()
+            for row in unique_rows
+            if (row.get("role_name") or "").strip()
+        }
+        builtin_rows = [
+            row
+            for row in unique_rows
+            if (row.get("role_name") or "").strip().upper()
+            in _WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES
+        ]
+        custom_rows = [
+            row
+            for row in unique_rows
+            if (row.get("role_name") or "").strip().upper() == "CUSTOM"
+        ]
+
+        if (
+            role_names
+            and role_names.issubset(_WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES)
+            and not custom_rows
+        ):
+            selected_row = max(
+                builtin_rows,
+                key=lambda row: _WORKSPACE_ROLE_PRECEDENCE.get(
+                    (row.get("role_name") or "").strip().upper(), 0
+                ),
+            )
+            normalized_rows.append(dict(selected_row))
+            continue
+
+        role_labels = sorted(
+            {
+                (row.get("langsmith_role") or row.get("role_id") or "<unknown>").strip()
+                for row in unique_rows
+                if (row.get("langsmith_role") or row.get("role_id") or "").strip()
+            },
+            key=str.lower,
+        )
+        if not auto_merge_custom_roles:
+            if custom_rows and builtin_rows:
+                errors.append(
+                    "Members CSV has mixed built-in and custom workspace roles for "
+                    f"{email} in workspace {workspace_id}: "
+                    + ", ".join(role_labels)
+                    + ". Re-run with --auto-merge-custom-roles to synthesize a "
+                    "managed union role for that workspace."
+                )
+            else:
+                errors.append(
+                    "Members CSV has multiple custom workspace roles for "
+                    f"{email} in workspace {workspace_id}: "
+                    + ", ".join(role_labels)
+                    + ". Re-run with --auto-merge-custom-roles to synthesize a "
+                    "managed union role for that workspace."
+                )
+            continue
+
+        source_role_ids = sorted(unique_rows_by_role_id)
+        signature = _build_workspace_role_union_signature(source_role_ids)
+        union_role_id = f"union::{signature}"
+        union_rows = {
+            row.get("langsmith_role") or row.get("role_id") or "<unknown>"
+            for row in unique_rows
+        }
+        exemplar = dict(unique_rows[0])
+        exemplar["role_id"] = union_role_id
+        exemplar["role_name"] = "CUSTOM"
+        exemplar["langsmith_role"] = " + ".join(sorted(union_rows, key=str.lower))
+        normalized_rows.append(exemplar)
+        union_specs.append(
+            {
+                "signature": signature,
+                "role_id": union_role_id,
+                "source_role_ids": source_role_ids,
+                "workspace_id": workspace_id,
+                "email": email,
+                "role_labels": role_labels,
+            }
+        )
+
+    if errors:
+        raise click.ClickException("; ".join(errors))
+
+    return normalized_rows, union_specs
+
+
+def _partition_needed_workspace_role_ids(
+    role_ids: set[str],
+    workspace_role_union_specs_by_role_id: dict[str, dict],
+) -> tuple[set[str], set[str]]:
+    """Split needed workspace-role IDs into normal source roles vs managed unions."""
+    if not role_ids:
+        return set(), set()
+
+    union_role_ids = {
+        role_id
+        for role_id in role_ids
+        if role_id in workspace_role_union_specs_by_role_id
+    }
+    return role_ids - union_role_ids, union_role_ids
+
+
+def _ensure_workspace_role_union_mappings(
+    user_role_migrator,
+    *,
+    role_mapping: dict[str, str],
+    source_roles: list[dict],
+    workspace_role_union_specs_by_role_id: dict[str, dict],
+    needed_union_role_ids: set[str],
+) -> dict[str, str]:
+    """Ensure selected managed workspace-role unions exist on destination."""
+    pending_specs = [
+        workspace_role_union_specs_by_role_id[role_id]
+        for role_id in sorted(needed_union_role_ids)
+        if role_id not in role_mapping
+    ]
+    if not pending_specs:
+        return {}
+
+    return user_role_migrator.ensure_workspace_role_unions(
+        source_roles=source_roles,
+        union_specs=pending_specs,
+    )
 
 
 def _csv_rows_to_org_members(
@@ -866,10 +1116,14 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
         probe="workspace_discovery",
     )
 
-    for label, endpoint in (
+    lookup_targets = [
         ("project_lookup", "/sessions"),
         ("dataset_lookup", "/datasets"),
-    ):
+    ]
+    if "queues" in resource_list or "rules" in resource_list:
+        lookup_targets.append(("queue_lookup", "/annotation-queues"))
+
+    for label, endpoint in lookup_targets:
         source_supported, source_detail = _probe_lookup_capability(orchestrator.source_client, endpoint)
         dest_supported, dest_detail = _probe_lookup_capability(orchestrator.dest_client, endpoint)
         state.record_capability(
@@ -916,6 +1170,7 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
         f"rules:{scope_key}": [
             f"project_lookup:{scope_key}",
             f"dataset_lookup:{scope_key}",
+            f"queue_lookup:{scope_key}",
             f"prompts:{scope_key}",
         ],
         f"charts:{scope_key}": [
@@ -1445,6 +1700,15 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
 @click.option('--roles-only', is_flag=True, help='Only migrate custom roles (skip members)')
 @click.option('--skip-workspace-members', is_flag=True, help='Skip workspace member migration')
 @click.option(
+    '--auto-merge-custom-roles',
+    is_flag=True,
+    help=(
+        'Beta: when duplicate CSV workspace rows contain multiple distinct '
+        'custom roles for one user, synthesize a managed destination custom '
+        'role with the union of permissions and ABAC policy attachments.'
+    ),
+)
+@click.option(
     '--single-instance',
     '--instance',
     is_flag=True,
@@ -1497,6 +1761,7 @@ def users(
     users_dry_run,
     roles_only,
     skip_workspace_members,
+    auto_merge_custom_roles,
     single_instance,
     csv_source_of_truth,
     members_csv,
@@ -1518,6 +1783,7 @@ def users(
     if users_non_interactive:
         config.migration.non_interactive = True
         config.migration.interactive = False
+    config.migration.auto_merge_custom_roles = auto_merge_custom_roles
 
     if bool(instance_key) != bool(instance_url):
         raise click.ClickException(
@@ -1542,6 +1808,10 @@ def users(
         raise click.ClickException(
             "--roles-only cannot be combined with --members-csv because CSV "
             "input only applies to member migration"
+        )
+    if auto_merge_custom_roles and not members_csv:
+        raise click.ClickException(
+            "--auto-merge-custom-roles requires --members-csv"
         )
     if csv_source_of_truth and not members_csv:
         raise click.ClickException(
@@ -1682,6 +1952,9 @@ def users(
     default_org_role_id: str | None = None
     ws_only_emails: set[str] = set()
     org_admin_workspace_row_count = 0
+    workspace_role_union_specs: list[dict] = []
+    workspace_role_union_specs_by_role_id: dict[str, dict] = {}
+    source_roles: list[dict] = []
 
     if csv_member_rows is not None:
         source_roles = user_role_migrator.list_source_roles()
@@ -1691,6 +1964,15 @@ def users(
         csv_member_rows, org_admin_workspace_row_count = _normalize_csv_role_scopes(
             csv_member_rows
         )
+        csv_member_rows, workspace_role_union_specs = _normalize_workspace_csv_rows(
+            csv_member_rows,
+            auto_merge_custom_roles=auto_merge_custom_roles,
+        )
+        workspace_role_union_specs_by_role_id = {
+            spec["role_id"]: spec
+            for spec in workspace_role_union_specs
+            if spec.get("role_id")
+        }
         org_emails: set[str] = set()
         ws_emails: set[str] = set()
         for row in csv_member_rows:
@@ -1789,20 +2071,46 @@ def users(
                 )
                 if role_id and role_id not in role_mapping
             }
-            if needed_role_ids:
+            needed_custom_role_ids, needed_union_role_ids = (
+                _partition_needed_workspace_role_ids(
+                    needed_role_ids,
+                    workspace_role_union_specs_by_role_id,
+                )
+            )
+            if needed_custom_role_ids:
                 console.print(
-                    f"  Syncing {len(needed_role_ids)} additional role(s) needed by selected members..."
+                    f"  Syncing {len(needed_custom_role_ids)} additional role(s) needed by selected members..."
                 )
                 try:
                     role_mapping.update(
                         user_role_migrator.build_role_mapping(
-                            custom_role_ids=needed_role_ids,
+                            custom_role_ids=needed_custom_role_ids,
                         )
                     )
                 except Exception as e:
                     console.print(
                         f"  [yellow]Warning: failed to sync some roles: {e}[/yellow]"
                     )
+            if needed_union_role_ids:
+                console.print(
+                    "  Preparing managed workspace roles needed by selected members..."
+                )
+                try:
+                    role_mapping.update(
+                        _ensure_workspace_role_union_mappings(
+                            user_role_migrator,
+                            role_mapping=role_mapping,
+                            source_roles=source_roles,
+                            workspace_role_union_specs_by_role_id=workspace_role_union_specs_by_role_id,
+                            needed_union_role_ids=needed_union_role_ids,
+                        )
+                    )
+                except Exception as e:
+                    console.print(
+                        f"  [red]Failed to prepare merged workspace roles: {e}[/red]"
+                    )
+                    orchestrator.cleanup()
+                    return
 
             migrated, skipped, failed = user_role_migrator.migrate_org_members(
                 selected_members,
@@ -1871,15 +2179,21 @@ def users(
                     if (role_id := (member.get("role_id") or "").strip())
                     and role_id not in role_mapping
                 }
-                if needed_workspace_role_ids:
+                needed_workspace_custom_role_ids, needed_workspace_union_role_ids = (
+                    _partition_needed_workspace_role_ids(
+                        needed_workspace_role_ids,
+                        workspace_role_union_specs_by_role_id,
+                    )
+                )
+                if needed_workspace_custom_role_ids:
                     console.print(
                         "    "
-                        f"Syncing {len(needed_workspace_role_ids)} additional role(s) needed by selected workspace members..."
+                        f"Syncing {len(needed_workspace_custom_role_ids)} additional role(s) needed by selected workspace members..."
                     )
                     try:
                         role_mapping.update(
                             user_role_migrator.build_role_mapping(
-                                custom_role_ids=needed_workspace_role_ids,
+                                custom_role_ids=needed_workspace_custom_role_ids,
                             )
                         )
                     except Exception as e:
@@ -1887,6 +2201,27 @@ def users(
                             "    [yellow]Warning: failed to sync some workspace "
                             f"roles: {e}[/yellow]"
                         )
+                if needed_workspace_union_role_ids:
+                    console.print(
+                        "    Preparing managed workspace roles needed by selected workspace members..."
+                    )
+                    try:
+                        role_mapping.update(
+                            _ensure_workspace_role_union_mappings(
+                                user_role_migrator,
+                                role_mapping=role_mapping,
+                                source_roles=source_roles,
+                                workspace_role_union_specs_by_role_id=workspace_role_union_specs_by_role_id,
+                                needed_union_role_ids=needed_workspace_union_role_ids,
+                            )
+                        )
+                    except Exception as e:
+                        console.print(
+                            "    [red]Failed to prepare merged workspace roles: "
+                            f"{e}[/red]"
+                        )
+                        orchestrator.cleanup()
+                        return
 
                 try:
                     m, s, f = user_role_migrator.migrate_workspace_members(
@@ -2920,16 +3255,12 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
             chart_migrator._project_id_map = dict(project_id_map)
             console.print(f"[dim]Using interactive project mapping ({len(project_id_map)} project(s))[/dim]")
 
-        same_instance = False
-        source_url = config.source.base_url.rstrip('/').lower()
-        dest_url = config.destination.base_url.rstrip('/').lower()
-        if source_url == dest_url:
-            if config.source.api_key == config.destination.api_key:
-                same_instance = True
-                console.print("[dim]Detected same source and destination instance (same URL and API key)[/dim]")
-            else:
-                console.print("[dim]Detected same instance URL but different API keys (likely different workspaces).[/dim]")
-                console.print("[dim]Will use project name matching instead of same session IDs.[/dim]")
+        workspace_pair = _active_workspace_pair(orchestrator)
+        same_instance = _auto_detect_chart_same_instance(
+            config,
+            source_workspace_id=workspace_pair["source"],
+            dest_workspace_id=workspace_pair["dest"],
+        )
 
         source_charts = chart_migrator.list_charts()
         if source_charts:
@@ -2939,21 +3270,16 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                 chart_migrator.state = orchestrator.state
                 tracked_chart_items = {}
 
-                if not same_instance and not chart_migrator._project_id_map:
-                    chart_migrator._build_project_mapping()
-
                 for chart in source_charts:
                     chart_id = chart.get("id")
                     if not chart_id:
                         continue
                     chart_title = chart.get("title") or chart.get("name") or "Untitled Chart"
                     source_session_id = chart_migrator._extract_session_id(chart)
-                    dest_session_id = None
-                    if source_session_id:
-                        if same_instance:
-                            dest_session_id = source_session_id
-                        elif chart_migrator._project_id_map:
-                            dest_session_id = chart_migrator._project_id_map.get(source_session_id)
+                    dest_session_id = chart_migrator.resolve_destination_session_id(
+                        source_session_id,
+                        same_instance=same_instance,
+                    )
                     item_id = _ensure_state_item(
                         orchestrator,
                         config,
@@ -3001,7 +3327,11 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
 @cli.command()
 @ssl_option
 @click.option('--session', help='Migrate charts for a specific session/project (by name or ID)')
-@click.option('--same-instance', is_flag=True, help='Source and destination are the same instance (use same session IDs)')
+@click.option(
+    '--same-instance',
+    is_flag=True,
+    help='Reuse source project/session IDs on destination (only when both sides truly share IDs)',
+)
 @click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
 @workspace_options
 @click.pass_context
@@ -3041,22 +3371,18 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
 
-    # Auto-detect if same instance (same base URL) — not workspace-scoped
-    if not same_instance:
-        source_url = config.source.base_url.rstrip('/').lower()
-        dest_url = config.destination.base_url.rstrip('/').lower()
-        if source_url == dest_url:
-            if config.source.api_key == config.destination.api_key:
-                same_instance = True
-                console.print("[dim]Detected same source and destination instance (same URL and API key)[/dim]")
-            else:
-                console.print("[dim]Detected same instance URL but different API keys (likely different workspaces).[/dim]")
-                console.print("[dim]Will use project name matching instead of same session IDs.[/dim]")
-
     for src_ws, dst_ws in ws_pairs:
         if src_ws and dst_ws:
             orchestrator.set_workspace_context(src_ws, dst_ws)
             console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+
+        effective_same_instance = same_instance
+        if not effective_same_instance:
+            effective_same_instance = _auto_detect_chart_same_instance(
+                config,
+                source_workspace_id=src_ws,
+                dest_workspace_id=dst_ws,
+            )
 
         _run_preflight(orchestrator, config, ["charts"])
 
@@ -3118,22 +3444,22 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             console.print(f"[green]✓[/green] Found: {target_session.get('name', 'unnamed')}")
             source_session_id = target_session['id']
 
-            if same_instance:
-                dest_session_id = source_session_id
+            dest_session_id = chart_migrator.resolve_destination_session_id(
+                source_session_id,
+                same_instance=effective_same_instance,
+            )
+            if not dest_session_id:
+                console.print(f"[red]No destination mapping found for session {session}[/red]")
+                console.print(
+                    "\n[yellow]The project/session could not be resolved on the destination.[/yellow]"
+                )
+                console.print("[yellow]Options:[/yellow]")
+                console.print("  1. Migrate projects first so state contains project mappings")
+                console.print("  2. Use --map-projects to provide a project mapping for this workspace pair")
+                continue
+            if effective_same_instance:
                 console.print("[dim]Using same session ID for destination[/dim]\n")
             else:
-                dest_session_id = (
-                    orchestrator.state.get_mapped_id('project', source_session_id)
-                    if orchestrator.state
-                    else None
-                )
-                if not dest_session_id:
-                    console.print(f"[red]No destination mapping found for session {session}[/red]")
-                    console.print("\n[yellow]This means the project/session hasn't been migrated yet.[/yellow]")
-                    console.print("[yellow]Options:[/yellow]")
-                    console.print("  1. Run 'langsmith-migrator datasets' first to migrate projects")
-                    console.print("  2. Use --same-instance flag if source and dest are the same")
-                    continue
                 console.print(f"[dim]Mapped to destination session: {dest_session_id[:8]}...[/dim]\n")
 
             _ensure_migration_session(orchestrator, config)
@@ -3153,7 +3479,7 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
                     metadata={
                         "chart": chart,
                         "dest_session_id": dest_session_id,
-                        "same_instance": same_instance,
+                        "same_instance": effective_same_instance,
                     },
                 )
                 tracked_chart_items[chart_id] = item_id
@@ -3161,7 +3487,8 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
             chart_mappings = chart_migrator.migrate_session_charts(
                 source_session_id,
-                dest_session_id
+                dest_session_id,
+                same_instance=effective_same_instance,
             )
 
             for chart_id, item_id in tracked_chart_items.items():
@@ -3184,10 +3511,13 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             # Migrate all charts from all sessions
             console.print("\n[bold]Migrating charts from all sessions...[/bold]")
 
-            if same_instance:
+            if effective_same_instance:
                 console.print("[dim]Mode: Same instance (using same session IDs)[/dim]")
             else:
-                console.print("[dim]Mode: Different instances (requires session ID mappings)[/dim]")
+                console.print(
+                    "[dim]Mode: Remapped project/session IDs "
+                    "(source IDs are not reused)[/dim]"
+                )
 
             console.print()
 
@@ -3200,20 +3530,16 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             chart_migrator.state = orchestrator.state
             tracked_chart_items = {}
             source_charts = chart_migrator.list_charts()
-            if not same_instance:
-                chart_migrator._build_project_mapping()
             for chart in source_charts:
                 chart_id = chart.get("id")
                 if not chart_id:
                     continue
                 chart_title = chart.get("title") or chart.get("name") or "Untitled Chart"
                 source_session_id = chart_migrator._extract_session_id(chart)
-                dest_session_id = None
-                if source_session_id:
-                    if same_instance:
-                        dest_session_id = source_session_id
-                    elif chart_migrator._project_id_map:
-                        dest_session_id = chart_migrator._project_id_map.get(source_session_id)
+                dest_session_id = chart_migrator.resolve_destination_session_id(
+                    source_session_id,
+                    same_instance=effective_same_instance,
+                )
                 item_id = _ensure_state_item(
                     orchestrator,
                     config,
@@ -3223,12 +3549,14 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
                     metadata={
                         "chart": chart,
                         "dest_session_id": dest_session_id,
-                        "same_instance": same_instance,
+                        "same_instance": effective_same_instance,
                     },
                 )
                 tracked_chart_items[chart_id] = item_id
                 _mark_state_item_started(orchestrator, item_id)
-            all_mappings = chart_migrator.migrate_all_charts(same_instance=same_instance)
+            all_mappings = chart_migrator.migrate_all_charts(
+                same_instance=effective_same_instance
+            )
             flat_chart_map = {}
             for session_chart_map in all_mappings.values():
                 flat_chart_map.update(session_chart_map)

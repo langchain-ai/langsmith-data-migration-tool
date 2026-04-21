@@ -137,7 +137,7 @@ langsmith-migrator rules --create-enabled      # Create rules enabled (default: 
 langsmith-migrator charts
 langsmith-migrator charts --session "project-name"
 langsmith-migrator charts --map-projects        # Interactive TUI project mapping
-langsmith-migrator charts --same-instance       # Reuse source project/session IDs on destination
+langsmith-migrator charts --same-instance       # Reuse source project/session IDs only when both sides truly share IDs
 
 # Utilities
 langsmith-migrator list-projects --source
@@ -215,6 +215,12 @@ In `--single-instance` mode, the command mirrors the provided instance configura
 `users --dry-run` is also supported as a command-local preview flag if you prefer to put dry-run after the subcommand instead of before it.
 For cron jobs and other headless runs, `users --non-interactive` is also supported as a command-local alias for the global `langsmith-migrator --non-interactive users ...` form. In headless mode, missing credentials fail fast instead of prompting.
 
+Duplicate workspace rows are normalized before any org-member or workspace-member writes:
+- identical duplicate rows are deduplicated
+- duplicate built-in workspace roles collapse to the highest privilege (`Workspace Admin` > `Workspace User` > `Workspace Viewer`)
+- duplicate custom workspace roles still fail by default; opt in to `--auto-merge-custom-roles` to synthesize one managed destination custom role with the union of permissions and ABAC policy attachments for that `(email, workspace_id)` pair
+- conflicting org-level duplicate rows still fail validation
+
 CSV schema:
 
 ```csv
@@ -232,6 +238,8 @@ Notes:
 - `Organization Admin` on a workspace row is treated as org-level admin access only. No explicit workspace membership is created because org admins already have workspace access.
 - Other org-scoped roles cannot be used on workspace rows. If you want org-level access, leave `workspace_id` empty.
 - Workspace-scoped roles such as `Workspace Admin` cannot be used on org-level rows.
+- If one user appears multiple times for the same `workspace_id`, built-in workspace roles are merged automatically to the highest privilege. Distinct custom roles require `--auto-merge-custom-roles`.
+- `--auto-merge-custom-roles` creates or reuses destination-side managed custom roles and matching ABAC policy attachments. These managed artifacts are reused across runs but are not deleted automatically when they become unused.
 - `--sync` / `--csv-source-of-truth` is the only mode that removes access. Without it, single-instance CSV mode only adds or updates access.
 - `--csv-source-of-truth` is available with `--single-instance` and makes the CSV authoritative for access:
   - users missing from the CSV are removed from the org
@@ -245,6 +253,7 @@ Guardrails:
 - `--sync` requires `--csv` and cannot be combined with `--skip-existing` or `--skip-workspace-members`.
 - `--single-instance` cannot be combined with workspace mapping flags.
 - `--roles-only` cannot be combined with `--single-instance` or `--members-csv`.
+- `--auto-merge-custom-roles` requires `--members-csv`.
 - If the CSV contains workspace rows and `--skip-workspace-members` is set, the command fails instead of silently ignoring those rows.
 - If the CSV contains workspace-only users, the target instance must have an `ORGANIZATION_USER` role available or the command fails before applying member changes.
 - If the CSV references unknown `workspace_id` values, the command fails before any membership changes are applied.
@@ -319,7 +328,7 @@ The prompt default is `No` (rules are created disabled).
 ```bash
 --session TEXT          Migrate charts for a specific session/project (by name or ID)
 --map-projects          Launch interactive TUI to map source projects to destination projects
---same-instance         Source and destination are the same instance (use same session IDs)
+--same-instance         Reuse source project/session IDs on destination only when both sides truly share IDs
 ```
 
 ### Users Options
@@ -329,6 +338,8 @@ The prompt default is `No` (rules are created disabled).
 --non-interactive          Disable prompts for this users run. Same as the global --non-interactive.
 --roles-only               Only migrate custom roles (skip member migration)
 --skip-workspace-members   Skip workspace member migration
+--auto-merge-custom-roles  Beta: merge duplicate custom workspace CSV rows into one managed destination custom role with
+                           unioned permissions and ABAC policy attachments
 --single-instance, --instance
                            Use one target LangSmith instance for CSV-driven access sync instead of source→destination migration
 --csv-source-of-truth, --sync
@@ -375,7 +386,8 @@ Rules and charts reference projects by ID. When migrating between instances, pro
 
 - **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input. Supports auto-match by name, skip, and custom name entry.
 - **Rules (`--project-mapping`)**: Supply an explicit source→destination project ID mapping as JSON or a file path. Use `list-projects --source` and `list-projects --dest` to get IDs. Mutually exclusive with `--map-projects`.
-- **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination.
+- **Rules queue targets**: When a rule references an annotation queue, the migrator first reuses any saved queue migration mapping, then falls back to an exact-name queue match in the destination workspace. If neither is safe, the rule is exported for remediation instead of being posted with the source queue ID.
+- **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination. When both sides point at the same deployment URL but use different API keys/workspaces, charts still remap project/session IDs; the tool does not treat that as `--same-instance`.
 - **`migrate-all`**: Supports `--strip-projects`, `--map-projects`, and `--rules-create-enabled` for rules. Use the standalone `rules` command for `--project-mapping` JSON mappings.
 
 ### Interactive Selection

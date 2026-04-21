@@ -6,10 +6,12 @@ import click
 import pytest
 
 from langsmith_migrator.cli.main import (
+    _build_workspace_role_union_signature,
     _configure_single_instance,
     _csv_rows_for_workspace,
     _csv_rows_to_org_members,
     _load_members_csv,
+    _normalize_workspace_csv_rows,
     _normalize_single_instance_url,
     _normalize_csv_role_scopes,
     _resolve_single_instance_workspace_ids,
@@ -355,6 +357,144 @@ def test_normalize_csv_role_scopes_rejects_org_user_on_workspace_row():
 
     with pytest.raises(click.ClickException, match="org-scoped and cannot be used on a workspace row"):
         _normalize_csv_role_scopes(rows)
+
+
+# ── _normalize_workspace_csv_rows ──
+
+
+def test_build_workspace_role_union_signature_sorts_and_dedupes():
+    assert _build_workspace_role_union_signature(
+        ["role-b", "role-a", "role-b"]
+    ) == "role-a|role-b"
+
+
+def test_normalize_workspace_csv_rows_dedupes_identical_rows():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Workspace Admin",
+            "role_id": "role-admin",
+            "role_name": "WORKSPACE_ADMIN",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Workspace Admin",
+            "role_id": "role-admin",
+            "role_name": "WORKSPACE_ADMIN",
+            "workspace_id": "ws-1",
+        },
+    ]
+
+    normalized, union_specs = _normalize_workspace_csv_rows(rows)
+
+    assert union_specs == []
+    assert normalized == [rows[0]]
+
+
+def test_normalize_workspace_csv_rows_prefers_highest_builtin_role():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Workspace Viewer",
+            "role_id": "role-viewer",
+            "role_name": "WORKSPACE_VIEWER",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Workspace User",
+            "role_id": "role-user",
+            "role_name": "WORKSPACE_USER",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Workspace Admin",
+            "role_id": "role-admin",
+            "role_name": "WORKSPACE_ADMIN",
+            "workspace_id": "ws-1",
+        },
+    ]
+
+    normalized, union_specs = _normalize_workspace_csv_rows(rows)
+
+    assert union_specs == []
+    assert normalized == [
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Workspace Admin",
+            "role_id": "role-admin",
+            "role_name": "WORKSPACE_ADMIN",
+            "workspace_id": "ws-1",
+        }
+    ]
+
+
+def test_normalize_workspace_csv_rows_rejects_multiple_custom_roles_without_flag():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Assistant A",
+            "role_id": "role-a",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Assistant B",
+            "role_id": "role-b",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
+    ]
+
+    with pytest.raises(click.ClickException, match="multiple custom workspace roles"):
+        _normalize_workspace_csv_rows(rows)
+
+
+def test_normalize_workspace_csv_rows_emits_union_role_when_flag_enabled():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Assistant B",
+            "role_id": "role-b",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Assistant A",
+            "role_id": "role-a",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
+    ]
+
+    normalized, union_specs = _normalize_workspace_csv_rows(
+        rows,
+        auto_merge_custom_roles=True,
+    )
+
+    assert normalized == [
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Assistant A + Assistant B",
+            "role_id": "union::role-a|role-b",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        }
+    ]
+    assert union_specs == [
+        {
+            "signature": "role-a|role-b",
+            "role_id": "union::role-a|role-b",
+            "source_role_ids": ["role-a", "role-b"],
+            "workspace_id": "ws-1",
+            "email": "alice@example.com",
+            "role_labels": ["Assistant A", "Assistant B"],
+        }
+    ]
 
 
 # ── _csv_rows_to_org_members ──

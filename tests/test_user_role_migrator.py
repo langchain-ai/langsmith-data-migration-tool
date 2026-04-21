@@ -121,6 +121,561 @@ class TestUserRoleMigrator:
 
         migrator.dest.patch.assert_not_called()
 
+    def test_ensure_workspace_role_unions_reuses_state_mapping(
+        self, migrator, migration_state
+    ):
+        """Managed union roles are reused across retries via persisted state."""
+        migration_state.id_mappings["role_unions"] = {"src-a|src-b": "dst-union"}
+        migrator.state = migration_state
+
+        source_roles = [
+            {
+                "id": "src-a",
+                "name": "CUSTOM",
+                "display_name": "Assistant A",
+                "permissions": ["projects:read"],
+            },
+            {
+                "id": "src-b",
+                "name": "CUSTOM",
+                "display_name": "Assistant B",
+                "permissions": ["datasets:read"],
+            },
+        ]
+        migrator.source.get.side_effect = lambda endpoint: []
+        migrator.dest.get.side_effect = lambda endpoint: (
+            [
+                {
+                    "id": "dst-union",
+                    "name": "CUSTOM",
+                    "display_name": "Migrator Union 128d62f94654",
+                    "description": (
+                        "Managed by langsmith-migrator for union::src-a|src-b. "
+                        "Source roles: Assistant A, Assistant B"
+                    ),
+                    "permissions": ["projects:read"],
+                }
+            ]
+            if endpoint == "/orgs/current/roles"
+            else []
+        )
+
+        mapping = migrator.ensure_workspace_role_unions(
+            source_roles=source_roles,
+            union_specs=[
+                {
+                    "signature": "src-a|src-b",
+                    "role_id": "union::src-a|src-b",
+                    "source_role_ids": ["src-a", "src-b"],
+                }
+            ],
+        )
+
+        assert mapping == {"union::src-a|src-b": "dst-union"}
+        assert (
+            migrator.state.get_mapped_id("roles", "union::src-a|src-b")
+            == "dst-union"
+        )
+        assert migrator.dest.post.call_args_list == [
+            call(
+                "/orgs/current/roles/dst-union/access-policies",
+                {"access_policy_ids": []},
+            )
+        ]
+
+    def test_ensure_workspace_role_unions_patches_permission_union(self, migrator):
+        """Existing managed union roles are updated to the full permission union."""
+        source_roles = [
+            {
+                "id": "src-a",
+                "name": "CUSTOM",
+                "display_name": "Assistant A",
+                "permissions": ["projects:read"],
+            },
+            {
+                "id": "src-b",
+                "name": "CUSTOM",
+                "display_name": "Assistant B",
+                "permissions": ["datasets:read", "projects:read"],
+            },
+        ]
+        migrator.state.id_mappings["role_unions"] = {"src-a|src-b": "dst-union"}
+        migrator.source.get.side_effect = lambda endpoint: []
+        migrator.dest.get.side_effect = lambda endpoint: (
+            [
+                {
+                    "id": "dst-union",
+                    "name": "CUSTOM",
+                    "display_name": "Old Union",
+                    "description": "Managed by langsmith-migrator for union::src-a|src-b.",
+                    "permissions": ["projects:read"],
+                }
+            ]
+            if endpoint == "/orgs/current/roles"
+            else []
+        )
+
+        migrator.ensure_workspace_role_unions(
+            source_roles=source_roles,
+            union_specs=[
+                {
+                    "signature": "src-a|src-b",
+                    "role_id": "union::src-a|src-b",
+                    "source_role_ids": ["src-a", "src-b"],
+                }
+            ],
+        )
+
+        migrator.dest.patch.assert_called_once_with(
+            "/orgs/current/roles/dst-union",
+            {
+                "display_name": "Migrator Union 128d62f94654",
+                "description": (
+                    "Managed by langsmith-migrator for union::src-a|src-b. "
+                    "Source roles: Assistant A, Assistant B"
+                ),
+                "permissions": ["datasets:read", "projects:read"],
+            },
+        )
+
+    def test_ensure_workspace_role_unions_skip_existing_reuses_without_mutation(
+        self, migrator, sample_config
+    ):
+        """Existing managed union roles are reused as-is when skip_existing is enabled."""
+        sample_config.migration.skip_existing = True
+        source_roles = [
+            {
+                "id": "src-a",
+                "name": "CUSTOM",
+                "display_name": "Assistant A",
+                "permissions": ["projects:read"],
+            },
+            {
+                "id": "src-b",
+                "name": "CUSTOM",
+                "display_name": "Assistant B",
+                "permissions": ["datasets:read", "projects:read"],
+            },
+        ]
+        source_policy = {
+            "id": "src-policy-1",
+            "name": "Project Access",
+            "effect": "allow",
+            "condition_groups": [
+                {
+                    "permission": "projects:read",
+                    "resource_type": "project",
+                    "conditions": [],
+                }
+            ],
+            "role_ids": ["src-a"],
+        }
+        migrator.state.id_mappings["role_unions"] = {"src-a|src-b": "dst-union"}
+
+        def source_get(endpoint):
+            if endpoint == "/orgs/current/access-policies":
+                return [source_policy]
+            raise AssertionError(endpoint)
+
+        def dest_get(endpoint):
+            if endpoint == "/orgs/current/roles":
+                return [
+                    {
+                        "id": "dst-union",
+                        "name": "CUSTOM",
+                        "display_name": "Migrator Union 128d62f94654",
+                        "description": (
+                            "Managed by langsmith-migrator for union::src-a|src-b. "
+                            "Source roles: Assistant A, Assistant B"
+                        ),
+                        "permissions": ["projects:read"],
+                    }
+                ]
+            if endpoint == "/orgs/current/access-policies":
+                return []
+            raise AssertionError(endpoint)
+
+        migrator.source.get.side_effect = source_get
+        migrator.dest.get.side_effect = dest_get
+
+        mapping = migrator.ensure_workspace_role_unions(
+            source_roles=source_roles,
+            union_specs=[
+                {
+                    "signature": "src-a|src-b",
+                    "role_id": "union::src-a|src-b",
+                    "source_role_ids": ["src-a", "src-b"],
+                }
+            ],
+        )
+
+        assert mapping == {"union::src-a|src-b": "dst-union"}
+        migrator.dest.patch.assert_not_called()
+        migrator.dest.post.assert_not_called()
+
+    def test_ensure_workspace_role_unions_requires_exact_signature_match(
+        self, migrator
+    ):
+        """A shorter union must not reuse or mutate a managed superset-signature role."""
+        source_roles = [
+            {
+                "id": "src-a",
+                "name": "CUSTOM",
+                "display_name": "Assistant A",
+                "permissions": ["projects:read"],
+            },
+            {
+                "id": "src-b",
+                "name": "CUSTOM",
+                "display_name": "Assistant B",
+                "permissions": ["datasets:read"],
+            },
+        ]
+        superset_roles = source_roles + [
+            {
+                "id": "src-c",
+                "name": "CUSTOM",
+                "display_name": "Assistant C",
+                "permissions": ["runs:read"],
+            }
+        ]
+        superset_signature = "src-a|src-b|src-c"
+
+        def source_get(endpoint):
+            if endpoint == "/orgs/current/access-policies":
+                return []
+            raise AssertionError(endpoint)
+
+        def dest_get(endpoint):
+            if endpoint == "/orgs/current/roles":
+                return [
+                    {
+                        "id": "dst-union-superset",
+                        "name": "CUSTOM",
+                        "display_name": migrator._workspace_role_union_display_name(
+                            superset_signature
+                        ),
+                        "description": migrator._workspace_role_union_description(
+                            superset_signature,
+                            superset_roles,
+                        ),
+                        "permissions": ["datasets:read", "projects:read", "runs:read"],
+                    }
+                ]
+            if endpoint == "/orgs/current/access-policies":
+                return []
+            raise AssertionError(endpoint)
+
+        migrator.source.get.side_effect = source_get
+        migrator.dest.get.side_effect = dest_get
+        migrator.dest.post.side_effect = [
+            {"id": "dst-union-short", "name": "CUSTOM"},
+            {},
+        ]
+
+        mapping = migrator.ensure_workspace_role_unions(
+            source_roles=source_roles,
+            union_specs=[
+                {
+                    "signature": "src-a|src-b",
+                    "role_id": "union::src-a|src-b",
+                    "source_role_ids": ["src-a", "src-b"],
+                }
+            ],
+        )
+
+        assert mapping == {"union::src-a|src-b": "dst-union-short"}
+        assert migrator.dest.post.call_args_list == [
+            call(
+                "/orgs/current/roles",
+                {
+                    "display_name": migrator._workspace_role_union_display_name(
+                        "src-a|src-b"
+                    ),
+                    "description": migrator._workspace_role_union_description(
+                        "src-a|src-b",
+                        source_roles,
+                    ),
+                    "permissions": ["datasets:read", "projects:read"],
+                },
+            ),
+            call(
+                "/orgs/current/roles/dst-union-short/access-policies",
+                {"access_policy_ids": []},
+            ),
+        ]
+        migrator.dest.patch.assert_not_called()
+
+    def test_ensure_workspace_role_unions_creates_and_reuses_equivalent_policies(
+        self, migrator
+    ):
+        """Equivalent destination policies are reused and only missing ones are created."""
+        source_roles = [
+            {
+                "id": "src-a",
+                "name": "CUSTOM",
+                "display_name": "Assistant A",
+                "permissions": ["projects:read"],
+            },
+            {
+                "id": "src-b",
+                "name": "CUSTOM",
+                "display_name": "Assistant B",
+                "permissions": ["datasets:read"],
+            },
+        ]
+        source_policies = [
+            {
+                "id": "src-policy-1",
+                "name": "Project Access",
+                "effect": "allow",
+                "condition_groups": [
+                    {
+                        "permission": "projects:read",
+                        "resource_type": "project",
+                        "conditions": [
+                            {
+                                "attribute_name": "resource_tag_key",
+                                "attribute_key": "Assistant",
+                                "operator": "equals",
+                                "attribute_value": "A",
+                            }
+                        ],
+                    }
+                ],
+                "role_ids": ["src-a"],
+            },
+            {
+                "id": "src-policy-2",
+                "name": "Dataset Access",
+                "effect": "allow",
+                "condition_groups": [
+                    {
+                        "permission": "datasets:read",
+                        "resource_type": "dataset",
+                        "conditions": [
+                            {
+                                "attribute_name": "resource_tag_key",
+                                "attribute_key": "Assistant",
+                                "operator": "equals",
+                                "attribute_value": "B",
+                            }
+                        ],
+                    }
+                ],
+                "role_ids": ["src-b"],
+            },
+        ]
+        dest_policies = [
+            {
+                "id": "dst-policy-existing",
+                "name": "Existing Project Access",
+                "effect": "allow",
+                "condition_groups": source_policies[0]["condition_groups"],
+                "role_ids": [],
+            }
+        ]
+
+        def source_get(endpoint):
+            if endpoint == "/orgs/current/access-policies":
+                return source_policies
+            raise AssertionError(endpoint)
+
+        def dest_get(endpoint):
+            if endpoint == "/orgs/current/roles":
+                return []
+            if endpoint == "/orgs/current/access-policies":
+                return dest_policies
+            raise AssertionError(endpoint)
+
+        migrator.source.get.side_effect = source_get
+        migrator.dest.get.side_effect = dest_get
+        migrator.dest.post.side_effect = [
+            {"id": "dst-union", "name": "CUSTOM"},
+            {**source_policies[1], "id": "dst-policy-created", "role_ids": ["dst-union"]},
+            {},
+        ]
+
+        mapping = migrator.ensure_workspace_role_unions(
+            source_roles=source_roles,
+            union_specs=[
+                {
+                    "signature": "src-a|src-b",
+                    "role_id": "union::src-a|src-b",
+                    "source_role_ids": ["src-a", "src-b"],
+                }
+            ],
+        )
+
+        assert mapping == {"union::src-a|src-b": "dst-union"}
+        assert migrator.dest.post.call_args_list == [
+            call(
+                "/orgs/current/roles",
+                {
+                    "display_name": "Migrator Union 128d62f94654",
+                    "description": (
+                        "Managed by langsmith-migrator for union::src-a|src-b. "
+                        "Source roles: Assistant A, Assistant B"
+                    ),
+                    "permissions": ["datasets:read", "projects:read"],
+                },
+            ),
+            call(
+                "/orgs/current/access-policies",
+                {
+                    "name": "Dataset Access",
+                    "description": "",
+                    "effect": "allow",
+                    "condition_groups": source_policies[1]["condition_groups"],
+                    "role_ids": ["dst-union"],
+                },
+            ),
+            call(
+                "/orgs/current/roles/dst-union/access-policies",
+                {"access_policy_ids": ["dst-policy-created", "dst-policy-existing"]},
+            ),
+        ]
+
+    def test_ensure_workspace_role_unions_reconciles_policy_attachments(
+        self, migrator
+    ):
+        """Role attachment reconciliation can remove stale policy bindings for the managed role."""
+        source_roles = [
+            {
+                "id": "src-a",
+                "name": "CUSTOM",
+                "display_name": "Assistant A",
+                "permissions": ["projects:read"],
+            }
+        ]
+        source_policy = {
+            "id": "src-policy-1",
+            "name": "Project Access",
+            "effect": "allow",
+            "condition_groups": [
+                {
+                    "permission": "projects:read",
+                    "resource_type": "project",
+                    "conditions": [
+                        {
+                            "attribute_name": "resource_tag_key",
+                            "attribute_key": "Assistant",
+                            "operator": "equals",
+                            "attribute_value": "A",
+                        }
+                    ],
+                }
+            ],
+            "role_ids": ["src-a"],
+        }
+        stale_policy = {
+            "id": "dst-policy-stale",
+            "name": "Stale",
+            "effect": "allow",
+            "condition_groups": [
+                {
+                    "permission": "datasets:read",
+                    "resource_type": "dataset",
+                    "conditions": [],
+                }
+            ],
+            "role_ids": ["dst-union"],
+        }
+        desired_dest_policy = {
+            "id": "dst-policy-1",
+            "name": "Project Access",
+            "effect": "allow",
+            "condition_groups": source_policy["condition_groups"],
+            "role_ids": [],
+        }
+
+        def source_get(endpoint):
+            if endpoint == "/orgs/current/access-policies":
+                return [source_policy]
+            raise AssertionError(endpoint)
+
+        def dest_get(endpoint):
+            if endpoint == "/orgs/current/roles":
+                return [
+                    {
+                        "id": "dst-union",
+                        "name": "CUSTOM",
+                        "display_name": "Migrator Union 48d4658aab03",
+                        "description": (
+                            "Managed by langsmith-migrator for union::src-a. "
+                            "Source roles: Assistant A"
+                        ),
+                        "permissions": ["projects:read"],
+                    }
+                ]
+            if endpoint == "/orgs/current/access-policies":
+                return [desired_dest_policy, stale_policy]
+            raise AssertionError(endpoint)
+
+        migrator.state.id_mappings["role_unions"] = {"src-a": "dst-union"}
+        migrator.source.get.side_effect = source_get
+        migrator.dest.get.side_effect = dest_get
+
+        migrator.ensure_workspace_role_unions(
+            source_roles=source_roles,
+            union_specs=[
+                {
+                    "signature": "src-a",
+                    "role_id": "union::src-a",
+                    "source_role_ids": ["src-a"],
+                }
+            ],
+        )
+
+        migrator.dest.post.assert_called_once_with(
+            "/orgs/current/roles/dst-union/access-policies",
+            {"access_policy_ids": ["dst-policy-1"]},
+        )
+        cached_policies = migrator._dest_access_policies_cache or []
+        stale_after = next(
+            policy for policy in cached_policies if policy.get("id") == "dst-policy-stale"
+        )
+        assert stale_after["role_ids"] == []
+
+    def test_ensure_workspace_role_unions_fails_fast_when_policy_listing_is_unavailable(
+        self, migrator
+    ):
+        """ABAC auto-merge fails before any role/member writes when policies cannot be listed."""
+        source_roles = [
+            {
+                "id": "src-a",
+                "name": "CUSTOM",
+                "display_name": "Assistant A",
+                "permissions": ["projects:read"],
+            },
+            {
+                "id": "src-b",
+                "name": "CUSTOM",
+                "display_name": "Assistant B",
+                "permissions": ["datasets:read"],
+            },
+        ]
+        migrator.source.get.side_effect = APIError(
+            "not found",
+            status_code=404,
+            request_info={},
+        )
+        migrator.dest.get.return_value = []
+
+        with pytest.raises(APIError, match="Unable to list source access policies"):
+            migrator.ensure_workspace_role_unions(
+                source_roles=source_roles,
+                union_specs=[
+                    {
+                        "signature": "src-a|src-b",
+                        "role_id": "union::src-a|src-b",
+                        "source_role_ids": ["src-a", "src-b"],
+                    }
+                ],
+            )
+
+        migrator.dest.post.assert_not_called()
+
     def test_build_role_mapping_persists_to_state(self, migrator, source_roles, dest_roles, migration_state):
         """Role mapping is persisted in state.id_mappings['roles']."""
         migrator.source.get.return_value = source_roles

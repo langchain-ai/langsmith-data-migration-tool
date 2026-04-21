@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Custom ABAC workspace-role auto-merge**: `users --auto-merge-custom-roles` can now synthesize managed destination custom roles for duplicate workspace CSV rows, union their permissions, and reconcile equivalent ABAC access-policy attachments before member writes.
+
+### Changed
+- **Duplicate workspace CSV normalization**: `users --members-csv` now deduplicates identical workspace rows and collapses duplicate built-in workspace roles to the highest effective privilege for each `(email, workspace_id)` pair, while org-level conflicts remain strict validation errors.
+- **README parity**: updated the CSV users-sync documentation to cover duplicate-row normalization, the new custom-role auto-merge beta flag, and the lifecycle of managed destination-side union roles and policies.
+
 ## [0.0.64] - 2026-04-10
 
 ### Added

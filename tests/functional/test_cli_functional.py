@@ -77,6 +77,17 @@ def test_name_mapping_to_id_mapping_ignores_unknown_project_names():
     assert result == {"src-a": "dst-a"}
 
 
+def test_normalize_deployment_url_treats_api_suffixes_as_the_same_deployment():
+    """Same-deployment detection should ignore trailing API path suffixes."""
+
+    assert cli_main._normalize_deployment_url("https://same.example") == (
+        cli_main._normalize_deployment_url("https://same.example/api/v1")
+    )
+    assert cli_main._normalize_deployment_url("https://same.example/api/v2/") == (
+        cli_main._normalize_deployment_url("https://same.example")
+    )
+
+
 def test_display_resolution_summary_groups_duplicate_user_failures(monkeypatch, tmp_path):
     """Resolution summaries should collapse repeated user-role blockers into a grouped next step."""
 
@@ -342,6 +353,68 @@ def test_users_command_members_csv_supports_utf8_bom(cli_harness, monkeypatch, t
     # alice only appears in a workspace row, so she gets the default org role (ORGANIZATION_USER)
     user_role_migrator.migrate_org_members.assert_called_once_with(
         [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-user", "full_name": ""}],
+        remove_missing=False,
+        remove_pending=False,
+    )
+    user_role_migrator.migrate_workspace_members.assert_called_once_with(
+        selected_members=[
+            {
+                "id": "src-ws:alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-ws-admin",
+                "full_name": "",
+            }
+        ],
+        remove_missing=False,
+    )
+
+
+def test_users_command_members_csv_merges_duplicate_builtin_workspace_roles(
+    cli_harness, monkeypatch, tmp_path
+):
+    """CSV duplicate built-in workspace rows collapse to the highest privilege role."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Workspace Viewer,src-ws\n"
+        "alice@example.com,Workspace Admin,src-ws\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {
+        "src-user": "dst-user",
+        "src-ws-admin": "dst-ws-admin",
+        "src-ws-viewer": "dst-ws-viewer",
+    }
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+        {"id": "src-ws-viewer", "name": "WORKSPACE_VIEWER", "display_name": "Workspace Viewer"},
+    ]
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(["users", "--members-csv", str(csv_path)])
+
+    assert result.exit_code == 0
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-user",
+                "full_name": "",
+            }
+        ],
         remove_missing=False,
         remove_pending=False,
     )
@@ -665,6 +738,39 @@ def test_users_command_rejects_roles_only_with_members_csv(cli_harness, tmp_path
     assert "--roles-only cannot be combined with --members-csv" in result.output
 
 
+def test_users_command_rejects_duplicate_custom_workspace_roles_without_auto_merge(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Duplicate custom workspace rows fail clearly unless auto-merge is enabled."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Assistant A,src-ws\n"
+        "alice@example.com,Assistant B,src-ws\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-user": "dst-user"}
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-a", "name": "CUSTOM", "display_name": "Assistant A"},
+        {"id": "src-b", "name": "CUSTOM", "display_name": "Assistant B"},
+    ]
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(["users", "--members-csv", str(csv_path)])
+
+    assert result.exit_code != 0
+    assert "multiple custom workspace roles" in result.output
+    user_role_migrator.ensure_workspace_role_unions.assert_not_called()
+
+
 def test_users_command_single_instance_rejects_ambiguous_configured_targets(cli_harness, tmp_path):
     """Single-instance sync should fail instead of guessing between configured source/dest targets."""
     csv_path = tmp_path / "members.csv"
@@ -811,6 +917,351 @@ def test_users_command_single_instance_csv_apply_auto_applies_all_rows(
                 "id": "ws-1:bob@example.com",
                 "email": "bob@example.com",
                 "role_id": "src-ws-admin",
+                "full_name": "",
+            }
+        ],
+        remove_missing=False,
+    )
+
+
+def test_users_command_single_instance_merges_duplicate_builtin_workspace_roles(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Single-instance CSV apply uses the highest built-in workspace role for duplicates."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Workspace Viewer,ws-1\n"
+        "alice@example.com,Workspace Admin,ws-1\n",
+        encoding="utf-8",
+    )
+
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {
+        "src-user": "dst-user",
+        "src-ws-admin": "dst-ws-admin",
+        "src-ws-viewer": "dst-ws-viewer",
+    }
+    user_role_migrator.list_source_roles.return_value = [
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin"},
+        {"id": "src-ws-viewer", "name": "WORKSPACE_VIEWER", "display_name": "Workspace Viewer"},
+    ]
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+        ]
+    )
+
+    assert result.exit_code == 0
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-user",
+                "full_name": "",
+                "workspace_ids": ["ws-1"],
+                "workspace_role_id": "src-ws-admin",
+            }
+        ],
+        remove_missing=False,
+        remove_pending=False,
+    )
+    user_role_migrator.migrate_workspace_members.assert_called_once_with(
+        selected_members=[
+            {
+                "id": "ws-1:alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-ws-admin",
+                "full_name": "",
+            }
+        ],
+        remove_missing=False,
+    )
+
+
+def test_users_command_single_instance_auto_merges_duplicate_custom_workspace_roles(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Opt-in custom auto-merge prepares one effective workspace role before member sync."""
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Assistant A,ws-1\n"
+        "alice@example.com,Assistant B,ws-1\n",
+        encoding="utf-8",
+    )
+
+    source_roles = [
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-a", "name": "CUSTOM", "display_name": "Assistant A", "permissions": ["projects:read"]},
+        {"id": "src-b", "name": "CUSTOM", "display_name": "Assistant B", "permissions": ["datasets:read"]},
+    ]
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-user": "dst-user"}
+    user_role_migrator.list_source_roles.return_value = source_roles
+    user_role_migrator.ensure_workspace_role_unions.return_value = {
+        "union::src-a|src-b": "dst-union"
+    }
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+            "--auto-merge-custom-roles",
+        ]
+    )
+
+    assert result.exit_code == 0
+    user_role_migrator.ensure_workspace_role_unions.assert_called_once_with(
+        source_roles=source_roles,
+        union_specs=[
+            {
+                "signature": "src-a|src-b",
+                "role_id": "union::src-a|src-b",
+                "source_role_ids": ["src-a", "src-b"],
+                "workspace_id": "ws-1",
+                "email": "alice@example.com",
+                "role_labels": ["Assistant A", "Assistant B"],
+            }
+        ],
+    )
+    user_role_migrator.migrate_org_members.assert_called_once_with(
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-user",
+                "full_name": "",
+                "workspace_ids": ["ws-1"],
+                "workspace_role_id": "union::src-a|src-b",
+            }
+        ],
+        remove_missing=False,
+        remove_pending=False,
+    )
+    user_role_migrator.migrate_workspace_members.assert_called_once_with(
+        selected_members=[
+            {
+                "id": "ws-1:alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "union::src-a|src-b",
+                "full_name": "",
+            }
+        ],
+        remove_missing=False,
+    )
+
+
+def test_users_command_single_instance_splits_custom_role_sync_from_union_role_sync(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Single-instance auto-merge should route org custom roles and workspace unions separately."""
+
+    cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
+        {"id": "ws-1", "display_name": "Workspace 1"},
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Data Scientist,\n"
+        "alice@example.com,Assistant A,ws-1\n"
+        "alice@example.com,Assistant B,ws-1\n",
+        encoding="utf-8",
+    )
+
+    source_roles = [
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-org-custom", "name": "CUSTOM", "display_name": "Data Scientist"},
+        {"id": "src-a", "name": "CUSTOM", "display_name": "Assistant A", "permissions": ["projects:read"]},
+        {"id": "src-b", "name": "CUSTOM", "display_name": "Assistant B", "permissions": ["datasets:read"]},
+    ]
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.side_effect = [
+        {"src-user": "dst-user"},
+        {"src-org-custom": "dst-org-custom"},
+    ]
+    user_role_migrator.list_source_roles.return_value = source_roles
+    user_role_migrator.ensure_workspace_role_unions.return_value = {
+        "union::src-a|src-b": "dst-union"
+    }
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "users",
+            "--api-key",
+            "sync-key",
+            "--url",
+            "https://sync.example",
+            "--csv",
+            str(csv_path),
+            "--auto-merge-custom-roles",
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert user_role_migrator.build_role_mapping.call_args_list == [
+        call(custom_role_ids=set()),
+        call(custom_role_ids={"src-org-custom"}),
+    ]
+    user_role_migrator.ensure_workspace_role_unions.assert_called_once_with(
+        source_roles=source_roles,
+        union_specs=[
+            {
+                "signature": "src-a|src-b",
+                "role_id": "union::src-a|src-b",
+                "source_role_ids": ["src-a", "src-b"],
+                "workspace_id": "ws-1",
+                "email": "alice@example.com",
+                "role_labels": ["Assistant A", "Assistant B"],
+            }
+        ],
+    )
+
+
+def test_users_command_auto_merge_skips_union_role_prep_when_members_are_deselected(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Interactive CSV runs should not prepare managed union roles for deselected members."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.controls.select_results = [[], []]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Assistant A,src-ws\n"
+        "alice@example.com,Assistant B,src-ws\n",
+        encoding="utf-8",
+    )
+
+    source_roles = [
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-a", "name": "CUSTOM", "display_name": "Assistant A", "permissions": ["projects:read"]},
+        {"id": "src-b", "name": "CUSTOM", "display_name": "Assistant B", "permissions": ["datasets:read"]},
+    ]
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-user": "dst-user"}
+    user_role_migrator.list_source_roles.return_value = source_roles
+    user_role_migrator.migrate_org_members.return_value = (0, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (0, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(
+        ["users", "--members-csv", str(csv_path), "--auto-merge-custom-roles"]
+    )
+
+    assert result.exit_code == 0
+    user_role_migrator.ensure_workspace_role_unions.assert_not_called()
+    user_role_migrator.migrate_org_members.assert_not_called()
+    user_role_migrator.migrate_workspace_members.assert_not_called()
+
+
+def test_users_command_auto_merge_only_prepares_union_roles_for_selected_workspace_pairs(
+    cli_harness, monkeypatch, tmp_path
+):
+    """Interactive CSV runs should only materialize unions for the selected workspace scope."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"ws-1": "dst-ws-1"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.controls.select_results = [
+        [],
+        lambda items: items,
+    ]
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id\n"
+        "alice@example.com,Assistant A,ws-1\n"
+        "alice@example.com,Assistant B,ws-1\n"
+        "bob@example.com,Assistant C,ws-2\n"
+        "bob@example.com,Assistant D,ws-2\n",
+        encoding="utf-8",
+    )
+
+    source_roles = [
+        {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User"},
+        {"id": "src-a", "name": "CUSTOM", "display_name": "Assistant A", "permissions": ["projects:read"]},
+        {"id": "src-b", "name": "CUSTOM", "display_name": "Assistant B", "permissions": ["datasets:read"]},
+        {"id": "src-c", "name": "CUSTOM", "display_name": "Assistant C", "permissions": ["runs:read"]},
+        {"id": "src-d", "name": "CUSTOM", "display_name": "Assistant D", "permissions": ["feedback:read"]},
+    ]
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {"src-user": "dst-user"}
+    user_role_migrator.list_source_roles.return_value = source_roles
+    user_role_migrator.ensure_workspace_role_unions.return_value = {
+        "union::src-a|src-b": "dst-union-ab"
+    }
+    user_role_migrator.migrate_org_members.return_value = (0, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(
+        ["users", "--members-csv", str(csv_path), "--auto-merge-custom-roles"]
+    )
+
+    assert result.exit_code == 0
+    assert user_role_migrator.build_role_mapping.call_args_list == [
+        call(custom_role_ids=set()),
+    ]
+    user_role_migrator.ensure_workspace_role_unions.assert_called_once_with(
+        source_roles=source_roles,
+        union_specs=[
+            {
+                "signature": "src-a|src-b",
+                "role_id": "union::src-a|src-b",
+                "source_role_ids": ["src-a", "src-b"],
+                "workspace_id": "ws-1",
+                "email": "alice@example.com",
+                "role_labels": ["Assistant A", "Assistant B"],
+            }
+        ],
+    )
+    user_role_migrator.migrate_workspace_members.assert_called_once_with(
+        selected_members=[
+            {
+                "id": "ws-1:alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "union::src-a|src-b",
                 "full_name": "",
             }
         ],
@@ -1879,7 +2330,149 @@ def test_charts_command_auto_detects_same_instance(cli_harness):
 
     assert result.exit_code == 0
     cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=True)
-    assert "Detected same source and destination instance" in cli_harness.console.text
+    assert "Detected same source and destination deployment" in cli_harness.console.text
+
+
+def test_charts_command_same_key_cross_workspace_uses_remap_mode(cli_harness):
+    """Charts migration should not auto-enable same-instance mode across different workspace pairs."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "session-1": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
+        same_instance=False
+    )
+    assert "different workspaces" in cli_harness.console.text
+    assert "Mode: Remapped project/session IDs" in cli_harness.console.text
+
+
+def test_charts_command_same_key_identical_workspace_keeps_same_instance_mode(cli_harness):
+    """Charts migration should keep same-instance mode when the scoped workspace pair is identical."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"shared-ws": "shared-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "session-1": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example",
+            "charts",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=True)
+    assert "Detected same source and destination deployment" in cli_harness.console.text
+    assert "Mode: Same instance" in cli_harness.console.text
+
+
+def test_charts_command_same_deployment_identical_workspace_reuses_ids_with_different_keys(
+    cli_harness,
+):
+    """Charts migration should reuse IDs when the deployment and workspace scope are identical."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"shared-ws": "shared-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "session-1": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "src-key",
+            "--dest-key",
+            "dest-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
+        same_instance=True
+    )
+    assert "identical workspace scope" in cli_harness.console.text
+
+
+def test_charts_command_same_deployment_different_keys_uses_remap_mode(cli_harness):
+    """Same deployment with different API keys should remap projects instead of reusing IDs."""
+
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
+    ]
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "source-project-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    cli_harness.console.clear()
+    result = cli_harness.runner.invoke(
+        cli_main.cli,
+        [
+            "--source-key",
+            "src-key",
+            "--dest-key",
+            "dest-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
+        same_instance=False
+    )
+    assert "auto-remap projects and sessions" in cli_harness.console.text
 
 
 def test_charts_command_uses_workspace_project_mappings(cli_harness):
@@ -1930,8 +2523,189 @@ def test_charts_command_uses_saved_project_mapping_for_session_migration(cli_har
     cli_harness.migrators.chart.migrate_session_charts.assert_called_once_with(
         "source-session",
         "dest-session",
+        same_instance=False,
     )
     assert "Mapped to destination session" in cli_harness.console.text
+
+
+def test_charts_command_session_uses_workspace_project_mappings(cli_harness):
+    """Session-scoped chart migration should honor workspace/TUI project mappings."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Source Session": "Destination Session"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "source-session", "name": "Source Session"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "dest-session", "name": "Destination Session"},
+    ]
+    cli_harness.migrators.chart.list_sessions.return_value = [
+        {"id": "source-session", "name": "Source Session"},
+    ]
+    cli_harness.migrators.chart.migrate_session_charts.return_value = {
+        "chart-1": "dest-chart-1"
+    }
+
+    result = cli_harness.invoke(["charts", "--session", "Source Session"])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {
+        "source-session": "dest-session"
+    }
+    cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
+        "source-session",
+        same_instance=False,
+    )
+    cli_harness.migrators.chart.migrate_session_charts.assert_called_once_with(
+        "source-session",
+        "dest-session",
+        same_instance=False,
+    )
+
+
+def test_charts_command_session_same_deployment_identical_workspace_reuses_ids_with_different_keys(
+    cli_harness,
+):
+    """Session-scoped chart migration should reuse source IDs for the same workspace scope."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"shared-ws": "shared-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.list_sessions.return_value = [
+        {"id": "source-session", "name": "Source Session"},
+    ]
+    cli_harness.migrators.chart.migrate_session_charts.return_value = {
+        "chart-1": "dest-chart-1"
+    }
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "src-key",
+            "--dest-key",
+            "dest-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+            "--session",
+            "Source Session",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
+        "source-session",
+        same_instance=True,
+    )
+    cli_harness.migrators.chart.migrate_session_charts.assert_called_once_with(
+        "source-session",
+        "source-session",
+        same_instance=True,
+    )
+    assert "Using same session ID for destination" in cli_harness.console.text
+
+
+def test_migrate_all_chart_step_same_key_cross_workspace_uses_remap_mode(cli_harness):
+    """migrate-all should keep chart migration in remap mode for different workspace pairs."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
+    ]
+    cli_harness.migrators.chart._extract_session_id.side_effect = (
+        lambda chart: chart.get("project_id")
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "source-project-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "migrate-all",
+            "--skip-users",
+            "--skip-datasets",
+            "--skip-prompts",
+            "--skip-queues",
+            "--skip-rules",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
+        same_instance=False
+    )
+    assert "different workspaces" in cli_harness.console.text
+    assert "auto-remap projects and sessions" in cli_harness.console.text
+
+
+def test_migrate_all_chart_step_same_deployment_identical_workspace_reuses_ids_with_different_keys(
+    cli_harness,
+):
+    """migrate-all should keep same-instance chart mode for the same workspace scope."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"shared-ws": "shared-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
+    ]
+    cli_harness.migrators.chart._extract_session_id.side_effect = (
+        lambda chart: chart.get("project_id")
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "source-project-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "src-key",
+            "--dest-key",
+            "dest-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "migrate-all",
+            "--skip-users",
+            "--skip-datasets",
+            "--skip-prompts",
+            "--skip-queues",
+            "--skip-rules",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
+        same_instance=True
+    )
+    assert "identical workspace scope" in cli_harness.console.text
 
 
 def test_resume_command_retries_pending_datasets(cli_harness):
@@ -2048,6 +2822,7 @@ def test_resume_command_retries_prompt_queue_rule_and_chart_items(cli_harness):
     cli_harness.migrators.chart.migrate_chart.assert_called_once_with(
         {"id": "chart-1", "title": "Chart One", "series": [{"filters": {}}]},
         "dest-session-1",
+        same_instance=False,
     )
     assert "Resume processing completed" in cli_harness.console.text
 

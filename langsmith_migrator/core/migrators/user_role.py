@@ -1,9 +1,23 @@
 """User and role migration logic."""
 
+import hashlib
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import BaseMigrator
 from ...utils.retry import APIError, AuthenticationError, ConflictError
+
+
+_ROLE_UNION_DESCRIPTION_PREFIX = "Managed by langsmith-migrator for union::"
+_ACCESS_POLICY_ENDPOINT_CANDIDATES = (
+    "/orgs/current/access-policies",
+    "/orgs/current/access_policies",
+)
+_ROLE_ACCESS_POLICY_ENDPOINT_TEMPLATES = (
+    "/orgs/current/roles/{role_id}/access-policies",
+    "/orgs/current/roles/{role_id}/access-policies/attach",
+    "/orgs/current/roles/{role_id}/access_policies",
+)
 
 
 class UserRoleMigrator(BaseMigrator):
@@ -25,6 +39,8 @@ class UserRoleMigrator(BaseMigrator):
         self._pending_workspace_invites: set[tuple[str, str]] = set()
         self._last_org_member_removals = 0
         self._last_workspace_member_removals = 0
+        self._source_access_policies_cache: Optional[List[Dict[str, Any]]] = None
+        self._dest_access_policies_cache: Optional[List[Dict[str, Any]]] = None
 
     # ------------------------------------------------------------------
     # Phase 0: data fetching
@@ -37,6 +53,16 @@ class UserRoleMigrator(BaseMigrator):
     def list_dest_roles(self) -> List[Dict[str, Any]]:
         """Fetch all roles from the destination organisation."""
         return self.dest.get("/orgs/current/roles")
+
+    def list_source_access_policies(self) -> List[Dict[str, Any]]:
+        """Fetch all access policies from the source organisation."""
+        return self._list_access_policies(self.source, cache_attr="_source_access_policies_cache")
+
+    def list_dest_access_policies(self, *, force: bool = False) -> List[Dict[str, Any]]:
+        """Fetch all access policies from the destination organisation."""
+        if force:
+            self._dest_access_policies_cache = None
+        return self._list_access_policies(self.dest, cache_attr="_dest_access_policies_cache")
 
     def list_source_org_members(self) -> List[Dict[str, Any]]:
         """Fetch active org members from source (paginated)."""
@@ -99,6 +125,65 @@ class UserRoleMigrator(BaseMigrator):
                 active_by_email.setdefault(email, member)
             self._dest_email_to_identity = active_by_email
         return self._dest_email_to_identity
+
+    def _list_access_policies(
+        self,
+        client,
+        *,
+        cache_attr: str,
+    ) -> List[Dict[str, Any]]:
+        """Fetch access policies with compatibility fallbacks."""
+        cached = getattr(self, cache_attr)
+        if cached is not None:
+            return cached
+
+        last_error: Optional[APIError] = None
+        for endpoint in _ACCESS_POLICY_ENDPOINT_CANDIDATES:
+            try:
+                response = client.get(endpoint)
+                policies = self._normalize_access_policy_response(response)
+                setattr(self, cache_attr, policies)
+                return policies
+            except APIError as e:
+                if self._is_unavailable_endpoint_error(e):
+                    last_error = e
+                    continue
+                raise
+
+        scope = "source" if client is self.source else "destination"
+        raise APIError(
+            f"Unable to list {scope} access policies for custom role auto-merge: {last_error}",
+            request_info={},
+        )
+
+    @staticmethod
+    def _normalize_access_policy_response(response: Any) -> List[Dict[str, Any]]:
+        """Coerce common API response shapes into a list of policies."""
+        items: List[Any]
+        if isinstance(response, list):
+            items = response
+        elif isinstance(response, dict):
+            for key in ("access_policies", "policies", "items", "results"):
+                value = response.get(key)
+                if isinstance(value, list):
+                    items = value
+                    break
+            else:
+                items = [response] if response.get("id") else []
+        else:
+            items = []
+        return [item for item in items if isinstance(item, dict)]
+
+    @staticmethod
+    def _is_unavailable_endpoint_error(error: APIError) -> bool:
+        """Return True when an API error indicates an unsupported endpoint."""
+        status_code = getattr(error, "status_code", None)
+        message = str(error).lower()
+        return (
+            status_code in {404, 405}
+            or "not found" in message
+            or "not allowed" in message
+        )
 
     # ------------------------------------------------------------------
     # Phase 1: role synchronisation
@@ -296,6 +381,435 @@ class UserRoleMigrator(BaseMigrator):
                 f"Failed to update custom role '{display_name}': {e}", "error"
             )
             return False
+
+    # ------------------------------------------------------------------
+    # Managed workspace-role unions
+    # ------------------------------------------------------------------
+
+    def ensure_workspace_role_unions(
+        self,
+        *,
+        source_roles: List[Dict[str, Any]],
+        union_specs: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        """Ensure managed destination roles exist for CSV workspace-role unions."""
+        if not union_specs:
+            return {}
+
+        source_roles_by_id = {
+            role["id"]: role
+            for role in source_roles
+            if isinstance(role, dict) and role.get("id")
+        }
+        dest_roles = self.list_dest_roles()
+        dest_roles_by_id = {
+            role["id"]: role
+            for role in dest_roles
+            if isinstance(role, dict) and role.get("id")
+        }
+        source_policies = self.list_source_access_policies()
+        dest_policies = self.list_dest_access_policies(force=True)
+        dest_policies_by_fingerprint = self._index_access_policies(dest_policies)
+
+        mapping: Dict[str, str] = {}
+        specs_by_signature = {
+            spec["signature"]: spec
+            for spec in union_specs
+        }
+
+        for signature, spec in specs_by_signature.items():
+            union_role_key = spec["role_id"]
+            union_source_roles: List[Dict[str, Any]] = []
+            for source_role_id in spec.get("source_role_ids") or []:
+                source_role = source_roles_by_id.get(source_role_id)
+                if not source_role:
+                    raise APIError(
+                        (
+                            "Cannot prepare merged workspace role "
+                            f"{union_role_key}: source role {source_role_id!r} "
+                            "was not found in the source role inventory"
+                        ),
+                        request_info={},
+                    )
+                union_source_roles.append(source_role)
+
+            dest_role, should_reconcile_policies = self._ensure_workspace_role_union(
+                signature,
+                union_source_roles,
+                dest_roles_by_id,
+            )
+            dest_roles_by_id[dest_role["id"]] = dest_role
+
+            if should_reconcile_policies:
+                desired_policy_ids, dest_policies, dest_policies_by_fingerprint = (
+                    self._ensure_union_access_policies(
+                        dest_role["id"],
+                        union_source_roles,
+                        source_policies,
+                        dest_policies,
+                        dest_policies_by_fingerprint,
+                    )
+                )
+                self._attach_access_policies_to_role(
+                    dest_role["id"], desired_policy_ids
+                )
+                self._update_cached_policy_role_attachments(
+                    dest_policies,
+                    dest_role["id"],
+                    desired_policy_ids,
+                )
+
+            mapping[union_role_key] = dest_role["id"]
+            self._role_id_map[union_role_key] = dest_role["id"]
+            if self.state:
+                self.state.set_mapped_id("role_unions", signature, dest_role["id"])
+                self.state.set_mapped_id("roles", union_role_key, dest_role["id"])
+
+        if self.state:
+            self.persist_state()
+        self._dest_access_policies_cache = dest_policies
+        return mapping
+
+    def _ensure_workspace_role_union(
+        self,
+        signature: str,
+        source_roles: List[Dict[str, Any]],
+        dest_roles_by_id: Dict[str, Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Create or update a managed custom role representing a role union."""
+        union_role_key = f"union::{signature}"
+        desired_display_name = self._workspace_role_union_display_name(signature)
+        desired_description = self._workspace_role_union_description(
+            signature, source_roles
+        )
+        desired_permissions = sorted(
+            {
+                permission
+                for role in source_roles
+                for permission in (role.get("permissions") or [])
+                if permission
+            }
+        )
+
+        existing_role: Optional[Dict[str, Any]] = None
+        existing_role_id = self._role_id_map.get(union_role_key)
+        if not existing_role_id and self.state:
+            existing_role_id = (
+                self.state.get_mapped_id("role_unions", signature)
+                or self.state.get_mapped_id("roles", union_role_key)
+            )
+        if existing_role_id:
+            existing_role = dest_roles_by_id.get(existing_role_id)
+
+        if not existing_role:
+            for role in dest_roles_by_id.values():
+                if role.get("name") != "CUSTOM":
+                    continue
+                description = (role.get("description") or "").strip()
+                if (
+                    self._managed_workspace_role_union_signature(description)
+                    == signature
+                ):
+                    existing_role = role
+                    break
+
+        if existing_role and existing_role.get("name") != "CUSTOM":
+            raise APIError(
+                (
+                    "Managed workspace-role union mapping resolved to a non-custom "
+                    f"role ({existing_role.get('id')}); refusing to overwrite it"
+                ),
+                request_info={},
+            )
+
+        payload = {
+            "display_name": desired_display_name,
+            "description": desired_description,
+            "permissions": desired_permissions,
+        }
+
+        if existing_role:
+            if self.config.migration.skip_existing:
+                self.log(
+                    f"Managed union role '{desired_display_name}' exists, "
+                    "skipping reconciliation",
+                    "info",
+                )
+                return existing_role, False
+            if self.config.migration.dry_run:
+                self.log(
+                    f"[DRY RUN] Would reconcile managed union role: {desired_display_name}"
+                )
+                reconciled_role = {**existing_role, **payload}
+            else:
+                self.dest.patch(f"/orgs/current/roles/{existing_role['id']}", payload)
+                reconciled_role = {**existing_role, **payload}
+            self.log(f"Prepared managed union role: {desired_display_name}", "success")
+            return reconciled_role, True
+
+        if self.config.migration.dry_run:
+            self.log(f"[DRY RUN] Would create managed union role: {desired_display_name}")
+            return {
+                "id": f"dry-run-{hashlib.sha1(signature.encode('utf-8')).hexdigest()[:12]}",
+                "name": "CUSTOM",
+                **payload,
+            }, True
+
+        response = self.dest.post("/orgs/current/roles", payload)
+        if not isinstance(response, dict) or not response.get("id"):
+            raise APIError(
+                f"Invalid response creating managed union role '{desired_display_name}': {response}",
+                request_info={},
+            )
+        self.log(f"Created managed union role: {desired_display_name}", "success")
+        return response, True
+
+    @staticmethod
+    def _workspace_role_union_display_name(signature: str) -> str:
+        """Return the deterministic display name for a managed union role."""
+        short_hash = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:12]
+        return f"Migrator Union {short_hash}"
+
+    @staticmethod
+    def _workspace_role_union_description(
+        signature: str,
+        source_roles: List[Dict[str, Any]],
+    ) -> str:
+        """Return the deterministic description for a managed union role."""
+        labels = ", ".join(
+            sorted(
+                {
+                    (role.get("display_name") or role.get("name") or role.get("id") or "").strip()
+                    for role in source_roles
+                    if (
+                        role.get("display_name")
+                        or role.get("name")
+                        or role.get("id")
+                    )
+                },
+                key=str.lower,
+            )
+        )
+        return (
+            f"{_ROLE_UNION_DESCRIPTION_PREFIX}{signature}. "
+            f"Source roles: {labels or '<unknown>'}"
+        )
+
+    @staticmethod
+    def _managed_workspace_role_union_signature(
+        description: str,
+    ) -> Optional[str]:
+        """Extract the managed union signature from a role description."""
+        normalized_description = (description or "").strip()
+        if not normalized_description.startswith(_ROLE_UNION_DESCRIPTION_PREFIX):
+            return None
+
+        suffix = normalized_description[len(_ROLE_UNION_DESCRIPTION_PREFIX):]
+        if suffix.endswith(".") and ". Source roles:" not in suffix:
+            signature = suffix[:-1].strip()
+            return signature or None
+
+        signature, separator, _ = suffix.partition(". Source roles:")
+        if separator:
+            signature = signature.strip()
+            return signature or None
+
+        return None
+
+    def _ensure_union_access_policies(
+        self,
+        dest_role_id: str,
+        source_roles: List[Dict[str, Any]],
+        source_policies: List[Dict[str, Any]],
+        dest_policies: List[Dict[str, Any]],
+        dest_policies_by_fingerprint: Dict[str, List[Dict[str, Any]]],
+    ) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+        """Ensure equivalent destination policies exist for a managed union role."""
+        source_role_ids = {
+            role.get("id")
+            for role in source_roles
+            if role.get("id")
+        }
+        desired_policy_ids: List[str] = []
+        seen_policy_fingerprints: set[str] = set()
+
+        for policy in source_policies:
+            policy_role_ids = {
+                role_id
+                for role_id in (policy.get("role_ids") or [])
+                if role_id
+            }
+            if not policy_role_ids.intersection(source_role_ids):
+                continue
+
+            fingerprint = self._access_policy_fingerprint(policy)
+            if fingerprint in seen_policy_fingerprints:
+                continue
+            seen_policy_fingerprints.add(fingerprint)
+
+            candidate_dest_policies = dest_policies_by_fingerprint.get(fingerprint, [])
+            if candidate_dest_policies:
+                desired_policy_ids.append(candidate_dest_policies[0]["id"])
+                continue
+
+            created_policy = self._create_access_policy(policy, dest_role_id)
+            dest_policies.append(created_policy)
+            dest_policies_by_fingerprint.setdefault(fingerprint, []).append(
+                created_policy
+            )
+            desired_policy_ids.append(created_policy["id"])
+
+        return sorted(set(desired_policy_ids)), dest_policies, dest_policies_by_fingerprint
+
+    def _create_access_policy(
+        self,
+        source_policy: Dict[str, Any],
+        dest_role_id: str,
+    ) -> Dict[str, Any]:
+        """Create a destination access policy equivalent to the source policy."""
+        payload = {
+            "name": source_policy.get("name") or "Migrated Access Policy",
+            "description": source_policy.get("description", ""),
+            "effect": source_policy.get("effect"),
+            "condition_groups": source_policy.get("condition_groups") or [],
+            "role_ids": [dest_role_id],
+        }
+
+        if self.config.migration.dry_run:
+            self.log(
+                f"[DRY RUN] Would create access policy: {payload['name']}"
+            )
+            return {
+                "id": f"dry-run-policy-{hashlib.sha1(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()[:12]}",
+                **payload,
+            }
+
+        last_error: Optional[APIError] = None
+        for endpoint in _ACCESS_POLICY_ENDPOINT_CANDIDATES:
+            try:
+                response = self.dest.post(endpoint, payload)
+                if not isinstance(response, dict) or not response.get("id"):
+                    raise APIError(
+                        f"Invalid response creating access policy: {response}",
+                        request_info={},
+                    )
+                self.log(f"Created access policy: {payload['name']}", "success")
+                return response
+            except APIError as e:
+                if self._is_unavailable_endpoint_error(e):
+                    last_error = e
+                    continue
+                raise
+
+        raise APIError(
+            f"Unable to create destination access policy for custom role auto-merge: {last_error}",
+            request_info={},
+        )
+
+    def _attach_access_policies_to_role(
+        self,
+        dest_role_id: str,
+        access_policy_ids: List[str],
+    ) -> None:
+        """Replace the attached access-policy set for a destination role."""
+        payload = {"access_policy_ids": sorted(set(access_policy_ids))}
+
+        if self.config.migration.dry_run:
+            self.log(
+                f"[DRY RUN] Would attach {len(payload['access_policy_ids'])} access policy(s) to role {dest_role_id}"
+            )
+            return
+
+        last_error: Optional[APIError] = None
+        for endpoint_template in _ROLE_ACCESS_POLICY_ENDPOINT_TEMPLATES:
+            endpoint = endpoint_template.format(role_id=dest_role_id)
+            try:
+                self.dest.post(endpoint, payload)
+                self.log(
+                    f"Attached {len(payload['access_policy_ids'])} access policy(s) to role {dest_role_id}",
+                    "success",
+                )
+                return
+            except APIError as e:
+                if self._is_unavailable_endpoint_error(e):
+                    last_error = e
+                    continue
+                raise
+
+        raise APIError(
+            f"Unable to attach access policies to role {dest_role_id}: {last_error}",
+            request_info={},
+        )
+
+    @staticmethod
+    def _update_cached_policy_role_attachments(
+        dest_policies: List[Dict[str, Any]],
+        role_id: str,
+        desired_policy_ids: List[str],
+    ) -> None:
+        """Update in-memory cached role attachments after a reconcile call."""
+        desired_set = set(desired_policy_ids)
+        for policy in dest_policies:
+            policy_role_ids = [
+                attached_role_id
+                for attached_role_id in (policy.get("role_ids") or [])
+                if attached_role_id and attached_role_id != role_id
+            ]
+            if policy.get("id") in desired_set:
+                policy_role_ids.append(role_id)
+            policy["role_ids"] = sorted(set(policy_role_ids))
+
+    def _index_access_policies(
+        self,
+        policies: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Index policies by semantic fingerprint."""
+        indexed: Dict[str, List[Dict[str, Any]]] = {}
+        for policy in policies:
+            fingerprint = self._access_policy_fingerprint(policy)
+            indexed.setdefault(fingerprint, []).append(policy)
+        return indexed
+
+    def _access_policy_fingerprint(self, policy: Dict[str, Any]) -> str:
+        """Build a semantic fingerprint that ignores IDs and attachments."""
+        canonical_groups: List[Dict[str, Any]] = []
+        for group in policy.get("condition_groups") or []:
+            if not isinstance(group, dict):
+                continue
+            normalized_conditions = sorted(
+                [
+                    {
+                        key: value
+                        for key, value in condition.items()
+                        if key
+                        in {
+                            "attribute_name",
+                            "attribute_key",
+                            "operator",
+                            "attribute_value",
+                        }
+                    }
+                    for condition in (group.get("conditions") or [])
+                    if isinstance(condition, dict)
+                ],
+                key=lambda item: json.dumps(item, sort_keys=True),
+            )
+            canonical_groups.append(
+                {
+                    "permission": group.get("permission"),
+                    "resource_type": group.get("resource_type"),
+                    "conditions": normalized_conditions,
+                }
+            )
+        canonical_groups.sort(key=lambda item: json.dumps(item, sort_keys=True))
+
+        return json.dumps(
+            {
+                "effect": policy.get("effect"),
+                "condition_groups": canonical_groups,
+            },
+            sort_keys=True,
+        )
 
     # ------------------------------------------------------------------
     # Phase 2: organisation member migration

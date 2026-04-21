@@ -20,6 +20,10 @@ class RulesMigrator(BaseMigrator):
         # ID mappings for projects and datasets
         self._project_id_map = None  # Maps old_project_id -> new_project_id
         self._dataset_id_map = None  # Maps old_dataset_id -> new_dataset_id
+        self._queue_id_map = {}  # Maps dest_workspace_id -> {old_queue_id -> new_queue_id}
+        self._source_queue_name_cache = {}
+        self._dest_queue_name_map = {}  # Maps dest_workspace_id -> {queue_name -> queue_id}
+        self._dest_queue_duplicates = {}  # Maps dest_workspace_id -> duplicate queue metadata
 
         # Initialize LangSmith client for checking prompts
         self.dest_ls_client = None
@@ -115,6 +119,104 @@ class RulesMigrator(BaseMigrator):
 
     def _rule_item_id(self, rule: Dict[str, Any]) -> str:
         return f"rule_{rule.get('id', rule.get('display_name', 'unnamed'))}"
+
+    def _active_dest_workspace_key(self) -> Optional[str]:
+        """Return the current destination workspace cache key."""
+        return self.dest.session.headers.get("X-Tenant-Id")
+
+    def _get_source_queue_name(self, queue_id: str) -> Optional[str]:
+        """Look up a source annotation queue name by ID with caching."""
+        if queue_id in self._source_queue_name_cache:
+            return self._source_queue_name_cache[queue_id]
+
+        try:
+            queue = self.source.get(f"/annotation-queues/{queue_id}")
+        except Exception as e:
+            self.log(
+                f"Failed to fetch source annotation queue {queue_id}: {e}",
+                "warning",
+            )
+            return None
+
+        queue_name = queue.get("name") if isinstance(queue, dict) else None
+        if queue_name:
+            self._source_queue_name_cache[queue_id] = queue_name
+        return queue_name
+
+    def _build_dest_queue_name_map(self) -> Dict[str, str]:
+        """Build a duplicate-aware destination queue name lookup."""
+        workspace_key = self._active_dest_workspace_key()
+        if workspace_key in self._dest_queue_name_map:
+            return self._dest_queue_name_map[workspace_key]
+
+        try:
+            dest_records: List[Dict[str, Any]] = []
+            for queue in self.dest.get_paginated("/annotation-queues", page_size=100):
+                if isinstance(queue, dict):
+                    dest_records.append(queue)
+
+            name_map, duplicates = unique_name_map(dest_records)
+            self._dest_queue_name_map[workspace_key] = name_map
+            self._dest_queue_duplicates[workspace_key] = duplicates
+        except Exception as e:
+            self.log(f"Failed to build annotation queue mapping: {e}", "warning")
+            self._dest_queue_name_map[workspace_key] = {}
+            self._dest_queue_duplicates[workspace_key] = {}
+
+        return self._dest_queue_name_map[workspace_key]
+
+    def _resolve_annotation_queue_id(
+        self,
+        queue_id: str,
+    ) -> tuple[Optional[str], Dict[str, Any]]:
+        """Resolve an annotation queue ID onto the destination instance."""
+        if not queue_id:
+            return None, {}
+
+        workspace_key = self._active_dest_workspace_key()
+        workspace_queue_id_map = self._queue_id_map.setdefault(workspace_key, {})
+        if queue_id in workspace_queue_id_map:
+            return workspace_queue_id_map[queue_id], {}
+
+        if self.state:
+            mapped_id = self.state.get_mapped_id("queue", queue_id)
+            if mapped_id:
+                workspace_queue_id_map[queue_id] = mapped_id
+                self.record_provenance(f"queue:{queue_id}", "state_mapping")
+                return mapped_id, {}
+
+        queue_name = self._get_source_queue_name(queue_id)
+        if not queue_name:
+            return None, {"annotation_queue_id": queue_id}
+
+        dest_queue_name_map = self._build_dest_queue_name_map()
+        dest_queue_duplicates = self._dest_queue_duplicates.get(workspace_key, {})
+        if queue_name in dest_queue_duplicates:
+            self.log(
+                f"Annotation queue '{queue_name}' is duplicated on destination; "
+                "cannot auto-map safely",
+                "warning",
+            )
+            return None, {
+                "annotation_queue_id": queue_id,
+                "annotation_queue_name": queue_name,
+                "duplicate_destination_names": dest_queue_duplicates[queue_name],
+            }
+
+        mapped_id = dest_queue_name_map.get(queue_name)
+        if not mapped_id:
+            self.log(
+                f"Annotation queue '{queue_name}' not found on destination",
+                "warning",
+            )
+            return None, {
+                "annotation_queue_id": queue_id,
+                "annotation_queue_name": queue_name,
+            }
+
+        workspace_queue_id_map[queue_id] = mapped_id
+        self.record_provenance(f"queue:{queue_id}", "exact_name_match")
+        return mapped_id, {}
 
     def probe_capabilities(self) -> Dict[str, Dict[str, Any]]:
         """Probe rules-related capabilities without mutating destination state."""
@@ -765,6 +867,9 @@ class RulesMigrator(BaseMigrator):
             dataset_map = self.build_dataset_mapping()
             source_add_to_dataset_id = rule.get('add_to_dataset_id')
             dest_add_to_dataset_id = None
+            source_add_to_annotation_queue_id = rule.get('add_to_annotation_queue_id')
+            dest_add_to_annotation_queue_id = None
+            annotation_queue_dependency = {}
 
             if source_add_to_dataset_id:
                 dest_add_to_dataset_id = dataset_map.get(source_add_to_dataset_id)
@@ -772,6 +877,24 @@ class RulesMigrator(BaseMigrator):
                     self.log(f"Mapped add_to_dataset_id: {source_add_to_dataset_id} -> {dest_add_to_dataset_id}", "info")
                 else:
                     self.log(f"Warning: add_to_dataset_id {source_add_to_dataset_id} not found in destination mapping", "warning")
+
+            if source_add_to_annotation_queue_id:
+                (
+                    dest_add_to_annotation_queue_id,
+                    annotation_queue_dependency,
+                ) = self._resolve_annotation_queue_id(source_add_to_annotation_queue_id)
+                if dest_add_to_annotation_queue_id:
+                    self.log(
+                        "Mapped add_to_annotation_queue_id: "
+                        f"{source_add_to_annotation_queue_id} -> {dest_add_to_annotation_queue_id}",
+                        "info",
+                    )
+                else:
+                    self.log(
+                        "Warning: add_to_annotation_queue_id "
+                        f"{source_add_to_annotation_queue_id} could not be resolved",
+                        "warning",
+                    )
 
             # Build initial payload - we'll filter out None values later
             # If create_disabled is True, force is_enabled=False to bypass secrets validation
@@ -794,7 +917,7 @@ class RulesMigrator(BaseMigrator):
                 'num_few_shot_examples': rule.get('num_few_shot_examples'),
                 'extend_only': rule.get('extend_only', False),
                 'transient': rule.get('transient', False),
-                'add_to_annotation_queue_id': rule.get('add_to_annotation_queue_id'),
+                'add_to_annotation_queue_id': dest_add_to_annotation_queue_id,
                 'add_to_dataset_id': dest_add_to_dataset_id or source_add_to_dataset_id,
                 'add_to_dataset_prefer_correction': rule.get('add_to_dataset_prefer_correction', False),
                 'evaluator_version': rule.get('evaluator_version'),
@@ -803,6 +926,46 @@ class RulesMigrator(BaseMigrator):
 
             # Remove None values from payload to avoid API validation errors
             payload = {k: v for k, v in payload.items() if v is not None}
+
+            if source_add_to_annotation_queue_id and not dest_add_to_annotation_queue_id:
+                export_path = self._export_rule_manual_apply(
+                    rule,
+                    payload,
+                    reason="missing_annotation_queue_dependency",
+                    unmet_dependencies=annotation_queue_dependency,
+                )
+                issue = self.record_issue(
+                    "dependency",
+                    "missing_annotation_queue_dependency",
+                    f"Rule '{display_name}' could not resolve annotation queue "
+                    f"{source_add_to_annotation_queue_id}",
+                    item_id=item_id,
+                    next_action=(
+                        "Migrate or map the missing annotation queue, then run "
+                        "`langsmith-migrator resume`."
+                    ),
+                    evidence=annotation_queue_dependency,
+                    export_path=export_path,
+                )
+                if issue:
+                    self.queue_remediation(
+                        issue_id=issue.id,
+                        item_id=item_id,
+                        next_action=issue.next_action or "Resolve annotation queue dependency.",
+                        export_path=export_path,
+                        command="langsmith-migrator resume",
+                    )
+                self.mark_exported(
+                    item_id,
+                    "missing_annotation_queue_dependency",
+                    next_action=(
+                        "Resolve the annotation queue dependency, then run "
+                        "`langsmith-migrator resume`."
+                    ),
+                    export_path=export_path,
+                    evidence=annotation_queue_dependency,
+                )
+                return None
 
             # Handle evaluators - for v3+ evaluators, the data might be in separate fields
             # that need to be reconstructed into the evaluators array
