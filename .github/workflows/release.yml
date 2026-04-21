@@ -28,6 +28,9 @@ jobs:
       - name: Build package
         run: uv build
 
+      - name: Verify wheel contents
+        run: python3 .github/scripts/check_wheel_contents.py dist/*.whl
+
       - name: Extract release notes
         id: extract-release-notes
         run: |

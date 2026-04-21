@@ -166,4 +166,4 @@ run_dataset_tests.py
 test_*.py
 !tests/**/test_*.py
 demo_*.py
-main.py
+/main.py

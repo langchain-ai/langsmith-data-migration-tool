@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.65] - 2026-04-21
+
+### Added
+- **Wheel artifact verification**: Test and release workflows now build the wheel and fail fast if the CLI module or console entry point metadata is missing from the published artifact.
+
+### Fixed
+- **CLI wheel packaging**: Narrowed the `.gitignore` `main.py` rule to the repository root so `langsmith_migrator/cli/main.py` is included in built wheels again, restoring `pip` and `uv` installs.
+
 ## [0.0.64] - 2026-04-10
 
 ### Added
@@ -281,7 +289,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.64...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.65...HEAD
+[0.0.65]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.64...v0.0.65
 [0.0.64]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.63...v0.0.64
 [0.0.63]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.62...v0.0.63
 [0.0.62]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.61...v0.0.62
