@@ -3,49 +3,33 @@
 import csv
 import functools
 import logging
+import time
 from pathlib import Path
 from typing import Iterable
+
 import click
-import time
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.table import Table
 from rich.prompt import Confirm
 from rich.progress import Progress
-
-load_dotenv()
+from rich.table import Table
 
 from ..utils.config import Config
-
-
-def ssl_option(f):
-    """
-    Decorator kept for backwards compatibility.
-
-    Note: --no-ssl is now handled globally in the cli() group, so this decorator
-    is a no-op. It's kept to avoid breaking existing command decorations.
-    """
-    @functools.wraps(f)
-    def wrapper(*args, **kwargs):
-        # The global cli() already handles --no-ssl via the config object
-        return f(*args, **kwargs)
-    return wrapper
 from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
 from ..core.migrators import (
-    MigrationOrchestrator,
-    DatasetMigrator,
     AnnotationQueueMigrator,
+    ChartMigrator,
+    DatasetMigrator,
+    MigrationOrchestrator,
     PromptMigrator,
     RulesMigrator,
-    ChartMigrator,
     UserRoleMigrator,
 )
-from .tui_selector import select_items
 from .tui_project_mapper import build_project_mapping_tui
+from .tui_selector import select_items
 from .tui_workspace_mapper import WorkspaceProjectResult
 from ..utils.workspace import (
     discover_workspaces,
-    get_workspace_name,
     list_projects as _list_projects,
     list_workspaces as _list_workspaces,
 )
@@ -56,7 +40,25 @@ from ..utils.workspace_resolver import (
 )
 
 
+load_dotenv()
+
 console = Console()
+
+
+def ssl_option(f):
+    """
+    Decorator kept for backwards compatibility.
+
+    Note: --no-ssl is now handled globally in the cli() group, so this decorator
+    is a no-op. It's kept to avoid breaking existing command decorations.
+    """
+
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        # The global cli() already handles --no-ssl via the config object
+        return f(*args, **kwargs)
+
+    return wrapper
 
 
 class _SuppressRunCompressionNoise(logging.Filter):
@@ -2082,48 +2084,48 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
 def list_projects(ctx, source, dest):
     """List projects with their IDs to help create project mappings."""
     config = ctx.obj['config']
-    
+
     if not source and not dest:
         console.print("[yellow]Specify --source or --dest to list projects[/yellow]")
         return
-    
+
     if not ensure_config(config):
         return
-    
+
     orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
-    
+
     from rich.table import Table
-    
+
     if source:
         console.print("\n[bold]Source Projects:[/bold]")
         try:
             table = Table(show_header=True)
             table.add_column("Name", style="cyan", width=50)
             table.add_column("ID", style="dim", width=36)
-            
+
             for project in orchestrator.source_client.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
                     table.add_row(project.get('name', 'unnamed'), project.get('id', ''))
-            
+
             console.print(table)
         except Exception as e:
             console.print(f"[red]Failed to list source projects: {e}[/red]")
-    
+
     if dest:
         console.print("\n[bold]Destination Projects:[/bold]")
         try:
             table = Table(show_header=True)
             table.add_column("Name", style="cyan", width=50)
             table.add_column("ID", style="dim", width=36)
-            
+
             for project in orchestrator.dest_client.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
                     table.add_row(project.get('name', 'unnamed'), project.get('id', ''))
-            
+
             console.print(table)
         except Exception as e:
             console.print(f"[red]Failed to list destination projects: {e}[/red]")
-    
+
     orchestrator.cleanup()
 
 
@@ -2290,7 +2292,6 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
         # Analyze rules for project/dataset associations
         project_specific = [r for r in rules if r.get('session_id')]
-        dataset_specific = [r for r in rules if r.get('dataset_id')]
         project_only = [r for r in rules if r.get('session_id') and not r.get('dataset_id')]
 
         if project_specific and not strip_projects:
@@ -2414,10 +2415,10 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
         # Show helpful message about disabled rules
         if success_count > 0 and not create_enabled:
-            console.print(f"\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
-            console.print(f"  To enable rules:")
-            console.print(f"  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
-            console.print(f"  2. Enable each rule in the LangSmith UI or use --create-enabled flag")
+            console.print("\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
+            console.print("  To enable rules:")
+            console.print("  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
+            console.print("  2. Enable each rule in the LangSmith UI or use --create-enabled flag")
 
     if ws_result:
         orchestrator.clear_workspace_context()
@@ -2806,7 +2807,7 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                 strip = strip_projects
                 ensure_projects = False
                 create_enabled = rules_create_enabled
-                
+
                 if project_specific and not strip:
                     strip = _confirm_action(
                         config,
@@ -2888,10 +2889,10 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
 
                 console.print(f"Rules: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed")
                 if success_count > 0 and create_disabled:
-                    console.print(f"\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
-                    console.print(f"  To enable rules:")
-                    console.print(f"  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
-                    console.print(f"  2. Enable each rule in the LangSmith UI or rerun with --rules-create-enabled")
+                    console.print("\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
+                    console.print("  To enable rules:")
+                    console.print("  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
+                    console.print("  2. Enable each rule in the LangSmith UI or rerun with --rules-create-enabled")
                 if (failed_items or skipped_items) and config.migration.verbose:
                     for name, err in skipped_items:
                         console.print(f"  [yellow]⊘[/yellow] {name}: {err}")
@@ -3108,7 +3109,7 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             if not target_session:
                 console.print("[red]✗[/red]")
                 console.print(f"[red]Session not found: {session}[/red]")
-                console.print(f"\n[yellow]Available sessions:[/yellow]")
+                console.print("\n[yellow]Available sessions:[/yellow]")
                 for s in sessions[:10]:
                     console.print(f"  - {s.get('name', 'unnamed')} ({s.get('id', 'no-id')})")
                 if len(sessions) > 10:
@@ -3391,7 +3392,7 @@ def resume(ctx):
         # Report results
         resumed = results.get("resumed", [])
         blocked = results.get("blocked", [])
-        console.print(f"\n[bold]Resume Results:[/bold]")
+        console.print("\n[bold]Resume Results:[/bold]")
         console.print(f"  [green]Resumed successfully: {len(resumed)}[/green]")
         console.print(f"  [yellow]Blocked/needs attention: {len(blocked)}[/yellow]")
 
