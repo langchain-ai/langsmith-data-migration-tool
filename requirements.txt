@@ -4,14 +4,14 @@ annotated-types==0.7.0
     # via pydantic
 anyio==4.13.0
     # via httpx
-certifi==2026.2.25
+certifi==2026.4.22
     # via
     #   httpcore
     #   httpx
     #   requests
 charset-normalizer==3.4.7
     # via requests
-click==8.3.2
+click==8.3.3
     # via langsmith-data-migration-tool (pyproject.toml)
 h11==0.16.0
     # via httpcore
@@ -19,12 +19,12 @@ httpcore==1.0.9
     # via httpx
 httpx==0.28.1
     # via langsmith
-idna==3.11
+idna==3.13
     # via
     #   anyio
     #   httpx
     #   requests
-langsmith==0.7.32
+langsmith==0.7.37
     # via langsmith-data-migration-tool (pyproject.toml)
 linkify-it-py==2.1.0
     # via markdown-it-py
@@ -39,7 +39,7 @@ mdurl==0.1.2
     # via markdown-it-py
 orjson==3.11.8
     # via langsmith
-packaging==26.1
+packaging==26.2
     # via langsmith
 platformdirs==4.9.6
     # via textual
