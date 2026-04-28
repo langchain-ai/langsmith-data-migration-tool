@@ -27,7 +27,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "langchain-core>=1.2.5",
     # Model packages required for pulling prompts with include_model=True
-    "langchain-openai>=0.1.0",
+    "langchain-openai>=1.1.14",
     "langchain-anthropic>=0.1.0",
 ]
 
