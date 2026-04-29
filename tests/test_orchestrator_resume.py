@@ -104,3 +104,69 @@ def test_resume_items_continues_non_user_items_when_dest_org_prefetch_fails(
         "team/prompt-a",
         include_all_commits=True,
     )
+
+
+def test_resume_items_forwards_chart_same_instance_metadata(
+    monkeypatch, sample_config, migration_state, tmp_path
+):
+    """Resume should preserve same-instance chart metadata when retrying chart items."""
+
+    clients = [_FakeClient(), _FakeClient()]
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.EnhancedAPIClient",
+        lambda **kwargs: clients.pop(0),
+    )
+
+    chart_migrator = Mock()
+    chart_migrator.migrate_chart.return_value = "dest-chart-1"
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.chart.ChartMigrator",
+        lambda *args, **kwargs: chart_migrator,
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.prompt.PromptMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.annotation_queue.AnnotationQueueMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.rules.RulesMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.ExperimentMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.FeedbackMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+
+    state_manager = StateManager(tmp_path / "state")
+    orchestrator = MigrationOrchestrator(sample_config, state_manager)
+    orchestrator.state = migration_state
+
+    chart_item = MigrationItem(
+        id="chart_default_chart-1",
+        type="chart",
+        name="Chart One",
+        source_id="chart-1",
+        status=MigrationStatus.PENDING,
+        metadata={
+            "chart": {"id": "chart-1", "title": "Chart One", "series": []},
+            "dest_session_id": "source-session",
+            "same_instance": True,
+        },
+    )
+    migration_state.add_item(chart_item)
+
+    results = orchestrator.resume_items([chart_item])
+
+    assert results["resumed"] == ["chart:chart-1"]
+    chart_migrator.migrate_chart.assert_called_once_with(
+        {"id": "chart-1", "title": "Chart One", "series": []},
+        "source-session",
+        same_instance=True,
+    )

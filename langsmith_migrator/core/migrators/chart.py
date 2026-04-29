@@ -14,6 +14,7 @@ class ChartMigrator(BaseMigrator):
         """Initialize chart migrator with ID mapping caches."""
         super().__init__(source_client, dest_client, state, config)
         self._project_id_map = None  # Lazy-loaded cache
+        self._project_mapping_complete = False
         self._dataset_id_map = None  # Lazy-loaded cache
         self._dest_section_map = None # Lazy-loaded cache for dest sections
         self._section_strategy = None
@@ -188,6 +189,44 @@ class ChartMigrator(BaseMigrator):
         except Exception as e:
             self.log(f"Failed to list sessions: {e}", "error")
             return []
+
+    def resolve_destination_session_id(
+        self,
+        source_session_id: Optional[str],
+        *,
+        same_instance: bool = False,
+    ) -> Optional[str]:
+        """Resolve a source session/project ID onto the destination instance."""
+        if not source_session_id:
+            return None
+
+        if same_instance:
+            return source_session_id
+
+        if self._project_id_map and source_session_id in self._project_id_map:
+            return self._project_id_map[source_session_id]
+
+        if self.state:
+            mapped_id = self.state.get_mapped_id("project", source_session_id)
+            if mapped_id:
+                if self._project_id_map is None:
+                    self._project_id_map = {}
+                self._project_id_map[source_session_id] = mapped_id
+                self.record_provenance(f"project:{source_session_id}", "state_mapping")
+                return mapped_id
+
+        return self._build_project_mapping().get(source_session_id)
+
+    @staticmethod
+    def _normalize_unresolved_dependencies(
+        unresolved: Dict[str, set[str]],
+    ) -> Dict[str, List[str]]:
+        """Convert unresolved dependency sets into stable JSON-serializable lists."""
+        return {
+            key: sorted(values)
+            for key, values in unresolved.items()
+            if values
+        }
 
     def _list_charts(
         self,
@@ -757,7 +796,13 @@ class ChartMigrator(BaseMigrator):
             )
             return None
 
-    def migrate_chart(self, chart: Dict[str, Any], dest_session_id: Optional[str] = None) -> Optional[str]:
+    def migrate_chart(
+        self,
+        chart: Dict[str, Any],
+        dest_session_id: Optional[str] = None,
+        *,
+        same_instance: bool = False,
+    ) -> Optional[str]:
         """
         Migrate a single chart.
 
@@ -819,7 +864,59 @@ class ChartMigrator(BaseMigrator):
         chart_copy = copy.deepcopy(chart)
 
         # Map IDs within chart config
-        self._map_ids_in_chart(chart_copy, dest_session_id)
+        unresolved_dependencies = self._map_ids_in_chart(
+            chart_copy,
+            dest_session_id,
+            same_instance=same_instance,
+        )
+        unresolved_dependencies = self._normalize_unresolved_dependencies(
+            unresolved_dependencies
+        )
+        if unresolved_dependencies:
+            self.log(
+                f"Chart '{chart_title}' has unresolved dependencies: "
+                f"{unresolved_dependencies}",
+                "warning",
+            )
+            export_path = self._export_chart_manual_apply(
+                chart_copy,
+                reason="unresolved_chart_dependencies",
+                analysis={
+                    "unresolved_dependencies": unresolved_dependencies,
+                    "dest_session_id": dest_session_id,
+                },
+            )
+            issue = self.record_issue(
+                "dependency",
+                "unresolved_chart_dependencies",
+                f"Chart '{chart_title}' could not resolve project/session/dataset dependencies",
+                item_id=item_id,
+                next_action=(
+                    "Provide the missing mappings or migrate the missing dependencies, "
+                    "then run `langsmith-migrator resume`."
+                ),
+                evidence=unresolved_dependencies,
+                export_path=export_path,
+            )
+            if issue:
+                self.queue_remediation(
+                    issue_id=issue.id,
+                    item_id=item_id,
+                    next_action=issue.next_action or "Resolve chart dependencies.",
+                    export_path=export_path,
+                    command="langsmith-migrator resume",
+                )
+            self.mark_exported(
+                item_id,
+                "unresolved_chart_dependencies",
+                next_action=(
+                    "Resolve the chart dependency mappings, then run "
+                    "`langsmith-migrator resume`."
+                ),
+                export_path=export_path,
+                evidence=unresolved_dependencies,
+            )
+            return None
         self.checkpoint_item(
             item_id,
             stage="mapped_dependencies",
@@ -834,7 +931,13 @@ class ChartMigrator(BaseMigrator):
             self.log(f"Failed to migrate chart '{chart_title}': {e}", "error")
             return None
 
-    def migrate_session_charts(self, source_session_id: str, dest_session_id: str) -> Dict[str, str]:
+    def migrate_session_charts(
+        self,
+        source_session_id: str,
+        dest_session_id: str,
+        *,
+        same_instance: bool = False,
+    ) -> Dict[str, str]:
         """
         Migrate all charts for a specific session.
 
@@ -864,7 +967,11 @@ class ChartMigrator(BaseMigrator):
             if not chart_id:
                 continue
 
-            new_id = self.migrate_chart(chart, dest_session_id)
+            new_id = self.migrate_chart(
+                chart,
+                dest_session_id,
+                same_instance=same_instance,
+            )
 
             if new_id:
                 id_mapping[chart_id] = new_id
@@ -907,10 +1014,6 @@ class ChartMigrator(BaseMigrator):
         success_count = 0
         failed_count = 0
 
-        # Pre-load project mapping if needed
-        if not same_instance:
-            self._build_project_mapping()
-
         for chart in charts:
             chart_id = chart.get("id")
             if not chart_id:
@@ -918,16 +1021,17 @@ class ChartMigrator(BaseMigrator):
 
             # Determine source session/project ID for this chart
             source_session_id = self._extract_session_id(chart)
-
-            dest_session_id = None
-            if source_session_id:
-                if same_instance:
-                    dest_session_id = source_session_id
-                elif self._project_id_map:
-                    dest_session_id = self._project_id_map.get(source_session_id)
+            dest_session_id = self.resolve_destination_session_id(
+                source_session_id,
+                same_instance=same_instance,
+            )
 
             # Migrate
-            new_id = self.migrate_chart(chart, dest_session_id)
+            new_id = self.migrate_chart(
+                chart,
+                dest_session_id,
+                same_instance=same_instance,
+            )
 
             if new_id:
                 success_count += 1
@@ -977,7 +1081,14 @@ class ChartMigrator(BaseMigrator):
 
         return None
 
-    def _map_ids_in_chart(self, obj: Any, dest_session_id: Optional[str] = None):
+    def _map_ids_in_chart(
+        self,
+        obj: Any,
+        dest_session_id: Optional[str] = None,
+        unresolved: Optional[Dict[str, set[str]]] = None,
+        *,
+        same_instance: bool = False,
+    ) -> Dict[str, set[str]]:
         """
         Recursively map project and dataset IDs within a chart object.
         Modifies the object in-place.
@@ -987,22 +1098,45 @@ class ChartMigrator(BaseMigrator):
             dest_session_id: If provided, forcibly sets project_id/session_id to this value
                              instead of using the mapping (useful when we know the target)
         """
+        if unresolved is None:
+            unresolved = {
+                "project_id": set(),
+                "session_id": set(),
+                "dataset_id": set(),
+            }
+
         if isinstance(obj, dict):
             # Check for specific keys to map
             if "project_id" in obj:
                 if dest_session_id:
                     obj["project_id"] = dest_session_id
                 else:
-                    self._map_id_field(obj, "project_id", self._build_project_mapping())
+                    self._map_id_field(
+                        obj,
+                        "project_id",
+                        self._build_project_mapping(),
+                        unresolved,
+                    )
 
             if "session_id" in obj:
                 if dest_session_id:
                     obj["session_id"] = dest_session_id
                 else:
-                    self._map_id_field(obj, "session_id", self._build_project_mapping())
+                    self._map_id_field(
+                        obj,
+                        "session_id",
+                        self._build_project_mapping(),
+                        unresolved,
+                    )
 
             if "dataset_id" in obj:
-                self._map_id_field(obj, "dataset_id", self._build_dataset_mapping())
+                self._map_id_field(
+                    obj,
+                    "dataset_id",
+                    self._build_dataset_mapping(),
+                    unresolved,
+                    preserve_unmapped=same_instance,
+                )
 
             if "session" in obj and isinstance(obj["session"], list):
                 # Map list of session IDs (used in common_filters)
@@ -1021,6 +1155,8 @@ class ChartMigrator(BaseMigrator):
                         if isinstance(old_id, str) and old_id in mapping:
                             new_ids.append(mapping[old_id])
                         else:
+                            if isinstance(old_id, str) and old_id:
+                                unresolved["session_id"].add(old_id)
                             new_ids.append(old_id)
                 obj["session"] = new_ids
 
@@ -1029,27 +1165,51 @@ class ChartMigrator(BaseMigrator):
 
             # Recurse into values
             for key, value in obj.items():
-                self._map_ids_in_chart(value, dest_session_id)
+                self._map_ids_in_chart(
+                    value,
+                    dest_session_id,
+                    unresolved,
+                    same_instance=same_instance,
+                )
 
         elif isinstance(obj, list):
             for item in obj:
-                self._map_ids_in_chart(item, dest_session_id)
+                self._map_ids_in_chart(
+                    item,
+                    dest_session_id,
+                    unresolved,
+                    same_instance=same_instance,
+                )
 
-    def _map_id_field(self, obj: Dict, field: str, mapping: Dict[str, str]):
+        return unresolved
+
+    def _map_id_field(
+        self,
+        obj: Dict,
+        field: str,
+        mapping: Dict[str, str],
+        unresolved: Dict[str, set[str]],
+        *,
+        preserve_unmapped: bool = False,
+    ) -> None:
         """Map a single ID field if mapping exists."""
         old_id = obj.get(field)
         if old_id and old_id in mapping:
             new_id = mapping[old_id]
             obj[field] = new_id
+        elif preserve_unmapped:
+            return
+        elif isinstance(old_id, str) and old_id:
+            unresolved[field].add(old_id)
 
     def _build_project_mapping(self) -> Dict[str, str]:
         """
         Build a mapping of project IDs from source to destination by matching project names.
         """
-        if self._project_id_map is not None:
+        if self._project_mapping_complete and self._project_id_map is not None:
             return self._project_id_map
 
-        self._project_id_map = {}
+        existing_mapping = dict(self._project_id_map or {})
         try:
             source_records: List[Dict[str, Any]] = []
             for project in self.source.get_paginated("/sessions", page_size=100):
@@ -1068,9 +1228,13 @@ class ChartMigrator(BaseMigrator):
                 source_id = project["id"]
                 project_name = project["name"]
 
+                # Respect explicit mappings already loaded onto the migrator.
+                if source_id in existing_mapping:
+                    continue
+
                 if self.state and self.state.get_mapped_id("project", source_id):
                     mapped_id = self.state.get_mapped_id("project", source_id)
-                    self._project_id_map[source_id] = mapped_id
+                    existing_mapping[source_id] = mapped_id
                     self.record_provenance(f"project:{source_id}", "state_mapping")
                     continue
 
@@ -1082,11 +1246,12 @@ class ChartMigrator(BaseMigrator):
                     continue
 
                 if project_name in dest_unique:
-                    self._project_id_map[source_id] = dest_unique[project_name]
+                    existing_mapping[source_id] = dest_unique[project_name]
                     self.record_provenance(f"project:{source_id}", "exact_name_match")
         except Exception as e:
             self.log(f"Failed to build project mapping: {e}", "error")
-            self._project_id_map = {}
+        self._project_id_map = existing_mapping
+        self._project_mapping_complete = True
 
         return self._project_id_map
 

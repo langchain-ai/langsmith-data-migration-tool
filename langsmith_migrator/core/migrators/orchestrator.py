@@ -672,6 +672,7 @@ class MigrationOrchestrator:
                         destination_id = chart_migrator.migrate_chart(
                             chart_payload,
                             item.metadata.get("dest_session_id"),
+                            same_instance=item.metadata.get("same_instance", False),
                         )
                         if destination_id and not self.state.get_item(item.id).terminal_state:
                             self.state.update_item_status(

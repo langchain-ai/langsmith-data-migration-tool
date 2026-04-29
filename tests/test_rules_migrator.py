@@ -2,8 +2,19 @@
 
 import pytest
 from unittest.mock import Mock, patch
+from langsmith_migrator.core.api_client import EnhancedAPIClient
 from langsmith_migrator.core.migrators import RulesMigrator
 from langsmith_migrator.core.api_client import NotFoundError
+
+
+def _mock_rules_client() -> Mock:
+    """Create a standalone API client mock for source/destination-specific tests."""
+    client = Mock(spec=EnhancedAPIClient)
+    client.base_url = "https://api.test.langsmith.com/api/v1"
+    client.headers = {"X-API-Key": "test-key"}
+    client.session = Mock()
+    client.session.headers = {}
+    return client
 
 
 class TestRulesMigrator:
@@ -552,3 +563,202 @@ class TestRulesMigrator:
         assert rules_migrator.dest_ls_client.list_prompts.call_args_list[0].kwargs["offset"] == 0
         assert rules_migrator.dest_ls_client.list_prompts.call_args_list[1].kwargs["offset"] == 100
         assert rules_migrator._dest_session.headers["X-Tenant-Id"] == "workspace-123"
+
+    def test_create_rule_maps_annotation_queue_from_state(
+        self,
+        sample_config,
+        migration_state,
+    ):
+        """Rules should reuse prior queue migration state before falling back to name matching."""
+        sample_config.migration.dry_run = False
+        migration_state.id_mappings["queue"] = {"source-queue": "dest-queue"}
+
+        source_client = _mock_rules_client()
+        dest_client = _mock_rules_client()
+        dest_client.post.return_value = {"id": "new-rule-123"}
+        dest_client.get_paginated.return_value = []
+
+        with patch("langsmith_migrator.core.migrators.rules.Client"):
+            rules_migrator = RulesMigrator(
+                source_client,
+                dest_client,
+                migration_state,
+                sample_config,
+            )
+
+        rules_migrator.dest_ls_client = Mock()
+        rules_migrator._project_id_map = {"source-project": "dest-project"}
+        rules_migrator._dataset_id_map = {}
+        rules_migrator._verify_rule = Mock(return_value=(True, {}))
+
+        result = rules_migrator.create_rule(
+            {
+                "id": "rule-with-queue",
+                "display_name": "Queue Rule",
+                "session_id": "source-project",
+                "add_to_annotation_queue_id": "source-queue",
+            }
+        )
+
+        assert result == "new-rule-123"
+        payload = dest_client.post.call_args[0][1]
+        assert payload["session_id"] == "dest-project"
+        assert payload["add_to_annotation_queue_id"] == "dest-queue"
+        source_client.get.assert_not_called()
+
+    def test_create_rule_maps_annotation_queue_by_exact_name(
+        self,
+        sample_config,
+        migration_state,
+    ):
+        """Rules should exact-name match destination queues when no prior state mapping exists."""
+        sample_config.migration.dry_run = False
+
+        source_client = _mock_rules_client()
+        dest_client = _mock_rules_client()
+        dest_client.post.return_value = {"id": "new-rule-123"}
+
+        def dest_get_paginated(endpoint, *args, **kwargs):
+            if endpoint == "/annotation-queues":
+                return [{"id": "dest-queue", "name": "Queue One"}]
+            if endpoint == "/runs/rules":
+                return []
+            return []
+
+        source_client.get.return_value = {"id": "source-queue", "name": "Queue One"}
+        dest_client.get_paginated.side_effect = dest_get_paginated
+
+        with patch("langsmith_migrator.core.migrators.rules.Client"):
+            rules_migrator = RulesMigrator(
+                source_client,
+                dest_client,
+                migration_state,
+                sample_config,
+            )
+
+        rules_migrator.dest_ls_client = Mock()
+        rules_migrator._project_id_map = {"source-project": "dest-project"}
+        rules_migrator._dataset_id_map = {}
+        rules_migrator._verify_rule = Mock(return_value=(True, {}))
+
+        result = rules_migrator.create_rule(
+            {
+                "id": "rule-with-queue",
+                "display_name": "Queue Rule",
+                "session_id": "source-project",
+                "add_to_annotation_queue_id": "source-queue",
+            }
+        )
+
+        assert result == "new-rule-123"
+        payload = dest_client.post.call_args[0][1]
+        assert payload["add_to_annotation_queue_id"] == "dest-queue"
+        source_client.get.assert_called_once_with("/annotation-queues/source-queue")
+
+    def test_resolve_annotation_queue_scopes_cache_to_active_destination_workspace(
+        self,
+        sample_config,
+        migration_state,
+    ):
+        """Queue lookup caches should rebuild when the destination workspace header changes."""
+        source_client = _mock_rules_client()
+        dest_client = _mock_rules_client()
+
+        source_client.get.return_value = {"id": "source-queue", "name": "Queue One"}
+
+        def dest_get_paginated(endpoint, *args, **kwargs):
+            if endpoint != "/annotation-queues":
+                return []
+
+            workspace_id = dest_client.session.headers.get("X-Tenant-Id")
+            if workspace_id == "workspace-1":
+                return [{"id": "dest-queue-ws-1", "name": "Queue One"}]
+            if workspace_id == "workspace-2":
+                return [{"id": "dest-queue-ws-2", "name": "Queue One"}]
+            return []
+
+        dest_client.get_paginated.side_effect = dest_get_paginated
+
+        with patch("langsmith_migrator.core.migrators.rules.Client"):
+            rules_migrator = RulesMigrator(
+                source_client,
+                dest_client,
+                migration_state,
+                sample_config,
+            )
+
+        dest_client.session.headers["X-Tenant-Id"] = "workspace-1"
+        mapped_id_one, deps_one = rules_migrator._resolve_annotation_queue_id("source-queue")
+
+        dest_client.session.headers["X-Tenant-Id"] = "workspace-2"
+        mapped_id_two, deps_two = rules_migrator._resolve_annotation_queue_id("source-queue")
+
+        dest_client.session.headers["X-Tenant-Id"] = "workspace-1"
+        mapped_id_three, deps_three = rules_migrator._resolve_annotation_queue_id("source-queue")
+
+        assert (mapped_id_one, deps_one) == ("dest-queue-ws-1", {})
+        assert (mapped_id_two, deps_two) == ("dest-queue-ws-2", {})
+        assert (mapped_id_three, deps_three) == ("dest-queue-ws-1", {})
+        source_client.get.assert_called_once_with("/annotation-queues/source-queue")
+        assert dest_client.get_paginated.call_count == 2
+
+    def test_create_rule_exports_when_annotation_queue_is_unresolved(
+        self,
+        sample_config,
+        migration_state,
+    ):
+        """Rules should export remediation instead of POSTing the source queue ID."""
+        sample_config.migration.dry_run = False
+
+        source_client = _mock_rules_client()
+        dest_client = _mock_rules_client()
+
+        def dest_get_paginated(endpoint, *args, **kwargs):
+            if endpoint == "/annotation-queues":
+                return [{"id": "different-queue", "name": "Other Queue"}]
+            if endpoint == "/runs/rules":
+                return []
+            return []
+
+        source_client.get.return_value = {"id": "source-queue", "name": "Queue One"}
+        dest_client.get_paginated.side_effect = dest_get_paginated
+
+        with patch("langsmith_migrator.core.migrators.rules.Client"):
+            rules_migrator = RulesMigrator(
+                source_client,
+                dest_client,
+                migration_state,
+                sample_config,
+            )
+
+        issue = Mock()
+        issue.id = "issue-1"
+        issue.next_action = "Resolve annotation queue dependency."
+        rules_migrator.dest_ls_client = Mock()
+        rules_migrator._project_id_map = {"source-project": "dest-project"}
+        rules_migrator._dataset_id_map = {}
+        rules_migrator._export_rule_manual_apply = Mock(return_value="/tmp/rule.json")
+        rules_migrator.record_issue = Mock(return_value=issue)
+        rules_migrator.queue_remediation = Mock()
+        rules_migrator.mark_exported = Mock()
+
+        result = rules_migrator.create_rule(
+            {
+                "id": "rule-with-queue",
+                "display_name": "Queue Rule",
+                "session_id": "source-project",
+                "add_to_annotation_queue_id": "source-queue",
+            }
+        )
+
+        assert result is None
+        dest_client.post.assert_not_called()
+        rules_migrator._export_rule_manual_apply.assert_called_once()
+        unmet_dependencies = rules_migrator._export_rule_manual_apply.call_args.kwargs[
+            "unmet_dependencies"
+        ]
+        assert unmet_dependencies == {
+            "annotation_queue_id": "source-queue",
+            "annotation_queue_name": "Queue One",
+        }
+        rules_migrator.mark_exported.assert_called_once()

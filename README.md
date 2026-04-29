@@ -391,7 +391,8 @@ Rules and charts reference projects by ID. When migrating between instances, pro
 
 - **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input. Supports auto-match by name, skip, and custom name entry.
 - **Rules (`--project-mapping`)**: Supply an explicit source→destination project ID mapping as JSON or a file path. Use `list-projects --source` and `list-projects --dest` to get IDs. The mapping is applied to both top-level project associations and project IDs embedded inside rule filters. Mutually exclusive with `--map-projects`.
-- **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination.
+- **Rules queue targets**: When a rule references an annotation queue, the migrator first reuses any saved queue migration mapping, then falls back to an exact-name queue match in the destination workspace. If neither is safe, the rule is exported for remediation instead of being posted with the source queue ID.
+- **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination. When both sides point at the same deployment URL but use different API keys/workspaces, charts still remap project/session IDs; the tool does not treat that as `--same-instance`.
 - **`migrate-all`**: Supports `--strip-projects`, `--map-projects`, and `--rules-create-enabled` for rules. Use the standalone `rules` command for `--project-mapping` JSON mappings.
 
 ### Interactive Selection

@@ -114,6 +114,77 @@ def _name_mapping_to_id_mapping(
     return id_map
 
 
+def _normalize_deployment_url(base_url: str) -> str:
+    """Normalize a LangSmith deployment URL for same-deployment comparisons."""
+    normalized = (base_url or "").strip().rstrip("/").lower()
+    for suffix in ("/api/v1", "/api/v2"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized
+
+
+def _is_same_deployment(config: Config) -> bool:
+    """Return True when source and destination point at the same deployment."""
+    return _normalize_deployment_url(config.source.base_url) == _normalize_deployment_url(
+        config.destination.base_url
+    )
+
+
+def _workspace_pair_allows_same_instance(source_workspace_id=None, dest_workspace_id=None) -> bool:
+    """Return True when chart IDs can safely be reused across the active workspace scope."""
+    if not source_workspace_id and not dest_workspace_id:
+        return True
+    return bool(source_workspace_id) and source_workspace_id == dest_workspace_id
+
+
+def _auto_detect_chart_same_instance(
+    config: Config,
+    source_workspace_id=None,
+    dest_workspace_id=None,
+) -> bool:
+    """Auto-detect safe same-instance chart mode for the current workspace scope."""
+    if not _is_same_deployment(config):
+        return False
+
+    same_workspace_scope = (
+        bool(source_workspace_id)
+        and source_workspace_id == dest_workspace_id
+    )
+    if _workspace_pair_allows_same_instance(source_workspace_id, dest_workspace_id) and (
+        config.source.api_key == config.destination.api_key
+        or same_workspace_scope
+    ):
+        if same_workspace_scope and config.source.api_key != config.destination.api_key:
+            console.print(
+                "[dim]Detected the same deployment with an identical workspace scope "
+                "(IDs can be reused even though API keys differ).[/dim]"
+            )
+            return True
+        console.print(
+            "[dim]Detected same source and destination deployment "
+            "(same normalized URL and API key)[/dim]"
+        )
+        return True
+
+    if config.source.api_key == config.destination.api_key:
+        console.print(
+            "[dim]Detected the same deployment URL and API key but different workspaces.[/dim]"
+        )
+    else:
+        console.print(
+            "[dim]Detected the same deployment URL but different API keys/workspaces.[/dim]"
+        )
+
+    console.print(
+        "[dim]Will auto-remap projects and sessions instead of reusing source IDs.[/dim]"
+    )
+    console.print(
+        "[dim]Use --map-projects if automatic project resolution is not enough.[/dim]"
+    )
+    return False
+
+
 _WS_CANCELLED = "__cancelled__"
 _WS_ABORTED = "__aborted__"
 
@@ -1066,6 +1137,8 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
         lookup_probes.append(("project_lookup", "/sessions"))
     if {"datasets", "experiments", "rules"} & resource_set:
         lookup_probes.append(("dataset_lookup", "/datasets"))
+    if {"queues", "rules"} & resource_set:
+        lookup_probes.append(("queue_lookup", "/annotation-queues"))
 
     for label, endpoint in lookup_probes:
         source_supported, source_detail = _probe_lookup_capability(orchestrator.source_client, endpoint)
@@ -1121,6 +1194,7 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
         f"rules:{scope_key}": [
             f"project_lookup:{scope_key}",
             f"dataset_lookup:{scope_key}",
+            f"queue_lookup:{scope_key}",
             f"prompts:{scope_key}",
         ],
         f"charts:{scope_key}": [
@@ -3186,16 +3260,12 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
             chart_migrator._project_id_map = dict(project_id_map)
             console.print(f"[dim]Using interactive project mapping ({len(project_id_map)} project(s))[/dim]")
 
-        same_instance = False
-        source_url = config.source.base_url.rstrip('/').lower()
-        dest_url = config.destination.base_url.rstrip('/').lower()
-        if source_url == dest_url:
-            if config.source.api_key == config.destination.api_key:
-                same_instance = True
-                console.print("[dim]Detected same source and destination instance (same URL and API key)[/dim]")
-            else:
-                console.print("[dim]Detected same instance URL but different API keys (likely different workspaces).[/dim]")
-                console.print("[dim]Will use project name matching instead of same session IDs.[/dim]")
+        workspace_pair = _active_workspace_pair(orchestrator)
+        same_instance = _auto_detect_chart_same_instance(
+            config,
+            source_workspace_id=workspace_pair["source"],
+            dest_workspace_id=workspace_pair["dest"],
+        )
 
         source_charts = chart_migrator.list_charts()
         if source_charts:
@@ -3205,21 +3275,16 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                 chart_migrator.state = orchestrator.state
                 tracked_chart_items = {}
 
-                if not same_instance and not chart_migrator._project_id_map:
-                    chart_migrator._build_project_mapping()
-
                 for chart in source_charts:
                     chart_id = chart.get("id")
                     if not chart_id:
                         continue
                     chart_title = chart.get("title") or chart.get("name") or "Untitled Chart"
                     source_session_id = chart_migrator._extract_session_id(chart)
-                    dest_session_id = None
-                    if source_session_id:
-                        if same_instance:
-                            dest_session_id = source_session_id
-                        elif chart_migrator._project_id_map:
-                            dest_session_id = chart_migrator._project_id_map.get(source_session_id)
+                    dest_session_id = chart_migrator.resolve_destination_session_id(
+                        source_session_id,
+                        same_instance=same_instance,
+                    )
                     item_id = _ensure_state_item(
                         orchestrator,
                         config,
@@ -3267,7 +3332,11 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
 @cli.command()
 @ssl_option
 @click.option('--session', help='Migrate charts for a specific session/project (by name or ID)')
-@click.option('--same-instance', is_flag=True, help='Source and destination are the same instance (use same session IDs)')
+@click.option(
+    '--same-instance',
+    is_flag=True,
+    help='Reuse source project/session IDs on destination (only when both sides truly share IDs)',
+)
 @click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
 @workspace_options
 @click.pass_context
@@ -3307,22 +3376,18 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
 
-    # Auto-detect if same instance (same base URL) — not workspace-scoped
-    if not same_instance:
-        source_url = config.source.base_url.rstrip('/').lower()
-        dest_url = config.destination.base_url.rstrip('/').lower()
-        if source_url == dest_url:
-            if config.source.api_key == config.destination.api_key:
-                same_instance = True
-                console.print("[dim]Detected same source and destination instance (same URL and API key)[/dim]")
-            else:
-                console.print("[dim]Detected same instance URL but different API keys (likely different workspaces).[/dim]")
-                console.print("[dim]Will use project name matching instead of same session IDs.[/dim]")
-
     for src_ws, dst_ws in ws_pairs:
         if src_ws and dst_ws:
             orchestrator.set_workspace_context(src_ws, dst_ws)
             console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+
+        effective_same_instance = same_instance
+        if not effective_same_instance:
+            effective_same_instance = _auto_detect_chart_same_instance(
+                config,
+                source_workspace_id=src_ws,
+                dest_workspace_id=dst_ws,
+            )
 
         _run_preflight(orchestrator, config, ["charts"])
 
@@ -3384,22 +3449,22 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             console.print(f"[green]✓[/green] Found: {target_session.get('name', 'unnamed')}")
             source_session_id = target_session['id']
 
-            if same_instance:
-                dest_session_id = source_session_id
+            dest_session_id = chart_migrator.resolve_destination_session_id(
+                source_session_id,
+                same_instance=effective_same_instance,
+            )
+            if not dest_session_id:
+                console.print(f"[red]No destination mapping found for session {session}[/red]")
+                console.print(
+                    "\n[yellow]The project/session could not be resolved on the destination.[/yellow]"
+                )
+                console.print("[yellow]Options:[/yellow]")
+                console.print("  1. Migrate projects first so state contains project mappings")
+                console.print("  2. Use --map-projects to provide a project mapping for this workspace pair")
+                continue
+            if effective_same_instance:
                 console.print("[dim]Using same session ID for destination[/dim]\n")
             else:
-                dest_session_id = (
-                    orchestrator.state.get_mapped_id('project', source_session_id)
-                    if orchestrator.state
-                    else None
-                )
-                if not dest_session_id:
-                    console.print(f"[red]No destination mapping found for session {session}[/red]")
-                    console.print("\n[yellow]This means the project/session hasn't been migrated yet.[/yellow]")
-                    console.print("[yellow]Options:[/yellow]")
-                    console.print("  1. Run 'langsmith-migrator datasets' first to migrate projects")
-                    console.print("  2. Use --same-instance flag if source and dest are the same")
-                    continue
                 console.print(f"[dim]Mapped to destination session: {dest_session_id[:8]}...[/dim]\n")
 
             _ensure_migration_session(orchestrator, config)
@@ -3419,7 +3484,7 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
                     metadata={
                         "chart": chart,
                         "dest_session_id": dest_session_id,
-                        "same_instance": same_instance,
+                        "same_instance": effective_same_instance,
                     },
                 )
                 tracked_chart_items[chart_id] = item_id
@@ -3427,7 +3492,8 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
             chart_mappings = chart_migrator.migrate_session_charts(
                 source_session_id,
-                dest_session_id
+                dest_session_id,
+                same_instance=effective_same_instance,
             )
 
             for chart_id, item_id in tracked_chart_items.items():
@@ -3450,10 +3516,13 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             # Migrate all charts from all sessions
             console.print("\n[bold]Migrating charts from all sessions...[/bold]")
 
-            if same_instance:
+            if effective_same_instance:
                 console.print("[dim]Mode: Same instance (using same session IDs)[/dim]")
             else:
-                console.print("[dim]Mode: Different instances (requires session ID mappings)[/dim]")
+                console.print(
+                    "[dim]Mode: Remapped project/session IDs "
+                    "(source IDs are not reused)[/dim]"
+                )
 
             console.print()
 
@@ -3466,20 +3535,16 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             chart_migrator.state = orchestrator.state
             tracked_chart_items = {}
             source_charts = chart_migrator.list_charts()
-            if not same_instance:
-                chart_migrator._build_project_mapping()
             for chart in source_charts:
                 chart_id = chart.get("id")
                 if not chart_id:
                     continue
                 chart_title = chart.get("title") or chart.get("name") or "Untitled Chart"
                 source_session_id = chart_migrator._extract_session_id(chart)
-                dest_session_id = None
-                if source_session_id:
-                    if same_instance:
-                        dest_session_id = source_session_id
-                    elif chart_migrator._project_id_map:
-                        dest_session_id = chart_migrator._project_id_map.get(source_session_id)
+                dest_session_id = chart_migrator.resolve_destination_session_id(
+                    source_session_id,
+                    same_instance=effective_same_instance,
+                )
                 item_id = _ensure_state_item(
                     orchestrator,
                     config,
@@ -3489,12 +3554,14 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
                     metadata={
                         "chart": chart,
                         "dest_session_id": dest_session_id,
-                        "same_instance": same_instance,
+                        "same_instance": effective_same_instance,
                     },
                 )
                 tracked_chart_items[chart_id] = item_id
                 _mark_state_item_started(orchestrator, item_id)
-            all_mappings = chart_migrator.migrate_all_charts(same_instance=same_instance)
+            all_mappings = chart_migrator.migrate_all_charts(
+                same_instance=effective_same_instance
+            )
             flat_chart_map = {}
             for session_chart_map in all_mappings.values():
                 flat_chart_map.update(session_chart_map)
