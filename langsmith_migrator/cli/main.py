@@ -15,6 +15,12 @@ from rich.prompt import Confirm
 from rich.progress import Progress
 from rich.table import Table
 
+from ..utils.chart_mode import (
+    is_same_deployment as _chart_is_same_deployment,
+    normalize_deployment_url as _chart_normalize_deployment_url,
+    should_reuse_chart_ids,
+    workspace_pair_allows_same_instance as _chart_workspace_pair_allows_same_instance,
+)
 from ..utils.config import Config
 from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
 from ..core.migrators import (
@@ -116,26 +122,20 @@ def _name_mapping_to_id_mapping(
 
 def _normalize_deployment_url(base_url: str) -> str:
     """Normalize a LangSmith deployment URL for same-deployment comparisons."""
-    normalized = (base_url or "").strip().rstrip("/").lower()
-    for suffix in ("/api/v1", "/api/v2"):
-        if normalized.endswith(suffix):
-            normalized = normalized[: -len(suffix)]
-            break
-    return normalized
+    return _chart_normalize_deployment_url(base_url)
 
 
 def _is_same_deployment(config: Config) -> bool:
     """Return True when source and destination point at the same deployment."""
-    return _normalize_deployment_url(config.source.base_url) == _normalize_deployment_url(
-        config.destination.base_url
-    )
+    return _chart_is_same_deployment(config)
 
 
 def _workspace_pair_allows_same_instance(source_workspace_id=None, dest_workspace_id=None) -> bool:
     """Return True when chart IDs can safely be reused across the active workspace scope."""
-    if not source_workspace_id and not dest_workspace_id:
-        return True
-    return bool(source_workspace_id) and source_workspace_id == dest_workspace_id
+    return _chart_workspace_pair_allows_same_instance(
+        source_workspace_id,
+        dest_workspace_id,
+    )
 
 
 def _auto_detect_chart_same_instance(
@@ -151,10 +151,7 @@ def _auto_detect_chart_same_instance(
         bool(source_workspace_id)
         and source_workspace_id == dest_workspace_id
     )
-    if _workspace_pair_allows_same_instance(source_workspace_id, dest_workspace_id) and (
-        config.source.api_key == config.destination.api_key
-        or same_workspace_scope
-    ):
+    if should_reuse_chart_ids(config, source_workspace_id, dest_workspace_id):
         if same_workspace_scope and config.source.api_key != config.destination.api_key:
             console.print(
                 "[dim]Detected the same deployment with an identical workspace scope "

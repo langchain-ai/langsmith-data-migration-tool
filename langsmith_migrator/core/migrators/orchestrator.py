@@ -14,6 +14,7 @@ from ...utils.state import (
     StateManager,
     VerificationState,
 )
+from ...utils.chart_mode import should_reuse_chart_ids
 from .dataset import DatasetMigrator
 from .experiment import ExperimentMigrator
 from .feedback import FeedbackMigrator
@@ -522,6 +523,100 @@ class MigrationOrchestrator:
         else:
             self.clear_workspace_context()
 
+    def _prepare_chart_resume_context(
+        self,
+        item: MigrationItem,
+        chart_payload,
+        chart_migrator,
+    ) -> tuple[bool, str | None, bool]:
+        """Validate and refresh chart resume mode metadata for the current config."""
+        saved_same_instance_present = "same_instance" in item.metadata
+        saved_same_instance = bool(item.metadata.get("same_instance", False))
+        saved_dest_session_id = item.metadata.get("dest_session_id")
+        workspace_pair = self.workspace_pair()
+        current_same_instance = should_reuse_chart_ids(
+            self.config,
+            workspace_pair.get("source"),
+            workspace_pair.get("dest"),
+        )
+
+        if not saved_same_instance_present or saved_same_instance == current_same_instance:
+            return True, saved_dest_session_id, saved_same_instance
+
+        chart_name = item.name or item.source_id
+        self.console.print(
+            "[yellow]Chart resume context changed for "
+            f"{chart_name}: saved same-instance mode was {saved_same_instance}, "
+            f"current source/destination context expects {current_same_instance}. "
+            "Re-resolving destination project/session before retrying.[/yellow]"
+        )
+
+        source_session_id = chart_migrator._extract_session_id(chart_payload)
+        dest_session_id = chart_migrator.resolve_destination_session_id(
+            source_session_id,
+            same_instance=current_same_instance,
+        )
+        evidence = {
+            "source_session_id": source_session_id,
+            "saved_same_instance": saved_same_instance,
+            "current_same_instance": current_same_instance,
+            "saved_dest_session_id": saved_dest_session_id,
+            "resolved_dest_session_id": dest_session_id,
+            "workspace_pair": workspace_pair,
+        }
+
+        if not dest_session_id:
+            message = (
+                "Cannot resume chart with stale same-instance metadata because "
+                "the current source/destination context could not resolve a "
+                "destination project/session."
+            )
+            next_action = (
+                "Start a fresh `langsmith-migrator charts` run with the current "
+                "source/destination configuration, or run with `--map-projects` "
+                "so the destination project/session can be resolved."
+            )
+            self.console.print(f"[yellow]{message}[/yellow]")
+            issue = self.state.add_issue(
+                "configuration",
+                "chart_resume_context_changed",
+                message,
+                item_id=item.id,
+                next_action=next_action,
+                evidence=evidence,
+                workspace_pair=workspace_pair,
+            )
+            self.state.queue_remediation(
+                issue_id=issue.id,
+                item_id=item.id,
+                next_action=next_action,
+                command="langsmith-migrator charts --map-projects",
+            )
+            self.state.mark_terminal(
+                item.id,
+                ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+                "chart_resume_context_changed",
+                verification_state=VerificationState.BLOCKED,
+                next_action=next_action,
+                evidence=evidence,
+                error=message,
+            )
+            return False, None, current_same_instance
+
+        self.state.update_item_checkpoint(
+            item.id,
+            stage="resume_context_refreshed",
+            metadata={
+                "same_instance": current_same_instance,
+                "dest_session_id": dest_session_id,
+                "previous_same_instance": saved_same_instance,
+                "previous_dest_session_id": saved_dest_session_id,
+            },
+            evidence=evidence,
+        )
+        self.state_manager.save()
+        return True, dest_session_id, current_same_instance
+
     def resume_items(self, items_to_process: List[MigrationItem]) -> Dict[str, List[str]]:
         """Resume pending and failed items using typed dispatch."""
         self.ensure_state()
@@ -669,10 +764,21 @@ class MigrationOrchestrator:
                 elif item.type == "chart":
                     chart_payload = item.metadata.get("chart")
                     if chart_payload:
+                        can_resume, dest_session_id, same_instance = (
+                            self._prepare_chart_resume_context(
+                                item,
+                                chart_payload,
+                                chart_migrator,
+                            )
+                        )
+                        if not can_resume:
+                            results["blocked"].append(f"{item.type}:{item.source_id}")
+                            self.state_manager.save()
+                            continue
                         destination_id = chart_migrator.migrate_chart(
                             chart_payload,
-                            item.metadata.get("dest_session_id"),
-                            same_instance=item.metadata.get("same_instance", False),
+                            dest_session_id,
+                            same_instance=same_instance,
                         )
                         if destination_id and not self.state.get_item(item.id).terminal_state:
                             self.state.update_item_status(
