@@ -3,49 +3,38 @@
 import csv
 import functools
 import logging
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
 import click
-import time
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.table import Table
 from rich.prompt import Confirm
 from rich.progress import Progress
-
-load_dotenv()
+from rich.table import Table
 
 from ..utils.config import Config
-
-
-def ssl_option(f):
-    """
-    Decorator kept for backwards compatibility.
-
-    Note: --no-ssl is now handled globally in the cli() group, so this decorator
-    is a no-op. It's kept to avoid breaking existing command decorations.
-    """
-    @functools.wraps(f)
-    def wrapper(*args, **kwargs):
-        # The global cli() already handles --no-ssl via the config object
-        return f(*args, **kwargs)
-    return wrapper
 from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
 from ..core.migrators import (
-    MigrationOrchestrator,
-    DatasetMigrator,
     AnnotationQueueMigrator,
+    ChartMigrator,
+    DatasetMigrator,
+    MigrationOrchestrator,
     PromptMigrator,
     RulesMigrator,
-    ChartMigrator,
     UserRoleMigrator,
 )
-from .tui_selector import select_items
+from ..core.migrators.user_role import (
+    is_workspace_role_union_id,
+    select_effective_workspace_role_id,
+)
 from .tui_project_mapper import build_project_mapping_tui
+from .tui_selector import select_items
 from .tui_workspace_mapper import WorkspaceProjectResult
 from ..utils.workspace import (
     discover_workspaces,
-    get_workspace_name,
     list_projects as _list_projects,
     list_workspaces as _list_workspaces,
 )
@@ -56,7 +45,25 @@ from ..utils.workspace_resolver import (
 )
 
 
+load_dotenv()
+
 console = Console()
+
+
+def ssl_option(f):
+    """
+    Decorator kept for backwards compatibility.
+
+    Note: --no-ssl is now handled globally in the cli() group, so this decorator
+    is a no-op. It's kept to avoid breaking existing command decorations.
+    """
+
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        # The global cli() already handles --no-ssl via the config object
+        return f(*args, **kwargs)
+
+    return wrapper
 
 
 class _SuppressRunCompressionNoise(logging.Filter):
@@ -421,6 +428,7 @@ def _load_members_csv(path: str) -> list[dict]:
                 email = (row.get("email") or "").strip().lower()
                 langsmith_role = (row.get("langsmith_role") or "").strip()
                 workspace_id = (row.get("workspace_id") or "").strip()
+                workspace_name = (row.get("workspace_name") or "").strip()
 
                 if not email:
                     raise click.ClickException(
@@ -445,13 +453,14 @@ def _load_members_csv(path: str) -> list[dict]:
                         "example 'Organization User' or 'Organization Admin'."
                     )
 
-                rows.append(
-                    {
-                        "email": email,
-                        "langsmith_role": langsmith_role,
-                        "workspace_id": workspace_id,
-                    }
-                )
+                csv_row = {
+                    "email": email,
+                    "langsmith_role": langsmith_role,
+                    "workspace_id": workspace_id,
+                }
+                if workspace_name:
+                    csv_row["workspace_name"] = workspace_name
+                rows.append(csv_row)
     except click.ClickException:
         raise
     except csv.Error as e:
@@ -484,23 +493,6 @@ _WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES = {
     "WORKSPACE_USER",
     "WORKSPACE_VIEWER",
 }
-_WORKSPACE_ROLE_PRECEDENCE = {
-    "WORKSPACE_ADMIN": 3,
-    "WORKSPACE_USER": 2,
-    "WORKSPACE_VIEWER": 1,
-}
-
-
-def _build_workspace_role_union_signature(role_ids: Iterable[str]) -> str:
-    """Build a stable signature for a merged workspace-role set."""
-    normalized_role_ids = sorted(
-        {
-            (role_id or "").strip()
-            for role_id in role_ids
-            if (role_id or "").strip()
-        }
-    )
-    return "|".join(normalized_role_ids)
 
 
 def _resolve_csv_role_names(
@@ -614,15 +606,11 @@ def _resolve_csv_role_names(
             if candidate_role_id == role_id
         )
 
-        resolved_rows.append(
-            {
-                "email": row["email"],
-                "langsmith_role": row["langsmith_role"],
-                "role_id": role_id,
-                "role_name": resolved_role_name,
-                "workspace_id": row.get("workspace_id", ""),
-            }
-        )
+        resolved_row = dict(row)
+        resolved_row["role_id"] = role_id
+        resolved_row["role_name"] = resolved_role_name
+        resolved_row["workspace_id"] = row.get("workspace_id", "")
+        resolved_rows.append(resolved_row)
 
     if ambiguous or unresolved:
         available = sorted(available_role_labels, key=str.lower)
@@ -699,166 +687,30 @@ def _normalize_csv_role_scopes(
     return normalized_rows, org_admin_workspace_rows
 
 
-def _normalize_workspace_csv_rows(
-    csv_rows: list[dict],
-    *,
-    auto_merge_custom_roles: bool = False,
-) -> tuple[list[dict], list[dict]]:
-    """Normalize duplicate workspace rows to one effective row per user/workspace.
-
-    Returns ``(normalized_rows, union_specs)``. ``union_specs`` contains the
-    source role IDs for any synthetic union roles emitted into the normalized rows.
-    """
-    normalized_rows: list[dict] = []
-    workspace_rows_by_key: dict[tuple[str, str], list[dict]] = {}
-    errors: list[str] = []
-    union_specs: list[dict] = []
-
-    for row in csv_rows:
+def _effective_workspace_role_ids_for_rows(
+    email: str,
+    workspace_rows: list[dict],
+) -> set[str]:
+    """Return effective per-workspace role IDs for one user's workspace rows."""
+    rows_by_workspace: dict[str, list[dict]] = {}
+    for row in workspace_rows:
         workspace_id = (row.get("workspace_id") or "").strip()
-        if not workspace_id:
-            normalized_rows.append(dict(row))
-            continue
-        key = (row["email"], workspace_id)
-        workspace_rows_by_key.setdefault(key, []).append(row)
+        if workspace_id:
+            rows_by_workspace.setdefault(workspace_id, []).append(row)
 
-    for (email, workspace_id), rows in workspace_rows_by_key.items():
-        unique_rows_by_role_id: dict[str, dict] = {}
-        for row in rows:
-            role_id = (row.get("role_id") or "").strip()
-            if role_id and role_id not in unique_rows_by_role_id:
-                unique_rows_by_role_id[role_id] = row
-
-        unique_rows = list(unique_rows_by_role_id.values())
-        if len(unique_rows) <= 1:
-            if unique_rows:
-                normalized_rows.append(dict(unique_rows[0]))
-            continue
-
-        role_names = {
-            (row.get("role_name") or "").strip().upper()
-            for row in unique_rows
-            if (row.get("role_name") or "").strip()
-        }
-        builtin_rows = [
-            row
-            for row in unique_rows
-            if (row.get("role_name") or "").strip().upper()
-            in _WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES
-        ]
-        custom_rows = [
-            row
-            for row in unique_rows
-            if (row.get("role_name") or "").strip().upper() == "CUSTOM"
-        ]
-
-        if (
-            role_names
-            and role_names.issubset(_WORKSPACE_SCOPED_BUILTIN_ROLE_NAMES)
-            and not custom_rows
-        ):
-            selected_row = max(
-                builtin_rows,
-                key=lambda row: _WORKSPACE_ROLE_PRECEDENCE.get(
-                    (row.get("role_name") or "").strip().upper(), 0
-                ),
+    effective_role_ids: set[str] = set()
+    for workspace_id, rows in rows_by_workspace.items():
+        try:
+            effective_role_id = select_effective_workspace_role_id(
+                rows,
+                email=email,
+                workspace_id=workspace_id,
             )
-            normalized_rows.append(dict(selected_row))
-            continue
-
-        role_labels = sorted(
-            {
-                (row.get("langsmith_role") or row.get("role_id") or "<unknown>").strip()
-                for row in unique_rows
-                if (row.get("langsmith_role") or row.get("role_id") or "").strip()
-            },
-            key=str.lower,
-        )
-        if not auto_merge_custom_roles:
-            if custom_rows and builtin_rows:
-                errors.append(
-                    "Members CSV has mixed built-in and custom workspace roles for "
-                    f"{email} in workspace {workspace_id}: "
-                    + ", ".join(role_labels)
-                    + ". Re-run with --auto-merge-custom-roles to synthesize a "
-                    "managed union role for that workspace."
-                )
-            else:
-                errors.append(
-                    "Members CSV has multiple custom workspace roles for "
-                    f"{email} in workspace {workspace_id}: "
-                    + ", ".join(role_labels)
-                    + ". Re-run with --auto-merge-custom-roles to synthesize a "
-                    "managed union role for that workspace."
-                )
-            continue
-
-        source_role_ids = sorted(unique_rows_by_role_id)
-        signature = _build_workspace_role_union_signature(source_role_ids)
-        union_role_id = f"union::{signature}"
-        union_rows = {
-            row.get("langsmith_role") or row.get("role_id") or "<unknown>"
-            for row in unique_rows
-        }
-        exemplar = dict(unique_rows[0])
-        exemplar["role_id"] = union_role_id
-        exemplar["role_name"] = "CUSTOM"
-        exemplar["langsmith_role"] = " + ".join(sorted(union_rows, key=str.lower))
-        normalized_rows.append(exemplar)
-        union_specs.append(
-            {
-                "signature": signature,
-                "role_id": union_role_id,
-                "source_role_ids": source_role_ids,
-                "workspace_id": workspace_id,
-                "email": email,
-                "role_labels": role_labels,
-            }
-        )
-
-    if errors:
-        raise click.ClickException("; ".join(errors))
-
-    return normalized_rows, union_specs
-
-
-def _partition_needed_workspace_role_ids(
-    role_ids: set[str],
-    workspace_role_union_specs_by_role_id: dict[str, dict],
-) -> tuple[set[str], set[str]]:
-    """Split needed workspace-role IDs into normal source roles vs managed unions."""
-    if not role_ids:
-        return set(), set()
-
-    union_role_ids = {
-        role_id
-        for role_id in role_ids
-        if role_id in workspace_role_union_specs_by_role_id
-    }
-    return role_ids - union_role_ids, union_role_ids
-
-
-def _ensure_workspace_role_union_mappings(
-    user_role_migrator,
-    *,
-    role_mapping: dict[str, str],
-    source_roles: list[dict],
-    workspace_role_union_specs_by_role_id: dict[str, dict],
-    needed_union_role_ids: set[str],
-) -> dict[str, str]:
-    """Ensure selected managed workspace-role unions exist on destination."""
-    pending_specs = [
-        workspace_role_union_specs_by_role_id[role_id]
-        for role_id in sorted(needed_union_role_ids)
-        if role_id not in role_mapping
-    ]
-    if not pending_specs:
-        return {}
-
-    return user_role_migrator.ensure_workspace_role_unions(
-        source_roles=source_roles,
-        union_specs=pending_specs,
-    )
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+        if effective_role_id:
+            effective_role_ids.add(effective_role_id)
+    return effective_role_ids
 
 
 def _csv_rows_to_org_members(
@@ -915,11 +767,10 @@ def _csv_rows_to_org_members(
             }
             if direct_workspace_invites:
                 workspace_rows = ws_rows_by_email.get(email, [])
-                workspace_role_ids = {
-                    (workspace_row.get("role_id") or "").strip()
-                    for workspace_row in workspace_rows
-                    if (workspace_row.get("role_id") or "").strip()
-                }
+                workspace_role_ids = _effective_workspace_role_ids_for_rows(
+                    email,
+                    workspace_rows,
+                )
                 if len(workspace_role_ids) == 1:
                     member["workspace_ids"] = sorted(
                         {
@@ -931,29 +782,56 @@ def _csv_rows_to_org_members(
                     member["workspace_role_id"] = next(iter(workspace_role_ids))
             members_by_email[email] = member
 
+    if direct_workspace_invites:
+        for email, workspace_rows in ws_rows_by_email.items():
+            member = members_by_email.get(email)
+            if not member:
+                continue
+            workspace_role_ids = _effective_workspace_role_ids_for_rows(
+                email,
+                workspace_rows,
+            )
+            if len(workspace_role_ids) != 1:
+                continue
+            member.setdefault(
+                "workspace_ids",
+                sorted(
+                    {
+                        workspace_row["workspace_id"]
+                        for workspace_row in workspace_rows
+                        if workspace_row.get("workspace_id")
+                    }
+                ),
+            )
+            member.setdefault("workspace_role_id", next(iter(workspace_role_ids)))
+
     return list(members_by_email.values())
 
 
 def _csv_rows_for_workspace(csv_rows: list[dict], source_workspace_id: str) -> list[dict]:
     """Build workspace member payloads for a specific source workspace."""
     rows_for_workspace = [row for row in csv_rows if row["workspace_id"] == source_workspace_id]
-    members_by_email: dict[str, dict] = {}
+    rows_by_email: dict[str, list[dict]] = {}
     for row in rows_for_workspace:
         email = row["email"]
-        existing = members_by_email.get(email)
-        if existing and existing["role_id"] != row["role_id"]:
-            raise click.ClickException(
-                "Members CSV has conflicting role_id values for "
-                f"{email} in workspace {source_workspace_id}: "
-                f"'{existing['role_id']}' vs '{row['role_id']}'"
+        rows_by_email.setdefault(email, []).append(row)
+
+    members_by_email: dict[str, dict] = {}
+    for email, rows in rows_by_email.items():
+        try:
+            role_id = select_effective_workspace_role_id(
+                rows,
+                email=email,
+                workspace_id=source_workspace_id,
             )
-        if not existing:
-            members_by_email[email] = {
-                "id": f"{source_workspace_id}:{email}",
-                "email": email,
-                "role_id": row["role_id"],
-                "full_name": "",
-            }
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+        members_by_email[email] = {
+            "id": f"{source_workspace_id}:{email}",
+            "email": email,
+            "role_id": role_id,
+            "full_name": "",
+        }
     return list(members_by_email.values())
 
 
@@ -1023,6 +901,136 @@ def _resolve_single_instance_workspace_ids(
     return sorted(workspace_ids)
 
 
+@dataclass(frozen=True)
+class SingleInstanceUsersPlan:
+    """Resolved single-instance users CSV plan."""
+
+    workspace_ids: list[str]
+    org_members: list[dict]
+    workspace_members_by_id: dict[str, list[dict]]
+    operator_notes: list[str]
+
+
+def _workspace_display_names(workspace: dict) -> list[str]:
+    """Return all stable names an operator might put in the CSV."""
+    names: list[str] = []
+    for key in ("display_name", "name", "tenant_handle"):
+        name = str(workspace.get(key) or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _normalize_workspace_name_for_compare(name: str) -> str:
+    """Normalize display labels for CSV-vs-target workspace name checks."""
+    return " ".join(name.split()).casefold()
+
+
+def _validate_csv_workspace_names(
+    csv_rows: list[dict],
+    available_workspaces_by_id: dict[str, dict],
+) -> None:
+    """Validate optional workspace_name hints against known target workspaces."""
+    mismatches: list[str] = []
+    for row in csv_rows:
+        workspace_id = (row.get("workspace_id") or "").strip()
+        csv_name = (row.get("workspace_name") or "").strip()
+        if not workspace_id or not csv_name:
+            continue
+
+        workspace = available_workspaces_by_id.get(workspace_id) or {}
+        target_names = _workspace_display_names(workspace)
+        if not target_names:
+            continue
+
+        normalized_csv_name = _normalize_workspace_name_for_compare(csv_name)
+        normalized_target_names = {
+            _normalize_workspace_name_for_compare(name)
+            for name in target_names
+        }
+        if normalized_csv_name not in normalized_target_names:
+            mismatches.append(
+                f"{workspace_id}: CSV workspace_name '{csv_name}' does not match "
+                f"target workspace name '{target_names[0]}'"
+            )
+
+    if mismatches:
+        raise click.ClickException(
+            "Members CSV workspace_name mismatch: " + "; ".join(mismatches)
+        )
+
+
+def _single_instance_operator_notes(
+    csv_rows: list[dict],
+    org_members: list[dict],
+) -> list[str]:
+    """Return operator-facing notes for lossy pending-invite shapes."""
+    direct_invite_by_email = {
+        member["email"]
+        for member in org_members
+        if member.get("workspace_ids") and member.get("workspace_role_id")
+    }
+    workspace_rows_by_email: dict[str, list[dict]] = {}
+    for row in csv_rows:
+        if (row.get("workspace_id") or "").strip():
+            workspace_rows_by_email.setdefault(row["email"], []).append(row)
+
+    notes: list[str] = []
+    for email, workspace_rows in sorted(workspace_rows_by_email.items()):
+        if email in direct_invite_by_email:
+            continue
+        workspace_role_ids = {
+            (row.get("role_id") or "").strip()
+            for row in workspace_rows
+            if (row.get("role_id") or "").strip()
+        }
+        if len(workspace_role_ids) > 1:
+            notes.append(
+                f"{email} has multiple workspace roles; the initial org invite "
+                "cannot attach all workspace access in one pending invite. "
+                "Workspace membership will be applied in phase 3 when the target "
+                "accepts it; otherwise re-run after the invite is accepted."
+            )
+    return notes
+
+
+def _build_single_instance_users_plan(
+    csv_rows: list[dict],
+    *,
+    available_workspaces: list[dict],
+    default_org_role_id: str | None,
+    source_of_truth: bool,
+) -> SingleInstanceUsersPlan:
+    """Build all derived single-instance users sync inputs in one place."""
+    available_workspaces_by_id = {
+        workspace["id"]: workspace
+        for workspace in available_workspaces
+        if workspace.get("id")
+    }
+    workspace_ids = _resolve_single_instance_workspace_ids(
+        csv_rows,
+        set(available_workspaces_by_id),
+        source_of_truth=source_of_truth,
+    )
+    _validate_csv_workspace_names(csv_rows, available_workspaces_by_id)
+    org_members = _csv_rows_to_org_members(
+        csv_rows,
+        default_org_role_id=default_org_role_id,
+        direct_workspace_invites=True,
+    )
+    workspace_members_by_id = {
+        workspace_id: _csv_rows_for_workspace(csv_rows, workspace_id)
+        for workspace_id in workspace_ids
+    }
+
+    return SingleInstanceUsersPlan(
+        workspace_ids=workspace_ids,
+        org_members=org_members,
+        workspace_members_by_id=workspace_members_by_id,
+        operator_notes=_single_instance_operator_notes(csv_rows, org_members),
+    )
+
+
 def _print_single_instance_users_summary(
     config: Config,
     *,
@@ -1030,6 +1038,7 @@ def _print_single_instance_users_summary(
     workspace_ids: list[str],
     csv_source_of_truth: bool,
     skip_workspace_members: bool,
+    operator_notes: list[str] | None = None,
 ) -> None:
     """Print a concise, high-signal summary for single-instance CSV sync runs."""
     org_rows = sum(1 for row in csv_rows if not row.get("workspace_id"))
@@ -1056,8 +1065,14 @@ def _print_single_instance_users_summary(
         console.print(
             f"  Workspace access: direct target workspace IDs from CSV ({len(workspace_ids)} workspace(s) in scope)"
         )
+        console.print(
+            "  Missing CSV rows: preserved "
+            "(workspace memberships missing from the CSV will be preserved)"
+        )
     else:
         console.print("  Workspace access: no workspace rows in the CSV")
+    for note in operator_notes or []:
+        console.print(f"  [yellow]Note:[/yellow] {note}")
 
 
 def _workspace_scope_key(orchestrator) -> str:
@@ -1069,9 +1084,9 @@ def _workspace_scope_key(orchestrator) -> str:
 
 
 def _probe_lookup_capability(client, endpoint: str) -> tuple[bool, str]:
-    """Probe a paginated lookup endpoint without mutating state."""
+    """Probe a lookup endpoint without mutating state or exhausting pagination."""
     try:
-        list(client.get_paginated(endpoint, page_size=1))
+        client.get(endpoint, params={"limit": 1})
         return True, "ok"
     except Exception as e:  # noqa: BLE001
         return False, str(e)
@@ -1082,6 +1097,7 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
     state = _ensure_migration_session(orchestrator, config)
     scope_key = _workspace_scope_key(orchestrator)
     resource_list = sorted(set(resources))
+    resource_set = set(resource_list)
     workspace_pair = _active_workspace_pair(orchestrator)
 
     state.record_inventory(
@@ -1116,14 +1132,15 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
         probe="workspace_discovery",
     )
 
-    lookup_targets = [
-        ("project_lookup", "/sessions"),
-        ("dataset_lookup", "/datasets"),
-    ]
-    if "queues" in resource_list or "rules" in resource_list:
-        lookup_targets.append(("queue_lookup", "/annotation-queues"))
+    lookup_probes = []
+    if {"experiments", "runs", "feedback", "rules", "charts"} & resource_set:
+        lookup_probes.append(("project_lookup", "/sessions"))
+    if {"datasets", "experiments", "rules"} & resource_set:
+        lookup_probes.append(("dataset_lookup", "/datasets"))
+    if {"queues", "rules"} & resource_set:
+        lookup_probes.append(("queue_lookup", "/annotation-queues"))
 
-    for label, endpoint in lookup_targets:
+    for label, endpoint in lookup_probes:
         source_supported, source_detail = _probe_lookup_capability(orchestrator.source_client, endpoint)
         dest_supported, dest_detail = _probe_lookup_capability(orchestrator.dest_client, endpoint)
         state.record_capability(
@@ -1141,6 +1158,13 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
             probe=f"GET {endpoint}",
         )
 
+    if "users" in resource_list:
+        UserRoleMigrator(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            state,
+            config,
+        ).probe_capabilities()
     if "prompts" in resource_list or "rules" in resource_list:
         PromptMigrator(
             orchestrator.source_client,
@@ -1700,15 +1724,6 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
 @click.option('--roles-only', is_flag=True, help='Only migrate custom roles (skip members)')
 @click.option('--skip-workspace-members', is_flag=True, help='Skip workspace member migration')
 @click.option(
-    '--auto-merge-custom-roles',
-    is_flag=True,
-    help=(
-        'Beta: when duplicate CSV workspace rows contain multiple distinct '
-        'custom roles for one user, synthesize a managed destination custom '
-        'role with the union of permissions and ABAC policy attachments.'
-    ),
-)
-@click.option(
     '--single-instance',
     '--instance',
     is_flag=True,
@@ -1761,7 +1776,6 @@ def users(
     users_dry_run,
     roles_only,
     skip_workspace_members,
-    auto_merge_custom_roles,
     single_instance,
     csv_source_of_truth,
     members_csv,
@@ -1783,7 +1797,6 @@ def users(
     if users_non_interactive:
         config.migration.non_interactive = True
         config.migration.interactive = False
-    config.migration.auto_merge_custom_roles = auto_merge_custom_roles
 
     if bool(instance_key) != bool(instance_url):
         raise click.ClickException(
@@ -1808,10 +1821,6 @@ def users(
         raise click.ClickException(
             "--roles-only cannot be combined with --members-csv because CSV "
             "input only applies to member migration"
-        )
-    if auto_merge_custom_roles and not members_csv:
-        raise click.ClickException(
-            "--auto-merge-custom-roles requires --members-csv"
         )
     if csv_source_of_truth and not members_csv:
         raise click.ClickException(
@@ -1858,14 +1867,10 @@ def users(
         orchestrator.cleanup()
         return
 
-    available_workspace_ids: set[str] = set()
+    available_workspaces: list[dict] = []
     ws_result = None
     if single_instance:
-        available_workspace_ids = {
-            ws.get("id", "")
-            for ws in _list_workspaces(orchestrator.dest_client)
-            if ws.get("id")
-        }
+        available_workspaces = _list_workspaces(orchestrator.dest_client)
         ws_pairs = [(None, None)]
     else:
         # Resolve workspace context (needed for phase 3)
@@ -1898,6 +1903,16 @@ def users(
     )
 
     _run_preflight(orchestrator, config, ["users"])
+    if csv_source_of_truth:
+        try:
+            user_role_migrator.require_destination_org_admin_for_authoritative_sync()
+        except Exception as e:  # noqa: BLE001
+            console.print(
+                "  [red]Failed to verify destination org-member management "
+                f"permissions: {e}[/red]"
+            )
+            orchestrator.cleanup()
+            ctx.exit(1)
 
     # ── Phase 1: Role synchronisation ──
     console.print("\n[bold]Phase 1: Synchronising roles...[/bold]")
@@ -1952,9 +1967,7 @@ def users(
     default_org_role_id: str | None = None
     ws_only_emails: set[str] = set()
     org_admin_workspace_row_count = 0
-    workspace_role_union_specs: list[dict] = []
-    workspace_role_union_specs_by_role_id: dict[str, dict] = {}
-    source_roles: list[dict] = []
+    single_instance_plan: SingleInstanceUsersPlan | None = None
 
     if csv_member_rows is not None:
         source_roles = user_role_migrator.list_source_roles()
@@ -1964,15 +1977,6 @@ def users(
         csv_member_rows, org_admin_workspace_row_count = _normalize_csv_role_scopes(
             csv_member_rows
         )
-        csv_member_rows, workspace_role_union_specs = _normalize_workspace_csv_rows(
-            csv_member_rows,
-            auto_merge_custom_roles=auto_merge_custom_roles,
-        )
-        workspace_role_union_specs_by_role_id = {
-            spec["role_id"]: spec
-            for spec in workspace_role_union_specs
-            if spec.get("role_id")
-        }
         org_emails: set[str] = set()
         ws_emails: set[str] = set()
         for row in csv_member_rows:
@@ -1993,12 +1997,16 @@ def users(
                 )
 
         if single_instance:
-            workspace_ids = _resolve_single_instance_workspace_ids(
+            single_instance_plan = _build_single_instance_users_plan(
                 csv_member_rows,
-                available_workspace_ids,
+                available_workspaces=available_workspaces,
+                default_org_role_id=default_org_role_id,
                 source_of_truth=csv_source_of_truth,
             )
-            ws_pairs = [(workspace_id, workspace_id) for workspace_id in workspace_ids]
+            ws_pairs = [
+                (workspace_id, workspace_id)
+                for workspace_id in single_instance_plan.workspace_ids
+            ]
 
         if org_admin_workspace_row_count:
             console.print(
@@ -2014,6 +2022,9 @@ def users(
             workspace_ids=[dst_ws for _, dst_ws in ws_pairs if dst_ws],
             csv_source_of_truth=csv_source_of_truth,
             skip_workspace_members=skip_workspace_members,
+            operator_notes=single_instance_plan.operator_notes
+            if single_instance_plan is not None
+            else [],
         )
         confirm_prompt = (
             "Proceed with authoritative single-instance CSV sync? This will "
@@ -2035,7 +2046,9 @@ def users(
     # ── Phase 2: Org member migration ──
     console.print("\n[bold]Phase 2: Migrating organisation members...[/bold]")
 
-    if csv_member_rows is not None:
+    if single_instance_plan is not None:
+        all_members = single_instance_plan.org_members
+    elif csv_member_rows is not None:
         all_members = _csv_rows_to_org_members(
             csv_member_rows,
             default_org_role_id=default_org_role_id,
@@ -2071,20 +2084,20 @@ def users(
                 )
                 if role_id and role_id not in role_mapping
             }
-            needed_custom_role_ids, needed_union_role_ids = (
-                _partition_needed_workspace_role_ids(
-                    needed_role_ids,
-                    workspace_role_union_specs_by_role_id,
-                )
-            )
-            if needed_custom_role_ids:
+            needed_union_role_ids = {
+                role_id
+                for role_id in needed_role_ids
+                if is_workspace_role_union_id(role_id)
+            }
+            needed_regular_role_ids = needed_role_ids - needed_union_role_ids
+            if needed_regular_role_ids:
                 console.print(
-                    f"  Syncing {len(needed_custom_role_ids)} additional role(s) needed by selected members..."
+                    f"  Syncing {len(needed_regular_role_ids)} additional role(s) needed by selected members..."
                 )
                 try:
                     role_mapping.update(
                         user_role_migrator.build_role_mapping(
-                            custom_role_ids=needed_custom_role_ids,
+                            custom_role_ids=needed_regular_role_ids,
                         )
                     )
                 except Exception as e:
@@ -2093,24 +2106,18 @@ def users(
                     )
             if needed_union_role_ids:
                 console.print(
-                    "  Preparing managed workspace roles needed by selected members..."
+                    f"  Creating {len(needed_union_role_ids)} managed workspace role union(s)..."
                 )
                 try:
                     role_mapping.update(
-                        _ensure_workspace_role_union_mappings(
-                            user_role_migrator,
-                            role_mapping=role_mapping,
-                            source_roles=source_roles,
-                            workspace_role_union_specs_by_role_id=workspace_role_union_specs_by_role_id,
-                            needed_union_role_ids=needed_union_role_ids,
+                        user_role_migrator.materialize_workspace_role_unions(
+                            needed_union_role_ids,
                         )
                     )
                 except Exception as e:
                     console.print(
-                        f"  [red]Failed to prepare merged workspace roles: {e}[/red]"
+                        f"  [yellow]Warning: failed to create workspace role union(s): {e}[/yellow]"
                     )
-                    orchestrator.cleanup()
-                    return
 
             migrated, skipped, failed = user_role_migrator.migrate_org_members(
                 selected_members,
@@ -2150,7 +2157,9 @@ def users(
                 orchestrator.set_workspace_context(src_ws, dst_ws)
                 console.print(f"\n  [cyan]Workspace: {src_ws} -> {dst_ws}[/cyan]")
 
-                if csv_member_rows is not None:
+                if single_instance_plan is not None:
+                    ws_members = single_instance_plan.workspace_members_by_id.get(src_ws, [])
+                elif csv_member_rows is not None:
                     ws_members = _csv_rows_for_workspace(csv_member_rows, src_ws)
                 else:
                     ws_members = user_role_migrator.list_source_workspace_members()
@@ -2179,21 +2188,23 @@ def users(
                     if (role_id := (member.get("role_id") or "").strip())
                     and role_id not in role_mapping
                 }
-                needed_workspace_custom_role_ids, needed_workspace_union_role_ids = (
-                    _partition_needed_workspace_role_ids(
-                        needed_workspace_role_ids,
-                        workspace_role_union_specs_by_role_id,
-                    )
+                needed_workspace_union_role_ids = {
+                    role_id
+                    for role_id in needed_workspace_role_ids
+                    if is_workspace_role_union_id(role_id)
+                }
+                needed_regular_workspace_role_ids = (
+                    needed_workspace_role_ids - needed_workspace_union_role_ids
                 )
-                if needed_workspace_custom_role_ids:
+                if needed_regular_workspace_role_ids:
                     console.print(
                         "    "
-                        f"Syncing {len(needed_workspace_custom_role_ids)} additional role(s) needed by selected workspace members..."
+                        f"Syncing {len(needed_regular_workspace_role_ids)} additional role(s) needed by selected workspace members..."
                     )
                     try:
                         role_mapping.update(
                             user_role_migrator.build_role_mapping(
-                                custom_role_ids=needed_workspace_custom_role_ids,
+                                custom_role_ids=needed_regular_workspace_role_ids,
                             )
                         )
                     except Exception as e:
@@ -2203,25 +2214,20 @@ def users(
                         )
                 if needed_workspace_union_role_ids:
                     console.print(
-                        "    Preparing managed workspace roles needed by selected workspace members..."
+                        "    "
+                        f"Creating {len(needed_workspace_union_role_ids)} managed workspace role union(s)..."
                     )
                     try:
                         role_mapping.update(
-                            _ensure_workspace_role_union_mappings(
-                                user_role_migrator,
-                                role_mapping=role_mapping,
-                                source_roles=source_roles,
-                                workspace_role_union_specs_by_role_id=workspace_role_union_specs_by_role_id,
-                                needed_union_role_ids=needed_workspace_union_role_ids,
+                            user_role_migrator.materialize_workspace_role_unions(
+                                needed_workspace_union_role_ids,
                             )
                         )
                     except Exception as e:
                         console.print(
-                            "    [red]Failed to prepare merged workspace roles: "
-                            f"{e}[/red]"
+                            "    [yellow]Warning: failed to create workspace role "
+                            f"union(s): {e}[/yellow]"
                         )
-                        orchestrator.cleanup()
-                        return
 
                 try:
                     m, s, f = user_role_migrator.migrate_workspace_members(
@@ -2417,48 +2423,48 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
 def list_projects(ctx, source, dest):
     """List projects with their IDs to help create project mappings."""
     config = ctx.obj['config']
-    
+
     if not source and not dest:
         console.print("[yellow]Specify --source or --dest to list projects[/yellow]")
         return
-    
+
     if not ensure_config(config):
         return
-    
+
     orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
-    
+
     from rich.table import Table
-    
+
     if source:
         console.print("\n[bold]Source Projects:[/bold]")
         try:
             table = Table(show_header=True)
             table.add_column("Name", style="cyan", width=50)
             table.add_column("ID", style="dim", width=36)
-            
+
             for project in orchestrator.source_client.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
                     table.add_row(project.get('name', 'unnamed'), project.get('id', ''))
-            
+
             console.print(table)
         except Exception as e:
             console.print(f"[red]Failed to list source projects: {e}[/red]")
-    
+
     if dest:
         console.print("\n[bold]Destination Projects:[/bold]")
         try:
             table = Table(show_header=True)
             table.add_column("Name", style="cyan", width=50)
             table.add_column("ID", style="dim", width=36)
-            
+
             for project in orchestrator.dest_client.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
                     table.add_row(project.get('name', 'unnamed'), project.get('id', ''))
-            
+
             console.print(table)
         except Exception as e:
             console.print(f"[red]Failed to list destination projects: {e}[/red]")
-    
+
     orchestrator.cleanup()
 
 
@@ -2625,7 +2631,6 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
         # Analyze rules for project/dataset associations
         project_specific = [r for r in rules if r.get('session_id')]
-        dataset_specific = [r for r in rules if r.get('dataset_id')]
         project_only = [r for r in rules if r.get('session_id') and not r.get('dataset_id')]
 
         if project_specific and not strip_projects:
@@ -2749,10 +2754,10 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
         # Show helpful message about disabled rules
         if success_count > 0 and not create_enabled:
-            console.print(f"\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
-            console.print(f"  To enable rules:")
-            console.print(f"  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
-            console.print(f"  2. Enable each rule in the LangSmith UI or use --create-enabled flag")
+            console.print("\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
+            console.print("  To enable rules:")
+            console.print("  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
+            console.print("  2. Enable each rule in the LangSmith UI or use --create-enabled flag")
 
     if ws_result:
         orchestrator.clear_workspace_context()
@@ -3141,7 +3146,7 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                 strip = strip_projects
                 ensure_projects = False
                 create_enabled = rules_create_enabled
-                
+
                 if project_specific and not strip:
                     strip = _confirm_action(
                         config,
@@ -3223,10 +3228,10 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
 
                 console.print(f"Rules: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed")
                 if success_count > 0 and create_disabled:
-                    console.print(f"\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
-                    console.print(f"  To enable rules:")
-                    console.print(f"  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
-                    console.print(f"  2. Enable each rule in the LangSmith UI or rerun with --rules-create-enabled")
+                    console.print("\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
+                    console.print("  To enable rules:")
+                    console.print("  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
+                    console.print("  2. Enable each rule in the LangSmith UI or rerun with --rules-create-enabled")
                 if (failed_items or skipped_items) and config.migration.verbose:
                     for name, err in skipped_items:
                         console.print(f"  [yellow]⊘[/yellow] {name}: {err}")
@@ -3434,7 +3439,7 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             if not target_session:
                 console.print("[red]✗[/red]")
                 console.print(f"[red]Session not found: {session}[/red]")
-                console.print(f"\n[yellow]Available sessions:[/yellow]")
+                console.print("\n[yellow]Available sessions:[/yellow]")
                 for s in sessions[:10]:
                     console.print(f"  - {s.get('name', 'unnamed')} ({s.get('id', 'no-id')})")
                 if len(sessions) > 10:
@@ -3719,7 +3724,7 @@ def resume(ctx):
         # Report results
         resumed = results.get("resumed", [])
         blocked = results.get("blocked", [])
-        console.print(f"\n[bold]Resume Results:[/bold]")
+        console.print("\n[bold]Resume Results:[/bold]")
         console.print(f"  [green]Resumed successfully: {len(resumed)}[/green]")
         console.print(f"  [yellow]Blocked/needs attention: {len(blocked)}[/yellow]")
 

@@ -117,6 +117,48 @@ class RulesMigrator(BaseMigrator):
             self.log(f"Failed to check prompt existence for {prompt_handle}: {e}", "warning")
             return False
 
+    def _replace_project_ids(self, value: Any, project_map: Dict[str, str]) -> Any:
+        """Recursively replace source project IDs with destination project IDs."""
+        if not project_map:
+            return value
+        if isinstance(value, str):
+            mapped = value
+            for source_id, dest_id in sorted(
+                project_map.items(),
+                key=lambda item: len(item[0]),
+                reverse=True,
+            ):
+                if source_id and dest_id:
+                    mapped = mapped.replace(source_id, dest_id)
+            return mapped
+        if isinstance(value, list):
+            return [self._replace_project_ids(item, project_map) for item in value]
+        if isinstance(value, dict):
+            return {
+                self._replace_project_ids(key, project_map): self._replace_project_ids(
+                    item,
+                    project_map,
+                )
+                for key, item in value.items()
+            }
+        return value
+
+    def _map_project_references_in_rule_payload(
+        self,
+        payload: Dict[str, Any],
+        project_map: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Map project IDs embedded inside rule filter payload fields."""
+        mapped_payload = dict(payload)
+        for field in ("filter", "trace_filter", "tree_filter"):
+            if field in mapped_payload:
+                original = mapped_payload[field]
+                mapped = self._replace_project_ids(original, project_map)
+                if mapped != original:
+                    self.log(f"Mapped project references in rule {field}", "info")
+                mapped_payload[field] = mapped
+        return mapped_payload
+
     def _rule_item_id(self, rule: Dict[str, Any]) -> str:
         return f"rule_{rule.get('id', rule.get('display_name', 'unnamed'))}"
 
@@ -1195,6 +1237,11 @@ class RulesMigrator(BaseMigrator):
                 dest_dataset_id = dataset_map.get(source_dataset_id)
                 if not dest_dataset_id:
                     self.log(f"Warning: Dataset {source_dataset_id} not found in destination", "warning")
+
+            effective_project_map = dict(project_map)
+            if source_session_id and target_project_id:
+                effective_project_map[source_session_id] = target_project_id
+            payload = self._map_project_references_in_rule_payload(payload, effective_project_map)
 
             # Determine endpoint and payload based on project/dataset context
             if strip_project_reference:

@@ -1,0 +1,6 @@
+email,langsmith_role,workspace_id,workspace_name
+saad@langchain.dev,Organization Admin,,
+pending.same-role@example.com,Workspace Admin,<workspace_a_uuid>,Workspace A
+pending.same-role@example.com,Workspace Admin,<workspace_b_uuid>,Workspace B
+pending.mixed-role@example.com,Workspace Admin,<workspace_a_uuid>,Workspace A
+pending.mixed-role@example.com,Workspace Viewer,<workspace_b_uuid>,Workspace B

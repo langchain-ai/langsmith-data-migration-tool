@@ -1,0 +1,7 @@
+email,langsmith_role,workspace_id,workspace_name
+saad@langchain.dev,Organization Admin,,
+alex.morgan@example.com,Organization User,,
+alex.morgan@example.com,Workspace Admin,812285f1-77c1-40fd-ad94-d9194c1d3a4b,Workspace A
+alex.morgan@example.com,Workspace Viewer,3e463447-7e35-4dbf-863a-fc3a19ee2c53,Workspace B
+sam.rivera@example.com,Workspace User,812285f1-77c1-40fd-ad94-d9194c1d3a4b,Workspace A
+sam.rivera@example.com,Workspace User,bd980bbb-4a80-4642-be6c-2039cbc740ac,Workspace C

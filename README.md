@@ -6,7 +6,7 @@ A Python CLI for migrating users and roles, datasets, experiments, annotation qu
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.67-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -23,7 +23,7 @@ langsmith-migrator datasets
 
 - **All-in-One Wizard**: Interactive migration of all resources (`migrate-all`)
 - **Users & Roles**: Migrate custom roles, org members, and workspace memberships between instances
-- **Single-Instance Access Sync**: Apply CSV-driven add/update or authoritative access sync to one LangSmith instance (`users --csv ... [--sync]`)
+- **Single-Instance Access Sync**: Apply CSV-driven add/update or authoritative access sync to one LangSmith instance (`users --csv ... [--sync]`), including multi-row workspace role unionization for custom ABAC roles
 - **Datasets**: Migrate datasets with examples and file attachments
 - **Experiments**: Include experiments, runs, and feedback during dataset migration (`datasets --include-experiments`) or through `migrate-all`
 - **Annotation Queues**: Transfer queue configurations
@@ -54,20 +54,20 @@ For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk E
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.67-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.67-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.67-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.64-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.67-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -137,7 +137,7 @@ langsmith-migrator rules --create-enabled      # Create rules enabled (default: 
 langsmith-migrator charts
 langsmith-migrator charts --session "project-name"
 langsmith-migrator charts --map-projects        # Interactive TUI project mapping
-langsmith-migrator charts --same-instance       # Reuse source project/session IDs only when both sides truly share IDs
+langsmith-migrator charts --same-instance       # Reuse source project/session IDs on destination
 
 # Utilities
 langsmith-migrator list-projects --source
@@ -215,12 +215,6 @@ In `--single-instance` mode, the command mirrors the provided instance configura
 `users --dry-run` is also supported as a command-local preview flag if you prefer to put dry-run after the subcommand instead of before it.
 For cron jobs and other headless runs, `users --non-interactive` is also supported as a command-local alias for the global `langsmith-migrator --non-interactive users ...` form. In headless mode, missing credentials fail fast instead of prompting.
 
-Duplicate workspace rows are normalized before any org-member or workspace-member writes:
-- identical duplicate rows are deduplicated
-- duplicate built-in workspace roles collapse to the highest privilege (`Workspace Admin` > `Workspace User` > `Workspace Viewer`)
-- duplicate custom workspace roles still fail by default; opt in to `--auto-merge-custom-roles` to synthesize one managed destination custom role with the union of permissions and ABAC policy attachments for that `(email, workspace_id)` pair
-- conflicting org-level duplicate rows still fail validation
-
 CSV schema:
 
 ```csv
@@ -229,17 +223,26 @@ alice@example.com,Organization Admin,,
 alice@example.com,Workspace Admin,ws_src_prod_us,Production US
 ```
 
+Example CSVs:
+- `examples/users_members_example.csv`: minimal org and workspace member rows.
+- `examples/users_members_multi_workspace_roles_example.csv`: users with multiple workspace assignments, including different workspace roles.
+- `examples/users_members_sync_remove_workspace_b_example.csv`: desired-state CSV for `--csv-source-of-truth` when a user should keep Workspace A and lose Workspace B.
+- `examples/users_members_sync_remove_user_example.csv`: desired-state CSV for `--csv-source-of-truth` after a removed user has been omitted entirely.
+- `examples/users_members_pending_mixed_workspace_roles_example.csv`: pending-invite examples for same-role multi-workspace invites and mixed workspace-role rows.
+
+These examples are templates. Do not run them with `--csv-source-of-truth` against a populated target unless the file has been expanded into the full desired org and workspace access state for that target; authoritative sync removes org users, pending invites, and workspace memberships that are not listed.
+
 Notes:
 - `email` and `langsmith_role` are required.
 - `workspace_id` is optional. Leave it empty for org-level role assignments.
-- `workspace_name` is optional and informational only.
+- `workspace_name` is optional. When provided in single-instance CSV sync, it is validated against the target workspace display name, name, or tenant handle; `workspace_id` remains authoritative for applying access.
 - `langsmith_role` should be a built-in LangSmith role name (for example `Organization Admin`, `Organization Operator`, `Organization User`, `Organization Viewer`, `Workspace Admin`, `Workspace User`, or `Workspace Viewer`) or a custom role `display_name`.
+- Multiple rows for the same user and workspace are combined. Built-in workspace roles collapse to the highest-privilege built-in role; custom ABAC roles are unioned with each other and with any built-in workspace role so their policy attachments are preserved.
 - Users who only appear in workspace rows are invited to the org with the source `ORGANIZATION_USER` role before workspace membership is applied.
+- Workspace-only users with multiple workspace roles cannot have all workspace access attached to the initial org invite. The command calls this out before apply, attempts phase 3 workspace membership application, and may require a rerun after the invite is accepted on target versions that block workspace membership for pending org invites.
 - `Organization Admin` on a workspace row is treated as org-level admin access only. No explicit workspace membership is created because org admins already have workspace access.
 - Other org-scoped roles cannot be used on workspace rows. If you want org-level access, leave `workspace_id` empty.
 - Workspace-scoped roles such as `Workspace Admin` cannot be used on org-level rows.
-- If one user appears multiple times for the same `workspace_id`, built-in workspace roles are merged automatically to the highest privilege. Distinct custom roles require `--auto-merge-custom-roles`.
-- `--auto-merge-custom-roles` creates or reuses destination-side managed custom roles and matching ABAC policy attachments. These managed artifacts are reused across runs but are not deleted automatically when they become unused.
 - `--sync` / `--csv-source-of-truth` is the only mode that removes access. Without it, single-instance CSV mode only adds or updates access.
 - `--csv-source-of-truth` is available with `--single-instance` and makes the CSV authoritative for access:
   - users missing from the CSV are removed from the org
@@ -253,10 +256,14 @@ Guardrails:
 - `--sync` requires `--csv` and cannot be combined with `--skip-existing` or `--skip-workspace-members`.
 - `--single-instance` cannot be combined with workspace mapping flags.
 - `--roles-only` cannot be combined with `--single-instance` or `--members-csv`.
-- `--auto-merge-custom-roles` requires `--members-csv`.
 - If the CSV contains workspace rows and `--skip-workspace-members` is set, the command fails instead of silently ignoring those rows.
 - If the CSV contains workspace-only users, the target instance must have an `ORGANIZATION_USER` role available or the command fails before applying member changes.
 - If the CSV references unknown `workspace_id` values, the command fails before any membership changes are applied.
+
+Operational notes:
+- Authoritative sync can remove active org members, cancel pending invites, and remove workspace memberships. Use an Organization Admin PAT for unattended runs that need removal semantics.
+- If the destination API key cannot manage org members or pending invites, 401/403 responses are reported as Organization Admin PAT blockers with grouped remediation and resume metadata.
+- Pending invites whose org role or workspace access does not match the CSV are refreshed when the target supports invite cancellation; if the target lacks a cancellation endpoint, the command reports an explicit manual follow-up instead of silently accepting stale access.
 
 ### CLI Options
 
@@ -328,7 +335,7 @@ The prompt default is `No` (rules are created disabled).
 ```bash
 --session TEXT          Migrate charts for a specific session/project (by name or ID)
 --map-projects          Launch interactive TUI to map source projects to destination projects
---same-instance         Reuse source project/session IDs on destination only when both sides truly share IDs
+--same-instance         Source and destination are the same instance (use same session IDs)
 ```
 
 ### Users Options
@@ -338,8 +345,6 @@ The prompt default is `No` (rules are created disabled).
 --non-interactive          Disable prompts for this users run. Same as the global --non-interactive.
 --roles-only               Only migrate custom roles (skip member migration)
 --skip-workspace-members   Skip workspace member migration
---auto-merge-custom-roles  Beta: merge duplicate custom workspace CSV rows into one managed destination custom role with
-                           unioned permissions and ABAC policy attachments
 --single-instance, --instance
                            Use one target LangSmith instance for CSV-driven access sync instead of source→destination migration
 --csv-source-of-truth, --sync
@@ -385,7 +390,7 @@ When `--skip-users` is omitted, `migrate-all` runs user/role migration as Step 0
 Rules and charts reference projects by ID. When migrating between instances, project IDs differ.
 
 - **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input. Supports auto-match by name, skip, and custom name entry.
-- **Rules (`--project-mapping`)**: Supply an explicit source→destination project ID mapping as JSON or a file path. Use `list-projects --source` and `list-projects --dest` to get IDs. Mutually exclusive with `--map-projects`.
+- **Rules (`--project-mapping`)**: Supply an explicit source→destination project ID mapping as JSON or a file path. Use `list-projects --source` and `list-projects --dest` to get IDs. The mapping is applied to both top-level project associations and project IDs embedded inside rule filters. Mutually exclusive with `--map-projects`.
 - **Rules queue targets**: When a rule references an annotation queue, the migrator first reuses any saved queue migration mapping, then falls back to an exact-name queue match in the destination workspace. If neither is safe, the rule is exported for remediation instead of being posted with the source queue ID.
 - **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination. When both sides point at the same deployment URL but use different API keys/workspaces, charts still remap project/session IDs; the tool does not treat that as `--same-instance`.
 - **`migrate-all`**: Supports `--strip-projects`, `--map-projects`, and `--rules-create-enabled` for rules. Use the standalone `rules` command for `--project-mapping` JSON mappings.
@@ -473,7 +478,7 @@ For release changes, update all of:
 - `CHANGELOG.md` release notes
 - `README.md` release-facing docs/examples
 
-CI enforces this on pull requests: if `pyproject.toml` or `CHANGELOG.md` changes, `README.md` must also be updated.
+CI enforces this on pull requests: if `pyproject.toml` or `CHANGELOG.md` changes, `README.md` must also be updated (including dependency-only bumps).
 
 ## Support
 

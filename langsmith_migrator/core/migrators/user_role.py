@@ -8,16 +8,154 @@ from .base import BaseMigrator
 from ...utils.retry import APIError, AuthenticationError, ConflictError
 
 
-_ROLE_UNION_DESCRIPTION_PREFIX = "Managed by langsmith-migrator for union::"
-_ACCESS_POLICY_ENDPOINT_CANDIDATES = (
-    "/orgs/current/access-policies",
-    "/orgs/current/access_policies",
+WORKSPACE_ROLE_UNION_PREFIX = "union::workspace::"
+WORKSPACE_ROLE_UNION_DISPLAY_PREFIX = "LangSmith Migrator Union"
+WORKSPACE_ROLE_PRECEDENCE = {
+    "WORKSPACE_VIEWER": 10,
+    "WORKSPACE_USER": 20,
+    "WORKSPACE_EDITOR": 20,
+    "WORKSPACE_ADMIN": 30,
+}
+ORG_MEMBER_MANAGEMENT_CAPABILITY = "org_member_management"
+ORG_ADMIN_PAT_REQUIRED_CODE = "dest_org_admin_pat_required"
+ORG_ADMIN_PAT_NEXT_ACTION = (
+    "Retry with an Organization Admin PAT for the destination organization, "
+    "or perform the org member or pending invite change manually and re-run "
+    "`langsmith-migrator users`."
 )
-_ROLE_ACCESS_POLICY_ENDPOINT_TEMPLATES = (
-    "/orgs/current/roles/{role_id}/access-policies",
-    "/orgs/current/roles/{role_id}/access-policies/attach",
-    "/orgs/current/roles/{role_id}/access_policies",
-)
+
+
+def make_workspace_role_union_id(role_ids: set[str]) -> str:
+    """Return a stable synthetic role ID for a set of source workspace role IDs."""
+    normalized = sorted({role_id.strip() for role_id in role_ids if role_id.strip()})
+    return WORKSPACE_ROLE_UNION_PREFIX + ",".join(normalized)
+
+
+def is_workspace_role_union_id(role_id: str | None) -> bool:
+    """Return whether *role_id* is a synthetic workspace role union ID."""
+    return bool(role_id and role_id.startswith(WORKSPACE_ROLE_UNION_PREFIX))
+
+
+def parse_workspace_role_union_id(role_id: str) -> set[str]:
+    """Return source role IDs embedded in a synthetic workspace role union ID."""
+    if not is_workspace_role_union_id(role_id):
+        return set()
+    encoded = role_id[len(WORKSPACE_ROLE_UNION_PREFIX):]
+    return {part for part in encoded.split(",") if part}
+
+
+def is_org_member_management_permission_error(error: BaseException) -> bool:
+    """Return whether an API error looks like missing org-member management access."""
+    status_code = getattr(error, "status_code", None)
+    return isinstance(error, AuthenticationError) or status_code in {401, 403}
+
+
+def is_member_absent_error(error: BaseException) -> bool:
+    """Return whether a member mutation error means the member is already absent."""
+    status_code = getattr(error, "status_code", None)
+    message = str(error).lower()
+    return status_code == 404 or "not found" in message
+
+
+def org_admin_pat_required_message(operation: str, error: BaseException) -> str:
+    """Build a consistent org-admin PAT requirement message."""
+    return (
+        f"{operation} requires an Organization Admin PAT on the destination "
+        "organization. The current destination API key does not appear to be "
+        f"allowed to manage organization members or pending invites. Original "
+        f"error: {error}"
+    )
+
+
+def org_admin_pat_required_evidence(
+    operation: str,
+    error: BaseException,
+) -> Dict[str, Any]:
+    """Build evidence payload for org-member permission failures."""
+    return {
+        "operation": operation,
+        "status_code": getattr(error, "status_code", None),
+        "error": str(error),
+        "requires_org_admin_pat": True,
+    }
+
+
+def select_effective_workspace_role_id(
+    rows: List[Dict[str, Any]],
+    *,
+    email: str,
+    workspace_id: str,
+) -> str:
+    """Collapse one user's CSV rows for a workspace to one effective role ID."""
+    role_rows = [
+        row
+        for row in rows
+        if (row.get("role_id") or "").strip()
+    ]
+    role_ids = {
+        (row.get("role_id") or "").strip()
+        for row in role_rows
+        if (row.get("role_id") or "").strip()
+    }
+    if not role_ids:
+        return ""
+    if len(role_ids) == 1:
+        return next(iter(role_ids))
+
+    custom_role_ids = {
+        (row.get("role_id") or "").strip()
+        for row in role_rows
+        if (row.get("role_name") or "").strip().upper() == "CUSTOM"
+    }
+    builtin_rows = [
+        row
+        for row in role_rows
+        if (row.get("role_name") or "").strip().upper() in WORKSPACE_ROLE_PRECEDENCE
+    ]
+    unknown_role_labels = sorted(
+        {
+            row.get("role_name") or row.get("langsmith_role") or row.get("role_id") or "<unknown>"
+            for row in role_rows
+            if (
+                (row.get("role_name") or "").strip().upper() not in WORKSPACE_ROLE_PRECEDENCE
+                and (row.get("role_name") or "").strip().upper() != "CUSTOM"
+            )
+        },
+        key=str.lower,
+    )
+    if unknown_role_labels:
+        raise ValueError(
+            "Members CSV has unsupported workspace role type(s) for "
+            f"{email} in workspace {workspace_id}: "
+            + ", ".join(unknown_role_labels)
+        )
+
+    if custom_role_ids:
+        union_role_ids = set(custom_role_ids)
+        union_role_ids.update(
+            (row.get("role_id") or "").strip()
+            for row in builtin_rows
+            if (row.get("role_id") or "").strip()
+        )
+        if len(union_role_ids) == 1:
+            return next(iter(union_role_ids))
+        return make_workspace_role_union_id(union_role_ids)
+
+    admin_role_ids = {
+        (row.get("role_id") or "").strip()
+        for row in role_rows
+        if (row.get("role_name") or "").strip().upper() == "WORKSPACE_ADMIN"
+    }
+    if admin_role_ids:
+        return sorted(admin_role_ids)[0]
+
+    best_row = max(
+        builtin_rows,
+        key=lambda row: WORKSPACE_ROLE_PRECEDENCE[
+            (row.get("role_name") or "").strip().upper()
+        ],
+    )
+    return (best_row.get("role_id") or "").strip()
 
 
 class UserRoleMigrator(BaseMigrator):
@@ -37,10 +175,10 @@ class UserRoleMigrator(BaseMigrator):
         self._dest_email_to_identity: Optional[Dict[str, Dict[str, Any]]] = None
         self._pending_org_email_to_identity: Dict[str, Dict[str, Any]] = {}
         self._pending_workspace_invites: set[tuple[str, str]] = set()
+        self._pending_org_blockers: Dict[str, Dict[str, Any]] = {}
+        self._pending_org_invite_wait_reported: set[str] = set()
         self._last_org_member_removals = 0
         self._last_workspace_member_removals = 0
-        self._source_access_policies_cache: Optional[List[Dict[str, Any]]] = None
-        self._dest_access_policies_cache: Optional[List[Dict[str, Any]]] = None
 
     # ------------------------------------------------------------------
     # Phase 0: data fetching
@@ -53,16 +191,6 @@ class UserRoleMigrator(BaseMigrator):
     def list_dest_roles(self) -> List[Dict[str, Any]]:
         """Fetch all roles from the destination organisation."""
         return self.dest.get("/orgs/current/roles")
-
-    def list_source_access_policies(self) -> List[Dict[str, Any]]:
-        """Fetch all access policies from the source organisation."""
-        return self._list_access_policies(self.source, cache_attr="_source_access_policies_cache")
-
-    def list_dest_access_policies(self, *, force: bool = False) -> List[Dict[str, Any]]:
-        """Fetch all access policies from the destination organisation."""
-        if force:
-            self._dest_access_policies_cache = None
-        return self._list_access_policies(self.dest, cache_attr="_dest_access_policies_cache")
 
     def list_source_org_members(self) -> List[Dict[str, Any]]:
         """Fetch active org members from source (paginated)."""
@@ -96,6 +224,65 @@ class UserRoleMigrator(BaseMigrator):
                 members.append(member)
         return members
 
+    def require_destination_org_admin_for_authoritative_sync(self) -> None:
+        """Fail fast when authoritative sync cannot read org-member state.
+
+        ``--csv-source-of-truth`` can remove active members and cancel pending
+        invites, so a non-admin PAT cannot safely provide the requested
+        semantics. There is no safe read-only delete probe; this verifies the
+        read side up front and write failures still report the same PAT hint.
+        """
+        probes = [
+            (
+                "Listing active organization members for authoritative users sync",
+                "/orgs/current/members/active",
+            ),
+            (
+                "Listing pending organization invites for authoritative users sync",
+                "/orgs/current/members/pending",
+            ),
+        ]
+        for operation, endpoint in probes:
+            try:
+                self.dest.get(endpoint, params={"limit": 1})
+            except (AuthenticationError, APIError) as e:
+                if is_org_member_management_permission_error(e):
+                    message = org_admin_pat_required_message(operation, e)
+                    evidence = {
+                        "endpoint": endpoint,
+                        **org_admin_pat_required_evidence(operation, e),
+                    }
+                    self.record_capability(
+                        "dest",
+                        ORG_MEMBER_MANAGEMENT_CAPABILITY,
+                        supported=False,
+                        detail=message,
+                        evidence=evidence,
+                        probe=f"GET {endpoint}?limit=1",
+                    )
+                    self.record_issue(
+                        "capability",
+                        ORG_ADMIN_PAT_REQUIRED_CODE,
+                        message,
+                        next_action=ORG_ADMIN_PAT_NEXT_ACTION,
+                        evidence=evidence,
+                    )
+                    raise APIError(
+                        message,
+                        status_code=getattr(e, "status_code", None),
+                        request_info=getattr(e, "request_info", None),
+                    ) from e
+                raise
+
+        self.record_capability(
+            "dest",
+            ORG_MEMBER_MANAGEMENT_CAPABILITY,
+            supported=True,
+            detail="Active and pending org-member list probes succeeded",
+            evidence={"endpoints": [endpoint for _, endpoint in probes]},
+            probe="GET /orgs/current/members/{active,pending}?limit=1",
+        )
+
     def list_source_workspace_members(self) -> List[Dict[str, Any]]:
         """Fetch active workspace members from source (requires X-Tenant-Id)."""
         members = []
@@ -125,65 +312,6 @@ class UserRoleMigrator(BaseMigrator):
                 active_by_email.setdefault(email, member)
             self._dest_email_to_identity = active_by_email
         return self._dest_email_to_identity
-
-    def _list_access_policies(
-        self,
-        client,
-        *,
-        cache_attr: str,
-    ) -> List[Dict[str, Any]]:
-        """Fetch access policies with compatibility fallbacks."""
-        cached = getattr(self, cache_attr)
-        if cached is not None:
-            return cached
-
-        last_error: Optional[APIError] = None
-        for endpoint in _ACCESS_POLICY_ENDPOINT_CANDIDATES:
-            try:
-                response = client.get(endpoint)
-                policies = self._normalize_access_policy_response(response)
-                setattr(self, cache_attr, policies)
-                return policies
-            except APIError as e:
-                if self._is_unavailable_endpoint_error(e):
-                    last_error = e
-                    continue
-                raise
-
-        scope = "source" if client is self.source else "destination"
-        raise APIError(
-            f"Unable to list {scope} access policies for custom role auto-merge: {last_error}",
-            request_info={},
-        )
-
-    @staticmethod
-    def _normalize_access_policy_response(response: Any) -> List[Dict[str, Any]]:
-        """Coerce common API response shapes into a list of policies."""
-        items: List[Any]
-        if isinstance(response, list):
-            items = response
-        elif isinstance(response, dict):
-            for key in ("access_policies", "policies", "items", "results"):
-                value = response.get(key)
-                if isinstance(value, list):
-                    items = value
-                    break
-            else:
-                items = [response] if response.get("id") else []
-        else:
-            items = []
-        return [item for item in items if isinstance(item, dict)]
-
-    @staticmethod
-    def _is_unavailable_endpoint_error(error: APIError) -> bool:
-        """Return True when an API error indicates an unsupported endpoint."""
-        status_code = getattr(error, "status_code", None)
-        message = str(error).lower()
-        return (
-            status_code in {404, 405}
-            or "not found" in message
-            or "not allowed" in message
-        )
 
     # ------------------------------------------------------------------
     # Phase 1: role synchronisation
@@ -237,6 +365,119 @@ class UserRoleMigrator(BaseMigrator):
         return [
             role for role in self.list_source_roles() if role.get("name") == "CUSTOM"
         ]
+
+    def list_source_access_policies(self) -> List[Dict[str, Any]]:
+        """Fetch ABAC access policies from the source organisation when supported."""
+        return self._list_access_policies(self.source)
+
+    def list_dest_access_policies(self) -> List[Dict[str, Any]]:
+        """Fetch ABAC access policies from the destination organisation when supported."""
+        return self._list_access_policies(self.dest)
+
+    def materialize_workspace_role_unions(
+        self,
+        union_role_ids: set[str],
+    ) -> Dict[str, str]:
+        """Create/reuse managed destination roles for synthetic workspace role unions."""
+        requested_union_ids = {
+            role_id
+            for role_id in union_role_ids
+            if is_workspace_role_union_id(role_id)
+        }
+        if not requested_union_ids:
+            return {}
+
+        source_roles = self.list_source_roles()
+        dest_roles = self.list_dest_roles()
+        source_role_by_id = {
+            role["id"]: role
+            for role in source_roles
+            if role.get("id")
+        }
+        dest_by_display = {
+            role.get("display_name", ""): role
+            for role in dest_roles
+            if role.get("name") == "CUSTOM"
+        }
+        source_policies = self.list_source_access_policies()
+        dest_policies = self.list_dest_access_policies()
+
+        mapping: Dict[str, str] = {}
+        for union_role_id in sorted(requested_union_ids):
+            source_role_ids = parse_workspace_role_union_id(union_role_id)
+            source_union_roles = [
+                source_role_by_id[role_id]
+                for role_id in sorted(source_role_ids)
+                if role_id in source_role_by_id
+            ]
+            missing_role_ids = source_role_ids - {
+                role["id"] for role in source_union_roles
+            }
+            if missing_role_ids:
+                raise APIError(
+                    "Cannot create workspace role union because source role "
+                    f"metadata is missing for: {', '.join(sorted(missing_role_ids))}",
+                    request_info={},
+                )
+
+            union_role = self._build_workspace_union_role(
+                union_role_id,
+                source_union_roles,
+            )
+            display_name = union_role["display_name"]
+            existing = dest_by_display.get(display_name)
+            if existing:
+                dest_role_id = existing["id"]
+                self.log(f"Reused managed workspace role union {display_name}")
+                if self.config.migration.skip_existing:
+                    self.log(f"Workspace role union '{display_name}' exists, skipping")
+                    mapping[union_role_id] = dest_role_id
+                    continue
+
+                if set(existing.get("permissions", [])) != set(union_role["permissions"]):
+                    if not self._update_custom_role(dest_role_id, union_role):
+                        self.log(
+                            f"Workspace role union '{display_name}' mapped but "
+                            "permissions may be stale",
+                            "warning",
+                        )
+                else:
+                    self.log(f"Workspace role union '{display_name}' already up to date")
+            else:
+                dest_role_id = self._create_custom_role(union_role)
+                if not dest_role_id:
+                    raise APIError(
+                        f"Failed to create workspace role union '{display_name}'",
+                        request_info={},
+                    )
+                self.log(
+                    f"Created managed workspace role union {display_name}",
+                    "success",
+                )
+                dest_by_display[display_name] = {
+                    **union_role,
+                    "id": dest_role_id,
+                    "name": "CUSTOM",
+                }
+
+            self._attach_union_access_policies(
+                source_role_ids,
+                dest_role_id,
+                source_policies,
+                dest_policies,
+                union_role_hash=self._workspace_union_hash(source_role_ids),
+            )
+            mapping[union_role_id] = dest_role_id
+            self.log(
+                f"Resolved workspace role union {union_role_id} -> {dest_role_id}"
+            )
+
+        self._role_id_map.update(mapping)
+        if self.state:
+            for src_id, dst_id in mapping.items():
+                self.state.set_mapped_id("roles", src_id, dst_id)
+            self.persist_state()
+        return mapping
 
     def _match_builtin_roles(
         self,
@@ -382,107 +623,74 @@ class UserRoleMigrator(BaseMigrator):
             )
             return False
 
-    # ------------------------------------------------------------------
-    # Managed workspace-role unions
-    # ------------------------------------------------------------------
+    def _platform_url(self, client, endpoint: str) -> str:
+        """Return an absolute platform API URL for clients based at /api/v1."""
+        base_url = getattr(client, "base_url", "").rstrip("/")
+        for suffix in ("/api/v1", "/api/v2"):
+            if base_url.endswith(suffix):
+                base_url = base_url[: -len(suffix)]
+                break
+        return f"{base_url}{endpoint}"
 
-    def ensure_workspace_role_unions(
-        self,
-        *,
-        source_roles: List[Dict[str, Any]],
-        union_specs: List[Dict[str, Any]],
-    ) -> Dict[str, str]:
-        """Ensure managed destination roles exist for CSV workspace-role unions."""
-        if not union_specs:
-            return {}
-
-        source_roles_by_id = {
-            role["id"]: role
-            for role in source_roles
-            if isinstance(role, dict) and role.get("id")
-        }
-        dest_roles = self.list_dest_roles()
-        dest_roles_by_id = {
-            role["id"]: role
-            for role in dest_roles
-            if isinstance(role, dict) and role.get("id")
-        }
-        source_policies = self.list_source_access_policies()
-        dest_policies = self.list_dest_access_policies(force=True)
-        dest_policies_by_fingerprint = self._index_access_policies(dest_policies)
-
-        mapping: Dict[str, str] = {}
-        specs_by_signature = {
-            spec["signature"]: spec
-            for spec in union_specs
-        }
-
-        for signature, spec in specs_by_signature.items():
-            union_role_key = spec["role_id"]
-            union_source_roles: List[Dict[str, Any]] = []
-            for source_role_id in spec.get("source_role_ids") or []:
-                source_role = source_roles_by_id.get(source_role_id)
-                if not source_role:
-                    raise APIError(
-                        (
-                            "Cannot prepare merged workspace role "
-                            f"{union_role_key}: source role {source_role_id!r} "
-                            "was not found in the source role inventory"
-                        ),
-                        request_info={},
-                    )
-                union_source_roles.append(source_role)
-
-            dest_role, should_reconcile_policies = self._ensure_workspace_role_union(
-                signature,
-                union_source_roles,
-                dest_roles_by_id,
-            )
-            dest_roles_by_id[dest_role["id"]] = dest_role
-
-            if should_reconcile_policies:
-                desired_policy_ids, dest_policies, dest_policies_by_fingerprint = (
-                    self._ensure_union_access_policies(
-                        dest_role["id"],
-                        union_source_roles,
-                        source_policies,
-                        dest_policies,
-                        dest_policies_by_fingerprint,
-                    )
-                )
-                self._attach_access_policies_to_role(
-                    dest_role["id"], desired_policy_ids
-                )
-                self._update_cached_policy_role_attachments(
-                    dest_policies,
-                    dest_role["id"],
-                    desired_policy_ids,
-                )
-
-            mapping[union_role_key] = dest_role["id"]
-            self._role_id_map[union_role_key] = dest_role["id"]
-            if self.state:
-                self.state.set_mapped_id("role_unions", signature, dest_role["id"])
-                self.state.set_mapped_id("roles", union_role_key, dest_role["id"])
-
-        if self.state:
-            self.persist_state()
-        self._dest_access_policies_cache = dest_policies
-        return mapping
-
-    def _ensure_workspace_role_union(
-        self,
-        signature: str,
-        source_roles: List[Dict[str, Any]],
-        dest_roles_by_id: Dict[str, Dict[str, Any]],
-    ) -> Tuple[Dict[str, Any], bool]:
-        """Create or update a managed custom role representing a role union."""
-        union_role_key = f"union::{signature}"
-        desired_display_name = self._workspace_role_union_display_name(signature)
-        desired_description = self._workspace_role_union_description(
-            signature, source_roles
+    def _list_access_policies(self, client) -> List[Dict[str, Any]]:
+        """List ABAC access policies, returning [] when the endpoint is unsupported."""
+        endpoint = self._platform_url(
+            client,
+            "/v1/platform/orgs/current/access-policies",
         )
-        desired_permissions = sorted(
+        try:
+            response = client.get(endpoint)
+        except APIError as e:
+            if getattr(e, "status_code", None) == 404:
+                self.log("ABAC access policy API is not available", "info")
+                return []
+            raise
+        if isinstance(response, dict):
+            policies = response.get("access_policies", [])
+            return policies if isinstance(policies, list) else []
+        if isinstance(response, list):
+            return response
+        return []
+
+    def _workspace_union_hash(self, source_role_ids: set[str]) -> str:
+        """Return a short stable hash for a synthetic workspace role union."""
+        encoded = json.dumps(sorted(source_role_ids), separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+
+    def _build_workspace_union_role(
+        self,
+        union_role_id: str,
+        source_roles: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Build the managed custom role payload for a workspace role union."""
+        source_role_ids = parse_workspace_role_union_id(union_role_id)
+        union_hash = self._workspace_union_hash(source_role_ids)
+        has_custom_role = any(role.get("name") == "CUSTOM" for role in source_roles)
+        builtin_roles_without_permissions = [
+            role
+            for role in source_roles
+            if (
+                has_custom_role
+                and role.get("name") in WORKSPACE_ROLE_PRECEDENCE
+                and not role.get("permissions")
+            )
+        ]
+        if builtin_roles_without_permissions:
+            labels = [
+                role.get("display_name") or role.get("name") or role["id"]
+                for role in builtin_roles_without_permissions
+            ]
+            raise APIError(
+                "Cannot create workspace role union because built-in role "
+                "permissions were not exposed by the roles API for: "
+                + ", ".join(sorted(labels)),
+                request_info={},
+            )
+        source_labels = [
+            f"{role.get('display_name') or role.get('name') or role['id']} ({role['id']})"
+            for role in source_roles
+        ]
+        permissions = sorted(
             {
                 permission
                 for role in source_roles
@@ -490,330 +698,343 @@ class UserRoleMigrator(BaseMigrator):
                 if permission
             }
         )
-
-        existing_role: Optional[Dict[str, Any]] = None
-        existing_role_id = self._role_id_map.get(union_role_key)
-        if not existing_role_id and self.state:
-            existing_role_id = (
-                self.state.get_mapped_id("role_unions", signature)
-                or self.state.get_mapped_id("roles", union_role_key)
-            )
-        if existing_role_id:
-            existing_role = dest_roles_by_id.get(existing_role_id)
-
-        if not existing_role:
-            for role in dest_roles_by_id.values():
-                if role.get("name") != "CUSTOM":
-                    continue
-                description = (role.get("description") or "").strip()
-                if (
-                    self._managed_workspace_role_union_signature(description)
-                    == signature
-                ):
-                    existing_role = role
-                    break
-
-        if existing_role and existing_role.get("name") != "CUSTOM":
-            raise APIError(
-                (
-                    "Managed workspace-role union mapping resolved to a non-custom "
-                    f"role ({existing_role.get('id')}); refusing to overwrite it"
-                ),
-                request_info={},
-            )
-
-        payload = {
-            "display_name": desired_display_name,
-            "description": desired_description,
-            "permissions": desired_permissions,
+        return {
+            "id": union_role_id,
+            "name": "CUSTOM",
+            "display_name": f"{WORKSPACE_ROLE_UNION_DISPLAY_PREFIX} {union_hash}",
+            "description": (
+                "Managed by langsmith-migrator. Union of source workspace roles: "
+                + "; ".join(source_labels)
+            ),
+            "permissions": permissions,
         }
 
-        if existing_role:
-            if self.config.migration.skip_existing:
-                self.log(
-                    f"Managed union role '{desired_display_name}' exists, "
-                    "skipping reconciliation",
-                    "info",
-                )
-                return existing_role, False
-            if self.config.migration.dry_run:
-                self.log(
-                    f"[DRY RUN] Would reconcile managed union role: {desired_display_name}"
-                )
-                reconciled_role = {**existing_role, **payload}
-            else:
-                self.dest.patch(f"/orgs/current/roles/{existing_role['id']}", payload)
-                reconciled_role = {**existing_role, **payload}
-            self.log(f"Prepared managed union role: {desired_display_name}", "success")
-            return reconciled_role, True
+    def _access_policy_signature(self, policy: Dict[str, Any]) -> str:
+        """Return a stable signature for policy equivalence across instances."""
+        payload = {
+            "name": policy.get("name") or "",
+            "description": policy.get("description") or "",
+            "effect": policy.get("effect") or "",
+            "condition_groups": policy.get("condition_groups") or [],
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
-        if self.config.migration.dry_run:
-            self.log(f"[DRY RUN] Would create managed union role: {desired_display_name}")
-            return {
-                "id": f"dry-run-{hashlib.sha1(signature.encode('utf-8')).hexdigest()[:12]}",
-                "name": "CUSTOM",
-                **payload,
-            }, True
-
-        response = self.dest.post("/orgs/current/roles", payload)
-        if not isinstance(response, dict) or not response.get("id"):
-            raise APIError(
-                f"Invalid response creating managed union role '{desired_display_name}': {response}",
-                request_info={},
-            )
-        self.log(f"Created managed union role: {desired_display_name}", "success")
-        return response, True
-
-    @staticmethod
-    def _workspace_role_union_display_name(signature: str) -> str:
-        """Return the deterministic display name for a managed union role."""
-        short_hash = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:12]
-        return f"Migrator Union {short_hash}"
-
-    @staticmethod
-    def _workspace_role_union_description(
-        signature: str,
-        source_roles: List[Dict[str, Any]],
-    ) -> str:
-        """Return the deterministic description for a managed union role."""
-        labels = ", ".join(
-            sorted(
-                {
-                    (role.get("display_name") or role.get("name") or role.get("id") or "").strip()
-                    for role in source_roles
-                    if (
-                        role.get("display_name")
-                        or role.get("name")
-                        or role.get("id")
-                    )
-                },
-                key=str.lower,
-            )
-        )
-        return (
-            f"{_ROLE_UNION_DESCRIPTION_PREFIX}{signature}. "
-            f"Source roles: {labels or '<unknown>'}"
-        )
-
-    @staticmethod
-    def _managed_workspace_role_union_signature(
-        description: str,
-    ) -> Optional[str]:
-        """Extract the managed union signature from a role description."""
-        normalized_description = (description or "").strip()
-        if not normalized_description.startswith(_ROLE_UNION_DESCRIPTION_PREFIX):
-            return None
-
-        suffix = normalized_description[len(_ROLE_UNION_DESCRIPTION_PREFIX):]
-        if suffix.endswith(".") and ". Source roles:" not in suffix:
-            signature = suffix[:-1].strip()
-            return signature or None
-
-        signature, separator, _ = suffix.partition(". Source roles:")
-        if separator:
-            signature = signature.strip()
-            return signature or None
-
-        return None
-
-    def _ensure_union_access_policies(
+    def _access_policy_payload(
         self,
+        policy: Dict[str, Any],
+        *,
+        role_ids: List[str],
+        fallback_name: str | None = None,
+    ) -> Dict[str, Any]:
+        """Build the create payload for an ABAC access policy clone."""
+        return {
+            "name": fallback_name or policy.get("name") or "Migrated access policy",
+            "description": policy.get("description") or "",
+            "effect": policy.get("effect") or "",
+            "condition_groups": policy.get("condition_groups") or [],
+            "role_ids": role_ids,
+        }
+
+    def _managed_union_policy_name(
+        self,
+        policy: Dict[str, Any],
+        *,
+        union_role_hash: str,
+    ) -> str:
+        """Return the deterministic managed fallback name for a cloned policy."""
+        return (
+            f"{WORKSPACE_ROLE_UNION_DISPLAY_PREFIX} {union_role_hash}: "
+            f"{policy.get('name') or policy.get('id') or 'policy'}"
+        )
+
+    def _attach_union_access_policies(
+        self,
+        source_role_ids: set[str],
         dest_role_id: str,
-        source_roles: List[Dict[str, Any]],
         source_policies: List[Dict[str, Any]],
         dest_policies: List[Dict[str, Any]],
-        dest_policies_by_fingerprint: Dict[str, List[Dict[str, Any]]],
-    ) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
-        """Ensure equivalent destination policies exist for a managed union role."""
-        source_role_ids = {
-            role.get("id")
-            for role in source_roles
-            if role.get("id")
+        *,
+        union_role_hash: str,
+    ) -> None:
+        """Clone or attach ABAC policies that apply to any source role in a union."""
+        relevant_policies = [
+            policy
+            for policy in source_policies
+            if source_role_ids.intersection(set(policy.get("role_ids") or []))
+        ]
+        if not relevant_policies:
+            return
+
+        dest_by_id = {
+            policy.get("id"): policy
+            for policy in dest_policies
+            if policy.get("id")
         }
-        desired_policy_ids: List[str] = []
-        seen_policy_fingerprints: set[str] = set()
+        dest_by_signature = {
+            self._access_policy_signature(policy): policy
+            for policy in dest_policies
+        }
+        dest_by_name = {
+            policy.get("name"): policy
+            for policy in dest_policies
+            if policy.get("name")
+        }
 
-        for policy in source_policies:
-            policy_role_ids = {
-                role_id
-                for role_id in (policy.get("role_ids") or [])
-                if role_id
+        for source_policy in relevant_policies:
+            dest_policy = dest_by_id.get(source_policy.get("id"))
+            if not dest_policy:
+                dest_policy = dest_by_signature.get(
+                    self._access_policy_signature(source_policy)
+                )
+            if not dest_policy:
+                dest_policy = dest_by_name.get(
+                    self._managed_union_policy_name(
+                        source_policy,
+                        union_role_hash=union_role_hash,
+                    )
+                )
+
+            if not dest_policy:
+                dest_policy = self._create_access_policy_clone(
+                    source_policy,
+                    dest_role_id,
+                    union_role_hash=union_role_hash,
+                )
+                if not dest_policy:
+                    raise APIError(
+                        "Failed to create destination access policy for "
+                        f"workspace role union {union_role_hash}",
+                        request_info={},
+                    )
+                dest_policies.append(dest_policy)
+                dest_by_id[dest_policy["id"]] = dest_policy
+                dest_by_signature[
+                    self._access_policy_signature(dest_policy)
+                ] = dest_policy
+                dest_by_name[dest_policy["name"]] = dest_policy
+                continue
+
+            attached_role_ids = {
+                role_id for role_id in (dest_policy.get("role_ids") or []) if role_id
             }
-            if not policy_role_ids.intersection(source_role_ids):
+            if dest_role_id in attached_role_ids:
                 continue
+            self._attach_access_policy_to_role(dest_policy["id"], dest_role_id)
+            dest_policy["role_ids"] = sorted(attached_role_ids | {dest_role_id})
 
-            fingerprint = self._access_policy_fingerprint(policy)
-            if fingerprint in seen_policy_fingerprints:
-                continue
-            seen_policy_fingerprints.add(fingerprint)
-
-            candidate_dest_policies = dest_policies_by_fingerprint.get(fingerprint, [])
-            if candidate_dest_policies:
-                desired_policy_ids.append(candidate_dest_policies[0]["id"])
-                continue
-
-            created_policy = self._create_access_policy(policy, dest_role_id)
-            dest_policies.append(created_policy)
-            dest_policies_by_fingerprint.setdefault(fingerprint, []).append(
-                created_policy
-            )
-            desired_policy_ids.append(created_policy["id"])
-
-        return sorted(set(desired_policy_ids)), dest_policies, dest_policies_by_fingerprint
-
-    def _create_access_policy(
+    def _create_access_policy_clone(
         self,
         source_policy: Dict[str, Any],
         dest_role_id: str,
+        *,
+        union_role_hash: str,
     ) -> Dict[str, Any]:
-        """Create a destination access policy equivalent to the source policy."""
-        payload = {
-            "name": source_policy.get("name") or "Migrated Access Policy",
-            "description": source_policy.get("description", ""),
-            "effect": source_policy.get("effect"),
-            "condition_groups": source_policy.get("condition_groups") or [],
-            "role_ids": [dest_role_id],
-        }
-
-        if self.config.migration.dry_run:
-            self.log(
-                f"[DRY RUN] Would create access policy: {payload['name']}"
+        """Create a destination ABAC access policy equivalent to a source policy."""
+        endpoint = self._platform_url(
+            self.dest,
+            "/v1/platform/orgs/current/access-policies",
+        )
+        payload = self._access_policy_payload(
+            source_policy,
+            role_ids=[dest_role_id],
+        )
+        try:
+            response = self.dest.post(endpoint, payload)
+        except ConflictError:
+            managed_name = self._managed_union_policy_name(
+                source_policy,
+                union_role_hash=union_role_hash,
             )
-            return {
-                "id": f"dry-run-policy-{hashlib.sha1(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()[:12]}",
-                **payload,
-            }
-
-        last_error: Optional[APIError] = None
-        for endpoint in _ACCESS_POLICY_ENDPOINT_CANDIDATES:
+            payload = self._access_policy_payload(
+                source_policy,
+                role_ids=[dest_role_id],
+                fallback_name=managed_name,
+            )
             try:
                 response = self.dest.post(endpoint, payload)
-                if not isinstance(response, dict) or not response.get("id"):
-                    raise APIError(
-                        f"Invalid response creating access policy: {response}",
-                        request_info={},
-                    )
-                self.log(f"Created access policy: {payload['name']}", "success")
-                return response
-            except APIError as e:
-                if self._is_unavailable_endpoint_error(e):
-                    last_error = e
-                    continue
-                raise
-
-        raise APIError(
-            f"Unable to create destination access policy for custom role auto-merge: {last_error}",
-            request_info={},
-        )
-
-    def _attach_access_policies_to_role(
-        self,
-        dest_role_id: str,
-        access_policy_ids: List[str],
-    ) -> None:
-        """Replace the attached access-policy set for a destination role."""
-        payload = {"access_policy_ids": sorted(set(access_policy_ids))}
-
-        if self.config.migration.dry_run:
-            self.log(
-                f"[DRY RUN] Would attach {len(payload['access_policy_ids'])} access policy(s) to role {dest_role_id}"
-            )
-            return
-
-        last_error: Optional[APIError] = None
-        for endpoint_template in _ROLE_ACCESS_POLICY_ENDPOINT_TEMPLATES:
-            endpoint = endpoint_template.format(role_id=dest_role_id)
-            try:
-                self.dest.post(endpoint, payload)
+            except ConflictError as e:
                 self.log(
-                    f"Attached {len(payload['access_policy_ids'])} access policy(s) to role {dest_role_id}",
-                    "success",
+                    f"Access policy '{managed_name}' already exists but could not "
+                    "be matched for attachment",
+                    "error",
                 )
-                return
-            except APIError as e:
-                if self._is_unavailable_endpoint_error(e):
-                    last_error = e
-                    continue
+                self.record_issue(
+                    "capability",
+                    "access_policy_create_conflict",
+                    (
+                        f"Access policy '{managed_name}' already exists but could "
+                        "not be matched for attachment"
+                    ),
+                    evidence={"policy": source_policy, "error": str(e)},
+                )
                 raise
+        except APIError as e:
+            self.log(
+                f"Failed to create access policy '{source_policy.get('name')}': {e}",
+                "error",
+            )
+            self.record_issue(
+                "capability",
+                "access_policy_create_failed",
+                f"Failed to create access policy '{source_policy.get('name')}': {e}",
+                evidence={"policy": source_policy, "error": str(e)},
+            )
+            raise
 
-        raise APIError(
-            f"Unable to attach access policies to role {dest_role_id}: {last_error}",
-            request_info={},
-        )
+        policy_id = response.get("id") if isinstance(response, dict) else None
+        if not policy_id:
+            self.record_issue(
+                "data_integrity",
+                "access_policy_create_missing_id",
+                "Access policy create response did not include an id",
+                evidence={"policy": source_policy, "response": response},
+            )
+            raise APIError(
+                "Access policy create response did not include an id",
+                request_info={"response": response},
+            )
+        self.log(f"Created access policy: {payload['name']}", "success")
+        return {
+            **payload,
+            "id": policy_id,
+        }
 
-    @staticmethod
-    def _update_cached_policy_role_attachments(
-        dest_policies: List[Dict[str, Any]],
-        role_id: str,
-        desired_policy_ids: List[str],
-    ) -> None:
-        """Update in-memory cached role attachments after a reconcile call."""
-        desired_set = set(desired_policy_ids)
-        for policy in dest_policies:
-            policy_role_ids = [
-                attached_role_id
-                for attached_role_id in (policy.get("role_ids") or [])
-                if attached_role_id and attached_role_id != role_id
-            ]
-            if policy.get("id") in desired_set:
-                policy_role_ids.append(role_id)
-            policy["role_ids"] = sorted(set(policy_role_ids))
-
-    def _index_access_policies(
+    def _attach_access_policy_to_role(
         self,
-        policies: List[Dict[str, Any]],
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """Index policies by semantic fingerprint."""
-        indexed: Dict[str, List[Dict[str, Any]]] = {}
-        for policy in policies:
-            fingerprint = self._access_policy_fingerprint(policy)
-            indexed.setdefault(fingerprint, []).append(policy)
-        return indexed
-
-    def _access_policy_fingerprint(self, policy: Dict[str, Any]) -> str:
-        """Build a semantic fingerprint that ignores IDs and attachments."""
-        canonical_groups: List[Dict[str, Any]] = []
-        for group in policy.get("condition_groups") or []:
-            if not isinstance(group, dict):
-                continue
-            normalized_conditions = sorted(
-                [
-                    {
-                        key: value
-                        for key, value in condition.items()
-                        if key
-                        in {
-                            "attribute_name",
-                            "attribute_key",
-                            "operator",
-                            "attribute_value",
-                        }
-                    }
-                    for condition in (group.get("conditions") or [])
-                    if isinstance(condition, dict)
-                ],
-                key=lambda item: json.dumps(item, sort_keys=True),
-            )
-            canonical_groups.append(
-                {
-                    "permission": group.get("permission"),
-                    "resource_type": group.get("resource_type"),
-                    "conditions": normalized_conditions,
-                }
-            )
-        canonical_groups.sort(key=lambda item: json.dumps(item, sort_keys=True))
-
-        return json.dumps(
-            {
-                "effect": policy.get("effect"),
-                "condition_groups": canonical_groups,
-            },
-            sort_keys=True,
+        access_policy_id: str,
+        dest_role_id: str,
+    ) -> None:
+        """Attach an existing destination ABAC access policy to a destination role."""
+        endpoint = self._platform_url(
+            self.dest,
+            f"/v1/platform/orgs/current/access-policies/roles/{dest_role_id}/access-policies",
         )
+        try:
+            self.dest.post(
+                endpoint,
+                {"access_policy_ids": [access_policy_id]},
+            )
+            self.log(
+                f"Attached access policy {access_policy_id} to role {dest_role_id}",
+                "success",
+            )
+        except APIError as e:
+            self.log(
+                f"Failed to attach access policy {access_policy_id}: {e}",
+                "error",
+            )
+            self.record_issue(
+                "capability",
+                "access_policy_attach_failed",
+                f"Failed to attach access policy {access_policy_id}: {e}",
+                evidence={
+                    "access_policy_id": access_policy_id,
+                    "dest_role_id": dest_role_id,
+                    "error": str(e),
+                },
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Phase 2: organisation member migration
     # ------------------------------------------------------------------
+
+    def _org_member_failure_context(
+        self,
+        *,
+        email: str,
+        error: BaseException,
+        operation: str,
+        fallback_next_action: str,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Return remediation text/evidence for org-member mutation failures."""
+        evidence: Dict[str, Any] = {"email": email, "error": str(error)}
+        if is_org_member_management_permission_error(error):
+            evidence.update(org_admin_pat_required_evidence(operation, error))
+            return ORG_ADMIN_PAT_NEXT_ACTION, evidence
+        return fallback_next_action, evidence
+
+    def _pending_invite_evidence(
+        self,
+        *,
+        email: str,
+        pending_member: Dict[str, Any],
+        desired_org_role_id: Optional[str],
+        desired_workspace_ids: List[str],
+        desired_workspace_role_id: Optional[str],
+        desired_workspace_access_representable: bool = True,
+        error: Optional[BaseException] = None,
+    ) -> Dict[str, Any]:
+        """Return structured evidence for pending invite reconciliation."""
+        evidence: Dict[str, Any] = {
+            "email": email,
+            "existing_pending_invite_id": pending_member.get("id"),
+            "existing_org_role_id": pending_member.get("role_id"),
+            "existing_workspace_ids": sorted(
+                workspace_id
+                for workspace_id in (pending_member.get("workspace_ids") or [])
+                if workspace_id
+            ),
+            "existing_workspace_role_id": (
+                (pending_member.get("workspace_role_id") or "").strip() or None
+            ),
+            "desired_org_role_id": desired_org_role_id,
+            "desired_workspace_ids": sorted(
+                workspace_id for workspace_id in desired_workspace_ids if workspace_id
+            ),
+            "desired_workspace_role_id": desired_workspace_role_id,
+            "desired_workspace_access_representable": (
+                desired_workspace_access_representable
+            ),
+        }
+        if error is not None:
+            evidence.update(
+                {
+                    "error": str(error),
+                    "status_code": getattr(error, "status_code", None),
+                    "request_info": getattr(error, "request_info", None),
+                }
+            )
+        return evidence
+
+    def _mark_pending_org_blocked(
+        self,
+        *,
+        email: str,
+        item_id: str,
+        code: str,
+        next_action: str,
+        evidence: Dict[str, Any],
+    ) -> None:
+        """Mark an org pending-invite blocker and expose it to workspace phase."""
+        self._pending_org_blockers[email] = {
+            "item_id": item_id,
+            "code": code,
+            "next_action": next_action,
+            "evidence": evidence,
+        }
+        self.mark_blocked(
+            item_id,
+            code,
+            next_action=next_action,
+            evidence=evidence,
+        )
+
+    def _log_pending_invite_workspace_payload(
+        self,
+        *,
+        email: str,
+        workspace_ids: List[str],
+        workspace_role_id: Optional[str],
+    ) -> None:
+        """Log the workspace access that can be embedded in an org invite."""
+        if not workspace_ids or not workspace_role_id:
+            return
+        self.log(
+            "Pending invite for "
+            f"{email} will include workspace access: {len(workspace_ids)} "
+            f"workspaces with role {workspace_role_id}"
+        )
 
     def migrate_org_members(
         self,
@@ -941,13 +1162,19 @@ class UserRoleMigrator(BaseMigrator):
                             f"Failed to update role for '{email}': {e}",
                             "error",
                         )
-                        self.mark_blocked(
-                            item_id, "org_member_role_update_failed",
-                            next_action=(
+                        next_action, evidence = self._org_member_failure_context(
+                            email=email,
+                            error=e,
+                            operation="Updating an organization member role",
+                            fallback_next_action=(
                                 "Review the org role update error in the remediation "
                                 "bundle, then re-run `langsmith-migrator users`."
                             ),
-                            evidence={"email": email, "error": str(e)},
+                        )
+                        self.mark_blocked(
+                            item_id, "org_member_role_update_failed",
+                            next_action=next_action,
+                            evidence=evidence,
                         )
                         failed += 1
                 else:
@@ -957,6 +1184,11 @@ class UserRoleMigrator(BaseMigrator):
             elif pending_member:
                 dest_role_id = pending_member.get("role_id")
                 needs_workspace_access = bool(workspace_ids and workspace_role_id)
+                desired_workspace_ids = {
+                    workspace_id
+                    for workspace_id in workspace_ids
+                    if workspace_id
+                }
                 pending_workspace_ids = {
                     workspace_id
                     for workspace_id in (pending_member.get("workspace_ids") or [])
@@ -967,15 +1199,20 @@ class UserRoleMigrator(BaseMigrator):
                 )
                 pending_covers_workspace_access = (
                     needs_workspace_access
-                    and set(workspace_ids).issubset(pending_workspace_ids)
+                    and desired_workspace_ids.issubset(pending_workspace_ids)
                     and pending_workspace_role_id == workspace_role_id
+                )
+                pending_workspace_access_matches = (
+                    (
+                        pending_workspace_ids == desired_workspace_ids
+                        and pending_workspace_role_id == workspace_role_id
+                    )
+                    if remove_missing
+                    else (not needs_workspace_access or pending_covers_workspace_access)
                 )
                 needs_reinvite = bool(
                     (mapped_role_id and dest_role_id != mapped_role_id)
-                    or (
-                        needs_workspace_access
-                        and not pending_covers_workspace_access
-                    )
+                    or not pending_workspace_access_matches
                 )
                 if needs_reinvite:
                     if self.config.migration.skip_existing:
@@ -991,10 +1228,77 @@ class UserRoleMigrator(BaseMigrator):
                         continue
 
                     try:
-                        self._remove_org_member(
+                        reasons: list[str] = []
+                        if mapped_role_id and dest_role_id != mapped_role_id:
+                            reasons.append("org role differs")
+                        if not pending_workspace_access_matches:
+                            reasons.append("workspace access differs")
+                        self.log(
+                            f"Replacing pending invite for {email}: "
+                            + ", ".join(reasons)
+                        )
+                        pending_removed = self._remove_org_member(
                             pending_member["id"],
                             pending=True,
+                            tolerate_missing=True,
                         )
+                    except (AuthenticationError, APIError) as e:
+                        self.log(
+                            f"Failed to cancel pending invite for '{email}': {e}",
+                            "error",
+                        )
+                        next_action, evidence = self._org_member_failure_context(
+                            email=email,
+                            error=e,
+                            operation="Replacing a pending organization invite",
+                            fallback_next_action=(
+                                "Cancel or replace the pending org invite on the "
+                                "target, then re-run `langsmith-migrator users`."
+                            ),
+                        )
+                        evidence.update(
+                            self._pending_invite_evidence(
+                                email=email,
+                                pending_member=pending_member,
+                                desired_org_role_id=mapped_role_id,
+                                desired_workspace_ids=workspace_ids,
+                                desired_workspace_role_id=workspace_role_id,
+                                error=e,
+                            )
+                        )
+                        self._mark_pending_org_blocked(
+                            email=email,
+                            item_id=item_id,
+                            code="org_member_pending_invite_replace_failed",
+                            next_action=next_action,
+                            evidence=evidence,
+                        )
+                        failed += 1
+                        continue
+
+                    if not pending_removed:
+                        next_action = (
+                            "Cancel or replace the pending org invite on the "
+                            "target, then re-run `langsmith-migrator users`."
+                        )
+                        evidence = self._pending_invite_evidence(
+                            email=email,
+                            pending_member=pending_member,
+                            desired_org_role_id=mapped_role_id,
+                            desired_workspace_ids=workspace_ids,
+                            desired_workspace_role_id=workspace_role_id,
+                        )
+                        self._mark_pending_org_blocked(
+                            email=email,
+                            item_id=item_id,
+                            code="org_member_pending_invite_cancel_unsupported",
+                            next_action=next_action,
+                            evidence=evidence,
+                        )
+                        failed += 1
+                        continue
+
+                    try:
                         self._invite_org_member(
                             email,
                             mapped_role_id,
@@ -1006,19 +1310,61 @@ class UserRoleMigrator(BaseMigrator):
                             outcome_code="org_member_migrated",
                         )
                         migrated += 1
+                    except ConflictError as e:
+                        self.log(
+                            f"Replacement invite for '{email}' conflicted: {e}",
+                            "error",
+                        )
+                        next_action = (
+                            "Cancel or replace the pending org invite on the "
+                            "target, then re-run `langsmith-migrator users`."
+                        )
+                        evidence = self._pending_invite_evidence(
+                            email=email,
+                            pending_member=pending_member,
+                            desired_org_role_id=mapped_role_id,
+                            desired_workspace_ids=workspace_ids,
+                            desired_workspace_role_id=workspace_role_id,
+                            error=e,
+                        )
+                        self._mark_pending_org_blocked(
+                            email=email,
+                            item_id=item_id,
+                            code="org_member_pending_invite_replace_conflict",
+                            next_action=next_action,
+                            evidence=evidence,
+                        )
+                        failed += 1
                     except (AuthenticationError, APIError) as e:
                         self.log(
                             f"Failed to replace pending invite for '{email}': {e}",
                             "error",
                         )
-                        self.mark_blocked(
-                            item_id,
-                            "org_member_pending_invite_replace_failed",
-                            next_action=(
+                        next_action, evidence = self._org_member_failure_context(
+                            email=email,
+                            error=e,
+                            operation="Replacing a pending organization invite",
+                            fallback_next_action=(
                                 "Cancel or replace the pending org invite on the "
                                 "target, then re-run `langsmith-migrator users`."
                             ),
-                            evidence={"email": email, "error": str(e)},
+                        )
+                        evidence.update(
+                            self._pending_invite_evidence(
+                                email=email,
+                                pending_member=pending_member,
+                                desired_org_role_id=mapped_role_id,
+                                desired_workspace_ids=workspace_ids,
+                                desired_workspace_role_id=workspace_role_id,
+                                error=e,
+                            )
+                        )
+                        self._mark_pending_org_blocked(
+                            email=email,
+                            item_id=item_id,
+                            code="org_member_pending_invite_replace_failed",
+                            next_action=next_action,
+                            evidence=evidence,
                         )
                         failed += 1
                 else:
@@ -1030,12 +1376,12 @@ class UserRoleMigrator(BaseMigrator):
                         for workspace_id in workspace_ids:
                             self._pending_workspace_invites.add((email, workspace_id))
                         self.log(
-                            f"Invite for '{email}' already pending with the required workspace access",
+                            f"Keeping pending invite for {email}: existing invite satisfies desired access",
                             "info",
                         )
                     else:
                         self.log(
-                            f"Invite for '{email}' already pending, skipping",
+                            f"Keeping pending invite for {email}: existing invite satisfies desired access",
                             "warning",
                         )
                     self.mark_migrated(
@@ -1062,13 +1408,19 @@ class UserRoleMigrator(BaseMigrator):
                     skipped += 1
                 except (AuthenticationError, APIError) as e:
                     self.log(f"Failed to invite '{email}': {e}", "error")
-                    self.mark_blocked(
-                        item_id, "org_member_invite_failed",
-                        next_action=(
+                    next_action, evidence = self._org_member_failure_context(
+                        email=email,
+                        error=e,
+                        operation="Inviting an organization member",
+                        fallback_next_action=(
                             "Review the org invite error in the remediation "
                             "bundle, then re-run `langsmith-migrator users`."
                         ),
-                        evidence={"email": email, "error": str(e)},
+                    )
+                    self.mark_blocked(
+                        item_id, "org_member_invite_failed",
+                        next_action=next_action,
+                        evidence=evidence,
                     )
                     failed += 1
 
@@ -1104,6 +1456,7 @@ class UserRoleMigrator(BaseMigrator):
                     self._remove_org_member(
                         member["id"],
                         pending=member.get("id") in pending_extra_ids,
+                        tolerate_missing=True,
                     )
                     self.mark_migrated(
                         item_id,
@@ -1116,14 +1469,20 @@ class UserRoleMigrator(BaseMigrator):
                         f"Failed to remove org member '{email}': {e}",
                         "error",
                     )
-                    self.mark_blocked(
-                        item_id,
-                        "org_member_remove_failed",
-                        next_action=(
+                    next_action, evidence = self._org_member_failure_context(
+                        email=email,
+                        error=e,
+                        operation="Removing an organization member or pending invite",
+                        fallback_next_action=(
                             "Remove the extra org user or pending invite manually "
                             "if needed, then re-run `langsmith-migrator users --sync`."
                         ),
-                        evidence={"email": email, "error": str(e)},
+                    )
+                    self.mark_blocked(
+                        item_id,
+                        "org_member_remove_failed",
+                        next_action=next_action,
+                        evidence=evidence,
                     )
                     failed += 1
 
@@ -1139,6 +1498,11 @@ class UserRoleMigrator(BaseMigrator):
         workspace_role_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Invite a new member to the destination org."""
+        self._log_pending_invite_workspace_payload(
+            email=email,
+            workspace_ids=workspace_ids or [],
+            workspace_role_id=workspace_role_id,
+        )
         if self.config.migration.dry_run:
             self.log(f"[DRY RUN] Would invite {email}")
             response = {"id": f"dry-run-{email}", "email": email}
@@ -1186,12 +1550,13 @@ class UserRoleMigrator(BaseMigrator):
         identity_id: str,
         *,
         pending: bool = False,
-    ) -> None:
+        tolerate_missing: bool = False,
+    ) -> bool:
         """Remove an active org member or cancel a pending invite."""
         if self.config.migration.dry_run:
             action = "cancel org invite" if pending else "remove org member"
             self.log(f"[DRY RUN] Would {action}: {identity_id}")
-            return
+            return True
 
         if pending:
             pending_endpoint = f"/orgs/current/members/pending/{identity_id}"
@@ -1199,15 +1564,57 @@ class UserRoleMigrator(BaseMigrator):
             try:
                 self.dest.delete(pending_endpoint)
             except APIError as e:
+                if is_org_member_management_permission_error(e):
+                    raise
                 status_code = getattr(e, "status_code", None)
                 message = str(e).lower()
-                if status_code not in {404, 405} and "not found" not in message and "not allowed" not in message:
+                if (
+                    status_code not in {404, 405}
+                    and "not found" not in message
+                    and "not allowed" not in message
+                ):
                     raise
-                self.dest.delete(legacy_endpoint)
+                try:
+                    self.dest.delete(legacy_endpoint)
+                except APIError as legacy_error:
+                    if is_org_member_management_permission_error(legacy_error):
+                        raise
+                    legacy_status_code = getattr(legacy_error, "status_code", None)
+                    legacy_message = str(legacy_error).lower()
+                    if is_member_absent_error(legacy_error):
+                        if not tolerate_missing:
+                            raise
+                        self.log(
+                            f"Pending org invite already absent: {identity_id}",
+                            "warning",
+                        )
+                        return True
+                    legacy_unsupported = (
+                        legacy_status_code == 405 or "not allowed" in legacy_message
+                    )
+                    if not (tolerate_missing and legacy_unsupported):
+                        raise
+                    self.log(
+                        "Pending org invite is not cancellable via known endpoints: "
+                        f"{identity_id}",
+                        "warning",
+                    )
+                    return False
         else:
-            self.dest.delete(f"/orgs/current/members/{identity_id}")
+            endpoint = f"/orgs/current/members/{identity_id}"
+            try:
+                self.dest.delete(endpoint)
+            except APIError as e:
+                if not (tolerate_missing and is_member_absent_error(e)):
+                    raise
+                self.log(
+                    f"Org member already absent during source-of-truth cleanup: {identity_id}",
+                    "warning",
+                )
+                return False
         action = "Cancelled org invite" if pending else "Removed org member"
         self.log(f"{action}: {identity_id}", "success")
+        return True
 
     # ------------------------------------------------------------------
     # Phase 3: workspace member migration
@@ -1228,32 +1635,36 @@ class UserRoleMigrator(BaseMigrator):
                 request_info={},
             )
 
-        selected_by_email: Dict[str, Dict[str, Any]] = {}
+        rows_by_email: Dict[str, List[Dict[str, Any]]] = {}
         for row in csv_rows:
             if row.get("workspace_id") != source_workspace_id:
                 continue
 
             email = (row.get("email") or "").strip().lower()
-            role_id = (row.get("role_id") or "").strip()
             if not email:
                 continue
+            rows_by_email.setdefault(email, []).append(row)
 
-            existing = selected_by_email.get(email)
-            if existing and existing["role_id"] != role_id:
-                raise APIError(
-                    (
-                        "Conflicting workspace role_id values in CSV rows for "
-                        f"{email} in workspace {source_workspace_id}"
-                    ),
-                    request_info={},
+        selected_by_email: Dict[str, Dict[str, Any]] = {}
+        for email, rows in rows_by_email.items():
+            try:
+                role_id = select_effective_workspace_role_id(
+                    rows,
+                    email=email,
+                    workspace_id=source_workspace_id,
                 )
-            if not existing:
-                selected_by_email[email] = {
-                    "id": row.get("id") or f"{source_workspace_id}:{email}",
-                    "email": email,
-                    "role_id": role_id,
-                    "full_name": row.get("full_name", ""),
-                }
+            except ValueError as e:
+                raise APIError(
+                    str(e),
+                    request_info={},
+                ) from e
+            first_row = rows[0]
+            selected_by_email[email] = {
+                "id": first_row.get("id") or f"{source_workspace_id}:{email}",
+                "email": email,
+                "role_id": role_id,
+                "full_name": first_row.get("full_name", ""),
+            }
 
         return self.migrate_workspace_members(
             selected_members=list(selected_by_email.values())
@@ -1320,6 +1731,25 @@ class UserRoleMigrator(BaseMigrator):
                 member.get("id", email),
                 metadata={"member": member, "workspace_pair": ws_pair},
             )
+
+            pending_org_blocker = self._pending_org_blockers.get(email)
+            if pending_org_blocker:
+                self.log(
+                    "Skipping workspace membership for "
+                    f"'{email}' because org pending invite reconciliation is blocked",
+                    "warning",
+                )
+                self.mark_migrated(
+                    item_id,
+                    outcome_code="ws_member_skipped_pending_org_blocker",
+                    evidence={
+                        "email": email,
+                        "org_item_id": pending_org_blocker.get("item_id"),
+                        "org_blocker": pending_org_blocker.get("code"),
+                    },
+                )
+                skipped += 1
+                continue
 
             source_role_id = (member.get("role_id") or "").strip() or None
             mapped_role_id = (
@@ -1395,6 +1825,43 @@ class UserRoleMigrator(BaseMigrator):
                     self.mark_blocked(
                         item_id, "ws_member_not_in_org",
                         next_action="Migrate the user as an org member first, then retry.",
+                        evidence={"email": email},
+                    )
+                    failed += 1
+                    continue
+                pending_org_member = self._pending_org_email_to_identity.get(email)
+                pending_user_id = (
+                    pending_org_member
+                    and (
+                        pending_org_member.get("user_id")
+                        or (pending_org_member.get("user") or {}).get("id")
+                    )
+                )
+                if pending_org_member and not pending_user_id:
+                    if email in self._pending_org_invite_wait_reported:
+                        self.log(
+                            f"Workspace membership for '{email}' is already waiting on pending org invite acceptance",
+                            "info",
+                        )
+                        self.mark_migrated(
+                            item_id,
+                            outcome_code="ws_member_skipped_pending_org_invite_waiting",
+                            evidence={"email": email},
+                        )
+                        skipped += 1
+                        continue
+                    self._pending_org_invite_wait_reported.add(email)
+                    self.log(
+                        f"Cannot add '{email}' to workspace until the pending org invite is accepted",
+                        "warning",
+                    )
+                    self.mark_blocked(
+                        item_id,
+                        "ws_member_pending_org_invite",
+                        next_action=(
+                            "Wait for the pending org invite to be accepted, "
+                            "then re-run `langsmith-migrator users`."
+                        ),
                         evidence={"email": email},
                     )
                     failed += 1

@@ -67,11 +67,14 @@ _ACTIONABLE_GROUP_LABELS = {
     "unmapped_role": "Roles are missing from the mapping",
     "unmapped_workspace_role": "Workspace roles are missing from the mapping",
     "org_member_role_update_failed": "Org role updates failed",
+    "org_member_pending_invite_cancel_unsupported": "Pending org invites could not be cancelled",
+    "org_member_pending_invite_replace_conflict": "Pending org invites could not be replaced",
     "org_member_pending_invite_replace_failed": "Pending org invites could not be refreshed",
     "org_member_invite_failed": "Org invites failed",
     "org_member_remove_failed": "Extra org users or pending invites could not be removed",
     "ws_member_role_update_failed": "Workspace role updates failed",
     "ws_member_not_in_org": "Workspace users are missing org access",
+    "ws_member_pending_org_invite": "Workspace users are waiting on pending org invites",
     "ws_member_add_failed": "Workspace memberships failed to add",
     "ws_member_remove_failed": "Extra workspace memberships could not be removed",
 }
@@ -83,6 +86,14 @@ _ACTIONABLE_NEXT_ACTION_OVERRIDES = {
         "then re-run `langsmith-migrator users`."
     ),
     "org_member_pending_invite_replace_failed": (
+        "Cancel or replace the pending org invite on the target, "
+        "then re-run `langsmith-migrator users`."
+    ),
+    "org_member_pending_invite_cancel_unsupported": (
+        "Cancel or replace the pending org invite on the target, "
+        "then re-run `langsmith-migrator users`."
+    ),
+    "org_member_pending_invite_replace_conflict": (
         "Cancel or replace the pending org invite on the target, "
         "then re-run `langsmith-migrator users`."
     ),
@@ -100,6 +111,10 @@ _ACTIONABLE_NEXT_ACTION_OVERRIDES = {
     ),
     "ws_member_add_failed": (
         "Review the workspace membership create error in the remediation bundle, "
+        "then re-run `langsmith-migrator users`."
+    ),
+    "ws_member_pending_org_invite": (
+        "Wait for the pending org invite to be accepted, "
         "then re-run `langsmith-migrator users`."
     ),
     "ws_member_remove_failed": (
