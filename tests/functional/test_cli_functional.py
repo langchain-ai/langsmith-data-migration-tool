@@ -1923,6 +1923,45 @@ def test_rules_command_uses_custom_project_mapping_and_create_enabled(cli_harnes
     assert "Rules: 1 migrated, 0 skipped, 0 failed" in cli_harness.console.text
 
 
+def test_rules_command_uses_custom_project_mapping_for_selected_rule(cli_harness):
+    """Inline project mappings should also work through the interactive selector path."""
+
+    source_rule = {
+        "id": "rule-1",
+        "display_name": "Alignment",
+        "dataset_id": "dataset-1",
+    }
+    skipped_rule = {
+        "id": "rule-2",
+        "display_name": "Not Selected",
+        "dataset_id": "dataset-2",
+    }
+    cli_harness.migrators.rules.list_rules.return_value = [source_rule, skipped_rule]
+    cli_harness.migrators.rules.create_rule.return_value = "dest-rule-1"
+    cli_harness.controls.select_results = [[source_rule]]
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "rules",
+            "--project-mapping",
+            '{"source-project-id": "dest-project-id"}',
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.rules._project_id_map == {
+        "source-project-id": "dest-project-id"
+    }
+    cli_harness.migrators.rules.create_rule.assert_called_once_with(
+        source_rule,
+        strip_project_reference=False,
+        create_disabled=True,
+    )
+    assert "Selected 1 rule(s)" in cli_harness.console.text
+    assert "Rules: 1 migrated, 0 skipped, 0 failed" in cli_harness.console.text
+
+
 def test_rules_command_uses_workspace_project_mappings(cli_harness):
     """Standalone rules migration should consume per-workspace project mappings from workspace resolution."""
 

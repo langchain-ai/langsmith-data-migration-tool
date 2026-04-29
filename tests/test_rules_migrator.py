@@ -323,6 +323,42 @@ class TestRulesMigrator:
         payload = call_args[0][1]
         assert payload.get('session_id') == 'dest-project-456'
 
+    def test_create_rule_remaps_project_ids_inside_rule_filters(
+        self, rules_migrator, mock_api_client, sample_config
+    ):
+        """Project mappings should rewrite project IDs embedded in rule filters."""
+        sample_config.migration.dry_run = False
+
+        project_filtered_rule = {
+            'id': 'rule-with-filtered-project',
+            'display_name': 'Project Filtered Rule',
+            'is_enabled': True,
+            'sampling_rate': 1.0,
+            'dataset_id': 'source-dataset-789',
+            'filter': 'and(eq(session_id, "source-project-123"), eq(is_root, true))',
+            'trace_filter': {
+                'op': 'eq',
+                'field': 'session_id',
+                'value': 'source-project-123',
+            },
+            'tree_filter': [
+                {'field': 'project_id', 'value': 'source-project-123'},
+            ],
+        }
+
+        rules_migrator._project_id_map = {'source-project-123': 'dest-project-456'}
+        rules_migrator._dataset_id_map = {'source-dataset-789': 'dest-dataset-abc'}
+        mock_api_client.post.return_value = {'id': 'new-rule-123'}
+
+        result = rules_migrator.create_rule(project_filtered_rule)
+
+        assert result == 'new-rule-123'
+        payload = mock_api_client.post.call_args[0][1]
+        assert 'source-project-123' not in str(payload)
+        assert 'dest-project-456' in payload['filter']
+        assert payload['trace_filter']['value'] == 'dest-project-456'
+        assert payload['tree_filter'][0]['value'] == 'dest-project-456'
+
     def test_create_rule_with_both_project_and_dataset(self, rules_migrator, mock_api_client, sample_config):
         """Test creating a rule with both project and dataset mapping."""
         sample_config.migration.dry_run = False
