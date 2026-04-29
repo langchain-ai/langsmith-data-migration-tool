@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.66] - 2026-04-29
+
+### Added
+- **CSV workspace role unionization**: Multiple CSV rows for the same user and workspace can now be combined into one effective workspace assignment. Built-in workspace roles collapse to the highest-privilege built-in role, while custom ABAC roles are materialized through managed union roles so all required source policy attachments are preserved.
+- **Automation-ready users sync remediation**: Authoritative single-instance sync now reports Organization Admin PAT blockers consistently when active members or pending invites cannot be managed by the destination key.
+- **Expanded users CSV examples**: Added scenario CSVs for multi-workspace roles, source-of-truth removals, and pending invites with mixed workspace role rows.
+
+### Fixed
+- **ABAC role preservation with Workspace Admin**: Workspace Admin rows no longer bypass custom ABAC role unionization when the same user also has custom roles for the same workspace.
+- **Pending invite permission handling**: 401/403 `not allowed` failures while cancelling pending invites now surface the Org Admin PAT remediation instead of falling through to an unsupported-cancel result.
+- **Authoritative pending invite reconciliation**: Pending invites with extra workspace grants are refreshed during CSV source-of-truth sync instead of being treated as valid supersets.
+- **Policy materialization safety**: Synthetic union roles are not mapped unless all required custom ABAC policy clone and attach operations succeed.
+
 ## [0.0.65] - 2026-04-21
 
 ### Added
@@ -289,7 +302,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.65...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.66...HEAD
+[0.0.66]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.65...v0.0.66
 [0.0.65]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.64...v0.0.65
 [0.0.64]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.63...v0.0.64
 [0.0.63]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.62...v0.0.63

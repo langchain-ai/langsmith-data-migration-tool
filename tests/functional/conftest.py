@@ -87,7 +87,7 @@ class FakeClient:
         self.set_workspace_calls: list[str | None] = []
         self.closed = False
 
-    def get(self, endpoint: str) -> Any:
+    def get(self, endpoint: str, params: dict[str, Any] | None = None) -> Any:
         self.get_calls.append(endpoint)
         response = self.get_responses.get(endpoint, [])
         if isinstance(response, Exception):
@@ -358,7 +358,9 @@ def cli_harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> CliHarness:
     monkeypatch.setattr(cli_main, "MigrationOrchestrator", orchestrator_factory)
 
     def patch_migrator(name: str, instance: Mock) -> None:
-        factory = lambda *args, **kwargs: instance
+        def factory(*args: Any, **kwargs: Any) -> Mock:
+            return instance
+
         monkeypatch.setattr(cli_main, name, factory)
         monkeypatch.setattr(migrators_module, name, factory)
 
