@@ -7,16 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.67] - 2026-04-29
+
 ### Added
 - **Rules annotation queue remapping**: Rules that target annotation queues now reuse saved queue mappings or exact-name destination queue matches, and export for remediation when the queue dependency cannot be resolved safely.
 
 ### Fixed
-- **Chart dependency remapping**: Chart migration now records unresolved project/session/dataset dependencies for manual remediation instead of posting charts with source IDs, while preserving dataset IDs in true same-instance chart runs.
-
-## [0.0.67] - 2026-04-29
-
-### Fixed
 - **Rules project mapping**: `langsmith-migrator rules --project-mapping ...` now rewrites source project IDs embedded in `filter`, `trace_filter`, and `tree_filter` payloads, including dataset-associated rules whose project scope is hidden inside the rule filter body.
+- **Chart dependency remapping**: Chart migration now records unresolved project/session/dataset dependencies for manual remediation instead of posting charts with source IDs, while preserving dataset IDs in true same-instance chart runs.
 
 ## [0.0.66] - 2026-04-29
 
