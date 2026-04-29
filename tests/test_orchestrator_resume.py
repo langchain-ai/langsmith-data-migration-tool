@@ -6,7 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
-from langsmith_migrator.utils.state import MigrationItem, MigrationStatus, StateManager
+from langsmith_migrator.utils.state import (
+    MigrationItem,
+    MigrationStatus,
+    ResolutionOutcome,
+    StateManager,
+)
 
 
 class _FakeClient:
@@ -21,6 +26,14 @@ class _FakeClient:
 
     def close(self) -> None:
         return None
+
+
+class _FakeConsole:
+    def __init__(self) -> None:
+        self.text = ""
+
+    def print(self, *args, end="\n", **kwargs) -> None:
+        self.text += "".join(str(arg) for arg in args) + end
 
 
 def test_resume_items_continues_non_user_items_when_dest_org_prefetch_fails(
@@ -111,6 +124,10 @@ def test_resume_items_forwards_chart_same_instance_metadata(
 ):
     """Resume should preserve same-instance chart metadata when retrying chart items."""
 
+    sample_config.source.base_url = "https://api.smith.langchain.com"
+    sample_config.destination.base_url = "https://api.smith.langchain.com/api/v1"
+    sample_config.destination.api_key = sample_config.source.api_key
+
     clients = [_FakeClient(), _FakeClient()]
     monkeypatch.setattr(
         "langsmith_migrator.core.migrators.orchestrator.EnhancedAPIClient",
@@ -170,3 +187,173 @@ def test_resume_items_forwards_chart_same_instance_metadata(
         "source-session",
         same_instance=True,
     )
+
+
+def test_resume_items_re_resolves_chart_when_same_instance_metadata_is_stale(
+    monkeypatch, sample_config, migration_state, tmp_path
+):
+    """Stale same-instance chart resume metadata should be repaired before replay."""
+
+    sample_config.source.base_url = "https://api.smith.langchain.com"
+    sample_config.destination.base_url = "https://api.smith.langchain.com"
+    sample_config.source.api_key = "source-workspace-key"
+    sample_config.destination.api_key = "dest-workspace-key"
+    migration_state.id_mappings["project"] = {"source-session": "dest-session"}
+
+    clients = [_FakeClient(), _FakeClient()]
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.EnhancedAPIClient",
+        lambda **kwargs: clients.pop(0),
+    )
+
+    chart_migrator = Mock()
+    chart_migrator._extract_session_id.return_value = "source-session"
+    chart_migrator.resolve_destination_session_id.return_value = "dest-session"
+    chart_migrator.migrate_chart.return_value = "dest-chart-1"
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.chart.ChartMigrator",
+        lambda *args, **kwargs: chart_migrator,
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.prompt.PromptMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.annotation_queue.AnnotationQueueMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.rules.RulesMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.ExperimentMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.FeedbackMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+
+    state_manager = StateManager(tmp_path / "state")
+    orchestrator = MigrationOrchestrator(sample_config, state_manager)
+    orchestrator.console = _FakeConsole()
+    orchestrator.state = migration_state
+
+    chart_payload = {
+        "id": "chart-1",
+        "title": "Chart One",
+        "project_id": "source-session",
+        "series": [],
+    }
+    chart_item = MigrationItem(
+        id="chart_default_chart-1",
+        type="chart",
+        name="Chart One",
+        source_id="chart-1",
+        status=MigrationStatus.PENDING,
+        metadata={
+            "chart": chart_payload,
+            "dest_session_id": "source-session",
+            "same_instance": True,
+        },
+    )
+    migration_state.add_item(chart_item)
+
+    results = orchestrator.resume_items([chart_item])
+
+    assert results["resumed"] == ["chart:chart-1"]
+    assert results["blocked"] == []
+    assert "Chart resume context changed" in orchestrator.console.text
+    chart_migrator.resolve_destination_session_id.assert_called_once_with(
+        "source-session",
+        same_instance=False,
+    )
+    chart_migrator.migrate_chart.assert_called_once_with(
+        chart_payload,
+        "dest-session",
+        same_instance=False,
+    )
+    assert chart_item.metadata["same_instance"] is False
+    assert chart_item.metadata["dest_session_id"] == "dest-session"
+    assert chart_item.metadata["previous_same_instance"] is True
+    assert chart_item.metadata["previous_dest_session_id"] == "source-session"
+
+
+def test_resume_items_blocks_chart_when_stale_context_cannot_resolve_destination(
+    monkeypatch, sample_config, migration_state, tmp_path
+):
+    """Stale chart resume metadata should checkpoint if remap resolution is unsafe."""
+
+    sample_config.source.base_url = "https://api.smith.langchain.com"
+    sample_config.destination.base_url = "https://api.smith.langchain.com"
+    sample_config.source.api_key = "source-workspace-key"
+    sample_config.destination.api_key = "dest-workspace-key"
+
+    clients = [_FakeClient(), _FakeClient()]
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.EnhancedAPIClient",
+        lambda **kwargs: clients.pop(0),
+    )
+
+    chart_migrator = Mock()
+    chart_migrator._extract_session_id.return_value = "source-session"
+    chart_migrator.resolve_destination_session_id.return_value = None
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.chart.ChartMigrator",
+        lambda *args, **kwargs: chart_migrator,
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.prompt.PromptMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.annotation_queue.AnnotationQueueMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.rules.RulesMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.ExperimentMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.FeedbackMigrator",
+        lambda *args, **kwargs: Mock(),
+    )
+
+    state_manager = StateManager(tmp_path / "state")
+    orchestrator = MigrationOrchestrator(sample_config, state_manager)
+    orchestrator.console = _FakeConsole()
+    orchestrator.state = migration_state
+
+    chart_item = MigrationItem(
+        id="chart_default_chart-1",
+        type="chart",
+        name="Chart One",
+        source_id="chart-1",
+        status=MigrationStatus.PENDING,
+        metadata={
+            "chart": {
+                "id": "chart-1",
+                "title": "Chart One",
+                "project_id": "source-session",
+                "series": [],
+            },
+            "dest_session_id": "source-session",
+            "same_instance": True,
+        },
+    )
+    migration_state.add_item(chart_item)
+
+    results = orchestrator.resume_items([chart_item])
+
+    assert results["resumed"] == []
+    assert results["blocked"] == ["chart:chart-1"]
+    assert "Cannot resume chart" in orchestrator.console.text
+    chart_migrator.migrate_chart.assert_not_called()
+    assert chart_item.terminal_state == ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value
+    assert chart_item.outcome_code == "chart_resume_context_changed"
+    assert "fresh `langsmith-migrator charts` run" in chart_item.next_action

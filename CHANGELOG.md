@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Chart resume mode changes**: `resume` now detects stale chart `--same-instance` metadata, re-resolves the destination project/session for the current source/destination context, and checkpoints with clear guidance if remapping cannot be resolved safely.
+
 ## [0.0.67] - 2026-04-29
 
 ### Added
