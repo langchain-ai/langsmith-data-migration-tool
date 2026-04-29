@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.68] - 2026-04-29
+
 ### Fixed
 - **Chart resume mode changes**: `resume` now detects stale chart `--same-instance` metadata, re-resolves the destination project/session for the current source/destination context, and checkpoints with clear guidance if remapping cannot be resolved safely.
 
@@ -314,7 +316,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.67...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.68...HEAD
+[0.0.68]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.67...v0.0.68
 [0.0.67]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.66...v0.0.67
 [0.0.66]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.65...v0.0.66
 [0.0.65]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.64...v0.0.65
