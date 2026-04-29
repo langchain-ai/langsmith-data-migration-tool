@@ -450,6 +450,8 @@ Every migration session persists state and writes a remediation bundle when ther
 - org members
 - workspace members
 
+For chart items, `resume` revalidates saved `--same-instance` metadata against the current source/destination and workspace context. If the mode changed, it re-resolves the destination project/session before retrying; if that cannot be resolved safely, the item is checkpointed with guidance to rerun `charts` with project mapping.
+
 Use `langsmith-migrator clean` to remove saved sessions once you no longer need their state or remediation bundles.
 
 ## SSL Certificate Issues
