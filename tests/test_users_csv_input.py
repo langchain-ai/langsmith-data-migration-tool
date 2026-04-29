@@ -6,6 +6,7 @@ import click
 import pytest
 
 from langsmith_migrator.cli.main import (
+    _build_single_instance_users_plan,
     _configure_single_instance,
     _csv_rows_for_workspace,
     _csv_rows_to_org_members,
@@ -14,6 +15,9 @@ from langsmith_migrator.cli.main import (
     _normalize_csv_role_scopes,
     _resolve_single_instance_workspace_ids,
     _resolve_csv_role_names,
+)
+from langsmith_migrator.core.migrators.user_role import (
+    make_workspace_role_union_id,
 )
 from langsmith_migrator.utils.config import Config
 
@@ -101,6 +105,26 @@ def test_load_members_csv_accepts_utf8_bom_header(tmp_path: Path):
     ]
 
 
+def test_load_members_csv_preserves_non_empty_workspace_name(tmp_path: Path):
+    csv_path = tmp_path / "members.csv"
+    csv_path.write_text(
+        "email,langsmith_role,workspace_id,workspace_name\n"
+        "alice@example.com,Workspace Admin,ws-1,Workspace A\n",
+        encoding="utf-8",
+    )
+
+    rows = _load_members_csv(str(csv_path))
+
+    assert rows == [
+        {
+            "email": "alice@example.com",
+            "langsmith_role": "Workspace Admin",
+            "workspace_id": "ws-1",
+            "workspace_name": "Workspace A",
+        }
+    ]
+
+
 def test_load_members_csv_allows_empty_workspace_id(tmp_path: Path):
     csv_path = tmp_path / "members.csv"
     csv_path.write_text(
@@ -156,6 +180,21 @@ def test_resolve_csv_role_names_builtin_roles():
     assert resolved[0]["role_id"] == "src-admin"
     assert resolved[1]["role_id"] == "src-ws-admin"
     assert org_user_id == "src-user"
+
+
+def test_resolve_csv_role_names_preserves_workspace_name():
+    rows = [
+        {
+            "email": "b@example.com",
+            "langsmith_role": "Workspace Admin",
+            "workspace_id": "ws-1",
+            "workspace_name": "Workspace A",
+        },
+    ]
+
+    resolved, _ = _resolve_csv_role_names(rows, SOURCE_ROLES)
+
+    assert resolved[0]["workspace_name"] == "Workspace A"
 
 
 def test_resolve_csv_role_names_extended_builtin_aliases():
@@ -409,6 +448,31 @@ def test_csv_rows_to_org_members_single_instance_workspace_only_carries_workspac
     ]
 
 
+def test_csv_rows_to_org_members_single_instance_org_row_carries_workspace_invite():
+    rows = [
+        {"email": "alice@example.com", "role_id": "role-user", "workspace_id": ""},
+        {"email": "alice@example.com", "role_id": "role-ws-admin", "workspace_id": "ws-2"},
+        {"email": "alice@example.com", "role_id": "role-ws-admin", "workspace_id": "ws-1"},
+    ]
+
+    members = _csv_rows_to_org_members(
+        rows,
+        default_org_role_id="role-user",
+        direct_workspace_invites=True,
+    )
+
+    assert members == [
+        {
+            "id": "alice@example.com",
+            "email": "alice@example.com",
+            "role_id": "role-user",
+            "full_name": "",
+            "workspace_ids": ["ws-1", "ws-2"],
+            "workspace_role_id": "role-ws-admin",
+        }
+    ]
+
+
 def test_csv_rows_to_org_members_single_instance_mixed_workspace_roles_omit_direct_invite():
     rows = [
         {"email": "alice@example.com", "role_id": "role-ws-admin", "workspace_id": "ws-1"},
@@ -427,6 +491,42 @@ def test_csv_rows_to_org_members_single_instance_mixed_workspace_roles_omit_dire
             "email": "alice@example.com",
             "role_id": "role-user",
             "full_name": "",
+        }
+    ]
+
+
+def test_csv_rows_to_org_members_single_instance_combines_duplicate_custom_roles_for_invite():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "role_id": "src-custom-1",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "role_id": "src-custom-2",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
+    ]
+
+    members = _csv_rows_to_org_members(
+        rows,
+        default_org_role_id="role-user",
+        direct_workspace_invites=True,
+    )
+
+    assert members == [
+        {
+            "id": "alice@example.com",
+            "email": "alice@example.com",
+            "role_id": "role-user",
+            "full_name": "",
+            "workspace_ids": ["ws-1"],
+            "workspace_role_id": make_workspace_role_union_id(
+                {"src-custom-1", "src-custom-2"}
+            ),
         }
     ]
 
@@ -475,14 +575,111 @@ def test_csv_rows_for_workspace_dedupes_by_email():
     ]
 
 
-def test_csv_rows_for_workspace_rejects_conflicting_roles():
+def test_csv_rows_for_workspace_combines_custom_roles():
     rows = [
-        {"email": "alice@example.com", "role_id": "role-1", "workspace_id": "ws-1"},
-        {"email": "alice@example.com", "role_id": "role-2", "workspace_id": "ws-1"},
+        {
+            "email": "alice@example.com",
+            "role_id": "src-custom-1",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "role_id": "src-custom-2",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
     ]
 
-    with pytest.raises(click.ClickException, match="conflicting role_id"):
-        _csv_rows_for_workspace(rows, "ws-1")
+    selected = _csv_rows_for_workspace(rows, "ws-1")
+
+    assert selected == [
+        {
+            "id": "ws-1:alice@example.com",
+            "email": "alice@example.com",
+            "role_id": make_workspace_role_union_id(
+                {"src-custom-1", "src-custom-2"}
+            ),
+            "full_name": "",
+        }
+    ]
+
+
+def test_csv_rows_for_workspace_picks_highest_builtin_role():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "role_id": "src-ws-viewer",
+            "role_name": "WORKSPACE_VIEWER",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "role_id": "src-ws-admin",
+            "role_name": "WORKSPACE_ADMIN",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "role_id": "src-ws-user",
+            "role_name": "WORKSPACE_USER",
+            "workspace_id": "ws-1",
+        },
+    ]
+
+    selected = _csv_rows_for_workspace(rows, "ws-1")
+
+    assert selected[0]["role_id"] == "src-ws-admin"
+
+
+def test_csv_rows_for_workspace_unions_custom_role_with_workspace_admin():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "role_id": "src-ws-admin",
+            "role_name": "WORKSPACE_ADMIN",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "role_id": "src-custom-1",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
+    ]
+
+    selected = _csv_rows_for_workspace(rows, "ws-1")
+
+    assert selected[0]["role_id"] == make_workspace_role_union_id(
+        {"src-ws-admin", "src-custom-1"}
+    )
+
+
+def test_csv_rows_to_org_members_unions_custom_role_with_workspace_admin_for_invite():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "role_id": "src-ws-admin",
+            "role_name": "WORKSPACE_ADMIN",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "role_id": "src-custom-1",
+            "role_name": "CUSTOM",
+            "workspace_id": "ws-1",
+        },
+    ]
+
+    members = _csv_rows_to_org_members(
+        rows,
+        default_org_role_id="role-user",
+        direct_workspace_invites=True,
+    )
+
+    assert members[0]["workspace_role_id"] == make_workspace_role_union_id(
+        {"src-ws-admin", "src-custom-1"}
+    )
 
 
 def test_csv_rows_for_workspace_ignores_org_rows():
@@ -629,3 +826,131 @@ def test_resolve_single_instance_workspace_ids_source_of_truth_uses_all_workspac
     )
 
     assert workspace_ids == ["ws-1", "ws-2"]
+
+
+def test_build_single_instance_users_plan_rejects_workspace_name_mismatch():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "role_id": "role-ws-admin",
+            "workspace_id": "ws-1",
+            "workspace_name": "Workspace B",
+        },
+    ]
+
+    with pytest.raises(click.ClickException) as exc_info:
+        _build_single_instance_users_plan(
+            rows,
+            available_workspaces=[{"id": "ws-1", "display_name": "Workspace A"}],
+            default_org_role_id="role-user",
+            source_of_truth=False,
+        )
+
+    message = str(exc_info.value)
+    assert "workspace_name mismatch" in message
+    assert "Workspace B" in message
+    assert "Workspace A" in message
+
+
+def test_build_single_instance_users_plan_authoritative_includes_empty_workspaces():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "role_id": "role-ws-admin",
+            "workspace_id": "ws-1",
+        },
+    ]
+
+    plan = _build_single_instance_users_plan(
+        rows,
+        available_workspaces=[
+            {"id": "ws-1", "display_name": "Workspace A"},
+            {"id": "ws-2", "display_name": "Workspace B"},
+        ],
+        default_org_role_id="role-user",
+        source_of_truth=True,
+    )
+
+    assert plan.workspace_ids == ["ws-1", "ws-2"]
+    assert plan.workspace_members_by_id["ws-1"] == [
+        {
+            "id": "ws-1:alice@example.com",
+            "email": "alice@example.com",
+            "role_id": "role-ws-admin",
+            "full_name": "",
+        }
+    ]
+    assert plan.workspace_members_by_id["ws-2"] == []
+
+
+def test_build_single_instance_users_plan_notes_mixed_workspace_roles():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "role_id": "role-ws-admin",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "role_id": "role-ws-viewer",
+            "workspace_id": "ws-2",
+        },
+    ]
+
+    plan = _build_single_instance_users_plan(
+        rows,
+        available_workspaces=[
+            {"id": "ws-1", "display_name": "Workspace A"},
+            {"id": "ws-2", "display_name": "Workspace B"},
+        ],
+        default_org_role_id="role-user",
+        source_of_truth=False,
+    )
+
+    assert plan.org_members == [
+        {
+            "id": "alice@example.com",
+            "email": "alice@example.com",
+            "role_id": "role-user",
+            "full_name": "",
+        }
+    ]
+    assert any(
+        "alice@example.com has multiple workspace roles" in note
+        for note in plan.operator_notes
+    )
+
+
+def test_build_single_instance_users_plan_notes_org_row_with_mixed_workspace_roles():
+    rows = [
+        {
+            "email": "alice@example.com",
+            "role_id": "role-user",
+            "workspace_id": "",
+        },
+        {
+            "email": "alice@example.com",
+            "role_id": "role-ws-admin",
+            "workspace_id": "ws-1",
+        },
+        {
+            "email": "alice@example.com",
+            "role_id": "role-ws-viewer",
+            "workspace_id": "ws-2",
+        },
+    ]
+
+    plan = _build_single_instance_users_plan(
+        rows,
+        available_workspaces=[
+            {"id": "ws-1", "display_name": "Workspace A"},
+            {"id": "ws-2", "display_name": "Workspace B"},
+        ],
+        default_org_role_id="role-user",
+        source_of_truth=False,
+    )
+
+    assert any(
+        "alice@example.com has multiple workspace roles" in note
+        for note in plan.operator_notes
+    )

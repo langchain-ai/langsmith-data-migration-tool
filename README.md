@@ -6,7 +6,7 @@ A Python CLI for migrating users and roles, datasets, experiments, annotation qu
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.65-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.66-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -23,7 +23,7 @@ langsmith-migrator datasets
 
 - **All-in-One Wizard**: Interactive migration of all resources (`migrate-all`)
 - **Users & Roles**: Migrate custom roles, org members, and workspace memberships between instances
-- **Single-Instance Access Sync**: Apply CSV-driven add/update or authoritative access sync to one LangSmith instance (`users --csv ... [--sync]`)
+- **Single-Instance Access Sync**: Apply CSV-driven add/update or authoritative access sync to one LangSmith instance (`users --csv ... [--sync]`), including multi-row workspace role unionization for custom ABAC roles
 - **Datasets**: Migrate datasets with examples and file attachments
 - **Experiments**: Include experiments, runs, and feedback during dataset migration (`datasets --include-experiments`) or through `migrate-all`
 - **Annotation Queues**: Transfer queue configurations
@@ -54,20 +54,20 @@ For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk E
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.65-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.66-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.65-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.66-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.65-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.66-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.65-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.66-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -223,12 +223,23 @@ alice@example.com,Organization Admin,,
 alice@example.com,Workspace Admin,ws_src_prod_us,Production US
 ```
 
+Example CSVs:
+- `examples/users_members_example.csv`: minimal org and workspace member rows.
+- `examples/users_members_multi_workspace_roles_example.csv`: users with multiple workspace assignments, including different workspace roles.
+- `examples/users_members_sync_remove_workspace_b_example.csv`: desired-state CSV for `--csv-source-of-truth` when a user should keep Workspace A and lose Workspace B.
+- `examples/users_members_sync_remove_user_example.csv`: desired-state CSV for `--csv-source-of-truth` after a removed user has been omitted entirely.
+- `examples/users_members_pending_mixed_workspace_roles_example.csv`: pending-invite examples for same-role multi-workspace invites and mixed workspace-role rows.
+
+These examples are templates. Do not run them with `--csv-source-of-truth` against a populated target unless the file has been expanded into the full desired org and workspace access state for that target; authoritative sync removes org users, pending invites, and workspace memberships that are not listed.
+
 Notes:
 - `email` and `langsmith_role` are required.
 - `workspace_id` is optional. Leave it empty for org-level role assignments.
-- `workspace_name` is optional and informational only.
+- `workspace_name` is optional. When provided in single-instance CSV sync, it is validated against the target workspace display name, name, or tenant handle; `workspace_id` remains authoritative for applying access.
 - `langsmith_role` should be a built-in LangSmith role name (for example `Organization Admin`, `Organization Operator`, `Organization User`, `Organization Viewer`, `Workspace Admin`, `Workspace User`, or `Workspace Viewer`) or a custom role `display_name`.
+- Multiple rows for the same user and workspace are combined. Built-in workspace roles collapse to the highest-privilege built-in role; custom ABAC roles are unioned with each other and with any built-in workspace role so their policy attachments are preserved.
 - Users who only appear in workspace rows are invited to the org with the source `ORGANIZATION_USER` role before workspace membership is applied.
+- Workspace-only users with multiple workspace roles cannot have all workspace access attached to the initial org invite. The command calls this out before apply, attempts phase 3 workspace membership application, and may require a rerun after the invite is accepted on target versions that block workspace membership for pending org invites.
 - `Organization Admin` on a workspace row is treated as org-level admin access only. No explicit workspace membership is created because org admins already have workspace access.
 - Other org-scoped roles cannot be used on workspace rows. If you want org-level access, leave `workspace_id` empty.
 - Workspace-scoped roles such as `Workspace Admin` cannot be used on org-level rows.
@@ -248,6 +259,11 @@ Guardrails:
 - If the CSV contains workspace rows and `--skip-workspace-members` is set, the command fails instead of silently ignoring those rows.
 - If the CSV contains workspace-only users, the target instance must have an `ORGANIZATION_USER` role available or the command fails before applying member changes.
 - If the CSV references unknown `workspace_id` values, the command fails before any membership changes are applied.
+
+Operational notes:
+- Authoritative sync can remove active org members, cancel pending invites, and remove workspace memberships. Use an Organization Admin PAT for unattended runs that need removal semantics.
+- If the destination API key cannot manage org members or pending invites, 401/403 responses are reported as Organization Admin PAT blockers with grouped remediation and resume metadata.
+- Pending invites whose org role or workspace access does not match the CSV are refreshed when the target supports invite cancellation; if the target lacks a cancellation endpoint, the command reports an explicit manual follow-up instead of silently accepting stale access.
 
 ### CLI Options
 

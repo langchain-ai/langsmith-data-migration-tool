@@ -1,6 +1,6 @@
 email,langsmith_role,workspace_id,workspace_name
 amelia.nguyen@example.com,Organization Admin,,
-jordan.lee@example.com,Workspace Admin,<workspace_uuid>,Production US
-priya.patel@example.com,write-no-read,<workspace_uuid>,ML Platform
-mateo.garcia@example.com,Workspace User,<workspace_uuid>,Analytics
+jordan.lee@example.com,Workspace Admin,5025604d-c4ad-46ac-9f60-3840156ec9dc,Workspace 1
+priya.patel@example.com,write-no-read,5025604d-c4ad-46ac-9f60-3840156ec9dc,Workspace 1
+mateo.garcia@example.com,Workspace User,5025604d-c4ad-46ac-9f60-3840156ec9dc,Workspace 1
 sana.khan@example.com,Organization Viewer,,

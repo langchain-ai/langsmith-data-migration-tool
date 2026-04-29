@@ -1,0 +1,3 @@
+email,langsmith_role,workspace_id,workspace_name
+saad@langchain.dev,Organization Admin,,
+remaining.user@example.com,Workspace Admin,<workspace_a_uuid>,Workspace A
