@@ -5,4 +5,4 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("langsmith-data-migration-tool")
 except PackageNotFoundError:
-    __version__ = "0.0.66"
+    __version__ = "0.0.67"

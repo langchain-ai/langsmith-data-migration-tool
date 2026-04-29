@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.67] - 2026-04-29
+
+### Fixed
+- **Rules project mapping**: `langsmith-migrator rules --project-mapping ...` now rewrites source project IDs embedded in `filter`, `trace_filter`, and `tree_filter` payloads, including dataset-associated rules whose project scope is hidden inside the rule filter body.
+
 ## [0.0.66] - 2026-04-29
 
 ### Added
@@ -302,7 +307,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.66...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.67...HEAD
+[0.0.67]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.66...v0.0.67
 [0.0.66]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.65...v0.0.66
 [0.0.65]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.64...v0.0.65
 [0.0.64]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.63...v0.0.64
