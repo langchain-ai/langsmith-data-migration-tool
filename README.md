@@ -137,7 +137,7 @@ langsmith-migrator rules --create-enabled      # Create rules enabled (default: 
 langsmith-migrator charts
 langsmith-migrator charts --session "project-name"
 langsmith-migrator charts --map-projects        # Interactive TUI project mapping
-langsmith-migrator charts --same-instance       # Reuse source project/session IDs on destination
+langsmith-migrator charts --same-instance       # Reuse source IDs only when both sides share IDs
 
 # Utilities
 langsmith-migrator list-projects --source
@@ -335,7 +335,7 @@ The prompt default is `No` (rules are created disabled).
 ```bash
 --session TEXT          Migrate charts for a specific session/project (by name or ID)
 --map-projects          Launch interactive TUI to map source projects to destination projects
---same-instance         Source and destination are the same instance (use same session IDs)
+--same-instance         Reuse source project/session IDs on destination only when both sides truly share IDs
 ```
 
 ### Users Options
@@ -385,6 +385,7 @@ Rules are created disabled by default. Use `--create-enabled` on the `rules` com
 ```
 
 When `--skip-users` is omitted, `migrate-all` runs user/role migration as Step 0 before all other resources. Phases 1-2 (roles + org members) run once; phase 3 (workspace members) runs per workspace pair.
+
 ### Project Mapping
 
 Rules and charts reference projects by ID. When migrating between instances, project IDs differ.
