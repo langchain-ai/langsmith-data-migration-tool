@@ -539,19 +539,68 @@ class MigrationOrchestrator:
             workspace_pair.get("source"),
             workspace_pair.get("dest"),
         )
+        source_session_id = chart_migrator._extract_session_id(chart_payload)
+        has_source_session_dependency = bool(source_session_id)
 
-        if not saved_same_instance_present or saved_same_instance == current_same_instance:
+        missing_dest_session = (
+            saved_same_instance_present
+            and has_source_session_dependency
+            and not saved_dest_session_id
+        )
+        if (
+            not saved_same_instance_present
+            or (
+                saved_same_instance == current_same_instance
+                and not missing_dest_session
+            )
+        ):
             return True, saved_dest_session_id, saved_same_instance
 
         chart_name = item.name or item.source_id
-        self.console.print(
-            "[yellow]Chart resume context changed for "
-            f"{chart_name}: saved same-instance mode was {saved_same_instance}, "
-            f"current source/destination context expects {current_same_instance}. "
-            "Re-resolving destination project/session before retrying.[/yellow]"
-        )
+        if not has_source_session_dependency:
+            evidence = {
+                "source_session_id": source_session_id,
+                "saved_same_instance": saved_same_instance,
+                "current_same_instance": current_same_instance,
+                "saved_dest_session_id": saved_dest_session_id,
+                "resolved_dest_session_id": None,
+                "workspace_pair": workspace_pair,
+            }
+            self.console.print(
+                "[yellow]Chart resume context changed for "
+                f"{chart_name}: saved same-instance mode was {saved_same_instance}, "
+                f"current source/destination context expects {current_same_instance}. "
+                "The chart has no project/session dependency, so refreshing resume "
+                "mode before retrying.[/yellow]"
+            )
+            self.state.update_item_checkpoint(
+                item.id,
+                stage="resume_context_refreshed",
+                metadata={
+                    "same_instance": current_same_instance,
+                    "dest_session_id": None,
+                    "previous_same_instance": saved_same_instance,
+                    "previous_dest_session_id": saved_dest_session_id,
+                },
+                evidence=evidence,
+            )
+            self.state_manager.save()
+            return True, None, current_same_instance
 
-        source_session_id = chart_migrator._extract_session_id(chart_payload)
+        if missing_dest_session:
+            self.console.print(
+                "[yellow]Chart resume item has a missing destination session for "
+                f"{chart_name}. Re-resolving destination project/session before "
+                "retrying.[/yellow]"
+            )
+        else:
+            self.console.print(
+                "[yellow]Chart resume context changed for "
+                f"{chart_name}: saved same-instance mode was {saved_same_instance}, "
+                f"current source/destination context expects {current_same_instance}. "
+                "Re-resolving destination project/session before retrying.[/yellow]"
+            )
+
         dest_session_id = chart_migrator.resolve_destination_session_id(
             source_session_id,
             same_instance=current_same_instance,
@@ -566,11 +615,18 @@ class MigrationOrchestrator:
         }
 
         if not dest_session_id:
-            message = (
-                "Cannot resume chart with stale same-instance metadata because "
-                "the current source/destination context could not resolve a "
-                "destination project/session."
-            )
+            if missing_dest_session:
+                message = (
+                    "Cannot resume chart with missing destination session metadata "
+                    "because the current source/destination context could not "
+                    "resolve a destination project/session."
+                )
+            else:
+                message = (
+                    "Cannot resume chart with stale same-instance metadata because "
+                    "the current source/destination context could not resolve a "
+                    "destination project/session."
+                )
             next_action = (
                 "Start a fresh `langsmith-migrator charts` run with the current "
                 "source/destination configuration, or run with `--map-projects` "

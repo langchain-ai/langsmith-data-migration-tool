@@ -142,6 +142,34 @@ def test_resolve_destination_session_id_falls_back_to_exact_name_matching(
     )
 
 
+def test_resolve_destination_session_id_uses_saved_project_mapping_before_listing(
+    sample_config,
+    migration_state,
+):
+    """Saved TUI/state project mappings should directly resolve chart destination sessions."""
+
+    source_session_id = "a3cee8e2-40bb-472e-8456-c660b5ea1f3d"
+    dest_session_id = "cc3ac580-destination-project"
+    migration_state.set_mapped_id("project", source_session_id, dest_session_id)
+    source_client = _mock_client()
+    dest_client = _mock_client()
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+
+    assert (
+        migrator.resolve_destination_session_id(source_session_id, same_instance=False)
+        == dest_session_id
+    )
+    assert migrator._project_id_map == {source_session_id: dest_session_id}
+    source_client.get_paginated.assert_not_called()
+    dest_client.get_paginated.assert_not_called()
+
+
 def test_migrate_chart_exports_when_dependencies_are_unresolved(
     sample_config,
     migration_state,

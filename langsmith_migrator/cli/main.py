@@ -107,17 +107,78 @@ def _name_mapping_to_id_mapping(
     name_mapping: dict,
     source_projects: list,
     dest_projects: list,
+    source_workspace_id=None,
+    dest_workspace_id=None,
 ) -> dict:
     """Convert a name-based project mapping to an ID-based mapping."""
-    src_name_to_id = {p['name']: p['id'] for p in source_projects if 'name' in p and 'id' in p}
-    dst_name_to_id = {p['name']: p['id'] for p in dest_projects if 'name' in p and 'id' in p}
+    source_projects = _filter_projects_for_workspace(source_projects, source_workspace_id)
+    dest_projects = _filter_projects_for_workspace(dest_projects, dest_workspace_id)
+
+    src_name_to_ids = _project_ids_by_name(source_projects)
+    dst_name_to_ids = _project_ids_by_name(dest_projects)
     id_map = {}
     for src_name, dst_name in name_mapping.items():
-        src_id = src_name_to_id.get(src_name)
-        dst_id = dst_name_to_id.get(dst_name)
-        if src_id and dst_id:
+        src_ids = src_name_to_ids.get(src_name, [])
+        dst_ids = dst_name_to_ids.get(dst_name, [])
+        if not src_ids or len(dst_ids) != 1:
+            continue
+        dst_id = dst_ids[0]
+        for src_id in src_ids:
             id_map[src_id] = dst_id
     return id_map
+
+
+def _project_ids_by_name(projects: list) -> dict:
+    """Group project IDs by project name."""
+    ids_by_name = {}
+    for project in projects:
+        name = project.get("name")
+        project_id = project.get("id")
+        if name and project_id:
+            ids_by_name.setdefault(name, []).append(project_id)
+    return ids_by_name
+
+
+def _workspace_ids_from_value(value) -> set[str]:
+    """Extract workspace IDs from common project workspace metadata shapes."""
+    if isinstance(value, str):
+        return {value} if value else set()
+    if isinstance(value, dict):
+        ids = set()
+        for key in ("id", "tenant_id", "workspace_id"):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested:
+                ids.add(nested)
+        return ids
+    if isinstance(value, (list, tuple, set)):
+        ids = set()
+        for item in value:
+            ids.update(_workspace_ids_from_value(item))
+        return ids
+    return set()
+
+
+def _project_workspace_ids(project: dict) -> set[str]:
+    """Return workspace IDs advertised on a project/session record."""
+    ids = set()
+    for key in ("tenant_id", "workspace_id", "workspace_ids", "tenant", "workspace"):
+        if key in project:
+            ids.update(_workspace_ids_from_value(project[key]))
+    return ids
+
+
+def _filter_projects_for_workspace(projects: list, workspace_id=None) -> list:
+    """Filter project records to a workspace when records carry workspace metadata."""
+    project_list = list(projects)
+    if not workspace_id:
+        return project_list
+
+    filtered = [
+        project
+        for project in project_list
+        if workspace_id in _project_workspace_ids(project)
+    ]
+    return filtered or project_list
 
 
 def _normalize_deployment_url(base_url: str) -> str:
@@ -250,7 +311,13 @@ def _workspace_scoped_project_id_map(orchestrator, ws_result, source_workspace_i
         f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)"
     )
 
-    id_map = _name_mapping_to_id_mapping(name_mapping, source_projects, dest_projects)
+    id_map = _name_mapping_to_id_mapping(
+        name_mapping,
+        source_projects,
+        dest_projects,
+        source_workspace_id=source_workspace_id,
+        dest_workspace_id=ws_result.workspace_mapping.get(source_workspace_id),
+    )
     console.print(f"Using workspace-scoped project mapping with {len(id_map)} project(s)")
     return id_map
 
@@ -2602,7 +2669,13 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
                 console.print("[yellow]Cancelled[/yellow]")
                 continue
 
-            id_map = _name_mapping_to_id_mapping(name_mapping, source_projects, dest_projects)
+            id_map = _name_mapping_to_id_mapping(
+                name_mapping,
+                source_projects,
+                dest_projects,
+                source_workspace_id=src_ws,
+                dest_workspace_id=dst_ws,
+            )
             rules_migrator._project_id_map = id_map
             console.print(f"Using interactive project mapping with {len(id_map)} project(s)")
 
@@ -2896,7 +2969,8 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
 
         _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
                                    skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits,
-                                   strip_projects, map_projects, rules_create_enabled, ws_project_mapping)
+                                   strip_projects, map_projects, rules_create_enabled, ws_project_mapping,
+                                   src_ws, dst_ws)
 
     if ws_result:
         orchestrator.clear_workspace_context()
@@ -2909,7 +2983,8 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
 
 def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
                                 skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits,
-                                strip_projects, map_projects, rules_create_enabled=None, ws_project_mapping=None):
+                                strip_projects, map_projects, rules_create_enabled=None, ws_project_mapping=None,
+                                source_workspace_id=None, dest_workspace_id=None):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
     Args:
@@ -2927,7 +3002,13 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
         source_projects = _list_projects(orchestrator.source_client)
         dest_projects = _list_projects(orchestrator.dest_client)
         console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
-        project_id_map = _name_mapping_to_id_mapping(ws_project_mapping, source_projects, dest_projects)
+        project_id_map = _name_mapping_to_id_mapping(
+            ws_project_mapping,
+            source_projects,
+            dest_projects,
+            source_workspace_id=source_workspace_id,
+            dest_workspace_id=dest_workspace_id,
+        )
         console.print(f"Using workspace-scoped project mapping with {len(project_id_map)} project(s)\n")
     elif map_projects:
         console.print("Fetching projects from both instances... ", end="")
@@ -2940,7 +3021,13 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
             console.print("[yellow]Cancelled[/yellow]")
             return
 
-        project_id_map = _name_mapping_to_id_mapping(name_mapping, source_projects, dest_projects)
+        project_id_map = _name_mapping_to_id_mapping(
+            name_mapping,
+            source_projects,
+            dest_projects,
+            source_workspace_id=source_workspace_id,
+            dest_workspace_id=dest_workspace_id,
+        )
         console.print(f"Using interactive project mapping with {len(project_id_map)} project(s)\n")
 
     # Track dataset ID mappings for use in rules migration
@@ -3411,7 +3498,13 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
                 console.print("[yellow]Cancelled[/yellow]")
                 continue
 
-            id_map = _name_mapping_to_id_mapping(name_mapping, source_projects, dest_projects)
+            id_map = _name_mapping_to_id_mapping(
+                name_mapping,
+                source_projects,
+                dest_projects,
+                source_workspace_id=src_ws,
+                dest_workspace_id=dst_ws,
+            )
             chart_migrator._project_id_map = id_map
             console.print(f"Using interactive project mapping with {len(id_map)} project(s)")
 
