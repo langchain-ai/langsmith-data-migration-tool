@@ -16,7 +16,7 @@ class ChartMigrator(BaseMigrator):
         self._project_id_map = None  # Lazy-loaded cache
         self._project_mapping_complete = False
         self._dataset_id_map = None  # Lazy-loaded cache
-        self._dest_section_map = None # Lazy-loaded cache for dest sections
+        self._dest_section_map = None  # Lazy-loaded cache for dest sections
         self._section_strategy = None
 
     def _chart_item_id(self, chart: Dict[str, Any]) -> str:
@@ -168,7 +168,10 @@ class ChartMigrator(BaseMigrator):
                 if candidate.get("id") == chart.get("id"):
                     return candidate
         except Exception as e:
-            self.log(f"Failed to enrich chart '{chart.get('title') or chart.get('name')}': {e}", "warning")
+            self.log(
+                f"Failed to enrich chart '{chart.get('title') or chart.get('name')}': {e}",
+                "warning",
+            )
 
         return chart
 
@@ -222,11 +225,95 @@ class ChartMigrator(BaseMigrator):
         unresolved: Dict[str, set[str]],
     ) -> Dict[str, List[str]]:
         """Convert unresolved dependency sets into stable JSON-serializable lists."""
-        return {
-            key: sorted(values)
-            for key, values in unresolved.items()
-            if values
-        }
+        return {key: sorted(values) for key, values in unresolved.items() if values}
+
+    @staticmethod
+    def _replace_project_ids(value: str, project_map: Dict[str, str]) -> str:
+        """Replace source project IDs in a serialized filter string."""
+        mapped = value
+        for source_id, dest_id in sorted(
+            project_map.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            if source_id and dest_id:
+                mapped = mapped.replace(source_id, dest_id)
+        return mapped
+
+    def _replace_project_ids_in_string_filters(
+        self,
+        obj: Any,
+        project_map: Dict[str, str],
+        *,
+        parent_key: Optional[str] = None,
+    ) -> None:
+        """Map project IDs embedded in serialized filter strings.
+
+        Structured ID fields are left for _map_ids_in_chart so unresolved
+        dependencies are still detected accurately.
+        """
+        if not project_map:
+            return
+
+        structured_keys = {"project_id", "session_id", "dataset_id", "session"}
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, str):
+                    if key not in structured_keys:
+                        obj[key] = self._replace_project_ids(value, project_map)
+                else:
+                    self._replace_project_ids_in_string_filters(
+                        value,
+                        project_map,
+                        parent_key=key,
+                    )
+        elif isinstance(obj, list):
+            for idx, value in enumerate(obj):
+                if isinstance(value, str):
+                    if parent_key not in structured_keys:
+                        obj[idx] = self._replace_project_ids(value, project_map)
+                else:
+                    self._replace_project_ids_in_string_filters(
+                        value,
+                        project_map,
+                        parent_key=parent_key,
+                    )
+
+    def collect_project_dependency_ids(
+        self,
+        charts: Any,
+        *,
+        known_project_ids: Optional[set[str]] = None,
+    ) -> set[str]:
+        """Collect project/session IDs referenced by chart payloads."""
+        dependencies: set[str] = set()
+        known_project_ids = known_project_ids or set()
+
+        def visit(obj: Any) -> None:
+            if isinstance(obj, dict):
+                for key in ("session_id", "project_id"):
+                    value = obj.get(key)
+                    if isinstance(value, str) and value:
+                        dependencies.add(value)
+
+                sessions = obj.get("session")
+                if isinstance(sessions, list):
+                    for value in sessions:
+                        if isinstance(value, str) and value:
+                            dependencies.add(value)
+
+                for value in obj.values():
+                    visit(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    visit(item)
+            elif isinstance(obj, str) and known_project_ids:
+                for project_id in known_project_ids:
+                    if project_id and project_id in obj:
+                        dependencies.add(project_id)
+
+        visit(charts)
+        return dependencies
 
     def _list_charts(
         self,
@@ -250,7 +337,7 @@ class ChartMigrator(BaseMigrator):
                 "end_time": None,
                 "stride": {"days": 0, "hours": 0, "minutes": 15},
                 "after_index": None,
-                "tag_value_id": None
+                "tag_value_id": None,
             }
 
             response = client.post("/charts", payload)
@@ -261,22 +348,22 @@ class ChartMigrator(BaseMigrator):
                 charts = response
             elif isinstance(response, dict):
                 # Check for nested sections (dashboard layout)
-                if 'sections' in response and isinstance(response['sections'], list):
-                    for section in response['sections']:
+                if "sections" in response and isinstance(response["sections"], list):
+                    for section in response["sections"]:
                         if isinstance(section, dict):
-                            section_title = section.get('title')
-                            section_desc = section.get('description')
+                            section_title = section.get("title")
+                            section_desc = section.get("description")
                             # If charts are in the section, extract them
-                            if 'charts' in section:
-                                for c in section['charts']:
+                            if "charts" in section:
+                                for c in section["charts"]:
                                     if section_title:
-                                        c['_source_section_title'] = section_title
+                                        c["_source_section_title"] = section_title
                                     if section_desc:
-                                        c['_source_section_description'] = section_desc
+                                        c["_source_section_description"] = section_desc
                                     charts.append(c)
                 # Check for direct charts list
-                elif 'charts' in response:
-                    charts = response['charts']
+                elif "charts" in response:
+                    charts = response["charts"]
                 else:
                     # Sometimes the list is the response itself if it's not wrapped
                     # But if it has keys like "detail" it might be error, assumed handled by api_client
@@ -287,21 +374,27 @@ class ChartMigrator(BaseMigrator):
                 filtered_charts = []
                 for chart in charts:
                     # Check obvious fields
-                    if chart.get('session_id') == session_id or chart.get('project_id') == session_id:
+                    if (
+                        chart.get("session_id") == session_id
+                        or chart.get("project_id") == session_id
+                    ):
                         filtered_charts.append(chart)
                         continue
 
                     # Check inside series filters
                     # Series is usually a list of dicts
-                    series = chart.get('series', [])
+                    series = chart.get("series", [])
                     matched = False
                     for s in series:
                         if isinstance(s, dict):
-                            filters = s.get('filters')
+                            filters = s.get("filters")
                             if not filters:
                                 continue
 
-                            if filters.get('project_id') == session_id or filters.get('session_id') == session_id:
+                            if (
+                                filters.get("project_id") == session_id
+                                or filters.get("session_id") == session_id
+                            ):
                                 filtered_charts.append(chart)
                                 matched = True
                                 break
@@ -309,11 +402,11 @@ class ChartMigrator(BaseMigrator):
                         # Some charts might be attached to a section that is attached to a project
                         # But we can't easily resolve that here without more queries.
                         if self.config.migration.verbose:
-                            chart_title = chart.get('title') or chart.get('name', 'Untitled')
+                            chart_title = chart.get("title") or chart.get("name", "Untitled")
                             self.log(
                                 f"Chart '{chart_title}' filtered out - no matching session_id/project_id "
                                 f"in filters (looking for {session_id})",
-                                "info"
+                                "info",
                             )
 
                 return filtered_charts
@@ -365,14 +458,14 @@ class ChartMigrator(BaseMigrator):
             payload = {
                 "title": title,
                 "description": description or "",
-                "index": 0 # Default index
+                "index": 0,  # Default index
             }
             # Use the endpoint identified by user
             response = self.dest.post("/charts/section", payload)
 
-            if isinstance(response, dict) and 'id' in response:
-                new_id = response['id']
-                self._dest_section_map[title] = new_id # Update cache
+            if isinstance(response, dict) and "id" in response:
+                new_id = response["id"]
+                self._dest_section_map[title] = new_id  # Update cache
                 self.log(f"Created section '{title}' -> {new_id}", "success")
                 return new_id
 
@@ -411,20 +504,22 @@ class ChartMigrator(BaseMigrator):
                 "timezone": "UTC",
                 "omit_data": True,
                 "start_time": start_time,
-                "stride": {"days": 0, "hours": 0, "minutes": 15}
+                "stride": {"days": 0, "hours": 0, "minutes": 15},
             }
 
             response = self.dest.post("/charts", payload)
 
-            if isinstance(response, dict) and 'sections' in response:
-                for section in response['sections']:
+            if isinstance(response, dict) and "sections" in response:
+                for section in response["sections"]:
                     if isinstance(section, dict):
-                        title = section.get('title')
-                        sec_id = section.get('id')
+                        title = section.get("title")
+                        sec_id = section.get("id")
                         if title and sec_id:
                             self._dest_section_map[title] = sec_id
 
-            self.log(f"Built destination section map: {list(self._dest_section_map.keys())}", "info")
+            self.log(
+                f"Built destination section map: {list(self._dest_section_map.keys())}", "info"
+            )
 
         except Exception as e:
             self.log(f"Failed to build destination section map: {e}", "warning")
@@ -515,8 +610,12 @@ class ChartMigrator(BaseMigrator):
         chart_copy = self._enrich_chart(chart_data)
         if chart_data.get("_source_section_title") and not chart_copy.get("_source_section_title"):
             chart_copy["_source_section_title"] = chart_data.get("_source_section_title")
-        if chart_data.get("_source_section_description") and not chart_copy.get("_source_section_description"):
-            chart_copy["_source_section_description"] = chart_data.get("_source_section_description")
+        if chart_data.get("_source_section_description") and not chart_copy.get(
+            "_source_section_description"
+        ):
+            chart_copy["_source_section_description"] = chart_data.get(
+                "_source_section_description"
+            )
 
         payload, downgraded_to_unsectioned = self._build_chart_payload(chart_copy)
         source_section_title = chart_copy.get("_source_section_title")
@@ -678,7 +777,9 @@ class ChartMigrator(BaseMigrator):
             if chart_id:
                 verified, mismatches = self._verify_chart(str(chart_id), payload)
                 if verified:
-                    if downgraded_to_unsectioned or (source_section_title and "section_id" not in payload):
+                    if downgraded_to_unsectioned or (
+                        source_section_title and "section_id" not in payload
+                    ):
                         self.mark_degraded(
                             item_id,
                             "chart_created_without_section",
@@ -861,31 +962,46 @@ class ChartMigrator(BaseMigrator):
 
         # Deep copy
         import copy
+
         chart_copy = copy.deepcopy(chart)
 
         # Map IDs within chart config
         source_session_id = self._extract_session_id(chart)
+        project_map = {} if same_instance else self._build_project_mapping()
+        if project_map:
+            self._replace_project_ids_in_string_filters(chart_copy, project_map)
         unresolved_dependencies = self._map_ids_in_chart(
             chart_copy,
             dest_session_id,
             same_instance=same_instance,
             source_session_id=source_session_id,
         )
-        unresolved_dependencies = self._normalize_unresolved_dependencies(
-            unresolved_dependencies
-        )
+        unresolved_dependencies = self._normalize_unresolved_dependencies(unresolved_dependencies)
         if unresolved_dependencies:
             self.log(
-                f"Chart '{chart_title}' has unresolved dependencies: "
-                f"{unresolved_dependencies}",
+                f"Chart '{chart_title}' has unresolved dependencies: {unresolved_dependencies}",
                 "warning",
             )
+            raw_project_map = self._project_id_map or {}
             export_path = self._export_chart_manual_apply(
                 chart_copy,
                 reason="unresolved_chart_dependencies",
                 analysis={
                     "unresolved_dependencies": unresolved_dependencies,
                     "dest_session_id": dest_session_id,
+                    "source_session_id": source_session_id,
+                    "source_session_in_project_map": (
+                        bool(source_session_id) and source_session_id in project_map
+                    ),
+                    "source_session_in_project_id_map": (
+                        bool(source_session_id) and source_session_id in raw_project_map
+                    ),
+                    "project_map_size": len(project_map),
+                    "unmapped_dependency_ids_short": {
+                        key: [value[:8] for value in values]
+                        for key, values in unresolved_dependencies.items()
+                    },
+                    "workspace_pair": self.workspace_pair(),
                 },
             )
             issue = self.record_issue(
@@ -912,8 +1028,7 @@ class ChartMigrator(BaseMigrator):
                 item_id,
                 "unresolved_chart_dependencies",
                 next_action=(
-                    "Resolve the chart dependency mappings, then run "
-                    "`langsmith-migrator resume`."
+                    "Resolve the chart dependency mappings, then run `langsmith-migrator resume`."
                 ),
                 export_path=export_path,
                 evidence=unresolved_dependencies,
@@ -1002,7 +1117,7 @@ class ChartMigrator(BaseMigrator):
         # But charts list is flat. We'll group them ourselves.
 
         all_mappings = {}  # session_id -> map
-        global_map = {} # chart_id -> new_id (for fallback)
+        global_map = {}  # chart_id -> new_id (for fallback)
 
         self.log("Fetching all charts from source...", "info")
         charts = self.list_charts()
@@ -1054,7 +1169,7 @@ class ChartMigrator(BaseMigrator):
 
         # Return grouped mappings, or just a generic group if none found
         if not all_mappings and global_map:
-            all_mappings['unknown_session'] = global_map
+            all_mappings["unknown_session"] = global_map
 
         return all_mappings
 

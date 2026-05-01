@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.72] - 2026-05-01
+
+### Fixed
+- **Chart project ID mapping**: `charts --map-projects` and `migrate-all` now use source project IDs as the mapping key, show duplicate same-name source projects as separate TUI rows, persist explicit project mappings for `resume`, and complete chart dependency IDs by selected project name before migration.
+- **Chart dependency diagnostics**: All-chart runs now block once when project/session dependencies remain unmapped, with the source IDs, map size, and workspace pair recorded, instead of exporting every chart with `dest_session_id: null`.
+- **Chart filter rewriting**: Chart migration now rewrites mapped project IDs inside serialized string filter expressions as well as structured `project_id`, `session_id`, and `session` fields.
+
 ## [0.0.71] - 2026-05-01
 
 ### Fixed
@@ -332,7 +339,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.71...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.72...HEAD
+[0.0.72]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.71...v0.0.72
 [0.0.71]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.70...v0.0.71
 [0.0.70]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.69...v0.0.70
 [0.0.69]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.68...v0.0.69

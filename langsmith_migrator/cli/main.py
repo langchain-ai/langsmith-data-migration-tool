@@ -36,7 +36,7 @@ from ..core.migrators.user_role import (
     is_workspace_role_union_id,
     select_effective_workspace_role_id,
 )
-from .tui_project_mapper import build_project_mapping_tui
+from .tui_project_mapper import build_project_id_mapping_tui, build_project_mapping_tui
 from .tui_selector import select_items
 from .tui_workspace_mapper import WorkspaceProjectResult
 from ..utils.workspace import (
@@ -94,12 +94,13 @@ def _install_log_filters() -> None:
 
 def workspace_options(f):
     """Decorator that adds --source-workspace, --dest-workspace, --map-workspaces options."""
-    f = click.option('--map-workspaces', is_flag=True,
-                     help='Force workspace mapping TUI even for single-workspace instances')(f)
-    f = click.option('--dest-workspace',
-                     help='Destination workspace ID (skip auto-detection)')(f)
-    f = click.option('--source-workspace',
-                     help='Source workspace ID (skip auto-detection)')(f)
+    f = click.option(
+        "--map-workspaces",
+        is_flag=True,
+        help="Force workspace mapping TUI even for single-workspace instances",
+    )(f)
+    f = click.option("--dest-workspace", help="Destination workspace ID (skip auto-detection)")(f)
+    f = click.option("--source-workspace", help="Source workspace ID (skip auto-detection)")(f)
     return f
 
 
@@ -126,6 +127,214 @@ def _name_mapping_to_id_mapping(
         for src_id in src_ids:
             id_map[src_id] = dst_id
     return id_map
+
+
+def _project_by_id(projects: list) -> dict:
+    """Index project/session records by ID."""
+    return {
+        project["id"]: project
+        for project in projects
+        if isinstance(project, dict) and project.get("id")
+    }
+
+
+def _mapping_result_to_project_id_map(
+    mapping_result: dict,
+    source_projects: list,
+    dest_projects: list,
+    source_workspace_id=None,
+    dest_workspace_id=None,
+) -> dict:
+    """Normalize project mapper output into source ID -> destination ID."""
+    if not mapping_result:
+        return {}
+
+    source_ids = set(_project_by_id(source_projects))
+    dest_ids = set(_project_by_id(dest_projects))
+    id_map = {
+        source_id: dest_id
+        for source_id, dest_id in mapping_result.items()
+        if source_id in source_ids and dest_id in dest_ids
+    }
+    name_pairs = {
+        source_name: dest_name
+        for source_name, dest_name in mapping_result.items()
+        if source_name not in source_ids or dest_name not in dest_ids
+    }
+    if name_pairs:
+        id_map.update(
+            _name_mapping_to_id_mapping(
+                name_pairs,
+                source_projects,
+                dest_projects,
+                source_workspace_id=source_workspace_id,
+                dest_workspace_id=dest_workspace_id,
+            )
+        )
+    return id_map
+
+
+def _complete_chart_project_id_map(
+    project_id_map: dict | None,
+    *,
+    source_projects: list,
+    dest_projects: list,
+    chart_dependency_ids: set[str],
+    name_mapping: dict | None = None,
+    dest_workspace_id=None,
+) -> dict:
+    """Extend selected project mappings to every chart dependency ID by source name."""
+    completed = dict(project_id_map or {})
+    if not chart_dependency_ids:
+        return completed
+
+    source_by_id = _project_by_id(source_projects)
+    dest_by_id = _project_by_id(dest_projects)
+    dest_name_to_ids = _project_ids_by_name(
+        _filter_projects_for_workspace(dest_projects, dest_workspace_id)
+    )
+
+    selected_name_to_dest_ids: dict[str, set[str]] = {}
+    for source_id, dest_id in completed.items():
+        source_name = source_by_id.get(source_id, {}).get("name")
+        if source_name and dest_id:
+            selected_name_to_dest_ids.setdefault(source_name, set()).add(dest_id)
+
+    for source_name, dest_name in (name_mapping or {}).items():
+        dest_ids = dest_name_to_ids.get(dest_name, [])
+        if len(dest_ids) == 1:
+            selected_name_to_dest_ids.setdefault(source_name, set()).add(dest_ids[0])
+
+    for dependency_id in sorted(chart_dependency_ids):
+        if dependency_id in completed:
+            continue
+        source_name = source_by_id.get(dependency_id, {}).get("name")
+        if not source_name:
+            continue
+        selected_dest_ids = selected_name_to_dest_ids.get(source_name, set())
+        valid_dest_ids = {dest_id for dest_id in selected_dest_ids if dest_id in dest_by_id}
+        if len(valid_dest_ids) == 1:
+            completed[dependency_id] = next(iter(valid_dest_ids))
+
+    return completed
+
+
+def _chart_project_dependency_ids(charts: list, source_projects: list | None = None) -> set[str]:
+    """Collect project/session IDs referenced by chart payloads."""
+    source_project_ids = set(_project_by_id(source_projects or []))
+    dependencies: set[str] = set()
+
+    def visit(obj):
+        if isinstance(obj, dict):
+            for key in ("session_id", "project_id"):
+                value = obj.get(key)
+                if isinstance(value, str) and value:
+                    dependencies.add(value)
+
+            sessions = obj.get("session")
+            if isinstance(sessions, list):
+                for value in sessions:
+                    if isinstance(value, str) and value:
+                        dependencies.add(value)
+
+            for value in obj.values():
+                visit(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                visit(item)
+        elif isinstance(obj, str) and source_project_ids:
+            for project_id in source_project_ids:
+                if project_id and project_id in obj:
+                    dependencies.add(project_id)
+
+    visit(charts)
+    return dependencies
+
+
+def _persist_project_id_map(orchestrator, config, project_id_map: dict | None) -> None:
+    """Persist explicit project mappings into migration state for resume."""
+    if not project_id_map:
+        return
+    state = _ensure_migration_session(orchestrator, config)
+    for source_id, dest_id in project_id_map.items():
+        if source_id and dest_id:
+            state.set_mapped_id("project", source_id, dest_id)
+    orchestrator.state_manager.save()
+
+
+def _unresolved_chart_project_dependencies(
+    chart_migrator,
+    dependency_ids: set[str],
+    *,
+    same_instance: bool,
+) -> list[str]:
+    """Return dependency IDs that still cannot resolve to destination projects."""
+    if same_instance:
+        return []
+    missing = []
+    for dependency_id in sorted(dependency_ids):
+        dest_id = chart_migrator.resolve_destination_session_id(
+            dependency_id,
+            same_instance=False,
+        )
+        if not dest_id:
+            missing.append(dependency_id)
+    return missing
+
+
+def _block_unresolved_chart_project_dependencies(
+    orchestrator,
+    config,
+    missing_ids: list[str],
+    project_id_map: dict | None,
+) -> None:
+    """Checkpoint one clear chart dependency mapping blocker."""
+    workspace_pair = _active_workspace_pair(orchestrator)
+    short_ids = [dependency_id[:8] for dependency_id in missing_ids]
+    console.print("[red]Chart project dependencies could not be resolved before migration.[/red]")
+    console.print(f"[yellow]Unmapped source project IDs: {', '.join(short_ids)}[/yellow]")
+    console.print(
+        "[yellow]Re-run with --map-projects and map these source project IDs to "
+        "destination project IDs.[/yellow]"
+    )
+
+    state = _ensure_migration_session(orchestrator, config)
+    item_id = _state_item_id(
+        "chart_dependency",
+        "project_mappings",
+        workspace_pair["source"],
+    )
+    state.ensure_item(
+        item_id,
+        "chart_dependency",
+        "Chart project dependency mappings",
+        "project_mappings",
+        stage="map_dependencies",
+        workspace_pair=workspace_pair,
+        metadata={
+            "unmapped_dependency_ids": missing_ids,
+            "unmapped_dependency_ids_short": short_ids,
+            "project_map_size": len(project_id_map or {}),
+            "workspace_pair": workspace_pair,
+        },
+    )
+    state.mark_terminal(
+        item_id,
+        ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+        "unresolved_chart_project_mapping",
+        verification_state=VerificationState.BLOCKED,
+        next_action=(
+            "Resolve the chart project mappings with `langsmith-migrator charts "
+            "--map-projects`, then run `langsmith-migrator resume`."
+        ),
+        evidence={
+            "unmapped_dependency_ids": missing_ids,
+            "unmapped_dependency_ids_short": short_ids,
+            "project_map_size": len(project_id_map or {}),
+            "workspace_pair": workspace_pair,
+        },
+    )
+    orchestrator.state_manager.save()
 
 
 def _project_ids_by_name(projects: list) -> dict:
@@ -174,9 +383,7 @@ def _filter_projects_for_workspace(projects: list, workspace_id=None) -> list:
         return project_list
 
     filtered = [
-        project
-        for project in project_list
-        if workspace_id in _project_workspace_ids(project)
+        project for project in project_list if workspace_id in _project_workspace_ids(project)
     ]
     return filtered or project_list
 
@@ -208,10 +415,7 @@ def _auto_detect_chart_same_instance(
     if not _is_same_deployment(config):
         return False
 
-    same_workspace_scope = (
-        bool(source_workspace_id)
-        and source_workspace_id == dest_workspace_id
-    )
+    same_workspace_scope = bool(source_workspace_id) and source_workspace_id == dest_workspace_id
     if should_reuse_chart_ids(config, source_workspace_id, dest_workspace_id):
         if same_workspace_scope and config.source.api_key != config.destination.api_key:
             console.print(
@@ -234,12 +438,8 @@ def _auto_detect_chart_same_instance(
             "[dim]Detected the same deployment URL but different API keys/workspaces.[/dim]"
         )
 
-    console.print(
-        "[dim]Will auto-remap projects and sessions instead of reusing source IDs.[/dim]"
-    )
-    console.print(
-        "[dim]Use --map-projects if automatic project resolution is not enough.[/dim]"
-    )
+    console.print("[dim]Will auto-remap projects and sessions instead of reusing source IDs.[/dim]")
+    console.print("[dim]Use --map-projects if automatic project resolution is not enough.[/dim]")
     return False
 
 
@@ -273,7 +473,9 @@ def _resolve_workspaces(
         )
 
     if source_workspace or dest_workspace:
-        console.print("[yellow]Both --source-workspace and --dest-workspace must be provided together[/yellow]")
+        console.print(
+            "[yellow]Both --source-workspace and --dest-workspace must be provided together[/yellow]"
+        )
         return _WS_CANCELLED
 
     # Auto-detect (config is lazy-loaded inside resolve_workspace_context)
@@ -311,14 +513,14 @@ def _workspace_scoped_project_id_map(orchestrator, ws_result, source_workspace_i
         f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)"
     )
 
-    id_map = _name_mapping_to_id_mapping(
+    id_map = _mapping_result_to_project_id_map(
         name_mapping,
         source_projects,
         dest_projects,
         source_workspace_id=source_workspace_id,
         dest_workspace_id=ws_result.workspace_mapping.get(source_workspace_id),
     )
-    console.print(f"Using workspace-scoped project mapping with {len(id_map)} project(s)")
+    console.print(f"Using workspace-scoped project mapping with {len(id_map)} source ID mapping(s)")
     return id_map
 
 
@@ -441,7 +643,9 @@ def _apply_item_workspace(orchestrator, item):
         orchestrator.clear_workspace_context()
 
 
-def _confirm_action(config: Config, prompt: str, *, default: bool = False, non_interactive_value: bool | None = None) -> bool:
+def _confirm_action(
+    config: Config, prompt: str, *, default: bool = False, non_interactive_value: bool | None = None
+) -> bool:
     """Ask for confirmation unless the command is running in non-interactive mode."""
     if config.migration.non_interactive:
         return default if non_interactive_value is None else non_interactive_value
@@ -455,7 +659,9 @@ _MEMBER_COLUMNS = [
 ]
 
 
-def _select_or_all(config: Config, items: list, *, select_all: bool, title: str, columns: list[dict]) -> list:
+def _select_or_all(
+    config: Config, items: list, *, select_all: bool, title: str, columns: list[dict]
+) -> list:
     """Return interactive selections or all items in non-interactive mode."""
     if select_all or config.migration.non_interactive:
         return items
@@ -483,8 +689,7 @@ def _load_members_csv(path: str) -> list[dict]:
             missing = sorted(required_columns - fieldnames)
             if missing:
                 raise click.ClickException(
-                    "Members CSV is missing required columns: "
-                    + ", ".join(missing)
+                    "Members CSV is missing required columns: " + ", ".join(missing)
                 )
 
             rows: list[dict] = []
@@ -495,9 +700,7 @@ def _load_members_csv(path: str) -> list[dict]:
                 workspace_name = (row.get("workspace_name") or "").strip()
 
                 if not email:
-                    raise click.ClickException(
-                        f"Members CSV row {index} has an empty email value"
-                    )
+                    raise click.ClickException(f"Members CSV row {index} has an empty email value")
                 if not langsmith_role:
                     if workspace_id:
                         raise click.ClickException(
@@ -651,8 +854,7 @@ def _resolve_csv_role_names(
 
         preferred_role_id = preferred_builtin_by_label.get(label)
         if preferred_role_id and any(
-            candidate_role_id == preferred_role_id
-            for candidate_role_id, _ in candidates
+            candidate_role_id == preferred_role_id for candidate_role_id, _ in candidates
         ):
             role_id = preferred_role_id
         else:
@@ -683,14 +885,13 @@ def _resolve_csv_role_names(
             ambiguity_details = "; ".join(
                 f"'{input_label}' matched multiple roles case-insensitively: "
                 + ", ".join(candidates)
-                for input_label, candidates in sorted(ambiguous.items(), key=lambda item: item[0].lower())
+                for input_label, candidates in sorted(
+                    ambiguous.items(), key=lambda item: item[0].lower()
+                )
             )
             errors.append("Ambiguous role name(s): " + ambiguity_details)
         if unresolved:
-            errors.append(
-                "Could not resolve role name(s): "
-                + ", ".join(sorted(unresolved))
-            )
+            errors.append("Could not resolve role name(s): " + ", ".join(sorted(unresolved)))
         errors.append("Available roles (case-insensitive): " + ", ".join(available))
         raise click.ClickException(". ".join(errors))
 
@@ -961,7 +1162,9 @@ def _resolve_single_instance_workspace_ids(
             + ", ".join(unknown_workspace_ids)
         )
 
-    workspace_ids = available_workspace_ids | csv_workspace_ids if source_of_truth else csv_workspace_ids
+    workspace_ids = (
+        available_workspace_ids | csv_workspace_ids if source_of_truth else csv_workspace_ids
+    )
     return sorted(workspace_ids)
 
 
@@ -1009,8 +1212,7 @@ def _validate_csv_workspace_names(
 
         normalized_csv_name = _normalize_workspace_name_for_compare(csv_name)
         normalized_target_names = {
-            _normalize_workspace_name_for_compare(name)
-            for name in target_names
+            _normalize_workspace_name_for_compare(name) for name in target_names
         }
         if normalized_csv_name not in normalized_target_names:
             mismatches.append(
@@ -1019,9 +1221,7 @@ def _validate_csv_workspace_names(
             )
 
     if mismatches:
-        raise click.ClickException(
-            "Members CSV workspace_name mismatch: " + "; ".join(mismatches)
-        )
+        raise click.ClickException("Members CSV workspace_name mismatch: " + "; ".join(mismatches))
 
 
 def _single_instance_operator_notes(
@@ -1067,9 +1267,7 @@ def _build_single_instance_users_plan(
 ) -> SingleInstanceUsersPlan:
     """Build all derived single-instance users sync inputs in one place."""
     available_workspaces_by_id = {
-        workspace["id"]: workspace
-        for workspace in available_workspaces
-        if workspace.get("id")
+        workspace["id"]: workspace for workspace in available_workspaces if workspace.get("id")
     }
     workspace_ids = _resolve_single_instance_workspace_ids(
         csv_rows,
@@ -1110,7 +1308,9 @@ def _print_single_instance_users_summary(
 
     console.print("\n[bold]Single-Instance User Sync[/bold]")
     console.print(f"  Target: {config.destination.base_url}")
-    console.print(f"  CSV rows: {len(csv_rows)} total ({org_rows} org-level, {workspace_rows} workspace-level)")
+    console.print(
+        f"  CSV rows: {len(csv_rows)} total ({org_rows} org-level, {workspace_rows} workspace-level)"
+    )
     console.print(
         f"  Execution: {'dry run (no changes will be sent)' if config.migration.dry_run else 'live apply'}"
     )
@@ -1205,7 +1405,9 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
         lookup_probes.append(("queue_lookup", "/annotation-queues"))
 
     for label, endpoint in lookup_probes:
-        source_supported, source_detail = _probe_lookup_capability(orchestrator.source_client, endpoint)
+        source_supported, source_detail = _probe_lookup_capability(
+            orchestrator.source_client, endpoint
+        )
         dest_supported, dest_detail = _probe_lookup_capability(orchestrator.dest_client, endpoint)
         state.record_capability(
             f"preflight:{scope_key}",
@@ -1282,16 +1484,16 @@ def _display_resolution_summary(orchestrator) -> None:
     stats = orchestrator.state.get_statistics()
     terminal = stats.get("terminal", {})
     bundle_path = orchestrator.state.write_remediation_bundle()
-    bundle_display = str(bundle_path.resolve()) if bundle_path else orchestrator.state.remediation_bundle_path
+    bundle_display = (
+        str(bundle_path.resolve()) if bundle_path else orchestrator.state.remediation_bundle_path
+    )
 
     console.print("\n[bold]Resolution Summary[/bold]")
     console.print(f"  Migrated: {terminal.get(ResolutionOutcome.MIGRATED.value, 0)}")
     console.print(
         f"  Verified downgrade: {terminal.get(ResolutionOutcome.MIGRATED_WITH_VERIFIED_DOWNGRADE.value, 0)}"
     )
-    console.print(
-        f"  Blocked: {terminal.get(ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value, 0)}"
-    )
+    console.print(f"  Blocked: {terminal.get(ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value, 0)}")
     console.print(
         f"  Exported/manual apply: {terminal.get(ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY.value, 0)}"
     )
@@ -1305,17 +1507,14 @@ def _display_resolution_summary(orchestrator) -> None:
         for group in actionable_groups[:5]:
             item_count = len(group["items"])
             if item_count == 1:
-                console.print(
-                    f"  • {group['subjects'][0]}: {group['next_action']}"
-                )
+                console.print(f"  • {group['subjects'][0]}: {group['next_action']}")
             else:
                 affected = orchestrator.state.format_actionable_subjects(
                     group["subjects"],
                     max_items=3,
                 )
                 console.print(
-                    f"  • {group['label']} ({item_count} items: {affected}): "
-                    f"{group['next_action']}"
+                    f"  • {group['label']} ({item_count} items: {affected}): {group['next_action']}"
                 )
 
 
@@ -1333,12 +1532,15 @@ def _needs_operator_action(state) -> bool:
 
 def _exit_for_remediation_if_needed(ctx, config: Config, orchestrator) -> None:
     """Exit with code 2 in non-interactive mode when manual action is required."""
-    if config.migration.non_interactive and orchestrator.state and _needs_operator_action(orchestrator.state):
+    if (
+        config.migration.non_interactive
+        and orchestrator.state
+        and _needs_operator_action(orchestrator.state)
+    ):
         console.print(
             "\n[yellow]Manual or external follow-up is required. Review the remediation bundle and run `langsmith-migrator resume` after resolving the blockers.[/yellow]"
         )
         ctx.exit(2)
-
 
 
 def display_banner():
@@ -1378,8 +1580,7 @@ def ensure_config(config: Config) -> bool:
             if guidance:
                 error_lines.extend(f"  • {line}" for line in guidance)
             raise click.ClickException(
-                "Configuration is invalid in --non-interactive mode:\n"
-                + "\n".join(error_lines)
+                "Configuration is invalid in --non-interactive mode:\n" + "\n".join(error_lines)
             )
         else:
             # Non-credential errors
@@ -1391,19 +1592,62 @@ def ensure_config(config: Config) -> bool:
 
 
 @click.group()
-@click.option('--source-key', envvar='LANGSMITH_OLD_API_KEY', help='Source API key (env: LANGSMITH_OLD_API_KEY)')
-@click.option('--dest-key', envvar='LANGSMITH_NEW_API_KEY', help='Destination API key (env: LANGSMITH_NEW_API_KEY)')
-@click.option('--source-url', envvar='LANGSMITH_OLD_BASE_URL', help='Source base URL (env: LANGSMITH_OLD_BASE_URL)')
-@click.option('--dest-url', envvar='LANGSMITH_NEW_BASE_URL', help='Destination base URL (env: LANGSMITH_NEW_BASE_URL)')
-@click.option('--no-ssl', is_flag=True, help='Disable SSL verification')
-@click.option('--batch-size', type=click.IntRange(min=1, max=1000), help='Batch size for operations (1-1000, default: 100)')
-@click.option('--workers', type=click.IntRange(min=1, max=10), help='Number of concurrent workers (1-10, default: 4)')
-@click.option('--dry-run', is_flag=True, help='Run in dry-run mode (no changes)')
-@click.option('--skip-existing', is_flag=True, help='Skip existing resources instead of updating them')
-@click.option('--non-interactive', is_flag=True, help='Disable prompts and emit exit code 2 when remediation is required')
-@click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
+@click.option(
+    "--source-key",
+    envvar="LANGSMITH_OLD_API_KEY",
+    help="Source API key (env: LANGSMITH_OLD_API_KEY)",
+)
+@click.option(
+    "--dest-key",
+    envvar="LANGSMITH_NEW_API_KEY",
+    help="Destination API key (env: LANGSMITH_NEW_API_KEY)",
+)
+@click.option(
+    "--source-url",
+    envvar="LANGSMITH_OLD_BASE_URL",
+    help="Source base URL (env: LANGSMITH_OLD_BASE_URL)",
+)
+@click.option(
+    "--dest-url",
+    envvar="LANGSMITH_NEW_BASE_URL",
+    help="Destination base URL (env: LANGSMITH_NEW_BASE_URL)",
+)
+@click.option("--no-ssl", is_flag=True, help="Disable SSL verification")
+@click.option(
+    "--batch-size",
+    type=click.IntRange(min=1, max=1000),
+    help="Batch size for operations (1-1000, default: 100)",
+)
+@click.option(
+    "--workers",
+    type=click.IntRange(min=1, max=10),
+    help="Number of concurrent workers (1-10, default: 4)",
+)
+@click.option("--dry-run", is_flag=True, help="Run in dry-run mode (no changes)")
+@click.option(
+    "--skip-existing", is_flag=True, help="Skip existing resources instead of updating them"
+)
+@click.option(
+    "--non-interactive",
+    is_flag=True,
+    help="Disable prompts and emit exit code 2 when remediation is required",
+)
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.pass_context
-def cli(ctx, source_key, dest_key, source_url, dest_url, no_ssl, batch_size, workers, dry_run, skip_existing, non_interactive, verbose):
+def cli(
+    ctx,
+    source_key,
+    dest_key,
+    source_url,
+    dest_url,
+    no_ssl,
+    batch_size,
+    workers,
+    dry_run,
+    skip_existing,
+    non_interactive,
+    verbose,
+):
     """LangSmith Migration Tool - Migrate data between LangSmith instances."""
     ctx.ensure_object(dict)
     _install_log_filters()
@@ -1420,12 +1664,12 @@ def cli(ctx, source_key, dest_key, source_url, dest_url, no_ssl, batch_size, wor
         dry_run=dry_run,
         skip_existing=skip_existing if skip_existing else None,
         non_interactive=non_interactive,
-        verbose=verbose
+        verbose=verbose,
     )
 
-    ctx.obj['config'] = config
-    ctx.obj['state_manager'] = StateManager()
-    config.state_manager = ctx.obj['state_manager']
+    ctx.obj["config"] = config
+    ctx.obj["state_manager"] = StateManager()
+    config.state_manager = ctx.obj["state_manager"]
 
 
 @cli.command()
@@ -1433,7 +1677,7 @@ def cli(ctx, source_key, dest_key, source_url, dest_url, no_ssl, batch_size, wor
 @click.pass_context
 def test(ctx):
     """Test connections to source and destination instances."""
-    config = ctx.obj['config']
+    config = ctx.obj["config"]
 
     display_banner()
 
@@ -1443,7 +1687,7 @@ def test(ctx):
     config.display_summary(console)
 
     console.print("Testing connections... ", end="")
-    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
+    orchestrator = MigrationOrchestrator(config, ctx.obj["state_manager"])
 
     if orchestrator.test_connections():
         console.print("[green]✓[/green]")
@@ -1469,14 +1713,16 @@ def test(ctx):
 
 @cli.command()
 @ssl_option
-@click.option('--include-experiments', is_flag=True, help='Include experiments with datasets')
-@click.option('--all', 'select_all', is_flag=True, help='Migrate all datasets')
+@click.option("--include-experiments", is_flag=True, help="Include experiments with datasets")
+@click.option("--all", "select_all", is_flag=True, help="Migrate all datasets")
 @workspace_options
 @click.pass_context
-def datasets(ctx, include_experiments, select_all, source_workspace, dest_workspace, map_workspaces):
+def datasets(
+    ctx, include_experiments, select_all, source_workspace, dest_workspace, map_workspaces
+):
     """Migrate datasets with interactive selection."""
-    config = ctx.obj['config']
-    state_manager = ctx.obj['state_manager']
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
 
     display_banner()
 
@@ -1502,7 +1748,13 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
         console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
     if ws_result is _WS_ABORTED:
         ctx.exit(1)
         return
@@ -1513,10 +1765,7 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
 
     dataset_migrator = DatasetMigrator(
-        orchestrator.source_client,
-        orchestrator.dest_client,
-        None,
-        config
+        orchestrator.source_client, orchestrator.dest_client, None, config
     )
 
     try:
@@ -1582,22 +1831,22 @@ def datasets(ctx, include_experiments, select_all, source_workspace, dest_worksp
 
             try:
                 orchestrator.migrate_datasets_parallel(
-                    dataset_ids,
-                    include_examples=True,
-                    include_experiments=inc_exp
+                    dataset_ids, include_examples=True, include_experiments=inc_exp
                 )
 
                 console.print("\n[green]✓[/green] Migration completed")
 
                 if orchestrator.state:
                     stats = orchestrator.state.get_statistics()
-                    if stats['completed'] > 0:
+                    if stats["completed"] > 0:
                         console.print(f"  Migrated: {stats['completed']} dataset(s)")
-                    if stats['failed'] > 0:
+                    if stats["failed"] > 0:
                         console.print(f"  [red]Failed: {stats['failed']}[/red]")
-                    if inc_exp and 'by_type' in stats and 'experiment' in stats['by_type']:
-                        exp_stats = stats['by_type']['experiment']
-                        console.print(f"  Experiments: {exp_stats['completed']} completed, {exp_stats['failed']} failed")
+                    if inc_exp and "by_type" in stats and "experiment" in stats["by_type"]:
+                        exp_stats = stats["by_type"]["experiment"]
+                        console.print(
+                            f"  Experiments: {exp_stats['completed']} completed, {exp_stats['failed']} failed"
+                        )
 
             except Exception as e:
                 console.print(f"\n[red]Migration failed: {e}[/red]")
@@ -1648,7 +1897,7 @@ def _select_resume_session(config: Config, state_manager: StateManager):
         return sessions[0]
 
     choice = console.input("\nEnter session number to resume (or 'q' to quit): ")
-    if choice.lower() == 'q':
+    if choice.lower() == "q":
         return None
 
     try:
@@ -1668,8 +1917,8 @@ def _select_resume_session(config: Config, state_manager: StateManager):
 @click.pass_context
 def queues(ctx, source_workspace, dest_workspace, map_workspaces):
     """Migrate annotation queues."""
-    config = ctx.obj['config']
-    state_manager = ctx.obj['state_manager']
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
 
     display_banner()
 
@@ -1685,7 +1934,13 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
         return
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
     if ws_result is _WS_ABORTED:
         ctx.exit(1)
         return
@@ -1697,10 +1952,7 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
 
     queue_migrator = AnnotationQueueMigrator(
-        orchestrator.source_client,
-        orchestrator.dest_client,
-        None,
-        config
+        orchestrator.source_client, orchestrator.dest_client, None, config
     )
 
     for src_ws, dst_ws in ws_pairs:
@@ -1760,7 +2012,7 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
                     success_count += 1
                     _mark_state_item_completed(orchestrator, item_id, destination_id=new_id)
                 except Exception as e:
-                    failed_items.append((queue['name'], str(e)))
+                    failed_items.append((queue["name"], str(e)))
                     _mark_state_item_failed(orchestrator, item_id, e)
                 progress.advance(task)
 
@@ -1780,34 +2032,34 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
 @cli.command()
 @ssl_option
 @click.option(
-    '--dry-run',
-    'users_dry_run',
+    "--dry-run",
+    "users_dry_run",
     is_flag=True,
-    help='Preview this users sync without making POST/PATCH/DELETE changes. Same as the global --dry-run.',
+    help="Preview this users sync without making POST/PATCH/DELETE changes. Same as the global --dry-run.",
 )
-@click.option('--roles-only', is_flag=True, help='Only migrate custom roles (skip members)')
-@click.option('--skip-workspace-members', is_flag=True, help='Skip workspace member migration')
+@click.option("--roles-only", is_flag=True, help="Only migrate custom roles (skip members)")
+@click.option("--skip-workspace-members", is_flag=True, help="Skip workspace member migration")
 @click.option(
-    '--single-instance',
-    '--instance',
+    "--single-instance",
+    "--instance",
     is_flag=True,
-    help='Use one target LangSmith instance for CSV-driven access sync instead of source→destination migration',
+    help="Use one target LangSmith instance for CSV-driven access sync instead of source→destination migration",
 )
 @click.option(
-    '--csv-source-of-truth',
-    '--sync',
+    "--csv-source-of-truth",
+    "--sync",
     is_flag=True,
     help=(
-        'Make the CSV authoritative for single-instance sync: any active org '
-        'user or pending invite not present in the CSV will be removed, and '
-        'workspace memberships not present in the CSV will also be removed. '
-        'Without this flag, CSV mode only adds or updates access.'
+        "Make the CSV authoritative for single-instance sync: any active org "
+        "user or pending invite not present in the CSV will be removed, and "
+        "workspace memberships not present in the CSV will also be removed. "
+        "Without this flag, CSV mode only adds or updates access."
     ),
 )
 @click.option(
-    '--members-csv',
-    '--csv',
-    'members_csv',
+    "--members-csv",
+    "--csv",
+    "members_csv",
     type=click.Path(exists=True, dir_okay=False, path_type=str),
     help=(
         "CSV file with member details (email, langsmith_role, workspace_id, "
@@ -1818,20 +2070,20 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
     ),
 )
 @click.option(
-    '--api-key',
-    'instance_key',
-    help='API key for the single-instance CSV sync target. Must be provided together with --url.',
+    "--api-key",
+    "instance_key",
+    help="API key for the single-instance CSV sync target. Must be provided together with --url.",
 )
 @click.option(
-    '--url',
-    'instance_url',
-    help='Base URL for the single-instance CSV sync target. Must be provided together with --api-key.',
+    "--url",
+    "instance_url",
+    help="Base URL for the single-instance CSV sync target. Must be provided together with --api-key.",
 )
 @click.option(
-    '--non-interactive',
-    'users_non_interactive',
+    "--non-interactive",
+    "users_non_interactive",
     is_flag=True,
-    help='Disable prompts for this users run. Same behavior as the global --non-interactive.',
+    help="Disable prompts for this users run. Same behavior as the global --non-interactive.",
 )
 @workspace_options
 @click.pass_context
@@ -1851,8 +2103,8 @@ def users(
     map_workspaces,
 ):
     """Migrate users and roles, or sync one LangSmith instance from a CSV."""
-    config = ctx.obj['config']
-    state_manager = ctx.obj['state_manager']
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
 
     display_banner()
 
@@ -1887,13 +2139,9 @@ def users(
             "input only applies to member migration"
         )
     if csv_source_of_truth and not members_csv:
-        raise click.ClickException(
-            "--csv-source-of-truth requires --members-csv"
-        )
+        raise click.ClickException("--csv-source-of-truth requires --members-csv")
     if csv_source_of_truth and config.migration.skip_existing:
-        raise click.ClickException(
-            "--csv-source-of-truth cannot be combined with --skip-existing"
-        )
+        raise click.ClickException("--csv-source-of-truth cannot be combined with --skip-existing")
     if csv_source_of_truth and skip_workspace_members:
         raise click.ClickException(
             "--csv-source-of-truth cannot be combined with "
@@ -1972,8 +2220,7 @@ def users(
             user_role_migrator.require_destination_org_admin_for_authoritative_sync()
         except Exception as e:  # noqa: BLE001
             console.print(
-                "  [red]Failed to verify destination org-member management "
-                f"permissions: {e}[/red]"
+                f"  [red]Failed to verify destination org-member management permissions: {e}[/red]"
             )
             orchestrator.cleanup()
             ctx.exit(1)
@@ -2038,9 +2285,7 @@ def users(
         csv_member_rows, default_org_role_id = _resolve_csv_role_names(
             csv_member_rows, source_roles
         )
-        csv_member_rows, org_admin_workspace_row_count = _normalize_csv_role_scopes(
-            csv_member_rows
-        )
+        csv_member_rows, org_admin_workspace_row_count = _normalize_csv_role_scopes(csv_member_rows)
         org_emails: set[str] = set()
         ws_emails: set[str] = set()
         for row in csv_member_rows:
@@ -2068,8 +2313,7 @@ def users(
                 source_of_truth=csv_source_of_truth,
             )
             ws_pairs = [
-                (workspace_id, workspace_id)
-                for workspace_id in single_instance_plan.workspace_ids
+                (workspace_id, workspace_id) for workspace_id in single_instance_plan.workspace_ids
             ]
 
         if org_admin_workspace_row_count:
@@ -2149,9 +2393,7 @@ def users(
                 if role_id and role_id not in role_mapping
             }
             needed_union_role_ids = {
-                role_id
-                for role_id in needed_role_ids
-                if is_workspace_role_union_id(role_id)
+                role_id for role_id in needed_role_ids if is_workspace_role_union_id(role_id)
             }
             needed_regular_role_ids = needed_role_ids - needed_union_role_ids
             if needed_regular_role_ids:
@@ -2165,9 +2407,7 @@ def users(
                         )
                     )
                 except Exception as e:
-                    console.print(
-                        f"  [yellow]Warning: failed to sync some roles: {e}[/yellow]"
-                    )
+                    console.print(f"  [yellow]Warning: failed to sync some roles: {e}[/yellow]")
             if needed_union_role_ids:
                 console.print(
                     f"  Creating {len(needed_union_role_ids)} managed workspace role union(s)..."
@@ -2300,9 +2540,7 @@ def users(
                     )
                     removal_note = ""
                     if csv_source_of_truth:
-                        removal_note = (
-                            f" [dim](includes {user_role_migrator._last_workspace_member_removals} removed)[/dim]"
-                        )
+                        removal_note = f" [dim](includes {user_role_migrator._last_workspace_member_removals} removed)[/dim]"
                     console.print(
                         f"    [green]{m} migrated[/green], {s} skipped, "
                         f"[red]{f} failed[/red]{removal_note}"
@@ -2312,7 +2550,9 @@ def users(
 
             orchestrator.clear_workspace_context()
         else:
-            console.print("\n[dim]No workspace pairs configured, skipping workspace member migration[/dim]")
+            console.print(
+                "\n[dim]No workspace pairs configured, skipping workspace member migration[/dim]"
+            )
 
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
@@ -2321,14 +2561,14 @@ def users(
 
 @cli.command()
 @ssl_option
-@click.option('--all', 'select_all', is_flag=True, help='Migrate all prompts')
-@click.option('--include-all-commits', is_flag=True, help='Include all commit history')
+@click.option("--all", "select_all", is_flag=True, help="Migrate all prompts")
+@click.option("--include-all-commits", is_flag=True, help="Include all commit history")
 @workspace_options
 @click.pass_context
 def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspace, map_workspaces):
     """Migrate prompts with interactive selection."""
-    config = ctx.obj['config']
-    state_manager = ctx.obj['state_manager']
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
 
     display_banner()
 
@@ -2350,7 +2590,13 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
     if ws_result is _WS_ABORTED:
         ctx.exit(1)
         return
@@ -2363,10 +2609,7 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
 
     # Create prompt migrator
     prompt_migrator = PromptMigrator(
-        orchestrator.source_client,
-        orchestrator.dest_client,
-        None,
-        config
+        orchestrator.source_client, orchestrator.dest_client, None, config
     )
 
     for src_ws, dst_ws in ws_pairs:
@@ -2401,8 +2644,12 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
 
         # Warning about SDK-based prompt migration
         console.print("[yellow]Note:[/yellow] Prompt migration uses the LangSmith SDK.")
-        console.print("[dim]Some prompts (especially those created via API) may not be accessible via the SDK.[/dim]")
-        console.print("[dim]If all prompts fail, they may need to be recreated manually in the destination.[/dim]\n")
+        console.print(
+            "[dim]Some prompts (especially those created via API) may not be accessible via the SDK.[/dim]"
+        )
+        console.print(
+            "[dim]If all prompts fail, they may need to be recreated manually in the destination.[/dim]\n"
+        )
 
         selected_prompts = _select_or_all(
             config,
@@ -2445,18 +2692,17 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
             for prompt in selected_prompts:
                 try:
                     result = prompt_migrator.migrate_prompt(
-                        prompt['repo_handle'],
-                        include_all_commits=include_all_commits
+                        prompt["repo_handle"], include_all_commits=include_all_commits
                     )
                     if result:
                         success_count += 1
                     else:
-                        failed_items.append((prompt['repo_handle'], "migration returned None"))
+                        failed_items.append((prompt["repo_handle"], "migration returned None"))
                 except Exception as e:
                     error_msg = str(e)
                     if "405" in error_msg or "Not Allowed" in error_msg:
                         has_405_error = True
-                    failed_items.append((prompt['repo_handle'], error_msg))
+                    failed_items.append((prompt["repo_handle"], error_msg))
                 progress.advance(task)
 
         console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
@@ -2465,10 +2711,14 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
                 console.print(f"  [red]✗[/red] {name}: {err}")
         if failed_items and has_405_error:
             console.print("\n[yellow]⚠ Some failures were due to 405 Not Allowed errors[/yellow]")
-            console.print("[dim]This indicates the destination instance does not support prompt write operations.[/dim]")
+            console.print(
+                "[dim]This indicates the destination instance does not support prompt write operations.[/dim]"
+            )
             console.print("[dim]Possible solutions:[/dim]")
             console.print("[dim]  • Enable the prompts feature on your LangSmith instance[/dim]")
-            console.print("[dim]  • Check nginx/proxy configuration for /api/v1/repos/* endpoints[/dim]")
+            console.print(
+                "[dim]  • Check nginx/proxy configuration for /api/v1/repos/* endpoints[/dim]"
+            )
             console.print("[dim]  • Contact your LangSmith administrator[/dim]")
 
     if ws_result:
@@ -2481,12 +2731,12 @@ def prompts(ctx, select_all, include_all_commits, source_workspace, dest_workspa
 
 @cli.command()
 @ssl_option
-@click.option('--source', is_flag=True, help='List projects from source instance')
-@click.option('--dest', is_flag=True, help='List projects from destination instance')
+@click.option("--source", is_flag=True, help="List projects from source instance")
+@click.option("--dest", is_flag=True, help="List projects from destination instance")
 @click.pass_context
 def list_projects(ctx, source, dest):
     """List projects with their IDs to help create project mappings."""
-    config = ctx.obj['config']
+    config = ctx.obj["config"]
 
     if not source and not dest:
         console.print("[yellow]Specify --source or --dest to list projects[/yellow]")
@@ -2495,7 +2745,7 @@ def list_projects(ctx, source, dest):
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
+    orchestrator = MigrationOrchestrator(config, ctx.obj["state_manager"])
 
     from rich.table import Table
 
@@ -2508,7 +2758,7 @@ def list_projects(ctx, source, dest):
 
             for project in orchestrator.source_client.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
-                    table.add_row(project.get('name', 'unnamed'), project.get('id', ''))
+                    table.add_row(project.get("name", "unnamed"), project.get("id", ""))
 
             console.print(table)
         except Exception as e:
@@ -2523,7 +2773,7 @@ def list_projects(ctx, source, dest):
 
             for project in orchestrator.dest_client.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
-                    table.add_row(project.get('name', 'unnamed'), project.get('id', ''))
+                    table.add_row(project.get("name", "unnamed"), project.get("id", ""))
 
             console.print(table)
         except Exception as e:
@@ -2532,14 +2782,14 @@ def list_projects(ctx, source, dest):
     orchestrator.cleanup()
 
 
-@cli.command(name='list_workspaces')
+@cli.command(name="list_workspaces")
 @ssl_option
-@click.option('--source', is_flag=True, help='List workspaces from source instance')
-@click.option('--dest', is_flag=True, help='List workspaces from destination instance')
+@click.option("--source", is_flag=True, help="List workspaces from source instance")
+@click.option("--dest", is_flag=True, help="List workspaces from destination instance")
 @click.pass_context
 def list_workspaces_cmd(ctx, source, dest):
     """List workspaces accessible to the configured API keys."""
-    config = ctx.obj['config']
+    config = ctx.obj["config"]
 
     if not source and not dest:
         console.print("[yellow]Specify --source or --dest to list workspaces[/yellow]")
@@ -2548,7 +2798,7 @@ def list_workspaces_cmd(ctx, source, dest):
     if not ensure_config(config):
         return
 
-    orchestrator = MigrationOrchestrator(config, ctx.obj['state_manager'])
+    orchestrator = MigrationOrchestrator(config, ctx.obj["state_manager"])
 
     if source:
         workspaces = _list_workspaces(orchestrator.source_client)
@@ -2563,17 +2813,41 @@ def list_workspaces_cmd(ctx, source, dest):
 
 @cli.command()
 @ssl_option
-@click.option('--all', 'select_all', is_flag=True, help='Migrate all rules')
-@click.option('--strip-projects', is_flag=True, help='Strip project associations and create as global rules')
-@click.option('--project-mapping', type=str, help='JSON string or file path with project ID mapping (e.g., \'{"old-id": "new-id"}\')')
-@click.option('--create-enabled', is_flag=True, help='Create rules as enabled (default is disabled to bypass API key/secrets validation)')
-@click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
+@click.option("--all", "select_all", is_flag=True, help="Migrate all rules")
+@click.option(
+    "--strip-projects", is_flag=True, help="Strip project associations and create as global rules"
+)
+@click.option(
+    "--project-mapping",
+    type=str,
+    help='JSON string or file path with project ID mapping (e.g., \'{"old-id": "new-id"}\')',
+)
+@click.option(
+    "--create-enabled",
+    is_flag=True,
+    help="Create rules as enabled (default is disabled to bypass API key/secrets validation)",
+)
+@click.option(
+    "--map-projects",
+    is_flag=True,
+    help="Launch interactive TUI to map source projects to destination projects",
+)
 @workspace_options
 @click.pass_context
-def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_projects, source_workspace, dest_workspace, map_workspaces):
+def rules(
+    ctx,
+    select_all,
+    strip_projects,
+    project_mapping,
+    create_enabled,
+    map_projects,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
+):
     """Migrate project rules (automation rules)."""
-    config = ctx.obj['config']
-    state_manager = ctx.obj['state_manager']
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
 
     display_banner()
 
@@ -2595,7 +2869,13 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
     if ws_result is _WS_ABORTED:
         ctx.exit(1)
         return
@@ -2608,7 +2888,9 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
     # --map-projects and --project-mapping are mutually exclusive
     if map_projects and project_mapping:
-        console.print("[red]Error: --map-projects and --project-mapping are mutually exclusive[/red]")
+        console.print(
+            "[red]Error: --map-projects and --project-mapping are mutually exclusive[/red]"
+        )
         orchestrator.cleanup()
         return
 
@@ -2620,7 +2902,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
         try:
             if os.path.isfile(project_mapping):
-                with open(project_mapping, 'r') as f:
+                with open(project_mapping, "r") as f:
                     custom_mapping = json.load(f)
                 console.print(f"Loaded project mapping from file: {project_mapping}")
             else:
@@ -2647,10 +2929,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
         _run_preflight(orchestrator, config, ["rules", "prompts"])
 
         rules_migrator = RulesMigrator(
-            orchestrator.source_client,
-            orchestrator.dest_client,
-            None,
-            config
+            orchestrator.source_client, orchestrator.dest_client, None, config
         )
 
         ws_project_id_map = _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
@@ -2662,7 +2941,9 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
             console.print("Fetching projects from both instances... ", end="")
             source_projects = _list_projects(orchestrator.source_client)
             dest_projects = _list_projects(orchestrator.dest_client)
-            console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
+            console.print(
+                f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)"
+            )
 
             name_mapping = build_project_mapping_tui(source_projects, dest_projects)
             if name_mapping is None:
@@ -2694,20 +2975,28 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
             console.print("[dim]  • Rules feature is not available on this instance[/dim]")
             console.print("[dim]  • Rules are project-specific (try with a specific project)[/dim]")
             console.print("[dim]  • Rules API uses a different endpoint than expected[/dim]")
-            console.print("\n[dim]Tip: Run with -v (verbose) flag to see which endpoints were checked[/dim]")
+            console.print(
+                "\n[dim]Tip: Run with -v (verbose) flag to see which endpoints were checked[/dim]"
+            )
             continue
 
         console.print(f"found {len(rules)}\n")
 
         # Analyze rules for project/dataset associations
-        project_specific = [r for r in rules if r.get('session_id')]
-        project_only = [r for r in rules if r.get('session_id') and not r.get('dataset_id')]
+        project_specific = [r for r in rules if r.get("session_id")]
+        project_only = [r for r in rules if r.get("session_id") and not r.get("dataset_id")]
 
         if project_specific and not strip_projects:
-            console.print(f"[yellow]Warning: {len(project_specific)} rule(s) are project-specific[/yellow]")
-            console.print("[dim]These rules reference projects that may not exist in the destination.[/dim]")
+            console.print(
+                f"[yellow]Warning: {len(project_specific)} rule(s) are project-specific[/yellow]"
+            )
+            console.print(
+                "[dim]These rules reference projects that may not exist in the destination.[/dim]"
+            )
             if project_only:
-                console.print(f"[dim]Note: {len(project_only)} rule(s) have no dataset_id and cannot be migrated without projects.[/dim]")
+                console.print(
+                    f"[dim]Note: {len(project_only)} rule(s) have no dataset_id and cannot be migrated without projects.[/dim]"
+                )
             console.print("[dim]Options:[/dim]")
             console.print("[dim]  • Migrate projects first, then migrate rules[/dim]")
             console.print("[dim]  • Rules with dataset_id can be migrated without projects[/dim]\n")
@@ -2716,17 +3005,17 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
         rules_for_display = []
         for rule in rules:
             rule_copy = rule.copy()
-            if rule.get('session_id') and rule.get('dataset_id'):
-                rule_copy['association'] = 'Project+Dataset'
-            elif rule.get('session_id'):
-                rule_copy['association'] = 'Project'
-            elif rule.get('dataset_id'):
-                rule_copy['association'] = 'Dataset'
+            if rule.get("session_id") and rule.get("dataset_id"):
+                rule_copy["association"] = "Project+Dataset"
+            elif rule.get("session_id"):
+                rule_copy["association"] = "Project"
+            elif rule.get("dataset_id"):
+                rule_copy["association"] = "Dataset"
             else:
-                rule_copy['association'] = 'None'
+                rule_copy["association"] = "None"
 
-            if not rule_copy.get('name') and rule_copy.get('display_name'):
-                rule_copy['name'] = rule_copy['display_name']
+            if not rule_copy.get("name") and rule_copy.get("display_name"):
+                rule_copy["name"] = rule_copy["display_name"]
 
             rules_for_display.append(rule_copy)
 
@@ -2756,7 +3045,9 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
             console.print("[dim]Mode: Dry Run (no changes)[/dim]")
 
         if strip_projects:
-            console.print("[dim]Mode: Stripping project associations (creating as global rules)[/dim]")
+            console.print(
+                "[dim]Mode: Stripping project associations (creating as global rules)[/dim]"
+            )
 
         if not _confirm_action(config, "\nProceed?", default=True, non_interactive_value=True):
             console.print("[yellow]Cancelled[/yellow]")
@@ -2772,7 +3063,7 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
         with Progress(console=console) as progress:
             task = progress.add_task("Migrating rules...", total=len(selected_rules))
             for rule in selected_rules:
-                rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+                rule_name = rule.get("display_name") or rule.get("name", "unnamed")
                 item_id = _ensure_state_item(
                     orchestrator,
                     config,
@@ -2788,12 +3079,18 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
                 )
                 try:
                     _mark_state_item_started(orchestrator, item_id)
-                    has_project = bool(rule.get('session_id'))
-                    has_dataset = bool(rule.get('dataset_id'))
-                    has_evaluators = bool(rule.get('evaluators') or rule.get('evaluator_prompt_handle'))
+                    has_project = bool(rule.get("session_id"))
+                    has_dataset = bool(rule.get("dataset_id"))
+                    has_evaluators = bool(
+                        rule.get("evaluators") or rule.get("evaluator_prompt_handle")
+                    )
 
                     create_disabled = not create_enabled
-                    result = rules_migrator.create_rule(rule, strip_project_reference=strip_projects, create_disabled=create_disabled)
+                    result = rules_migrator.create_rule(
+                        rule,
+                        strip_project_reference=strip_projects,
+                        create_disabled=create_disabled,
+                    )
                     if result:
                         success_count += 1
                         _mark_state_item_completed(orchestrator, item_id, destination_id=result)
@@ -2803,10 +3100,14 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
                             _mark_state_item_failed(orchestrator, item_id, "no dataset or project")
                         elif has_project and not has_dataset:
                             skipped_items.append((rule_name, "project not found in destination"))
-                            _mark_state_item_failed(orchestrator, item_id, "project not found in destination")
+                            _mark_state_item_failed(
+                                orchestrator, item_id, "project not found in destination"
+                            )
                         elif has_evaluators:
                             failed_items.append((rule_name, "check prompts exist on destination"))
-                            _mark_state_item_failed(orchestrator, item_id, "check prompts exist on destination")
+                            _mark_state_item_failed(
+                                orchestrator, item_id, "check prompts exist on destination"
+                            )
                         else:
                             failed_items.append((rule_name, "see verbose logs"))
                             _mark_state_item_failed(orchestrator, item_id, "see verbose logs")
@@ -2815,7 +3116,9 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
                     _mark_state_item_failed(orchestrator, item_id, e)
                 progress.advance(task)
 
-        console.print(f"Rules: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed")
+        console.print(
+            f"Rules: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed"
+        )
         if (failed_items or skipped_items) and config.migration.verbose:
             for name, err in skipped_items:
                 console.print(f"  [yellow]⊘[/yellow] {name}: {err}")
@@ -2824,9 +3127,13 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
         # Show helpful message about disabled rules
         if success_count > 0 and not create_enabled:
-            console.print("\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
+            console.print(
+                "\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation."
+            )
             console.print("  To enable rules:")
-            console.print("  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
+            console.print(
+                "  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings"
+            )
             console.print("  2. Enable each rule in the LangSmith UI or use --create-enabled flag")
 
     if ws_result:
@@ -2839,29 +3146,49 @@ def rules(ctx, select_all, strip_projects, project_mapping, create_enabled, map_
 
 @cli.command()
 @ssl_option
-@click.option('--skip-users', is_flag=True, help='Skip user and role migration')
-@click.option('--skip-datasets', is_flag=True, help='Skip dataset migration')
-@click.option('--skip-experiments', is_flag=True, help='Skip experiment migration')
-@click.option('--skip-prompts', is_flag=True, help='Skip prompt migration')
-@click.option('--skip-queues', is_flag=True, help='Skip annotation queue migration')
-@click.option('--skip-rules', is_flag=True, help='Skip rules migration')
-@click.option('--skip-charts', is_flag=True, help='Skip chart migration')
-@click.option('--include-all-commits', is_flag=True, help='Include all prompt commit history')
-@click.option('--strip-projects', is_flag=True, help='Strip project associations from rules')
-@click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
+@click.option("--skip-users", is_flag=True, help="Skip user and role migration")
+@click.option("--skip-datasets", is_flag=True, help="Skip dataset migration")
+@click.option("--skip-experiments", is_flag=True, help="Skip experiment migration")
+@click.option("--skip-prompts", is_flag=True, help="Skip prompt migration")
+@click.option("--skip-queues", is_flag=True, help="Skip annotation queue migration")
+@click.option("--skip-rules", is_flag=True, help="Skip rules migration")
+@click.option("--skip-charts", is_flag=True, help="Skip chart migration")
+@click.option("--include-all-commits", is_flag=True, help="Include all prompt commit history")
+@click.option("--strip-projects", is_flag=True, help="Strip project associations from rules")
 @click.option(
-    '--rules-create-enabled',
-    'rules_create_enabled',
+    "--map-projects",
+    is_flag=True,
+    help="Launch interactive TUI to map source projects to destination projects",
+)
+@click.option(
+    "--rules-create-enabled",
+    "rules_create_enabled",
     flag_value=True,
     default=None,
-    help='Create migrated rules as enabled (default: disabled). If omitted, migrate-all asks interactively (default: No)'
+    help="Create migrated rules as enabled (default: disabled). If omitted, migrate-all asks interactively (default: No)",
 )
 @workspace_options
 @click.pass_context
-def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits, strip_projects, map_projects, rules_create_enabled, source_workspace, dest_workspace, map_workspaces):
+def migrate_all(
+    ctx,
+    skip_users,
+    skip_datasets,
+    skip_experiments,
+    skip_prompts,
+    skip_queues,
+    skip_rules,
+    skip_charts,
+    include_all_commits,
+    strip_projects,
+    map_projects,
+    rules_create_enabled,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
+):
     """Migrate all resources interactively."""
-    config = ctx.obj['config']
-    state_manager = ctx.obj['state_manager']
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
 
     display_banner()
 
@@ -2884,7 +3211,13 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
     console.print("[green]✓[/green]\n")
 
     # Resolve workspace context (runs before asset discovery)
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
     if ws_result is _WS_ABORTED:
         ctx.exit(1)
         return
@@ -2924,7 +3257,12 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
         if role_mapping:
             org_members = user_role_migrator.list_source_org_members()
             if org_members:
-                if _confirm_action(config, f"Migrate {len(org_members)} org member(s)?", default=True, non_interactive_value=True):
+                if _confirm_action(
+                    config,
+                    f"Migrate {len(org_members)} org member(s)?",
+                    default=True,
+                    non_interactive_value=True,
+                ):
                     migrated, skipped, failed = user_role_migrator.migrate_org_members(org_members)
                     console.print(
                         f"  Org members: [green]{migrated} migrated[/green], "
@@ -2945,7 +3283,9 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
     for ws_idx, (src_ws, dst_ws) in enumerate(ws_pairs):
         if src_ws and dst_ws:
             orchestrator.set_workspace_context(src_ws, dst_ws)
-            console.print(f"\n[bold cyan]━━━ Workspace {ws_idx + 1}/{len(ws_pairs)}: {src_ws} -> {dst_ws} ━━━[/bold cyan]\n")
+            console.print(
+                f"\n[bold cyan]━━━ Workspace {ws_idx + 1}/{len(ws_pairs)}: {src_ws} -> {dst_ws} ━━━[/bold cyan]\n"
+            )
 
         preflight_resources = []
         if not skip_datasets:
@@ -2967,10 +3307,24 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
         if ws_result and src_ws and src_ws in ws_result.project_mappings:
             ws_project_mapping = ws_result.project_mappings[src_ws]
 
-        _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
-                                   skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits,
-                                   strip_projects, map_projects, rules_create_enabled, ws_project_mapping,
-                                   src_ws, dst_ws)
+        _migrate_all_for_workspace(
+            ctx,
+            orchestrator,
+            config,
+            skip_datasets,
+            skip_experiments,
+            skip_prompts,
+            skip_queues,
+            skip_rules,
+            skip_charts,
+            include_all_commits,
+            strip_projects,
+            map_projects,
+            rules_create_enabled,
+            ws_project_mapping,
+            src_ws,
+            dst_ws,
+        )
 
     if ws_result:
         orchestrator.clear_workspace_context()
@@ -2981,10 +3335,24 @@ def migrate_all(ctx, skip_users, skip_datasets, skip_experiments, skip_prompts, 
     orchestrator.cleanup()
 
 
-def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_experiments,
-                                skip_prompts, skip_queues, skip_rules, skip_charts, include_all_commits,
-                                strip_projects, map_projects, rules_create_enabled=None, ws_project_mapping=None,
-                                source_workspace_id=None, dest_workspace_id=None):
+def _migrate_all_for_workspace(
+    ctx,
+    orchestrator,
+    config,
+    skip_datasets,
+    skip_experiments,
+    skip_prompts,
+    skip_queues,
+    skip_rules,
+    skip_charts,
+    include_all_commits,
+    strip_projects,
+    map_projects,
+    rules_create_enabled=None,
+    ws_project_mapping=None,
+    source_workspace_id=None,
+    dest_workspace_id=None,
+):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
     Args:
@@ -2996,39 +3364,63 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
 
     # Launch interactive TUI project mapper if requested (and not already done at workspace level)
     project_id_map = None
+    source_projects_for_mapping = []
+    dest_projects_for_mapping = []
+    project_name_mapping = None
     if ws_project_mapping:
+        project_name_mapping = ws_project_mapping
         # Convert the name mapping from the workspace TUI to an ID mapping
         console.print("Fetching projects for project mapping... ", end="")
         source_projects = _list_projects(orchestrator.source_client)
         dest_projects = _list_projects(orchestrator.dest_client)
-        console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
-        project_id_map = _name_mapping_to_id_mapping(
+        source_projects_for_mapping = source_projects
+        dest_projects_for_mapping = dest_projects
+        console.print(
+            f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)"
+        )
+        project_id_map = _mapping_result_to_project_id_map(
             ws_project_mapping,
             source_projects,
             dest_projects,
             source_workspace_id=source_workspace_id,
             dest_workspace_id=dest_workspace_id,
         )
-        console.print(f"Using workspace-scoped project mapping with {len(project_id_map)} project(s)\n")
+        _persist_project_id_map(orchestrator, config, project_id_map)
+        console.print(
+            "Using workspace-scoped project mapping with "
+            f"{len(project_id_map)} source ID mapping(s)\n"
+        )
     elif map_projects:
         console.print("Fetching projects from both instances... ", end="")
         source_projects = _list_projects(orchestrator.source_client)
         dest_projects = _list_projects(orchestrator.dest_client)
-        console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
+        source_projects_for_mapping = source_projects
+        dest_projects_for_mapping = dest_projects
+        console.print(
+            f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)"
+        )
 
-        name_mapping = build_project_mapping_tui(source_projects, dest_projects)
-        if name_mapping is None:
+        mapping_result = build_project_id_mapping_tui(source_projects, dest_projects)
+        if mapping_result is None:
             console.print("[yellow]Cancelled[/yellow]")
             return
+        if mapping_result and not (set(mapping_result) & set(_project_by_id(source_projects))):
+            project_name_mapping = mapping_result
 
-        project_id_map = _name_mapping_to_id_mapping(
-            name_mapping,
+        project_id_map = _mapping_result_to_project_id_map(
+            mapping_result,
             source_projects,
             dest_projects,
             source_workspace_id=source_workspace_id,
             dest_workspace_id=dest_workspace_id,
         )
-        console.print(f"Using interactive project mapping with {len(project_id_map)} project(s)\n")
+        _persist_project_id_map(orchestrator, config, project_id_map)
+        console.print(
+            "Using interactive project mapping with "
+            f"{len(source_projects)} fetched source project record(s), "
+            f"{len([p for p in source_projects if p.get('id') and p.get('name')])} visible TUI row(s), "
+            f"{len(project_id_map)} source ID mapping(s)\n"
+        )
 
     # Track dataset ID mappings for use in rules migration
     dataset_id_mapping = {}
@@ -3038,18 +3430,21 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
         console.print("[bold]Step 1: Datasets[/bold]")
         console.print("Fetching datasets... ", end="")
         from ..core.migrators import DatasetMigrator
+
         dataset_migrator = DatasetMigrator(
-            orchestrator.source_client,
-            orchestrator.dest_client,
-            None,
-            config
+            orchestrator.source_client, orchestrator.dest_client, None, config
         )
         datasets = dataset_migrator.list_datasets()
 
         if datasets:
             console.print(f"found {len(datasets)}")
 
-            if _confirm_action(config, f"Migrate {len(datasets)} dataset(s)?", default=True, non_interactive_value=True):
+            if _confirm_action(
+                config,
+                f"Migrate {len(datasets)} dataset(s)?",
+                default=True,
+                non_interactive_value=True,
+            ):
                 include_exp = False
                 if not skip_experiments:
                     include_exp = _confirm_action(
@@ -3061,7 +3456,9 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
 
                 try:
                     dataset_ids = [d["id"] for d in datasets]
-                    dataset_id_mapping = orchestrator.migrate_datasets_parallel(dataset_ids, include_examples=True, include_experiments=include_exp)
+                    dataset_id_mapping = orchestrator.migrate_datasets_parallel(
+                        dataset_ids, include_examples=True, include_experiments=include_exp
+                    )
                     console.print("[green]✓ Datasets migrated successfully[/green]\n")
                 except Exception as e:
                     console.print(f"[red]✗ Dataset migration failed: {e}[/red]\n")
@@ -3077,19 +3474,24 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
         console.print("[bold]Step 2: Prompts[/bold]")
         console.print("Fetching prompts... ", end="")
         from ..core.migrators import PromptMigrator
+
         prompt_migrator = PromptMigrator(
-            orchestrator.source_client,
-            orchestrator.dest_client,
-            None,
-            config
+            orchestrator.source_client, orchestrator.dest_client, None, config
         )
         prompts = prompt_migrator.list_prompts()
 
         if prompts:
             console.print(f"found {len(prompts)}")
-            console.print("[dim]Note: Prompt migration uses the SDK. API-created prompts may not be accessible.[/dim]")
+            console.print(
+                "[dim]Note: Prompt migration uses the SDK. API-created prompts may not be accessible.[/dim]"
+            )
 
-            if _confirm_action(config, f"Migrate {len(prompts)} prompt(s)?", default=True, non_interactive_value=True):
+            if _confirm_action(
+                config,
+                f"Migrate {len(prompts)} prompt(s)?",
+                default=True,
+                non_interactive_value=True,
+            ):
                 include_history = include_all_commits or _confirm_action(
                     config,
                     "Include full commit history?",
@@ -3107,15 +3509,16 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                     for prompt in prompts:
                         try:
                             result = prompt_migrator.migrate_prompt(
-                                prompt['repo_handle'],
-                                include_all_commits=include_history
+                                prompt["repo_handle"], include_all_commits=include_history
                             )
                             if result:
                                 success_count += 1
                             else:
-                                failed_items.append((prompt['repo_handle'], "migration returned None"))
+                                failed_items.append(
+                                    (prompt["repo_handle"], "migration returned None")
+                                )
                         except Exception as e:
-                            failed_items.append((prompt['repo_handle'], str(e)))
+                            failed_items.append((prompt["repo_handle"], str(e)))
                         progress.advance(task)
 
                 console.print(f"Prompts: {success_count} migrated, {len(failed_items)} failed")
@@ -3135,18 +3538,21 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
         console.print("[bold]Step 3: Annotation Queues[/bold]")
         console.print("Fetching annotation queues... ", end="")
         from ..core.migrators import AnnotationQueueMigrator
+
         queue_migrator = AnnotationQueueMigrator(
-            orchestrator.source_client,
-            orchestrator.dest_client,
-            None,
-            config
+            orchestrator.source_client, orchestrator.dest_client, None, config
         )
         queues = queue_migrator.list_queues()
 
         if queues:
             console.print(f"found {len(queues)}")
 
-            if _confirm_action(config, f"Migrate {len(queues)} annotation queue(s)?", default=True, non_interactive_value=True):
+            if _confirm_action(
+                config,
+                f"Migrate {len(queues)} annotation queue(s)?",
+                default=True,
+                non_interactive_value=True,
+            ):
                 _ensure_migration_session(orchestrator, config)
                 queue_migrator.state = orchestrator.state
                 success_count = 0
@@ -3169,7 +3575,7 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                             success_count += 1
                             _mark_state_item_completed(orchestrator, item_id, destination_id=new_id)
                         except Exception as e:
-                            failed_items.append((queue['name'], str(e)))
+                            failed_items.append((queue["name"], str(e)))
                             _mark_state_item_failed(orchestrator, item_id, e)
                         progress.advance(task)
 
@@ -3188,25 +3594,29 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
     # 4. Rules (evaluators)
     if not skip_rules:
         console.print("[bold]Step 4: Rules (Evaluators)[/bold]")
-        console.print("[dim]Note: LLM evaluators reference prompts via hub_ref. Prompts were migrated in Step 2.[/dim]")
+        console.print(
+            "[dim]Note: LLM evaluators reference prompts via hub_ref. Prompts were migrated in Step 2.[/dim]"
+        )
         console.print("Fetching rules... ", end="")
         from ..core.migrators import RulesMigrator
+
         rules_migrator = RulesMigrator(
-            orchestrator.source_client,
-            orchestrator.dest_client,
-            None,
-            config
+            orchestrator.source_client, orchestrator.dest_client, None, config
         )
 
         # Pass dataset ID mapping from Step 1 so rules can reference correct destination datasets
         if dataset_id_mapping:
             rules_migrator._dataset_id_map = dataset_id_mapping
-            console.print(f"[dim]Using dataset mapping from Step 1 ({len(dataset_id_mapping)} dataset(s))[/dim]")
+            console.print(
+                f"[dim]Using dataset mapping from Step 1 ({len(dataset_id_mapping)} dataset(s))[/dim]"
+            )
 
         # Apply interactive project mapping if provided
         if project_id_map:
             rules_migrator._project_id_map = project_id_map
-            console.print(f"[dim]Using interactive project mapping ({len(project_id_map)} project(s))[/dim]")
+            console.print(
+                f"[dim]Using interactive project mapping ({len(project_id_map)} project(s))[/dim]"
+            )
 
         rules = rules_migrator.list_rules()
 
@@ -3214,19 +3624,29 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
             console.print(f"found {len(rules)}")
 
             # Check for rules with LLM evaluators
-            rules_with_evaluators = [r for r in rules if r.get('evaluators') or r.get('evaluator_prompt_handle')]
-            rules_with_code_evaluators = [r for r in rules if r.get('code_evaluators')]
+            rules_with_evaluators = [
+                r for r in rules if r.get("evaluators") or r.get("evaluator_prompt_handle")
+            ]
+            rules_with_code_evaluators = [r for r in rules if r.get("code_evaluators")]
             if rules_with_evaluators:
-                console.print(f"[dim]  - {len(rules_with_evaluators)} rule(s) have LLM evaluators[/dim]")
+                console.print(
+                    f"[dim]  - {len(rules_with_evaluators)} rule(s) have LLM evaluators[/dim]"
+                )
             if rules_with_code_evaluators:
-                console.print(f"[dim]  - {len(rules_with_code_evaluators)} rule(s) have code evaluators[/dim]")
+                console.print(
+                    f"[dim]  - {len(rules_with_code_evaluators)} rule(s) have code evaluators[/dim]"
+                )
 
             # Check for project-specific rules
-            project_specific = [r for r in rules if r.get('session_id')]
+            project_specific = [r for r in rules if r.get("session_id")]
             if project_specific:
-                console.print(f"[yellow]Note: {len(project_specific)} rule(s) are project-specific[/yellow]")
+                console.print(
+                    f"[yellow]Note: {len(project_specific)} rule(s) are project-specific[/yellow]"
+                )
 
-            if _confirm_action(config, f"Migrate {len(rules)} rule(s)?", default=True, non_interactive_value=True):
+            if _confirm_action(
+                config, f"Migrate {len(rules)} rule(s)?", default=True, non_interactive_value=True
+            ):
                 strip = strip_projects
                 ensure_projects = False
                 create_enabled = rules_create_enabled
@@ -3263,7 +3683,7 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                 with Progress(console=console) as progress:
                     task = progress.add_task("Migrating rules...", total=len(rules))
                     for rule in rules:
-                        rule_name = rule.get('display_name') or rule.get('name', 'unnamed')
+                        rule_name = rule.get("display_name") or rule.get("name", "unnamed")
                         item_id = _ensure_state_item(
                             orchestrator,
                             config,
@@ -3279,43 +3699,67 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                         )
                         try:
                             _mark_state_item_started(orchestrator, item_id)
-                            has_project = bool(rule.get('session_id'))
-                            has_dataset = bool(rule.get('dataset_id'))
-                            has_evaluators = bool(rule.get('evaluators') or rule.get('evaluator_prompt_handle'))
+                            has_project = bool(rule.get("session_id"))
+                            has_dataset = bool(rule.get("dataset_id"))
+                            has_evaluators = bool(
+                                rule.get("evaluators") or rule.get("evaluator_prompt_handle")
+                            )
 
                             result = rules_migrator.create_rule(
                                 rule,
                                 strip_project_reference=strip,
                                 ensure_project=ensure_projects,
-                                create_disabled=create_disabled
+                                create_disabled=create_disabled,
                             )
                             if result:
                                 success_count += 1
-                                _mark_state_item_completed(orchestrator, item_id, destination_id=result)
+                                _mark_state_item_completed(
+                                    orchestrator, item_id, destination_id=result
+                                )
                             else:
                                 if not has_dataset and not has_project:
                                     skipped_items.append((rule_name, "no dataset or project"))
-                                    _mark_state_item_failed(orchestrator, item_id, "no dataset or project")
+                                    _mark_state_item_failed(
+                                        orchestrator, item_id, "no dataset or project"
+                                    )
                                 elif has_project and not has_dataset and not ensure_projects:
-                                    skipped_items.append((rule_name, "project not found in destination"))
-                                    _mark_state_item_failed(orchestrator, item_id, "project not found in destination")
+                                    skipped_items.append(
+                                        (rule_name, "project not found in destination")
+                                    )
+                                    _mark_state_item_failed(
+                                        orchestrator, item_id, "project not found in destination"
+                                    )
                                 elif has_evaluators:
-                                    failed_items.append((rule_name, "check prompts exist on destination"))
-                                    _mark_state_item_failed(orchestrator, item_id, "check prompts exist on destination")
+                                    failed_items.append(
+                                        (rule_name, "check prompts exist on destination")
+                                    )
+                                    _mark_state_item_failed(
+                                        orchestrator, item_id, "check prompts exist on destination"
+                                    )
                                 else:
                                     failed_items.append((rule_name, "see verbose logs"))
-                                    _mark_state_item_failed(orchestrator, item_id, "see verbose logs")
+                                    _mark_state_item_failed(
+                                        orchestrator, item_id, "see verbose logs"
+                                    )
                         except Exception as e:
                             failed_items.append((rule_name, str(e)))
                             _mark_state_item_failed(orchestrator, item_id, e)
                         progress.advance(task)
 
-                console.print(f"Rules: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed")
+                console.print(
+                    f"Rules: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed"
+                )
                 if success_count > 0 and create_disabled:
-                    console.print("\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation.")
+                    console.print(
+                        "\n[cyan]Note:[/cyan] Rules were created as [yellow]disabled[/yellow] to bypass secrets validation."
+                    )
                     console.print("  To enable rules:")
-                    console.print("  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings")
-                    console.print("  2. Enable each rule in the LangSmith UI or rerun with --rules-create-enabled")
+                    console.print(
+                        "  1. Configure required secrets (e.g., OPENAI_API_KEY) in destination workspace settings"
+                    )
+                    console.print(
+                        "  2. Enable each rule in the LangSmith UI or rerun with --rules-create-enabled"
+                    )
                 if (failed_items or skipped_items) and config.migration.verbose:
                     for name, err in skipped_items:
                         console.print(f"  [yellow]⊘[/yellow] {name}: {err}")
@@ -3333,16 +3777,16 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
     if not skip_charts:
         console.print("[bold]Step 5: Charts[/bold]")
         from ..core.migrators import ChartMigrator
+
         chart_migrator = ChartMigrator(
-            orchestrator.source_client,
-            orchestrator.dest_client,
-            orchestrator.state,
-            config
+            orchestrator.source_client, orchestrator.dest_client, orchestrator.state, config
         )
 
         if project_id_map:
             chart_migrator._project_id_map = dict(project_id_map)
-            console.print(f"[dim]Using interactive project mapping ({len(project_id_map)} project(s))[/dim]")
+            console.print(
+                f"[dim]Using interactive project mapping ({len(project_id_map)} project(s))[/dim]"
+            )
 
         workspace_pair = _active_workspace_pair(orchestrator)
         same_instance = _auto_detect_chart_same_instance(
@@ -3354,9 +3798,54 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
         source_charts = chart_migrator.list_charts()
         if source_charts:
             console.print(f"found {len(source_charts)}")
-            if _confirm_action(config, f"Migrate {len(source_charts)} chart(s)?", default=True, non_interactive_value=True):
+            if _confirm_action(
+                config,
+                f"Migrate {len(source_charts)} chart(s)?",
+                default=True,
+                non_interactive_value=True,
+            ):
                 _ensure_migration_session(orchestrator, config)
                 chart_migrator.state = orchestrator.state
+                if not same_instance:
+                    chart_dependency_ids = _chart_project_dependency_ids(
+                        source_charts,
+                        source_projects_for_mapping,
+                    )
+                    if project_id_map is not None:
+                        project_id_map = _complete_chart_project_id_map(
+                            project_id_map,
+                            source_projects=source_projects_for_mapping,
+                            dest_projects=dest_projects_for_mapping,
+                            chart_dependency_ids=chart_dependency_ids,
+                            name_mapping=project_name_mapping,
+                            dest_workspace_id=dest_workspace_id,
+                        )
+                        chart_migrator._project_id_map = dict(project_id_map)
+                        _persist_project_id_map(orchestrator, config, project_id_map)
+                    if chart_dependency_ids:
+                        console.print(
+                            "[dim]Chart dependency validation: "
+                            f"{len(chart_dependency_ids)} dependency ID(s), "
+                            f"{len(chart_migrator._project_id_map or {})} source ID mapping(s)[/dim]"
+                        )
+
+                    missing_project_ids = _unresolved_chart_project_dependencies(
+                        chart_migrator,
+                        chart_dependency_ids,
+                        same_instance=False,
+                    )
+                    if missing_project_ids:
+                        _block_unresolved_chart_project_dependencies(
+                            orchestrator,
+                            config,
+                            missing_project_ids,
+                            chart_migrator._project_id_map,
+                        )
+                        console.print(
+                            "[yellow]Skipped charts until mappings are resolved[/yellow]\n"
+                        )
+                        return
+
                 tracked_chart_items = {}
 
                 for chart in source_charts:
@@ -3403,7 +3892,9 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
                             "chart migration returned None",
                         )
 
-                console.print(f"Charts: {len(flat_chart_map)} migrated, {len(tracked_chart_items) - len(flat_chart_map)} failed")
+                console.print(
+                    f"Charts: {len(flat_chart_map)} migrated, {len(tracked_chart_items) - len(flat_chart_map)} failed"
+                )
                 console.print()
             else:
                 console.print("[yellow]Skipped charts[/yellow]\n")
@@ -3415,19 +3906,25 @@ def _migrate_all_for_workspace(ctx, orchestrator, config, skip_datasets, skip_ex
 
 @cli.command()
 @ssl_option
-@click.option('--session', help='Migrate charts for a specific session/project (by name or ID)')
+@click.option("--session", help="Migrate charts for a specific session/project (by name or ID)")
 @click.option(
-    '--same-instance',
+    "--same-instance",
     is_flag=True,
-    help='Reuse source project/session IDs on destination (only when both sides truly share IDs)',
+    help="Reuse source project/session IDs on destination (only when both sides truly share IDs)",
 )
-@click.option('--map-projects', is_flag=True, help='Launch interactive TUI to map source projects to destination projects')
+@click.option(
+    "--map-projects",
+    is_flag=True,
+    help="Launch interactive TUI to map source projects to destination projects",
+)
 @workspace_options
 @click.pass_context
-def charts(ctx, session, same_instance, map_projects, source_workspace, dest_workspace, map_workspaces):
+def charts(
+    ctx, session, same_instance, map_projects, source_workspace, dest_workspace, map_workspaces
+):
     """Migrate monitoring charts from sessions/projects."""
-    config = ctx.obj['config']
-    state_manager = ctx.obj['state_manager']
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
 
     display_banner()
 
@@ -3449,7 +3946,13 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
     console.print("[green]✓[/green]")
 
     # Resolve workspace context
-    ws_result = _resolve_workspaces(orchestrator, source_workspace, dest_workspace, map_workspaces, non_interactive=config.migration.non_interactive)
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
     if ws_result is _WS_ABORTED:
         ctx.exit(1)
         return
@@ -3476,37 +3979,52 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
         _run_preflight(orchestrator, config, ["charts"])
 
         chart_migrator = ChartMigrator(
-            orchestrator.source_client,
-            orchestrator.dest_client,
-            orchestrator.state,
-            config
+            orchestrator.source_client, orchestrator.dest_client, orchestrator.state, config
         )
+        source_projects_for_mapping = []
+        dest_projects_for_mapping = []
+        project_name_mapping = None
 
         ws_project_id_map = _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
         if ws_project_id_map:
             chart_migrator._project_id_map = ws_project_id_map
+            _persist_project_id_map(orchestrator, config, ws_project_id_map)
+            if ws_result and src_ws:
+                project_name_mapping = ws_result.project_mappings.get(src_ws)
 
         # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
         if map_projects and not ws_project_id_map:
             console.print("Fetching projects from both instances... ", end="")
             source_projects = _list_projects(orchestrator.source_client)
             dest_projects = _list_projects(orchestrator.dest_client)
-            console.print(f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)")
+            source_projects_for_mapping = source_projects
+            dest_projects_for_mapping = dest_projects
+            console.print(
+                f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)"
+            )
 
-            name_mapping = build_project_mapping_tui(source_projects, dest_projects)
-            if name_mapping is None:
+            mapping_result = build_project_id_mapping_tui(source_projects, dest_projects)
+            if mapping_result is None:
                 console.print("[yellow]Cancelled[/yellow]")
                 continue
+            if mapping_result and not (set(mapping_result) & set(_project_by_id(source_projects))):
+                project_name_mapping = mapping_result
 
-            id_map = _name_mapping_to_id_mapping(
-                name_mapping,
+            id_map = _mapping_result_to_project_id_map(
+                mapping_result,
                 source_projects,
                 dest_projects,
                 source_workspace_id=src_ws,
                 dest_workspace_id=dst_ws,
             )
             chart_migrator._project_id_map = id_map
-            console.print(f"Using interactive project mapping with {len(id_map)} project(s)")
+            _persist_project_id_map(orchestrator, config, id_map)
+            console.print(
+                "Using interactive project mapping with "
+                f"{len(source_projects)} fetched source project record(s), "
+                f"{len([p for p in source_projects if p.get('id') and p.get('name')])} visible TUI row(s), "
+                f"{len(id_map)} source ID mapping(s)"
+            )
 
         if session:
             # Migrate charts for a specific session
@@ -3522,7 +4040,7 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 
             target_session = None
             for s in sessions:
-                if s.get('id') == session or s.get('name') == session:
+                if s.get("id") == session or s.get("name") == session:
                     target_session = s
                     break
 
@@ -3537,7 +4055,7 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
                 continue
 
             console.print(f"[green]✓[/green] Found: {target_session.get('name', 'unnamed')}")
-            source_session_id = target_session['id']
+            source_session_id = target_session["id"]
 
             dest_session_id = chart_migrator.resolve_destination_session_id(
                 source_session_id,
@@ -3550,12 +4068,16 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
                 )
                 console.print("[yellow]Options:[/yellow]")
                 console.print("  1. Migrate projects first so state contains project mappings")
-                console.print("  2. Use --map-projects to provide a project mapping for this workspace pair")
+                console.print(
+                    "  2. Use --map-projects to provide a project mapping for this workspace pair"
+                )
                 continue
             if effective_same_instance:
                 console.print("[dim]Using same session ID for destination[/dim]\n")
             else:
-                console.print(f"[dim]Mapped to destination session: {dest_session_id[:8]}...[/dim]\n")
+                console.print(
+                    f"[dim]Mapped to destination session: {dest_session_id[:8]}...[/dim]\n"
+                )
 
             _ensure_migration_session(orchestrator, config)
             chart_migrator.state = orchestrator.state
@@ -3610,13 +4132,14 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
                 console.print("[dim]Mode: Same instance (using same session IDs)[/dim]")
             else:
                 console.print(
-                    "[dim]Mode: Remapped project/session IDs "
-                    "(source IDs are not reused)[/dim]"
+                    "[dim]Mode: Remapped project/session IDs (source IDs are not reused)[/dim]"
                 )
 
             console.print()
 
-            if not _confirm_action(config, "Proceed with migration?", default=True, non_interactive_value=True):
+            if not _confirm_action(
+                config, "Proceed with migration?", default=True, non_interactive_value=True
+            ):
                 console.print("[yellow]Cancelled[/yellow]")
                 continue
 
@@ -3625,6 +4148,53 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
             chart_migrator.state = orchestrator.state
             tracked_chart_items = {}
             source_charts = chart_migrator.list_charts()
+            if not effective_same_instance:
+                if chart_migrator._project_id_map and not source_projects_for_mapping:
+                    console.print("Fetching projects for chart dependency validation... ", end="")
+                    source_projects_for_mapping = _list_projects(orchestrator.source_client)
+                    dest_projects_for_mapping = _list_projects(orchestrator.dest_client)
+                    console.print(
+                        f"[green]✓[/green] ({len(source_projects_for_mapping)} source, "
+                        f"{len(dest_projects_for_mapping)} destination)"
+                    )
+
+                chart_dependency_ids = _chart_project_dependency_ids(
+                    source_charts,
+                    source_projects_for_mapping,
+                )
+                if chart_migrator._project_id_map is not None:
+                    completed_map = _complete_chart_project_id_map(
+                        chart_migrator._project_id_map,
+                        source_projects=source_projects_for_mapping,
+                        dest_projects=dest_projects_for_mapping,
+                        chart_dependency_ids=chart_dependency_ids,
+                        name_mapping=project_name_mapping,
+                        dest_workspace_id=dst_ws,
+                    )
+                    chart_migrator._project_id_map = completed_map
+                    _persist_project_id_map(orchestrator, config, completed_map)
+                if chart_dependency_ids:
+                    console.print(
+                        "[dim]Chart dependency validation: "
+                        f"{len(chart_dependency_ids)} dependency ID(s), "
+                        f"{len(chart_migrator._project_id_map or {})} source ID mapping(s)[/dim]"
+                    )
+
+                missing_project_ids = _unresolved_chart_project_dependencies(
+                    chart_migrator,
+                    chart_dependency_ids,
+                    same_instance=False,
+                )
+                if missing_project_ids:
+                    _block_unresolved_chart_project_dependencies(
+                        orchestrator,
+                        config,
+                        missing_project_ids,
+                        chart_migrator._project_id_map,
+                    )
+                    console.print("[yellow]Skipped charts until mappings are resolved[/yellow]")
+                    continue
+
             for chart in source_charts:
                 chart_id = chart.get("id")
                 if not chart_id:
@@ -3649,9 +4219,7 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
                 )
                 tracked_chart_items[chart_id] = item_id
                 _mark_state_item_started(orchestrator, item_id)
-            all_mappings = chart_migrator.migrate_all_charts(
-                same_instance=effective_same_instance
-            )
+            all_mappings = chart_migrator.migrate_all_charts(same_instance=effective_same_instance)
             flat_chart_map = {}
             for session_chart_map in all_mappings.values():
                 flat_chart_map.update(session_chart_map)
@@ -3691,7 +4259,7 @@ def charts(ctx, session, same_instance, map_projects, source_workspace, dest_wor
 @click.pass_context
 def clean(ctx):
     """Clean up old migration sessions."""
-    state_manager = ctx.obj['state_manager']
+    state_manager = ctx.obj["state_manager"]
 
     sessions = state_manager.list_sessions()
 
@@ -3714,8 +4282,8 @@ def clean(ctx):
 @click.pass_context
 def resume(ctx):
     """Resume a previous migration session (retry pending/failed items)."""
-    config = ctx.obj['config']
-    state_manager = ctx.obj['state_manager']
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
 
     display_banner()
 
@@ -3771,9 +4339,7 @@ def resume(ctx):
             for group in actionable_groups[:10]:
                 item_count = len(group["items"])
                 if item_count == 1:
-                    console.print(
-                        f"  • {group['subjects'][0]}: {group['next_action']}"
-                    )
+                    console.print(f"  • {group['subjects'][0]}: {group['next_action']}")
                 else:
                     affected = state.format_actionable_subjects(
                         group["subjects"],
@@ -3787,7 +4353,9 @@ def resume(ctx):
         if not resume_items:
             console.print("\n[yellow]No items to resume automatically.[/yellow]")
             if actionable_groups:
-                console.print("[dim]Review the checkpoint items above and resolve them manually.[/dim]")
+                console.print(
+                    "[dim]Review the checkpoint items above and resolve them manually.[/dim]"
+                )
             return
 
         # Show what will be resumed
@@ -3798,7 +4366,9 @@ def resume(ctx):
         for item_type, count in sorted(type_counts.items()):
             console.print(f"  {item_type}: {count}")
 
-        if not _confirm_action(config, "\nProceed with resume?", default=True, non_interactive_value=True):
+        if not _confirm_action(
+            config, "\nProceed with resume?", default=True, non_interactive_value=True
+        ):
             console.print("[yellow]Cancelled[/yellow]")
             return
 
