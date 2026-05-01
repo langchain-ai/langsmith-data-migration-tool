@@ -130,9 +130,7 @@ def test_display_resolution_summary_groups_duplicate_user_failures(monkeypatch, 
     """Resolution summaries should collapse repeated user-role blockers into a grouped next step."""
 
     state = build_state("migration_grouped_summary")
-    state.remediation_bundle_path = str(
-        (tmp_path / "remediation" / state.session_id).resolve()
-    )
+    state.remediation_bundle_path = str((tmp_path / "remediation" / state.session_id).resolve())
     for email in ("alice@example.com", "bob@example.com"):
         item = state.ensure_item(
             f"ws_member_ws-1_{email}",
@@ -327,7 +325,9 @@ def test_users_command_members_csv_replaces_source_member_apis(cli_harness, monk
     user_role_migrator.list_dest_org_members.return_value = []
     user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
     user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
-    user_role_migrator.list_source_org_members.side_effect = AssertionError("org API should not be used in CSV mode")
+    user_role_migrator.list_source_org_members.side_effect = AssertionError(
+        "org API should not be used in CSV mode"
+    )
     user_role_migrator.list_source_pending_org_members.side_effect = AssertionError(
         "pending API should not be used in CSV mode"
     )
@@ -337,11 +337,17 @@ def test_users_command_members_csv_replaces_source_member_apis(cli_harness, monk
 
     monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
 
-    resolved_rows = [{"email": "alice@example.com", "role_id": "src-role", "workspace_id": "src-ws"}]
+    resolved_rows = [
+        {"email": "alice@example.com", "role_id": "src-role", "workspace_id": "src-ws"}
+    ]
     org_members = [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-role"}]
-    ws_members = [{"id": "src-ws:alice@example.com", "email": "alice@example.com", "role_id": "src-role"}]
+    ws_members = [
+        {"id": "src-ws:alice@example.com", "email": "alice@example.com", "role_id": "src-role"}
+    ]
     monkeypatch.setattr(cli_main, "_load_members_csv", lambda _: resolved_rows)
-    monkeypatch.setattr(cli_main, "_resolve_csv_role_names", lambda rows, roles: (resolved_rows, "src-user"))
+    monkeypatch.setattr(
+        cli_main, "_resolve_csv_role_names", lambda rows, roles: (resolved_rows, "src-user")
+    )
     monkeypatch.setattr(cli_main, "_csv_rows_to_org_members", lambda rows, **kw: org_members)
     monkeypatch.setattr(cli_main, "_csv_rows_for_workspace", lambda rows, ws_id: ws_members)
 
@@ -390,7 +396,14 @@ def test_users_command_members_csv_supports_utf8_bom(cli_harness, monkeypatch, t
     assert result.exit_code == 0
     # alice only appears in a workspace row, so she gets the default org role (ORGANIZATION_USER)
     user_role_migrator.migrate_org_members.assert_called_once_with(
-        [{"id": "alice@example.com", "email": "alice@example.com", "role_id": "src-user", "full_name": ""}],
+        [
+            {
+                "id": "alice@example.com",
+                "email": "alice@example.com",
+                "role_id": "src-user",
+                "full_name": "",
+            }
+        ],
         remove_missing=False,
         remove_pending=False,
     )
@@ -529,9 +542,7 @@ def test_users_command_preflight_stays_user_scoped(cli_harness, monkeypatch):
         assert ("/datasets", 1) not in client.get_paginated_calls
 
 
-def test_users_command_defers_custom_role_sync_until_members_are_selected(
-    cli_harness, monkeypatch
-):
+def test_users_command_defers_custom_role_sync_until_members_are_selected(cli_harness, monkeypatch):
     """Default users flow syncs custom roles only for selected org members."""
     cli_harness.controls.workspace_result = WorkspaceProjectResult(
         workspace_mapping={"src-ws": "dst-ws"},
@@ -551,9 +562,7 @@ def test_users_command_defers_custom_role_sync_until_members_are_selected(
     user_role_migrator.list_source_pending_org_members.return_value = []
     user_role_migrator.list_source_workspace_members.return_value = []
     user_role_migrator.migrate_org_members.return_value = (1, 0, 0)
-    monkeypatch.setattr(
-        cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator
-    )
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
 
     result = cli_harness.invoke(["users"])
 
@@ -586,9 +595,7 @@ def test_users_command_syncs_workspace_custom_roles_after_workspace_selection(
         {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-ws-custom"}
     ]
     user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
-    monkeypatch.setattr(
-        cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator
-    )
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
 
     result = cli_harness.invoke(["users"])
 
@@ -599,9 +606,7 @@ def test_users_command_syncs_workspace_custom_roles_after_workspace_selection(
     ]
 
 
-def test_users_command_always_refreshes_dest_org_identities_for_phase3(
-    cli_harness, monkeypatch
-):
+def test_users_command_always_refreshes_dest_org_identities_for_phase3(cli_harness, monkeypatch):
     """Workspace phase refreshes destination org identities via the cache helper."""
     cli_harness.controls.workspace_result = WorkspaceProjectResult(
         workspace_mapping={"src-ws": "dst-ws"},
@@ -640,9 +645,7 @@ def test_users_command_dest_org_refresh_failure_is_graceful(cli_harness, monkeyp
     user_role_migrator._dest_email_to_identity = {}
     user_role_migrator.list_source_org_members.return_value = []
     user_role_migrator.list_source_pending_org_members.return_value = []
-    user_role_migrator.ensure_dest_email_index.side_effect = Exception(
-        "dest lookup failed"
-    )
+    user_role_migrator.ensure_dest_email_index.side_effect = Exception("dest lookup failed")
     user_role_migrator.list_source_workspace_members.return_value = [
         {"id": "src-ws-1", "email": "alice@example.com", "role_id": "src-role"}
     ]
@@ -732,24 +735,21 @@ def test_users_command_single_instance_source_of_truth_uses_identity_workspace_p
         remove_pending=True,
     )
     assert len(user_role_migrator.migrate_workspace_members.call_args_list) == 2
-    assert (
-        user_role_migrator.migrate_workspace_members.call_args_list[0].kwargs
-        == {
-            "selected_members": [
-                {
-                    "id": "ws-1:bob@example.com",
-                    "email": "bob@example.com",
-                    "role_id": "src-ws-admin",
-                    "full_name": "",
-                }
-            ],
-            "remove_missing": True,
-        }
-    )
-    assert (
-        user_role_migrator.migrate_workspace_members.call_args_list[1].kwargs
-        == {"selected_members": [], "remove_missing": True}
-    )
+    assert user_role_migrator.migrate_workspace_members.call_args_list[0].kwargs == {
+        "selected_members": [
+            {
+                "id": "ws-1:bob@example.com",
+                "email": "bob@example.com",
+                "role_id": "src-ws-admin",
+                "full_name": "",
+            }
+        ],
+        "remove_missing": True,
+    }
+    assert user_role_migrator.migrate_workspace_members.call_args_list[1].kwargs == {
+        "selected_members": [],
+        "remove_missing": True,
+    }
 
 
 def test_users_command_single_instance_source_of_truth_removes_omitted_workspace_access(
@@ -795,7 +795,9 @@ def test_users_command_single_instance_source_of_truth_removes_omitted_workspace
     )
 
     assert result.exit_code == 0
-    assert "Workspace access: authoritative across 2 target workspace(s)" in cli_harness.console.text
+    assert (
+        "Workspace access: authoritative across 2 target workspace(s)" in cli_harness.console.text
+    )
     user_role_migrator.migrate_org_members.assert_called_once_with(
         [
             {
@@ -943,9 +945,7 @@ def test_users_command_rejects_sync_with_skip_existing(cli_harness, tmp_path):
     assert "--csv-source-of-truth cannot be combined with --skip-existing" in result.output
 
 
-def test_users_command_source_of_truth_requires_org_admin_pat(
-    cli_harness, monkeypatch, tmp_path
-):
+def test_users_command_source_of_truth_requires_org_admin_pat(cli_harness, monkeypatch, tmp_path):
     """Authoritative users sync should fail fast when the target PAT cannot manage org members."""
     csv_path = tmp_path / "members.csv"
     csv_path.write_text(
@@ -1033,7 +1033,9 @@ def test_users_command_single_instance_csv_apply_auto_applies_all_rows(
     assert "Single-Instance User Sync" in cli_harness.console.text
     assert "Row selection: disabled" in cli_harness.console.text
     assert "Removals: disabled (add/update only)" in cli_harness.console.text
-    assert "workspace memberships missing from the CSV will be preserved" in cli_harness.console.text
+    assert (
+        "workspace memberships missing from the CSV will be preserved" in cli_harness.console.text
+    )
     user_role_migrator.migrate_org_members.assert_called_once_with(
         [
             {
@@ -1232,8 +1234,7 @@ def test_users_command_single_instance_syncs_workspace_only_custom_roles_before_
     ]
     csv_path = tmp_path / "members.csv"
     csv_path.write_text(
-        "email,langsmith_role,workspace_id\n"
-        "alice@example.com,write-no-read,ws-1\n",
+        "email,langsmith_role,workspace_id\nalice@example.com,write-no-read,ws-1\n",
         encoding="utf-8",
     )
 
@@ -1404,9 +1405,7 @@ def test_users_command_single_instance_workspace_org_admin_becomes_org_access_on
     user_role_migrator.migrate_workspace_members.assert_not_called()
 
 
-def test_users_command_local_dry_run_flag_sets_preview_mode(
-    cli_harness, monkeypatch, tmp_path
-):
+def test_users_command_local_dry_run_flag_sets_preview_mode(cli_harness, monkeypatch, tmp_path):
     """users --dry-run should enable preview mode even when passed after the subcommand."""
     cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
         {"id": "ws-1", "display_name": "Workspace 1"},
@@ -1625,9 +1624,7 @@ def test_users_command_local_non_interactive_runs_headless_single_instance_csv_a
     user_role_migrator.list_dest_org_members.return_value = []
     user_role_migrator.migrate_org_members.return_value = (2, 0, 0)
     user_role_migrator.migrate_workspace_members.return_value = (1, 0, 0)
-    monkeypatch.setattr(
-        cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator
-    )
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
     cli_harness.controls.confirm_answers = [False]
 
     result = cli_harness.invoke(
@@ -1651,9 +1648,7 @@ def test_users_command_local_non_interactive_runs_headless_single_instance_csv_a
     user_role_migrator.migrate_workspace_members.assert_called_once()
 
 
-def test_users_command_rejects_org_scoped_role_on_workspace_row(
-    cli_harness, monkeypatch, tmp_path
-):
+def test_users_command_rejects_org_scoped_role_on_workspace_row(cli_harness, monkeypatch, tmp_path):
     """Workspace rows should fail fast when they use org-scoped roles other than Organization Admin."""
     cli_harness.orchestrator_factory.dest_client.get_responses["/api/v1/workspaces"] = [
         {"id": "ws-1", "display_name": "Workspace 1"},
@@ -1848,11 +1843,17 @@ def test_users_help_describes_single_instance_csv_guardrails(cli_harness):
     assert "Preview this users sync without making POST/PATCH/DELETE changes." in normalized_output
     assert "Use one target LangSmith instance" in normalized_output
     assert "access sync instead of" in normalized_output
-    assert "any active org user or pending invite not present in the CSV will be removed" in normalized_output
+    assert (
+        "any active org user or pending invite not present in the CSV will be removed"
+        in normalized_output
+    )
     assert "workspace memberships not present in the CSV will also be removed" in normalized_output
     assert "Without this flag, CSV mode only adds or updates access." in normalized_output
     assert "all CSV rows are applied automatically" in normalized_output
-    assert "Organization Admin on a workspace row is treated as org-level access only." in normalized_output
+    assert (
+        "Organization Admin on a workspace row is treated as org-level access only."
+        in normalized_output
+    )
     assert "Must be provided together with --url." in normalized_output
     assert "Base URL for the single-instance CSV sync target." in normalized_output
     assert "provided together with --api-" in normalized_output
@@ -1938,7 +1939,10 @@ def test_datasets_command_exits_nonzero_when_workspace_resolution_aborts(cli_har
 def test_prompts_command_surfaces_unavailable_prompts_api(cli_harness):
     """Prompt migration should stop early when the destination API is unavailable."""
 
-    cli_harness.migrators.prompt.check_prompts_api_available.return_value = (False, "Feature disabled")
+    cli_harness.migrators.prompt.check_prompts_api_available.return_value = (
+        False,
+        "Feature disabled",
+    )
 
     result = cli_harness.invoke(["prompts", "--all"])
 
@@ -2036,9 +2040,7 @@ def test_list_projects_queries_each_requested_instance(cli_harness):
     assert cli_harness.orchestrator_factory.source_client.get_paginated_calls == [
         ("/sessions", 100)
     ]
-    assert cli_harness.orchestrator_factory.dest_client.get_paginated_calls == [
-        ("/sessions", 100)
-    ]
+    assert cli_harness.orchestrator_factory.dest_client.get_paginated_calls == [("/sessions", 100)]
 
 
 def test_list_workspaces_queries_each_requested_instance(cli_harness):
@@ -2132,9 +2134,7 @@ def test_rules_command_uses_custom_project_mapping_for_selected_rule(cli_harness
     )
 
     assert result.exit_code == 0
-    assert cli_harness.migrators.rules._project_id_map == {
-        "source-project-id": "dest-project-id"
-    }
+    assert cli_harness.migrators.rules._project_id_map == {"source-project-id": "dest-project-id"}
     cli_harness.migrators.rules.create_rule.assert_called_once_with(
         source_rule,
         strip_project_reference=False,
@@ -2167,9 +2167,7 @@ def test_rules_command_uses_workspace_project_mappings(cli_harness):
     result = cli_harness.invoke(["rules", "--all"])
 
     assert result.exit_code == 0
-    assert cli_harness.migrators.rules._project_id_map == {
-        "source-project-id": "dest-project-id"
-    }
+    assert cli_harness.migrators.rules._project_id_map == {"source-project-id": "dest-project-id"}
     assert "Using workspace-scoped project mapping" in cli_harness.console.text
 
 
@@ -2224,16 +2222,12 @@ def test_migrate_all_runs_every_step_and_applies_workspace_project_mappings(cli_
         }
     ]
     assert cli_harness.migrators.rules._dataset_id_map == {"dataset-1": "dest-dataset-1"}
-    assert cli_harness.migrators.rules._project_id_map == {
-        "source-project-id": "dest-project-id"
-    }
+    assert cli_harness.migrators.rules._project_id_map == {"source-project-id": "dest-project-id"}
     assert cli_harness.migrators.prompt.migrate_prompt.call_count == 1
     assert cli_harness.migrators.queue.create_queue.call_count == 1
     assert cli_harness.migrators.rules.create_rule.call_count == 1
     cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
-    assert cli_harness.migrators.chart._project_id_map == {
-        "source-project-id": "dest-project-id"
-    }
+    assert cli_harness.migrators.chart._project_id_map == {"source-project-id": "dest-project-id"}
     assert orchestrator.clear_workspace_called is True
     assert "Migration wizard completed!" in cli_harness.console.text
 
@@ -2334,9 +2328,7 @@ def test_charts_command_same_key_cross_workspace_uses_remap_mode(cli_harness):
     )
 
     assert result.exit_code == 0
-    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
-        same_instance=False
-    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
     assert "different workspaces" in cli_harness.console.text
     assert "Mode: Remapped project/session IDs" in cli_harness.console.text
 
@@ -2406,15 +2398,18 @@ def test_charts_command_same_deployment_identical_workspace_reuses_ids_with_diff
     )
 
     assert result.exit_code == 0
-    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
-        same_instance=True
-    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=True)
     assert "identical workspace scope" in cli_harness.console.text
 
 
 def test_charts_command_same_deployment_different_keys_uses_remap_mode(cli_harness):
     """Same deployment with different API keys should remap projects instead of reusing IDs."""
 
+    cli_harness.orchestrator_factory.state.set_mapped_id(
+        "project",
+        "source-project-id",
+        "dest-project-id",
+    )
     cli_harness.migrators.chart.list_charts.return_value = [
         {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
     ]
@@ -2441,9 +2436,7 @@ def test_charts_command_same_deployment_different_keys_uses_remap_mode(cli_harne
     )
 
     assert result.exit_code == 0
-    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
-        same_instance=False
-    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
     assert "auto-remap projects and sessions" in cli_harness.console.text
 
 
@@ -2469,9 +2462,7 @@ def test_charts_command_uses_workspace_project_mappings(cli_harness):
     result = cli_harness.invoke(["charts"])
 
     assert result.exit_code == 0
-    assert cli_harness.migrators.chart._project_id_map == {
-        "source-project-id": "dest-project-id"
-    }
+    assert cli_harness.migrators.chart._project_id_map == {"source-project-id": "dest-project-id"}
     assert "Using workspace-scoped project mapping" in cli_harness.console.text
 
 
@@ -2499,9 +2490,7 @@ def test_charts_command_workspace_project_mapping_filters_duplicate_project_name
     result = cli_harness.invoke(["charts"])
 
     assert result.exit_code == 0
-    assert cli_harness.migrators.chart._project_id_map == {
-        "source-project-id": "dest-project-id"
-    }
+    assert cli_harness.migrators.chart._project_id_map == {"source-project-id": "dest-project-id"}
 
 
 def test_charts_map_projects_filters_duplicate_names_for_active_workspace_pair(cli_harness):
@@ -2544,8 +2533,8 @@ def test_charts_map_projects_filters_duplicate_names_for_active_workspace_pair(c
             "project_id": "a3cee8e2-40bb-472e-8456-c660b5ea1f3d",
         }
     ]
-    cli_harness.migrators.chart._extract_session_id.side_effect = (
-        lambda chart: chart.get("project_id")
+    cli_harness.migrators.chart._extract_session_id.side_effect = lambda chart: chart.get(
+        "project_id"
     )
     cli_harness.migrators.chart.migrate_all_charts.return_value = {
         "a3cee8e2-40bb-472e-8456-c660b5ea1f3d": {"chart-1": "dest-chart-1"}
@@ -2563,10 +2552,142 @@ def test_charts_map_projects_filters_duplicate_names_for_active_workspace_pair(c
         same_instance=False,
     )
     state = cli_harness.orchestrator_factory.state
-    item = state.get_item(
-        "chart_src-ws_chart-1"
-    )
+    item = state.get_item("chart_src-ws_chart-1")
     assert item.metadata["dest_session_id"] == "cc3ac580-destination-project"
+
+
+def test_charts_map_projects_maps_chart_dependency_id_omitted_by_workspace_metadata(
+    cli_harness,
+):
+    """A selected project name must map every chart dependency ID for that project."""
+
+    source_project_id = "a3cee8e2-40bb-472e-8456-c660b5ea1f3d"
+    dest_project_id = "cc3ac580-destination-project"
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.controls.project_mapping_result = {"Shared Project": "Shared Project"}
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {
+            "id": "source-visible-project",
+            "name": "Shared Project",
+            "tenant_id": "src-ws",
+        },
+        {
+            "id": source_project_id,
+            "name": "Shared Project",
+        },
+        {
+            "id": "source-other-project",
+            "name": "Shared Project",
+            "tenant_id": "src-ws",
+        },
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {
+            "id": dest_project_id,
+            "name": "Shared Project",
+            "tenant_id": "dst-ws",
+        },
+        {
+            "id": "dest-other-project",
+            "name": "Other Project",
+            "tenant_id": "dst-ws",
+        },
+        {
+            "id": "dest-third-project",
+            "name": "Third Project",
+            "tenant_id": "dst-ws",
+        },
+        {
+            "id": "dest-fourth-project",
+            "name": "Fourth Project",
+            "tenant_id": "dst-ws",
+        },
+    ]
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {
+            "id": "chart-1",
+            "title": "Chart One",
+            "series": [
+                {
+                    "filters": {
+                        "session": [source_project_id],
+                    }
+                }
+            ],
+        }
+    ]
+    real_chart_migrator = object.__new__(RealChartMigrator)
+    cli_harness.migrators.chart._extract_session_id.side_effect = (
+        lambda chart: RealChartMigrator._extract_session_id(
+            real_chart_migrator,
+            chart,
+        )
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        source_project_id: {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(["charts", "--map-projects"])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map[source_project_id] == (dest_project_id)
+    state = cli_harness.orchestrator_factory.state
+    assert state.get_mapped_id("project", source_project_id) == dest_project_id
+    item = state.get_item("chart_src-ws_chart-1")
+    assert item.metadata["dest_session_id"] == dest_project_id
+    assert "source ID mapping" in cli_harness.console.text
+
+
+def test_charts_blocks_once_when_all_chart_project_dependencies_are_unmapped(
+    cli_harness,
+):
+    """All-chart runs should stop once before exporting one artifact per chart."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {
+            "id": "chart-1",
+            "title": "Chart One",
+            "project_id": "source-project-id",
+        }
+    ]
+    cli_harness.migrators.chart._extract_session_id.side_effect = lambda chart: chart.get(
+        "project_id"
+    )
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.migrate_all_charts.assert_not_called()
+    assert "Chart project dependencies could not be resolved" in cli_harness.console.text
+    state = cli_harness.orchestrator_factory.state
+    item = state.get_item("chart_dependency_src-ws_project_mappings")
+    assert item.outcome_code == "unresolved_chart_project_mapping"
+    assert item.metadata["unmapped_dependency_ids"] == ["source-project-id"]
 
 
 def test_charts_map_projects_resolves_nested_session_filters_for_resume_metadata(
@@ -2602,13 +2723,7 @@ def test_charts_map_projects_resolves_nested_session_filters_for_resume_metadata
                 {
                     "filters": {
                         "operator": "and",
-                        "children": [
-                            {
-                                "session": [
-                                    "a3cee8e2-40bb-472e-8456-c660b5ea1f3d"
-                                ]
-                            }
-                        ],
+                        "children": [{"session": ["a3cee8e2-40bb-472e-8456-c660b5ea1f3d"]}],
                     }
                 }
             ],
@@ -2699,9 +2814,7 @@ def test_charts_map_projects_same_deployment_cross_workspace_remaps_metadata(
     )
 
     assert result.exit_code == 0
-    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
-        same_instance=False
-    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
     cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
         "source-project-id",
         same_instance=False,
@@ -2726,8 +2839,8 @@ def test_charts_command_same_instance_override_cross_workspace_reuses_ids(
     cli_harness.migrators.chart.list_charts.return_value = [
         {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
     ]
-    cli_harness.migrators.chart._extract_session_id.side_effect = (
-        lambda chart: chart.get("project_id")
+    cli_harness.migrators.chart._extract_session_id.side_effect = lambda chart: chart.get(
+        "project_id"
     )
     cli_harness.migrators.chart.migrate_all_charts.return_value = {
         "source-project-id": {"chart-1": "dest-chart-1"}
@@ -2755,9 +2868,7 @@ def test_charts_command_same_instance_override_cross_workspace_reuses_ids(
         "source-project-id",
         same_instance=True,
     )
-    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
-        same_instance=True
-    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=True)
     state = cli_harness.orchestrator_factory.state
     item = state.get_item("chart_src-ws_chart-1")
     assert item.metadata["dest_session_id"] == "source-project-id"
@@ -2775,9 +2886,7 @@ def test_charts_command_uses_saved_project_mapping_for_session_migration(cli_har
     cli_harness.migrators.chart.list_sessions.return_value = [
         {"id": "source-session", "name": "Session A"},
     ]
-    cli_harness.migrators.chart.migrate_session_charts.return_value = {
-        "chart-1": "dest-chart-1"
-    }
+    cli_harness.migrators.chart.migrate_session_charts.return_value = {"chart-1": "dest-chart-1"}
 
     result = cli_harness.invoke(["charts", "--session", "Session A"])
 
@@ -2807,16 +2916,12 @@ def test_charts_command_session_uses_workspace_project_mappings(cli_harness):
     cli_harness.migrators.chart.list_sessions.return_value = [
         {"id": "source-session", "name": "Source Session"},
     ]
-    cli_harness.migrators.chart.migrate_session_charts.return_value = {
-        "chart-1": "dest-chart-1"
-    }
+    cli_harness.migrators.chart.migrate_session_charts.return_value = {"chart-1": "dest-chart-1"}
 
     result = cli_harness.invoke(["charts", "--session", "Source Session"])
 
     assert result.exit_code == 0
-    assert cli_harness.migrators.chart._project_id_map == {
-        "source-session": "dest-session"
-    }
+    assert cli_harness.migrators.chart._project_id_map == {"source-session": "dest-session"}
     cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
         "source-session",
         same_instance=False,
@@ -2841,9 +2946,7 @@ def test_charts_command_session_same_deployment_identical_workspace_reuses_ids_w
     cli_harness.migrators.chart.list_sessions.return_value = [
         {"id": "source-session", "name": "Source Session"},
     ]
-    cli_harness.migrators.chart.migrate_session_charts.return_value = {
-        "chart-1": "dest-chart-1"
-    }
+    cli_harness.migrators.chart.migrate_session_charts.return_value = {"chart-1": "dest-chart-1"}
 
     result = cli_harness.invoke(
         [
@@ -2894,9 +2997,7 @@ def test_charts_command_session_same_deployment_cross_workspace_uses_mapping(
     cli_harness.migrators.chart.list_sessions.return_value = [
         {"id": "source-session", "name": "Source Session"},
     ]
-    cli_harness.migrators.chart.migrate_session_charts.return_value = {
-        "chart-1": "dest-chart-1"
-    }
+    cli_harness.migrators.chart.migrate_session_charts.return_value = {"chart-1": "dest-chart-1"}
 
     result = cli_harness.invoke(
         [
@@ -2970,6 +3071,11 @@ def test_charts_command_session_same_deployment_cross_workspace_blocks_without_m
 def test_migrate_all_chart_step_same_key_cross_workspace_uses_remap_mode(cli_harness):
     """migrate-all should keep chart migration in remap mode for different workspace pairs."""
 
+    cli_harness.orchestrator_factory.state.set_mapped_id(
+        "project",
+        "source-project-id",
+        "dest-project-id",
+    )
     cli_harness.controls.workspace_result = WorkspaceProjectResult(
         workspace_mapping={"src-ws": "dst-ws"},
         project_mappings={},
@@ -2978,8 +3084,8 @@ def test_migrate_all_chart_step_same_key_cross_workspace_uses_remap_mode(cli_har
     cli_harness.migrators.chart.list_charts.return_value = [
         {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
     ]
-    cli_harness.migrators.chart._extract_session_id.side_effect = (
-        lambda chart: chart.get("project_id")
+    cli_harness.migrators.chart._extract_session_id.side_effect = lambda chart: chart.get(
+        "project_id"
     )
     cli_harness.migrators.chart.migrate_all_charts.return_value = {
         "source-project-id": {"chart-1": "dest-chart-1"}
@@ -3007,9 +3113,7 @@ def test_migrate_all_chart_step_same_key_cross_workspace_uses_remap_mode(cli_har
     )
 
     assert result.exit_code == 0
-    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
-        same_instance=False
-    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
     assert "different workspaces" in cli_harness.console.text
     assert "auto-remap projects and sessions" in cli_harness.console.text
 
@@ -3027,8 +3131,8 @@ def test_migrate_all_chart_step_same_deployment_identical_workspace_reuses_ids_w
     cli_harness.migrators.chart.list_charts.return_value = [
         {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
     ]
-    cli_harness.migrators.chart._extract_session_id.side_effect = (
-        lambda chart: chart.get("project_id")
+    cli_harness.migrators.chart._extract_session_id.side_effect = lambda chart: chart.get(
+        "project_id"
     )
     cli_harness.migrators.chart.migrate_all_charts.return_value = {
         "source-project-id": {"chart-1": "dest-chart-1"}
@@ -3056,9 +3160,7 @@ def test_migrate_all_chart_step_same_deployment_identical_workspace_reuses_ids_w
     )
 
     assert result.exit_code == 0
-    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
-        same_instance=True
-    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=True)
     assert "identical workspace scope" in cli_harness.console.text
 
 
@@ -3081,8 +3183,8 @@ def test_migrate_all_chart_step_same_deployment_cross_workspace_maps_metadata(
     cli_harness.migrators.chart.list_charts.return_value = [
         {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
     ]
-    cli_harness.migrators.chart._extract_session_id.side_effect = (
-        lambda chart: chart.get("project_id")
+    cli_harness.migrators.chart._extract_session_id.side_effect = lambda chart: chart.get(
+        "project_id"
     )
     cli_harness.migrators.chart.migrate_all_charts.return_value = {
         "source-project-id": {"chart-1": "dest-chart-1"}
@@ -3114,9 +3216,7 @@ def test_migrate_all_chart_step_same_deployment_cross_workspace_maps_metadata(
         "source-project-id",
         same_instance=False,
     )
-    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
-        same_instance=False
-    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
     state = cli_harness.orchestrator_factory.state
     item = state.get_item("chart_src-ws_chart-1")
     assert item.metadata["dest_session_id"] == "dest-project-id"
@@ -3225,9 +3325,7 @@ def test_resume_command_retries_prompt_queue_rule_and_chart_items(cli_harness):
     cli_harness.migrators.queue.create_queue.assert_called_once_with(
         {"id": "queue-1", "name": "Queue One"}
     )
-    assert cli_harness.migrators.rules._project_id_map == {
-        "source-project-id": "dest-project-id"
-    }
+    assert cli_harness.migrators.rules._project_id_map == {"source-project-id": "dest-project-id"}
     cli_harness.migrators.rules.create_rule.assert_called_once_with(
         {"id": "rule-1", "display_name": "Rule One"},
         strip_project_reference=True,

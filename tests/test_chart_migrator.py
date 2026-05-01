@@ -196,13 +196,7 @@ def test_extract_session_id_finds_nested_session_filter(
                     {
                         "filters": {
                             "operator": "and",
-                            "children": [
-                                {
-                                    "session": [
-                                        "a3cee8e2-40bb-472e-8456-c660b5ea1f3d"
-                                    ]
-                                }
-                            ],
+                            "children": [{"session": ["a3cee8e2-40bb-472e-8456-c660b5ea1f3d"]}],
                         }
                     }
                 ],
@@ -527,6 +521,59 @@ def test_migrate_chart_maps_each_project_dependency_when_dest_session_is_known(
     migrator._export_chart_manual_apply.assert_not_called()
 
 
+def test_migrate_chart_rewrites_project_ids_embedded_in_string_filters(
+    sample_config,
+    migration_state,
+):
+    """Project mappings should also apply to serialized chart filter expressions."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+    migrator._project_id_map = {
+        "source-project-a": "dest-project-a",
+        "source-project-b": "dest-project-b",
+    }
+    migrator._project_mapping_complete = True
+    migrator._dataset_id_map = {}
+    migrator.create_chart = Mock(return_value="dest-chart")
+    migrator._export_chart_manual_apply = Mock(return_value="/tmp/chart.json")
+
+    chart_id = migrator.migrate_chart(
+        {
+            "id": "source-chart",
+            "title": "Latency",
+            "project_id": "source-project-a",
+            "series": [
+                {
+                    "filters": {
+                        "filter": (
+                            'and(eq(session_id, "source-project-a"), '
+                            'eq(project_id, "source-project-b"))'
+                        )
+                    }
+                }
+            ],
+        },
+        dest_session_id="dest-project-a",
+        same_instance=False,
+    )
+
+    assert chart_id == "dest-chart"
+    payload = migrator.create_chart.call_args.args[0]
+    filter_expr = payload["series"][0]["filters"]["filter"]
+    assert "dest-project-a" in filter_expr
+    assert "dest-project-b" in filter_expr
+    assert "source-project" not in filter_expr
+    migrator._export_chart_manual_apply.assert_not_called()
+
+
 def test_migrate_chart_same_instance_preserves_multiple_project_filters(
     sample_config,
     migration_state,
@@ -627,9 +674,7 @@ def test_migrate_chart_exports_unmapped_secondary_project_dependency(
     migrator.create_chart.assert_not_called()
     analysis = migrator._export_chart_manual_apply.call_args.kwargs["analysis"]
     assert analysis["dest_session_id"] == "dest-project-a"
-    assert analysis["unresolved_dependencies"] == {
-        "session_id": ["source-project-b"]
-    }
+    assert analysis["unresolved_dependencies"] == {"session_id": ["source-project-b"]}
 
 
 def test_migrate_session_charts_forwards_same_instance(
@@ -647,9 +692,7 @@ def test_migrate_session_charts_forwards_same_instance(
         migration_state,
         sample_config,
     )
-    migrator.list_charts = Mock(
-        return_value=[{"id": "chart-1", "title": "Latency"}]
-    )
+    migrator.list_charts = Mock(return_value=[{"id": "chart-1", "title": "Latency"}])
     migrator.migrate_chart = Mock(return_value="dest-chart-1")
 
     mappings = migrator.migrate_session_charts(

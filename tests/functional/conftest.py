@@ -198,7 +198,9 @@ class FakeOrchestratorInstance:
                 self.migrators.queue.create_queue(item.metadata.get("queue"))
                 results["resumed"].append(f"queue:{item.source_id}")
             elif item.type == "rule":
-                self.migrators.rules._project_id_map = dict(item.metadata.get("project_id_map") or {})
+                self.migrators.rules._project_id_map = dict(
+                    item.metadata.get("project_id_map") or {}
+                )
                 self.migrators.rules.create_rule(
                     item.metadata.get("rule"),
                     strip_project_reference=item.metadata.get("strip_projects", False),
@@ -352,14 +354,21 @@ def cli_harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> CliHarness:
     monkeypatch.setattr(cli_main, "console", console)
     monkeypatch.setattr(cli_main, "display_banner", lambda: None)
     monkeypatch.setattr(cli_main, "Progress", FakeProgress)
-    monkeypatch.setattr(cli_main.Confirm, "ask", lambda *args, **kwargs: controls.confirm(*args, **kwargs))
-    monkeypatch.setattr(cli_main, "select_items", lambda *args, **kwargs: controls.select(*args, **kwargs))
+    monkeypatch.setattr(
+        cli_main.Confirm, "ask", lambda *args, **kwargs: controls.confirm(*args, **kwargs)
+    )
+    monkeypatch.setattr(
+        cli_main, "select_items", lambda *args, **kwargs: controls.select(*args, **kwargs)
+    )
     monkeypatch.setattr(cli_main, "_resolve_workspaces", controls.resolve_workspaces)
     monkeypatch.setattr(cli_main, "build_project_mapping_tui", controls.build_project_mapping)
+    monkeypatch.setattr(cli_main, "build_project_id_mapping_tui", controls.build_project_mapping)
     monkeypatch.setattr(cli_main, "StateManager", lambda: state_manager)
     monkeypatch.setattr(cli_main, "MigrationOrchestrator", orchestrator_factory)
 
-    def _resolve_destination_session_id(source_session_id: str | None, *, same_instance: bool = False):
+    def _resolve_destination_session_id(
+        source_session_id: str | None, *, same_instance: bool = False
+    ):
         if not source_session_id:
             return None
         if same_instance:

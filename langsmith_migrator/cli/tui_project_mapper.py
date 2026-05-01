@@ -27,6 +27,57 @@ class ProjectMapping:
     source_name: str
     dest_name: Optional[str] = None
     status: MappingStatus = MappingStatus.UNMAPPED
+    source_id: Optional[str] = None
+    source_label: Optional[str] = None
+    dest_id: Optional[str] = None
+    dest_label: Optional[str] = None
+
+
+def _short_id(project_id: Optional[str]) -> str:
+    """Return a compact ID prefix for display."""
+    return str(project_id)[:8] if project_id else "no-id"
+
+
+def _workspace_ids_from_value(value) -> set[str]:
+    """Extract workspace IDs from common project metadata shapes."""
+    if isinstance(value, str):
+        return {value} if value else set()
+    if isinstance(value, dict):
+        ids = set()
+        for key in ("id", "tenant_id", "workspace_id"):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested:
+                ids.add(nested)
+        return ids
+    if isinstance(value, (list, tuple, set)):
+        ids = set()
+        for item in value:
+            ids.update(_workspace_ids_from_value(item))
+        return ids
+    return set()
+
+
+def _project_workspace_ids(project: Dict) -> list[str]:
+    """Return sorted workspace IDs advertised on a project/session record."""
+    ids = set()
+    for key in ("tenant_id", "workspace_id", "workspace_ids", "tenant", "workspace"):
+        if key in project:
+            ids.update(_workspace_ids_from_value(project[key]))
+    return sorted(ids)
+
+
+def _project_label(project: Dict) -> str:
+    """Display a project by name, short ID, and workspace metadata when present."""
+    name = project.get("name") or project.get("id") or "Unnamed Project"
+    label = f"{name} ({_short_id(project.get('id'))})"
+    workspaces = _project_workspace_ids(project)
+    if workspaces:
+        label = f"{label} · ws:{','.join(workspaces)}"
+    return label
+
+
+def _project_sort_key(project: Dict) -> tuple[str, str]:
+    return (str(project.get("name") or ""), str(project.get("id") or ""))
 
 
 STATUS_STYLES = {
@@ -41,6 +92,7 @@ STATUS_STYLES = {
 # ---------------------------------------------------------------------------
 # Modal: Destination Picker
 # ---------------------------------------------------------------------------
+
 
 class DestinationPickerScreen(ModalScreen[Optional[str]]):
     """Modal screen for picking a destination project via text input with suggestions."""
@@ -101,25 +153,29 @@ class DestinationPickerScreen(ModalScreen[Optional[str]]):
 
     def __init__(
         self,
-        source_name: str,
-        dest_names: List[str],
+        source_label: str,
+        dest_labels: List[str],
         reverse_map: Dict[str, str],
+        *,
+        initial_value: Optional[str] = None,
     ) -> None:
         super().__init__()
-        self.source_name = source_name
-        self.dest_names = dest_names  # already sorted by caller
-        self.reverse_map = reverse_map  # dest_name -> source_name that mapped to it
-        self.filtered_indices: List[int] = list(range(len(self.dest_names)))
-        self.filter_text = source_name
+        self.source_label = source_label
+        self.dest_labels = dest_labels  # already sorted by caller
+        self.reverse_map = reverse_map  # dest_label -> source_label that mapped to it
+        self.filtered_indices: List[int] = list(range(len(self.dest_labels)))
+        self.filter_text = initial_value or source_label
         self._filter_timer = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dest-dialog"):
-            yield Static(f"Destination for: [bold]{self.source_name}[/bold]", id="dest-title")
-            yield Input(value=self.source_name, id="dest-input")
+            yield Static(f"Destination for: [bold]{self.source_label}[/bold]", id="dest-title")
+            yield Input(value=self.filter_text, id="dest-input")
             yield DataTable(id="dest-table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="dest-no-matches")
-            yield Static("Enter: confirm name | ↑↓: browse suggestions | Esc: cancel", id="dest-help")
+            yield Static(
+                "Enter: confirm name | ↑↓: browse suggestions | Esc: cancel", id="dest-help"
+            )
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
@@ -136,13 +192,13 @@ class DestinationPickerScreen(ModalScreen[Optional[str]]):
         search = self.filter_text.lower()
         self.filtered_indices = []
 
-        for idx, name in enumerate(self.dest_names):
-            if search and search not in name.lower():
+        for idx, label in enumerate(self.dest_labels):
+            if search and search not in label.lower():
                 continue
             self.filtered_indices.append(idx)
-            mapped_from = self.reverse_map.get(name, "")
+            mapped_from = self.reverse_map.get(label, "")
             indicator = f"<- {mapped_from}" if mapped_from else ""
-            table.add_row(name, indicator, key=str(idx))
+            table.add_row(label, indicator, key=str(idx))
 
         no_matches = self.query_one("#dest-no-matches", Static)
         if search and not self.filtered_indices:
@@ -173,7 +229,7 @@ class DestinationPickerScreen(ModalScreen[Optional[str]]):
         if 0 <= cursor < len(self.filtered_indices):
             idx = self.filtered_indices[cursor]
             inp = self.query_one("#dest-input", Input)
-            inp.value = self.dest_names[idx]
+            inp.value = self.dest_labels[idx]
             inp.focus()
             inp.action_end()
 
@@ -184,6 +240,7 @@ class DestinationPickerScreen(ModalScreen[Optional[str]]):
 # ---------------------------------------------------------------------------
 # Modal: Custom Name Input
 # ---------------------------------------------------------------------------
+
 
 class CustomNameScreen(ModalScreen[Optional[str]]):
     """Modal screen for entering a custom destination project name."""
@@ -230,7 +287,9 @@ class CustomNameScreen(ModalScreen[Optional[str]]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="custom-dialog"):
-            yield Static(f"Custom Destination Name for: [bold]{self.source_name}[/bold]", id="custom-title")
+            yield Static(
+                f"Custom Destination Name for: [bold]{self.source_name}[/bold]", id="custom-title"
+            )
             yield Input(value=self.source_name, id="custom-input")
             yield Static("(This project will be created in the destination)", id="custom-hint")
             yield Static("Enter: confirm | Esc: cancel", id="custom-help")
@@ -253,6 +312,7 @@ class CustomNameScreen(ModalScreen[Optional[str]]):
 # ---------------------------------------------------------------------------
 # Main App: Project Mapper
 # ---------------------------------------------------------------------------
+
 
 class ProjectMapperApp(App):
     """Full-screen TUI for mapping source projects to destination projects."""
@@ -314,28 +374,90 @@ class ProjectMapperApp(App):
         source_projects: List[Dict],
         dest_projects: List[Dict],
         existing_mapping: Optional[Dict[str, str]] = None,
+        *,
+        return_ids: bool = False,
     ) -> None:
         super().__init__()
-        self.src_names = sorted({p["name"] for p in source_projects if "name" in p})
-        self.dest_names = sorted({p["name"] for p in dest_projects if "name" in p})
-        self.dest_name_set = set(self.dest_names)
+        self.return_ids = return_ids
+        self.source_projects = sorted(
+            [p for p in source_projects if p.get("name") and p.get("id")],
+            key=_project_sort_key,
+        )
+        self.dest_projects = sorted(
+            [p for p in dest_projects if p.get("name") and p.get("id")],
+            key=_project_sort_key,
+        )
+        self.src_names = [p["name"] for p in self.source_projects]
+        self.dest_names = [p["name"] for p in self.dest_projects]
+        self.dest_label_to_project = {
+            _project_label(project): project for project in self.dest_projects
+        }
+        self.dest_labels = list(self.dest_label_to_project)
+        self.dest_by_id = {
+            project["id"]: project for project in self.dest_projects if project.get("id")
+        }
+        self.dest_projects_by_name: Dict[str, List[Dict]] = {}
+        for project in self.dest_projects:
+            self.dest_projects_by_name.setdefault(project["name"], []).append(project)
+        self.dest_name_set = {
+            name for name, projects in self.dest_projects_by_name.items() if len(projects) == 1
+        }
 
         # Build mappings list
         self.mappings: List[ProjectMapping] = []
         existing = existing_mapping or {}
 
-        for name in self.src_names:
-            if name in existing:
-                dest = existing[name]
-                if dest == name:
+        for project in self.source_projects:
+            source_id = project["id"]
+            name = project["name"]
+            source_label = _project_label(project)
+            existing_key = source_id if self.return_ids else name
+            if existing_key in existing:
+                dest = existing[existing_key]
+                dest_project = self._resolve_dest_project(dest)
+                dest_name = dest_project.get("name") if dest_project else dest
+                dest_id = (
+                    dest_project.get("id") if dest_project else (dest if self.return_ids else None)
+                )
+                dest_label = _project_label(dest_project) if dest_project else dest_name
+                if dest_name == name:
                     status = self._status_for_same_name(name)
                 else:
                     status = MappingStatus.MAPPED
-                self.mappings.append(ProjectMapping(name, dest, status))
+                self.mappings.append(
+                    ProjectMapping(
+                        name,
+                        dest_name,
+                        status,
+                        source_id=source_id,
+                        source_label=source_label,
+                        dest_id=dest_id,
+                        dest_label=dest_label,
+                    )
+                )
             elif name in self.dest_name_set:
-                self.mappings.append(ProjectMapping(name, name, MappingStatus.AUTO_MATCHED))
+                dest_project = self.dest_projects_by_name[name][0]
+                self.mappings.append(
+                    ProjectMapping(
+                        name,
+                        dest_project["name"],
+                        MappingStatus.AUTO_MATCHED,
+                        source_id=source_id,
+                        source_label=source_label,
+                        dest_id=dest_project["id"],
+                        dest_label=_project_label(dest_project),
+                    )
+                )
             else:
-                self.mappings.append(ProjectMapping(name, None, MappingStatus.UNMAPPED))
+                self.mappings.append(
+                    ProjectMapping(
+                        name,
+                        None,
+                        MappingStatus.UNMAPPED,
+                        source_id=source_id,
+                        source_label=source_label,
+                    )
+                )
 
         self.filtered_indices: List[int] = list(range(len(self.mappings)))
         self.result: Optional[Dict[str, str]] = None
@@ -371,20 +493,25 @@ class ProjectMapperApp(App):
         self.filtered_indices = []
 
         for idx, m in enumerate(self.mappings):
-            if search and search not in m.source_name.lower():
+            source_display = m.source_label or m.source_name
+            if search and search not in source_display.lower():
                 continue
             self.filtered_indices.append(idx)
 
             dest_label, style = STATUS_STYLES[m.status]
-            dest_display = m.dest_name or dest_label
+            dest_display = m.dest_label or m.dest_name or dest_label
             status_display = f"[{style}]{m.status.value}[/{style}]"
 
-            table.add_row(m.source_name, dest_display, status_display, key=str(idx))
+            table.add_row(source_display, dest_display, status_display, key=str(idx))
 
     def _update_stats(self) -> None:
         mapped = skipped = unmapped = 0
         for m in self.mappings:
-            if m.status in (MappingStatus.MAPPED, MappingStatus.AUTO_MATCHED, MappingStatus.SAME_NAME):
+            if m.status in (
+                MappingStatus.MAPPED,
+                MappingStatus.AUTO_MATCHED,
+                MappingStatus.SAME_NAME,
+            ):
                 mapped += 1
             elif m.status == MappingStatus.SKIPPED:
                 skipped += 1
@@ -417,12 +544,55 @@ class ProjectMapperApp(App):
         return MappingStatus.AUTO_MATCHED if name in self.dest_name_set else MappingStatus.SAME_NAME
 
     def _reverse_map(self) -> Dict[str, str]:
-        """Build dest_name -> source_name for currently assigned mappings."""
+        """Build dest_label -> source_label for currently assigned mappings."""
         return {
-            m.dest_name: m.source_name
+            m.dest_label or m.dest_name: m.source_label or m.source_name
             for m in self.mappings
-            if m.dest_name and m.status not in (MappingStatus.UNMAPPED, MappingStatus.SKIPPED)
+            if (m.dest_label or m.dest_name)
+            and m.status not in (MappingStatus.UNMAPPED, MappingStatus.SKIPPED)
         }
+
+    def _resolve_dest_project(self, value: str) -> Optional[Dict]:
+        """Resolve a destination selection by ID, display label, or unique name."""
+        if value in self.dest_by_id:
+            return self.dest_by_id[value]
+        if value in self.dest_label_to_project:
+            return self.dest_label_to_project[value]
+        projects = self.dest_projects_by_name.get(value, [])
+        if len(projects) == 1:
+            return projects[0]
+        return None
+
+    def _set_destination(self, mapping: ProjectMapping, value: str) -> None:
+        """Assign a destination project selection to a mapping row."""
+        dest_project = self._resolve_dest_project(value)
+        if dest_project:
+            mapping.dest_name = dest_project["name"]
+            mapping.dest_id = dest_project["id"]
+            mapping.dest_label = _project_label(dest_project)
+        else:
+            mapping.dest_name = value
+            mapping.dest_id = None
+            mapping.dest_label = value
+        mapping.status = (
+            self._status_for_same_name(mapping.source_name)
+            if mapping.dest_name == mapping.source_name
+            else MappingStatus.MAPPED
+        )
+
+    def _set_same_name_destination(self, mapping: ProjectMapping) -> None:
+        """Assign a destination with the same name when it resolves unambiguously."""
+        projects = self.dest_projects_by_name.get(mapping.source_name, [])
+        if len(projects) == 1:
+            dest_project = projects[0]
+            mapping.dest_name = dest_project["name"]
+            mapping.dest_id = dest_project["id"]
+            mapping.dest_label = _project_label(dest_project)
+        else:
+            mapping.dest_name = mapping.source_name
+            mapping.dest_id = None
+            mapping.dest_label = mapping.source_name
+        mapping.status = self._status_for_same_name(mapping.source_name)
 
     def _refresh_and_stats(self) -> None:
         self._refresh_table()
@@ -460,7 +630,12 @@ class ProjectMapperApp(App):
         # Capture index now so the callback doesn't depend on cursor position
         self._pending_assign_idx = idx
         self.push_screen(
-            DestinationPickerScreen(m.source_name, self.dest_names, self._reverse_map()),
+            DestinationPickerScreen(
+                m.source_label or m.source_name,
+                self.dest_labels,
+                self._reverse_map(),
+                initial_value=m.source_name,
+            ),
             callback=self._on_dest_picked,
         )
 
@@ -469,12 +644,7 @@ class ProjectMapperApp(App):
         if result is None:
             return
         m = self.mappings[idx]
-        m.dest_name = result
-        m.status = (
-            self._status_for_same_name(result)
-            if result == m.source_name
-            else MappingStatus.MAPPED
-        )
+        self._set_destination(m, result)
         self._refresh_and_stats()
 
     def action_skip(self) -> None:
@@ -485,6 +655,8 @@ class ProjectMapperApp(App):
             return
         m = self.mappings[idx]
         m.dest_name = None
+        m.dest_id = None
+        m.dest_label = None
         m.status = MappingStatus.SKIPPED
         self._refresh_and_stats()
 
@@ -495,8 +667,7 @@ class ProjectMapperApp(App):
         if idx is None:
             return
         m = self.mappings[idx]
-        m.dest_name = m.source_name
-        m.status = self._status_for_same_name(m.source_name)
+        self._set_same_name_destination(m)
         self._refresh_and_stats()
 
     def action_unmap(self) -> None:
@@ -507,6 +678,8 @@ class ProjectMapperApp(App):
             return
         m = self.mappings[idx]
         m.dest_name = None
+        m.dest_id = None
+        m.dest_label = None
         m.status = MappingStatus.UNMAPPED
         self._refresh_and_stats()
 
@@ -515,8 +688,7 @@ class ProjectMapperApp(App):
             return
         for m in self.mappings:
             if m.status == MappingStatus.UNMAPPED and m.source_name in self.dest_name_set:
-                m.dest_name = m.source_name
-                m.status = MappingStatus.AUTO_MATCHED
+                self._set_same_name_destination(m)
         self._refresh_and_stats()
 
     def action_confirm(self) -> None:
@@ -525,7 +697,11 @@ class ProjectMapperApp(App):
         self.result = {}
         for m in self.mappings:
             if m.dest_name and m.status not in (MappingStatus.UNMAPPED, MappingStatus.SKIPPED):
-                self.result[m.source_name] = m.dest_name
+                if self.return_ids:
+                    if m.source_id and m.dest_id:
+                        self.result[m.source_id] = m.dest_id
+                else:
+                    self.result[m.source_name] = m.dest_name
         self.exit()
 
     def action_quit_app(self) -> None:
@@ -538,6 +714,7 @@ class ProjectMapperApp(App):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def build_project_mapping_tui(
     source_projects: List[Dict],
@@ -560,5 +737,30 @@ def build_project_mapping_tui(
     app = ProjectMapperApp(source_projects, dest_projects, existing_mapping)
     app.title = "Project Mapper"
     app.sub_title = "Map source projects to destination projects"
+    app.run()
+    return app.result
+
+
+def build_project_id_mapping_tui(
+    source_projects: List[Dict],
+    dest_projects: List[Dict],
+    existing_mapping: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, str]]:
+    """Launch the interactive project mapper and return source ID -> destination ID.
+
+    Source projects are displayed one row per source record so duplicate names remain
+    independently selectable.
+    """
+    if not source_projects:
+        return {}
+
+    app = ProjectMapperApp(
+        source_projects,
+        dest_projects,
+        existing_mapping,
+        return_ids=True,
+    )
+    app.title = "Project Mapper"
+    app.sub_title = "Map source project IDs to destination project IDs"
     app.run()
     return app.result
