@@ -1058,26 +1058,35 @@ class ChartMigrator(BaseMigrator):
 
     def _extract_session_id(self, chart: Dict[str, Any]) -> Optional[str]:
         """Extract session/project ID from chart config."""
-        # Top level
-        if chart.get('session_id'): return chart['session_id']
-        if chart.get('project_id'): return chart['project_id']
+        found = self._find_session_dependency(chart)
+        if found:
+            return found
+        return None
 
-        # In series
-        for s in chart.get('series', []):
-            if isinstance(s, dict):
-                filters = s.get('filters')
-                if not filters:
-                    continue
+    def _find_session_dependency(self, obj: Any) -> Optional[str]:
+        """Find the first project/session dependency in a chart filter tree."""
+        if isinstance(obj, dict):
+            for key in ("session_id", "project_id"):
+                value = obj.get(key)
+                if isinstance(value, str) and value:
+                    return value
 
-                if filters.get('project_id'): return filters['project_id']
-                if filters.get('session_id'): return filters['session_id']
+            sessions = obj.get("session")
+            if isinstance(sessions, list):
+                for value in sessions:
+                    if isinstance(value, str) and value:
+                        return value
 
-        # In common_filters
-        common_filters = chart.get('common_filters')
-        if isinstance(common_filters, dict):
-            sessions = common_filters.get('session')
-            if isinstance(sessions, list) and sessions:
-                return sessions[0]  # Return first session ID found
+            for value in obj.values():
+                found = self._find_session_dependency(value)
+                if found:
+                    return found
+
+        elif isinstance(obj, list):
+            for item in obj:
+                found = self._find_session_dependency(item)
+                if found:
+                    return found
 
         return None
 
