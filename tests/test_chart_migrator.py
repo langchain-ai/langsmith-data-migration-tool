@@ -574,6 +574,64 @@ def test_migrate_chart_rewrites_project_ids_embedded_in_string_filters(
     migrator._export_chart_manual_apply.assert_not_called()
 
 
+def test_migrate_chart_exports_unmapped_project_ids_embedded_only_in_string_filters(
+    sample_config,
+    migration_state,
+):
+    """String-only chart project dependencies must not survive cross-workspace remap."""
+
+    mapped_source_id = "11111111-1111-1111-1111-111111111111"
+    mapped_dest_id = "22222222-2222-2222-2222-222222222222"
+    unmapped_source_id = "33333333-3333-3333-3333-333333333333"
+    source_client = _mock_client()
+    dest_client = _mock_client()
+
+    def source_get_paginated(endpoint, page_size=100):
+        if endpoint == "/sessions":
+            return [
+                {"id": mapped_source_id, "name": "Mapped Project"},
+                {"id": unmapped_source_id, "name": "Unmapped Project"},
+            ]
+        return []
+
+    def dest_get_paginated(endpoint, page_size=100):
+        if endpoint == "/sessions":
+            return [{"id": mapped_dest_id, "name": "Mapped Project"}]
+        return []
+
+    source_client.get_paginated.side_effect = source_get_paginated
+    dest_client.get_paginated.side_effect = dest_get_paginated
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+    migrator.create_chart = Mock()
+    migrator._export_chart_manual_apply = Mock(return_value="/tmp/chart.json")
+
+    chart_id = migrator.migrate_chart(
+        {
+            "id": "source-chart",
+            "title": "Latency",
+            "series": [
+                {
+                    "filters": {
+                        "filter": f'eq(session_id, "{unmapped_source_id}")',
+                    }
+                }
+            ],
+        },
+        same_instance=False,
+    )
+
+    assert chart_id is None
+    migrator.create_chart.assert_not_called()
+    analysis = migrator._export_chart_manual_apply.call_args.kwargs["analysis"]
+    assert analysis["unresolved_dependencies"] == {"session_id": [unmapped_source_id]}
+
+
 def test_migrate_chart_same_instance_preserves_multiple_project_filters(
     sample_config,
     migration_state,
