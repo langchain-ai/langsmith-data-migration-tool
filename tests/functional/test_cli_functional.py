@@ -6,6 +6,7 @@ import json
 from unittest.mock import Mock, call
 
 from langsmith_migrator.cli import main as cli_main
+from langsmith_migrator.core.migrators.chart import ChartMigrator as RealChartMigrator
 from langsmith_migrator.cli.tui_workspace_mapper import WorkspaceProjectResult
 from langsmith_migrator.utils.retry import APIError
 from langsmith_migrator.utils.state import (
@@ -2565,6 +2566,75 @@ def test_charts_map_projects_filters_duplicate_names_for_active_workspace_pair(c
     item = state.get_item(
         "chart_src-ws_chart-1"
     )
+    assert item.metadata["dest_session_id"] == "cc3ac580-destination-project"
+
+
+def test_charts_map_projects_resolves_nested_session_filters_for_resume_metadata(
+    cli_harness,
+):
+    """--map-projects should pre-resolve nested session filters before chart resume."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.controls.project_mapping_result = {"Shared Project": "Shared Project"}
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {
+            "id": "a3cee8e2-40bb-472e-8456-c660b5ea1f3d",
+            "name": "Shared Project",
+            "tenant_id": "src-ws",
+        },
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {
+            "id": "cc3ac580-destination-project",
+            "name": "Shared Project",
+            "tenant_id": "dst-ws",
+        },
+    ]
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {
+            "id": "chart-1",
+            "title": "Chart One",
+            "series": [
+                {
+                    "filters": {
+                        "operator": "and",
+                        "children": [
+                            {
+                                "session": [
+                                    "a3cee8e2-40bb-472e-8456-c660b5ea1f3d"
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ],
+        }
+    ]
+    real_chart_migrator = object.__new__(RealChartMigrator)
+    cli_harness.migrators.chart._extract_session_id.side_effect = (
+        lambda chart: RealChartMigrator._extract_session_id(
+            real_chart_migrator,
+            chart,
+        )
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "a3cee8e2-40bb-472e-8456-c660b5ea1f3d": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(["charts", "--map-projects"])
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
+        "a3cee8e2-40bb-472e-8456-c660b5ea1f3d",
+        same_instance=False,
+    )
+    state = cli_harness.orchestrator_factory.state
+    item = state.get_item("chart_src-ws_chart-1")
     assert item.metadata["dest_session_id"] == "cc3ac580-destination-project"
 
 

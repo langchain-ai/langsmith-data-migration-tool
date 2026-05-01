@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.70] - 2026-05-01
+
+### Fixed
+- **Nested chart project/session filters**: `charts --map-projects` now discovers project dependencies nested inside chart filter trees, so remediation/resume metadata records the mapped destination session instead of `null` for charts whose filters use nested `session` lists.
+
 ## [0.0.69] - 2026-05-01
 
 ### Fixed
@@ -322,7 +327,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.69...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.70...HEAD
+[0.0.70]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.69...v0.0.70
 [0.0.69]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.68...v0.0.69
 [0.0.68]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.67...v0.0.68
 [0.0.67]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.66...v0.0.67

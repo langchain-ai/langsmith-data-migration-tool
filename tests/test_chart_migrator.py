@@ -170,6 +170,88 @@ def test_resolve_destination_session_id_uses_saved_project_mapping_before_listin
     dest_client.get_paginated.assert_not_called()
 
 
+def test_extract_session_id_finds_nested_session_filter(
+    sample_config,
+    migration_state,
+):
+    """Chart pre-resolution should find session filters that migration remaps."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+
+    assert (
+        migrator._extract_session_id(
+            {
+                "id": "chart-1",
+                "title": "Chart One",
+                "series": [
+                    {
+                        "filters": {
+                            "operator": "and",
+                            "children": [
+                                {
+                                    "session": [
+                                        "a3cee8e2-40bb-472e-8456-c660b5ea1f3d"
+                                    ]
+                                }
+                            ],
+                        }
+                    }
+                ],
+            }
+        )
+        == "a3cee8e2-40bb-472e-8456-c660b5ea1f3d"
+    )
+
+
+def test_migrate_all_charts_resolves_nested_session_filter(
+    sample_config,
+    migration_state,
+):
+    """All-chart migration should pass mapped destination IDs for nested filters."""
+
+    source_session_id = "a3cee8e2-40bb-472e-8456-c660b5ea1f3d"
+    dest_session_id = "cc3ac580-destination-project"
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+    chart = {
+        "id": "chart-1",
+        "title": "Chart One",
+        "series": [
+            {
+                "filters": {
+                    "operator": "and",
+                    "children": [{"session": [source_session_id]}],
+                }
+            }
+        ],
+    }
+    migrator._project_id_map = {source_session_id: dest_session_id}
+    migrator.list_charts = Mock(return_value=[chart])
+    migrator.migrate_chart = Mock(return_value="dest-chart-1")
+
+    mappings = migrator.migrate_all_charts(same_instance=False)
+
+    assert mappings == {source_session_id: {"chart-1": "dest-chart-1"}}
+    migrator.migrate_chart.assert_called_once_with(
+        chart,
+        dest_session_id,
+        same_instance=False,
+    )
+
+
 def test_migrate_chart_exports_when_dependencies_are_unresolved(
     sample_config,
     migration_state,
