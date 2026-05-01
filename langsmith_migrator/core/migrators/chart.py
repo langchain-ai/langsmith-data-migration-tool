@@ -15,6 +15,7 @@ class ChartMigrator(BaseMigrator):
         super().__init__(source_client, dest_client, state, config)
         self._project_id_map = None  # Lazy-loaded cache
         self._project_mapping_complete = False
+        self._source_project_ids = None  # Lazy-loaded source project IDs for string filters
         self._dataset_id_map = None  # Lazy-loaded cache
         self._dest_section_map = None  # Lazy-loaded cache for dest sections
         self._section_strategy = None
@@ -314,6 +315,73 @@ class ChartMigrator(BaseMigrator):
 
         visit(charts)
         return dependencies
+
+    def _mark_unresolved_string_project_dependencies(
+        self,
+        chart: Any,
+        project_map: Dict[str, str],
+        unresolved: Dict[str, set[str]],
+    ) -> None:
+        """Record source project IDs that remain inside serialized filter strings."""
+        known_project_ids = set(self._source_project_ids or set(project_map))
+        if not known_project_ids:
+            return
+
+        remaining_source_ids = self._project_ids_in_serialized_strings(
+            chart,
+            known_project_ids,
+        )
+        for project_id in remaining_source_ids:
+            if project_id not in project_map:
+                unresolved["session_id"].add(project_id)
+
+    def _project_ids_in_serialized_strings(
+        self,
+        obj: Any,
+        known_project_ids: set[str],
+        *,
+        parent_key: Optional[str] = None,
+    ) -> set[str]:
+        """Find known source project IDs inside non-structured string fields."""
+        found: set[str] = set()
+        structured_keys = {"project_id", "session_id", "dataset_id", "session"}
+
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, str):
+                    if key not in structured_keys:
+                        found.update(
+                            project_id
+                            for project_id in known_project_ids
+                            if project_id and project_id in value
+                        )
+                else:
+                    found.update(
+                        self._project_ids_in_serialized_strings(
+                            value,
+                            known_project_ids,
+                            parent_key=key,
+                        )
+                    )
+        elif isinstance(obj, list):
+            for value in obj:
+                if isinstance(value, str):
+                    if parent_key not in structured_keys:
+                        found.update(
+                            project_id
+                            for project_id in known_project_ids
+                            if project_id and project_id in value
+                        )
+                else:
+                    found.update(
+                        self._project_ids_in_serialized_strings(
+                            value,
+                            known_project_ids,
+                            parent_key=parent_key,
+                        )
+                    )
+
+        return found
 
     def _list_charts(
         self,
@@ -976,6 +1044,12 @@ class ChartMigrator(BaseMigrator):
             same_instance=same_instance,
             source_session_id=source_session_id,
         )
+        if not same_instance:
+            self._mark_unresolved_string_project_dependencies(
+                chart_copy,
+                project_map,
+                unresolved_dependencies,
+            )
         unresolved_dependencies = self._normalize_unresolved_dependencies(unresolved_dependencies)
         if unresolved_dependencies:
             self.log(
@@ -1367,6 +1441,9 @@ class ChartMigrator(BaseMigrator):
             for project in self.source.get_paginated("/sessions", page_size=100):
                 if isinstance(project, dict):
                     source_records.append(project)
+            self._source_project_ids = {
+                project["id"] for project in source_records if project.get("id")
+            }
 
             dest_records: List[Dict[str, Any]] = []
             for project in self.dest.get_paginated("/sessions", page_size=100):

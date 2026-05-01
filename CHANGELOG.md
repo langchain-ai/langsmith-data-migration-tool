@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.73] - 2026-05-01
+
+### Fixed
+- **Chart string-filter dependency guards**: Cross-workspace chart migration now detects source project IDs that remain only inside serialized filter strings and blocks with a single unresolved dependency diagnostic instead of allowing unmapped source IDs to survive chart remapping.
+
 ## [0.0.72] - 2026-05-01
 
 ### Fixed
@@ -339,7 +344,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.72...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.73...HEAD
+[0.0.73]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.72...v0.0.73
 [0.0.72]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.71...v0.0.72
 [0.0.71]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.70...v0.0.71
 [0.0.70]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.69...v0.0.70
