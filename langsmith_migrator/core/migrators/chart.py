@@ -864,10 +864,12 @@ class ChartMigrator(BaseMigrator):
         chart_copy = copy.deepcopy(chart)
 
         # Map IDs within chart config
+        source_session_id = self._extract_session_id(chart)
         unresolved_dependencies = self._map_ids_in_chart(
             chart_copy,
             dest_session_id,
             same_instance=same_instance,
+            source_session_id=source_session_id,
         )
         unresolved_dependencies = self._normalize_unresolved_dependencies(
             unresolved_dependencies
@@ -1097,6 +1099,7 @@ class ChartMigrator(BaseMigrator):
         unresolved: Optional[Dict[str, set[str]]] = None,
         *,
         same_instance: bool = False,
+        source_session_id: Optional[str] = None,
     ) -> Dict[str, set[str]]:
         """
         Recursively map project and dataset IDs within a chart object.
@@ -1104,8 +1107,8 @@ class ChartMigrator(BaseMigrator):
 
         Args:
             obj: Chart object or sub-structure
-            dest_session_id: If provided, forcibly sets project_id/session_id to this value
-                             instead of using the mapping (useful when we know the target)
+            dest_session_id: If provided, used as a fallback for the chart's source
+                             project/session dependency when no mapping is available.
         """
         if unresolved is None:
             unresolved = {
@@ -1117,26 +1120,24 @@ class ChartMigrator(BaseMigrator):
         if isinstance(obj, dict):
             # Check for specific keys to map
             if "project_id" in obj:
-                if dest_session_id:
-                    obj["project_id"] = dest_session_id
-                else:
-                    self._map_id_field(
-                        obj,
-                        "project_id",
-                        self._build_project_mapping(),
-                        unresolved,
-                    )
+                self._map_project_session_field(
+                    obj,
+                    "project_id",
+                    dest_session_id,
+                    unresolved,
+                    same_instance=same_instance,
+                    source_session_id=source_session_id,
+                )
 
             if "session_id" in obj:
-                if dest_session_id:
-                    obj["session_id"] = dest_session_id
-                else:
-                    self._map_id_field(
-                        obj,
-                        "session_id",
-                        self._build_project_mapping(),
-                        unresolved,
-                    )
+                self._map_project_session_field(
+                    obj,
+                    "session_id",
+                    dest_session_id,
+                    unresolved,
+                    same_instance=same_instance,
+                    source_session_id=source_session_id,
+                )
 
             if "dataset_id" in obj:
                 self._map_id_field(
@@ -1150,23 +1151,22 @@ class ChartMigrator(BaseMigrator):
             if "session" in obj and isinstance(obj["session"], list):
                 # Map list of session IDs (used in common_filters)
                 new_ids = []
-                # Only build mapping if we don't have a forced destination ID
-                mapping = {}
-                if not dest_session_id:
-                    mapping = self._build_project_mapping()
-
-                # If forced ID, just use that
-                if dest_session_id:
-                    new_ids = [dest_session_id]
-                else:
-                    # Map each ID
-                    for old_id in obj["session"]:
-                        if isinstance(old_id, str) and old_id in mapping:
-                            new_ids.append(mapping[old_id])
-                        else:
-                            if isinstance(old_id, str) and old_id:
-                                unresolved["session_id"].add(old_id)
-                            new_ids.append(old_id)
+                mapping = {} if same_instance else self._build_project_mapping()
+                for old_id in obj["session"]:
+                    if same_instance:
+                        new_ids.append(old_id)
+                    elif isinstance(old_id, str) and old_id in mapping:
+                        new_ids.append(mapping[old_id])
+                    elif (
+                        isinstance(old_id, str)
+                        and dest_session_id
+                        and (not source_session_id or old_id == source_session_id)
+                    ):
+                        new_ids.append(dest_session_id)
+                    else:
+                        if isinstance(old_id, str) and old_id:
+                            unresolved["session_id"].add(old_id)
+                        new_ids.append(old_id)
                 obj["session"] = new_ids
 
             # Handle special 'tag_value_id' which might be project ID in some contexts
@@ -1179,6 +1179,7 @@ class ChartMigrator(BaseMigrator):
                     dest_session_id,
                     unresolved,
                     same_instance=same_instance,
+                    source_session_id=source_session_id,
                 )
 
         elif isinstance(obj, list):
@@ -1188,9 +1189,36 @@ class ChartMigrator(BaseMigrator):
                     dest_session_id,
                     unresolved,
                     same_instance=same_instance,
+                    source_session_id=source_session_id,
                 )
 
         return unresolved
+
+    def _map_project_session_field(
+        self,
+        obj: Dict,
+        field: str,
+        dest_session_id: Optional[str],
+        unresolved: Dict[str, set[str]],
+        *,
+        same_instance: bool = False,
+        source_session_id: Optional[str] = None,
+    ) -> None:
+        """Map one project/session field without collapsing unrelated dependencies."""
+        old_id = obj.get(field)
+        if not isinstance(old_id, str) or not old_id:
+            return
+
+        if same_instance:
+            return
+
+        mapping = self._build_project_mapping()
+        if old_id in mapping:
+            obj[field] = mapping[old_id]
+        elif dest_session_id and (not source_session_id or old_id == source_session_id):
+            obj[field] = dest_session_id
+        else:
+            unresolved[field].add(old_id)
 
     def _map_id_field(
         self,

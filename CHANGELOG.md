@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.71] - 2026-05-01
+
+### Fixed
+- **Chart project/session remapping**: Chart migration now applies source→destination project mappings to every project/session dependency in chart payloads, including nested `session` lists and charts with multiple project filters, instead of depending on a single nullable `dest_session_id`.
+
 ## [0.0.70] - 2026-05-01
 
 ### Fixed
@@ -327,7 +332,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.70...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.71...HEAD
+[0.0.71]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.70...v0.0.71
 [0.0.70]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.69...v0.0.70
 [0.0.69]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.68...v0.0.69
 [0.0.68]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.67...v0.0.68
