@@ -78,6 +78,42 @@ def test_name_mapping_to_id_mapping_ignores_unknown_project_names():
     assert result == {"src-a": "dst-a"}
 
 
+def test_name_mapping_to_id_mapping_filters_common_workspace_metadata_shapes():
+    """Workspace-scoped project mappings should survive duplicate names across workspaces."""
+
+    result = cli_main._name_mapping_to_id_mapping(
+        {"Shared Project": "Shared Project"},
+        source_projects=[
+            {
+                "id": "source-target",
+                "name": "Shared Project",
+                "tenant": {"tenant_id": "src-ws"},
+            },
+            {
+                "id": "source-other",
+                "name": "Shared Project",
+                "workspace_ids": ["other-src-ws"],
+            },
+        ],
+        dest_projects=[
+            {
+                "id": "dest-target",
+                "name": "Shared Project",
+                "workspace": {"id": "dst-ws"},
+            },
+            {
+                "id": "dest-other",
+                "name": "Shared Project",
+                "workspace_ids": ["other-dst-ws"],
+            },
+        ],
+        source_workspace_id="src-ws",
+        dest_workspace_id="dst-ws",
+    )
+
+    assert result == {"source-target": "dest-target"}
+
+
 def test_normalize_deployment_url_treats_api_suffixes_as_the_same_deployment():
     """Same-deployment detection should ignore trailing API path suffixes."""
 
@@ -2436,6 +2472,100 @@ def test_charts_command_uses_workspace_project_mappings(cli_harness):
         "source-project-id": "dest-project-id"
     }
     assert "Using workspace-scoped project mapping" in cli_harness.console.text
+
+
+def test_charts_command_workspace_project_mapping_filters_duplicate_project_names(cli_harness):
+    """Workspace-scoped project mappings should resolve the project in the active pair."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Shared Project": "Shared Project"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "source-project-id", "name": "Shared Project", "tenant_id": "src-ws"},
+        {"id": "other-source-project-id", "name": "Shared Project", "tenant_id": "other-src-ws"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "dest-project-id", "name": "Shared Project", "tenant_id": "dst-ws"},
+        {"id": "other-dest-project-id", "name": "Shared Project", "tenant_id": "other-dst-ws"},
+    ]
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "source-project-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(["charts"])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {
+        "source-project-id": "dest-project-id"
+    }
+
+
+def test_charts_map_projects_filters_duplicate_names_for_active_workspace_pair(cli_harness):
+    """Explicit --map-projects should resolve duplicate project names in the active workspace."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.controls.project_mapping_result = {"Shared Project": "Shared Project"}
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {
+            "id": "a3cee8e2-40bb-472e-8456-c660b5ea1f3d",
+            "name": "Shared Project",
+            "tenant_id": "src-ws",
+        },
+        {
+            "id": "other-source-project-id",
+            "name": "Shared Project",
+            "tenant_id": "other-src-ws",
+        },
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {
+            "id": "cc3ac580-destination-project",
+            "name": "Shared Project",
+            "tenant_id": "dst-ws",
+        },
+        {
+            "id": "other-dest-project-id",
+            "name": "Shared Project",
+            "tenant_id": "other-dst-ws",
+        },
+    ]
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {
+            "id": "chart-1",
+            "title": "Chart One",
+            "project_id": "a3cee8e2-40bb-472e-8456-c660b5ea1f3d",
+        }
+    ]
+    cli_harness.migrators.chart._extract_session_id.side_effect = (
+        lambda chart: chart.get("project_id")
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "a3cee8e2-40bb-472e-8456-c660b5ea1f3d": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(["charts", "--map-projects"])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {
+        "a3cee8e2-40bb-472e-8456-c660b5ea1f3d": "cc3ac580-destination-project"
+    }
+    cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
+        "a3cee8e2-40bb-472e-8456-c660b5ea1f3d",
+        same_instance=False,
+    )
+    state = cli_harness.orchestrator_factory.state
+    item = state.get_item(
+        "chart_src-ws_chart-1"
+    )
+    assert item.metadata["dest_session_id"] == "cc3ac580-destination-project"
 
 
 def test_charts_command_uses_saved_project_mapping_for_session_migration(cli_harness):
