@@ -2638,6 +2638,133 @@ def test_charts_map_projects_resolves_nested_session_filters_for_resume_metadata
     assert item.metadata["dest_session_id"] == "cc3ac580-destination-project"
 
 
+def test_charts_map_projects_same_deployment_cross_workspace_remaps_metadata(
+    cli_harness,
+):
+    """Same deployment plus different workspaces should still remap chart metadata."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.controls.project_mapping_result = {"Shared Project": "Shared Project"}
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {
+            "id": "source-project-id",
+            "name": "Shared Project",
+            "tenant_id": "src-ws",
+        },
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {
+            "id": "dest-project-id",
+            "name": "Shared Project",
+            "tenant_id": "dst-ws",
+        },
+    ]
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {
+            "id": "chart-1",
+            "title": "Chart One",
+            "series": [{"filters": {"session": ["source-project-id"]}}],
+        }
+    ]
+    real_chart_migrator = object.__new__(RealChartMigrator)
+    cli_harness.migrators.chart._extract_session_id.side_effect = (
+        lambda chart: RealChartMigrator._extract_session_id(
+            real_chart_migrator,
+            chart,
+        )
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "source-project-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+            "--map-projects",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
+        same_instance=False
+    )
+    cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
+        "source-project-id",
+        same_instance=False,
+    )
+    state = cli_harness.orchestrator_factory.state
+    item = state.get_item("chart_src-ws_chart-1")
+    assert item.metadata["dest_session_id"] == "dest-project-id"
+    assert item.metadata["same_instance"] is False
+    assert "Mode: Remapped project/session IDs" in cli_harness.console.text
+
+
+def test_charts_command_same_instance_override_cross_workspace_reuses_ids(
+    cli_harness,
+):
+    """Explicit --same-instance should remain an operator override."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
+    ]
+    cli_harness.migrators.chart._extract_session_id.side_effect = (
+        lambda chart: chart.get("project_id")
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "source-project-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+            "--same-instance",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
+        "source-project-id",
+        same_instance=True,
+    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
+        same_instance=True
+    )
+    state = cli_harness.orchestrator_factory.state
+    item = state.get_item("chart_src-ws_chart-1")
+    assert item.metadata["dest_session_id"] == "source-project-id"
+    assert item.metadata["same_instance"] is True
+    assert "Mode: Same instance" in cli_harness.console.text
+
+
 def test_charts_command_uses_saved_project_mapping_for_session_migration(cli_harness):
     """Session-scoped chart migration should resolve the destination project from saved state."""
 
@@ -2748,6 +2875,98 @@ def test_charts_command_session_same_deployment_identical_workspace_reuses_ids_w
     assert "Using same session ID for destination" in cli_harness.console.text
 
 
+def test_charts_command_session_same_deployment_cross_workspace_uses_mapping(
+    cli_harness,
+):
+    """Session-scoped same-deployment cross-workspace runs should remap projects."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Source Session": "Destination Session"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "source-session", "name": "Source Session", "tenant_id": "src-ws"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "dest-session", "name": "Destination Session", "tenant_id": "dst-ws"},
+    ]
+    cli_harness.migrators.chart.list_sessions.return_value = [
+        {"id": "source-session", "name": "Source Session"},
+    ]
+    cli_harness.migrators.chart.migrate_session_charts.return_value = {
+        "chart-1": "dest-chart-1"
+    }
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+            "--session",
+            "Source Session",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
+        "source-session",
+        same_instance=False,
+    )
+    cli_harness.migrators.chart.migrate_session_charts.assert_called_once_with(
+        "source-session",
+        "dest-session",
+        same_instance=False,
+    )
+
+
+def test_charts_command_session_same_deployment_cross_workspace_blocks_without_mapping(
+    cli_harness,
+):
+    """Session-scoped cross-workspace chart runs need a destination project mapping."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.list_sessions.return_value = [
+        {"id": "source-session", "name": "Source Session"},
+    ]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+            "--session",
+            "Source Session",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
+        "source-session",
+        same_instance=False,
+    )
+    cli_harness.migrators.chart.migrate_session_charts.assert_not_called()
+    assert "No destination mapping found" in cli_harness.console.text
+
+
 def test_migrate_all_chart_step_same_key_cross_workspace_uses_remap_mode(cli_harness):
     """migrate-all should keep chart migration in remap mode for different workspace pairs."""
 
@@ -2841,6 +3060,67 @@ def test_migrate_all_chart_step_same_deployment_identical_workspace_reuses_ids_w
         same_instance=True
     )
     assert "identical workspace scope" in cli_harness.console.text
+
+
+def test_migrate_all_chart_step_same_deployment_cross_workspace_maps_metadata(
+    cli_harness,
+):
+    """migrate-all chart step should checkpoint remapped sessions across workspaces."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Source Project": "Destination Project"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "source-project-id", "name": "Source Project", "tenant_id": "src-ws"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "dest-project-id", "name": "Destination Project", "tenant_id": "dst-ws"},
+    ]
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "project_id": "source-project-id"},
+    ]
+    cli_harness.migrators.chart._extract_session_id.side_effect = (
+        lambda chart: chart.get("project_id")
+    )
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "source-project-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "--source-key",
+            "src-key",
+            "--dest-key",
+            "dst-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "migrate-all",
+            "--skip-users",
+            "--skip-datasets",
+            "--skip-prompts",
+            "--skip-queues",
+            "--skip-rules",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.resolve_destination_session_id.assert_called_with(
+        "source-project-id",
+        same_instance=False,
+    )
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(
+        same_instance=False
+    )
+    state = cli_harness.orchestrator_factory.state
+    item = state.get_item("chart_src-ws_chart-1")
+    assert item.metadata["dest_session_id"] == "dest-project-id"
+    assert item.metadata["same_instance"] is False
 
 
 def test_resume_command_retries_pending_datasets(cli_harness):
