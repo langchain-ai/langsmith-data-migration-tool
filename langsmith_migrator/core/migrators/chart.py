@@ -1,6 +1,7 @@
 """Chart migration logic using global API endpoints."""
 
 import datetime
+import re
 from typing import Dict, List, Any, Optional
 from .base import BaseMigrator
 from ..api_client import NotFoundError, APIError
@@ -57,13 +58,54 @@ class ChartMigrator(BaseMigrator):
 
     def _normalize_chart(self, chart_data: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize a chart payload for post-write verification."""
-        return {
+        return self._normalize_chart_value({
             "title": chart_data.get("title") or chart_data.get("name"),
             "chart_type": chart_data.get("chart_type"),
             "section_id": chart_data.get("section_id"),
             "common_filters": chart_data.get("common_filters"),
             "series": chart_data.get("series"),
-        }
+        })
+
+    def _normalize_chart_value(self, value: Any) -> Any:
+        """Drop API-normalized nulls and server-only fields before comparison."""
+        server_only_keys = {"id", "created_at", "updated_at"}
+
+        if isinstance(value, dict):
+            normalized = {}
+            for key, item in value.items():
+                if key in server_only_keys:
+                    continue
+                normalized_item = self._normalize_chart_value(item)
+                if normalized_item is None or normalized_item == {}:
+                    continue
+                normalized[key] = normalized_item
+            return normalized
+
+        if isinstance(value, list):
+            return [self._normalize_chart_value(item) for item in value]
+
+        return value
+
+    def _chart_mismatches(
+        self,
+        expected_chart: Dict[str, Any],
+        actual_chart: Dict[str, Any],
+        *,
+        actual_may_be_partial: bool = False,
+    ) -> Dict[str, Any]:
+        """Compare normalized chart fields and return mismatches."""
+        mismatches = {}
+        normalized_expected = self._normalize_chart(expected_chart)
+        normalized_actual = self._normalize_chart(actual_chart)
+        for key, expected in normalized_expected.items():
+            if actual_may_be_partial and key not in normalized_actual:
+                continue
+            if normalized_actual.get(key) != expected:
+                mismatches[key] = {
+                    "expected": expected,
+                    "actual": normalized_actual.get(key),
+                }
+        return mismatches
 
     def _build_chart_payload(self, chart_data: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
         """Build a destination chart payload and report whether fidelity was downgraded."""
@@ -94,25 +136,31 @@ class ChartMigrator(BaseMigrator):
 
         return payload, downgraded
 
-    def _verify_chart(self, chart_id: str, payload: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+    def _verify_chart(
+        self,
+        chart_id: str,
+        payload: Dict[str, Any],
+        *,
+        create_response: Optional[Dict[str, Any]] = None,
+    ) -> tuple[bool, Dict[str, Any]]:
         """Verify a chart by refetching destination charts and comparing normalized fields."""
-        mismatches = {}
         chart = None
         for existing in self._list_charts(self.dest, side="destination"):
             if existing.get("id") == chart_id:
                 chart = existing
                 break
         if chart is None:
+            if isinstance(create_response, dict) and str(create_response.get("id")) == chart_id:
+                mismatches = self._chart_mismatches(
+                    payload,
+                    create_response,
+                    actual_may_be_partial=True,
+                )
+                if not mismatches:
+                    return True, {}
             return False, {"error": "chart_not_found_after_write"}
 
-        normalized_expected = self._normalize_chart(payload)
-        normalized_actual = self._normalize_chart(chart)
-        for key, expected in normalized_expected.items():
-            if normalized_actual.get(key) != expected:
-                mismatches[key] = {
-                    "expected": expected,
-                    "actual": normalized_actual.get(key),
-                }
+        mismatches = self._chart_mismatches(payload, chart)
         return not mismatches, mismatches
 
     def _export_chart_manual_apply(
@@ -241,6 +289,68 @@ class ChartMigrator(BaseMigrator):
                 mapped = mapped.replace(source_id, dest_id)
         return mapped
 
+    @staticmethod
+    def _normalize_filter_project_attributes(value: str) -> str:
+        """Use session_id in chart filter expressions because the chart API rejects project_id."""
+        return re.sub(r"(?<![A-Za-z0-9_])project_id(?![A-Za-z0-9_])", "session_id", value)
+
+    @staticmethod
+    def _diagnose_chart_api_error(error: APIError) -> Optional[Dict[str, str]]:
+        """Return a focused chart-filter diagnostic for known destination API 422s."""
+        message = str(error)
+        lowered = message.lower()
+
+        if "attribute project_id not accepted" in lowered:
+            return {
+                "code": "invalid_project_id_filter_attribute",
+                "message": (
+                    "The destination chart API rejected a project_id filter attribute. "
+                    "Chart filters should use session_id for project scoping."
+                ),
+                "next_action": (
+                    "Review the exported chart filter expression and replace project_id "
+                    "with session_id before retrying."
+                ),
+            }
+
+        if "session_id" in lowered and "conflicting values" in lowered:
+            return {
+                "code": "conflicting_session_filter",
+                "message": (
+                    "The destination chart API rejected a filter that requires "
+                    "multiple conflicting session_id values."
+                ),
+                "next_action": (
+                    "Review the exported chart filter expression and remove contradictory "
+                    "session_id equality predicates before retrying."
+                ),
+            }
+
+        if "session filter must be a subset of the common filter" in lowered:
+            return {
+                "code": "series_session_filter_not_subset",
+                "message": (
+                    "The destination chart API requires series session filters to be a "
+                    "subset of common_filters.session."
+                ),
+                "next_action": (
+                    "Review the exported chart payload and move the referenced project IDs "
+                    "into common_filters.session, or narrow the series session filter."
+                ),
+            }
+
+        if error.status_code == 422 and "filter" in lowered:
+            return {
+                "code": "invalid_chart_filter",
+                "message": "The destination chart API rejected the chart filter payload.",
+                "next_action": (
+                    "Review the exported chart filter payload and adjust it to the "
+                    "destination chart API syntax before retrying."
+                ),
+            }
+
+        return None
+
     def _replace_project_ids_in_string_filters(
         self,
         obj: Any,
@@ -253,15 +363,16 @@ class ChartMigrator(BaseMigrator):
         Structured ID fields are left for _map_ids_in_chart so unresolved
         dependencies are still detected accurately.
         """
-        if not project_map:
-            return
-
         structured_keys = {"project_id", "session_id", "dataset_id", "session"}
+        serialized_filter_keys = {"filter", "trace_filter", "tree_filter"}
         if isinstance(obj, dict):
             for key, value in obj.items():
                 if isinstance(value, str):
                     if key not in structured_keys:
-                        obj[key] = self._replace_project_ids(value, project_map)
+                        rewritten = self._replace_project_ids(value, project_map)
+                        if key in serialized_filter_keys:
+                            rewritten = self._normalize_filter_project_attributes(rewritten)
+                        obj[key] = rewritten
                 else:
                     self._replace_project_ids_in_string_filters(
                         value,
@@ -272,13 +383,106 @@ class ChartMigrator(BaseMigrator):
             for idx, value in enumerate(obj):
                 if isinstance(value, str):
                     if parent_key not in structured_keys:
-                        obj[idx] = self._replace_project_ids(value, project_map)
+                        rewritten = self._replace_project_ids(value, project_map)
+                        if parent_key in serialized_filter_keys:
+                            rewritten = self._normalize_filter_project_attributes(rewritten)
+                        obj[idx] = rewritten
                 else:
                     self._replace_project_ids_in_string_filters(
                         value,
                         project_map,
                         parent_key=parent_key,
                     )
+
+    @staticmethod
+    def _append_session_filter_values(target: List[Any], value: Any) -> None:
+        """Append one structured chart session filter value or list of values."""
+        if value is None:
+            return
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            if item and item not in target:
+                target.append(item)
+
+    def _normalize_structured_chart_filter_keys(
+        self,
+        obj: Any,
+        *,
+        parent_key: Optional[str] = None,
+    ) -> None:
+        """Normalize structured chart filter project/session IDs to session lists."""
+        if isinstance(obj, dict):
+            if parent_key in {"filters", "common_filters"}:
+                session_values: List[Any] = []
+                self._append_session_filter_values(session_values, obj.get("session"))
+                self._append_session_filter_values(session_values, obj.pop("session_id", None))
+                self._append_session_filter_values(session_values, obj.pop("project_id", None))
+                if session_values:
+                    obj["session"] = session_values
+
+            for key, value in obj.items():
+                self._normalize_structured_chart_filter_keys(value, parent_key=key)
+
+        elif isinstance(obj, list):
+            for value in obj:
+                self._normalize_structured_chart_filter_keys(value, parent_key=parent_key)
+
+    def _normalize_chart_filter_payload(self, payload: Dict[str, Any]) -> None:
+        """Normalize chart filter payload fields accepted by the destination chart API."""
+        self._replace_project_ids_in_string_filters(payload, {})
+        self._normalize_structured_chart_filter_keys(payload)
+        sanitized_payload = self._sanitize_chart_payload_value(payload)
+        payload.clear()
+        payload.update(sanitized_payload)
+
+    def _sanitize_chart_payload_value(self, value: Any) -> Any:
+        """Remove server-owned IDs and API-normalized null fields before writes."""
+        server_only_keys = {"id", "created_at", "updated_at"}
+
+        if isinstance(value, dict):
+            sanitized = {}
+            for key, item in value.items():
+                if key in server_only_keys or item is None:
+                    continue
+                sanitized_item = self._sanitize_chart_payload_value(item)
+                if sanitized_item is None or sanitized_item == {}:
+                    continue
+                sanitized[key] = sanitized_item
+            return sanitized
+
+        if isinstance(value, list):
+            sanitized_list = []
+            for item in value:
+                sanitized_item = self._sanitize_chart_payload_value(item)
+                if sanitized_item is None or sanitized_item == {}:
+                    continue
+                sanitized_list.append(sanitized_item)
+            return sanitized_list
+
+        return value
+
+    def _chart_session_ids(self, obj: Any) -> set[str]:
+        """Collect project/session IDs from structured chart filter fields."""
+        session_ids: set[str] = set()
+
+        if isinstance(obj, dict):
+            sessions = obj.get("session")
+            if isinstance(sessions, list):
+                session_ids.update(value for value in sessions if isinstance(value, str) and value)
+
+            for key in ("session_id", "project_id"):
+                value = obj.get(key)
+                if isinstance(value, str) and value:
+                    session_ids.add(value)
+
+            for value in obj.values():
+                session_ids.update(self._chart_session_ids(value))
+
+        elif isinstance(obj, list):
+            for value in obj:
+                session_ids.update(self._chart_session_ids(value))
+
+        return session_ids
 
     def collect_project_dependency_ids(
         self,
@@ -592,19 +796,27 @@ class ChartMigrator(BaseMigrator):
         except Exception as e:
             self.log(f"Failed to build destination section map: {e}", "warning")
 
-    def find_existing_chart(self, title: str, section_id: Optional[str] = None) -> Optional[str]:
+    def find_existing_chart(
+        self,
+        title: str,
+        section_id: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Check if a chart with the same title already exists in destination.
 
         Args:
             title: Chart title
             section_id: Optional section ID to narrow the search
+            payload: Optional payload used to narrow duplicate titles by session filters
 
         Returns:
             The chart ID if found, None otherwise
         """
         try:
             charts = self._list_charts(self.dest, side="destination")
+            target_session_ids = self._chart_session_ids(payload or {})
+            title_matches = []
 
             for chart in charts:
                 chart_title = chart.get("title") or chart.get("name")
@@ -613,7 +825,15 @@ class ChartMigrator(BaseMigrator):
                 # Match by title, and optionally by section
                 if chart_title == title:
                     if section_id is None or chart_section == section_id:
-                        return chart.get("id")
+                        title_matches.append(chart)
+
+            if not target_session_ids:
+                return title_matches[0].get("id") if title_matches else None
+
+            for chart in title_matches:
+                existing_session_ids = self._chart_session_ids(chart)
+                if existing_session_ids == target_session_ids:
+                    return chart.get("id")
 
             return None
         except Exception as e:
@@ -637,6 +857,7 @@ class ChartMigrator(BaseMigrator):
             return True
 
         payload, _ = self._build_chart_payload(chart_data)
+        self._normalize_chart_filter_payload(payload)
 
         try:
             # Use PATCH to update the chart
@@ -686,6 +907,7 @@ class ChartMigrator(BaseMigrator):
             )
 
         payload, downgraded_to_unsectioned = self._build_chart_payload(chart_copy)
+        self._normalize_chart_filter_payload(payload)
         source_section_title = chart_copy.get("_source_section_title")
         self.checkpoint_item(
             item_id,
@@ -729,7 +951,11 @@ class ChartMigrator(BaseMigrator):
             return None
 
         # Check if chart already exists
-        existing_id = self.find_existing_chart(chart_title, payload.get("section_id"))
+        existing_id = self.find_existing_chart(
+            chart_title,
+            payload.get("section_id"),
+            payload=payload,
+        )
 
         if existing_id:
             if self.config.migration.skip_existing:
@@ -843,7 +1069,11 @@ class ChartMigrator(BaseMigrator):
                 chart_id = None
 
             if chart_id:
-                verified, mismatches = self._verify_chart(str(chart_id), payload)
+                verified, mismatches = self._verify_chart(
+                    str(chart_id),
+                    payload,
+                    create_response=response if isinstance(response, dict) else None,
+                )
                 if verified:
                     if downgraded_to_unsectioned or (
                         source_section_title and "section_id" not in payload
@@ -909,19 +1139,30 @@ class ChartMigrator(BaseMigrator):
 
         except APIError as e:
             self.log(f"Failed to create chart '{chart_title}': {e}", "error")
+            diagnostics = self._diagnose_chart_api_error(e)
+            analysis = {"error": str(e)}
+            evidence = {"error": str(e)}
+            next_action = (
+                "Review the exported chart payload and destination chart capabilities, "
+                "then re-run `langsmith-migrator resume`."
+            )
+            if diagnostics:
+                analysis["chart_filter_diagnostics"] = diagnostics
+                evidence["chart_filter_diagnostics"] = diagnostics
+                next_action = diagnostics["next_action"]
             export_path = self._export_chart_manual_apply(
                 chart_copy,
                 reason="chart_create_failed",
                 payload=payload,
-                analysis={"error": str(e)},
+                analysis=analysis,
             )
             issue = self.record_issue(
                 "capability",
                 "chart_create_failed",
                 f"Chart '{chart_title}' could not be created on the destination instance",
                 item_id=item_id,
-                next_action="Review the exported chart payload and destination chart capabilities, then re-run `langsmith-migrator resume`.",
-                evidence={"error": str(e)},
+                next_action=next_action,
+                evidence=evidence,
                 export_path=export_path,
             )
             if issue:
@@ -935,9 +1176,9 @@ class ChartMigrator(BaseMigrator):
             self.mark_exported(
                 item_id,
                 "chart_create_failed",
-                next_action="Review the exported chart payload, then run `langsmith-migrator resume`.",
+                next_action=next_action,
                 export_path=export_path,
-                evidence={"error": str(e)},
+                evidence=evidence,
             )
             return None
         except Exception as e:
@@ -1036,8 +1277,7 @@ class ChartMigrator(BaseMigrator):
         # Map IDs within chart config
         source_session_id = self._extract_session_id(chart)
         project_map = {} if same_instance else self._build_project_mapping()
-        if project_map:
-            self._replace_project_ids_in_string_filters(chart_copy, project_map)
+        self._replace_project_ids_in_string_filters(chart_copy, project_map)
         unresolved_dependencies = self._map_ids_in_chart(
             chart_copy,
             dest_session_id,

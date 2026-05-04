@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.74] - 2026-05-04
+
+### Fixed
+- **Chart API payload hardening**: Chart create and update requests now normalize structured project filters to the destination API's `session` shape, rewrite serialized `project_id` filter attributes to `session_id`, and strip server-owned series IDs/null fields before writes.
+- **Duplicate-title chart updates**: Existing chart detection now matches duplicate chart titles by destination session filters before PATCH, avoiding updates to the wrong chart when multiple projects share stock chart titles.
+- **Chart verification and diagnostics**: Post-write verification now tolerates API-normalized null/server fields, accepts create-response verification when list refetch lags, and exports clearer diagnostics for invalid chart filter semantics.
+
 ## [0.0.73] - 2026-05-01
 
 ### Fixed
@@ -344,7 +351,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.73...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.74...HEAD
+[0.0.74]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.73...v0.0.74
 [0.0.73]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.72...v0.0.73
 [0.0.72]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.71...v0.0.72
 [0.0.71]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.70...v0.0.71
