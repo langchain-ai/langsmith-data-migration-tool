@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from langsmith_migrator.core.api_client import EnhancedAPIClient
+from langsmith_migrator.core.api_client import APIError, EnhancedAPIClient
 from langsmith_migrator.core.migrators import ChartMigrator
 
 
@@ -40,6 +40,43 @@ def test_find_existing_chart_checks_destination_not_source(sample_config, migrat
     source_client.post.assert_not_called()
 
 
+def test_find_existing_chart_matches_requested_session_when_titles_repeat(
+    sample_config,
+    migration_state,
+):
+    """Duplicate chart titles should dedupe against the same destination session."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.return_value = [
+        {
+            "id": "wrong-session-chart",
+            "title": "Trace Count",
+            "common_filters": {"session": ["dest-session-b"]},
+        },
+        {
+            "id": "matching-session-chart",
+            "title": "Trace Count",
+            "common_filters": {"session": ["dest-session-a"]},
+        },
+    ]
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+
+    assert (
+        migrator.find_existing_chart(
+            "Trace Count",
+            payload={"common_filters": {"session": ["dest-session-a"]}},
+        )
+        == "matching-session-chart"
+    )
+
+
 def test_create_chart_enriches_missing_series_before_create(sample_config, migration_state):
     """Chart creation should attempt a richer fetch before exporting missing-series charts."""
 
@@ -73,9 +110,334 @@ def test_create_chart_enriches_missing_series_before_create(sample_config, migra
         {
             "title": "Latency",
             "chart_type": "line",
-            "series": [{"filters": {"project_id": "project-1"}}],
+            "series": [{"filters": {"session": ["project-1"]}}],
         },
     )
+
+
+def test_create_chart_strips_source_series_ids_before_create(sample_config, migration_state):
+    """Source/server series IDs should not be sent to destination chart create."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.return_value = {"id": "dest-chart"}
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+    migrator.find_existing_chart = Mock(return_value=None)
+    migrator._verify_chart = Mock(return_value=(True, {}))
+
+    chart_id = migrator.create_chart(
+        {
+            "id": "source-chart",
+            "title": "Latency",
+            "chart_type": "line",
+            "series": [
+                {
+                    "id": "source-series-id",
+                    "metric": "run_count",
+                    "name": "Run count",
+                    "filters": {
+                        "filter": None,
+                        "session": ["dest-project"],
+                        "trace_filter": None,
+                    },
+                    "workspace_id": None,
+                }
+            ],
+        }
+    )
+
+    assert chart_id == "dest-chart"
+    payload = dest_client.post.call_args.args[1]
+    assert payload["series"] == [
+        {
+            "metric": "run_count",
+            "name": "Run count",
+            "filters": {"session": ["dest-project"]},
+        }
+    ]
+
+
+def test_create_chart_normalizes_structured_project_filters_before_create(
+    sample_config,
+    migration_state,
+):
+    """Structured chart project filters should use the API's session list field."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.return_value = {"id": "dest-chart"}
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+    migrator.find_existing_chart = Mock(return_value=None)
+    migrator._verify_chart = Mock(return_value=(True, {}))
+
+    chart_id = migrator.create_chart(
+        {
+            "id": "source-chart",
+            "title": "Latency",
+            "chart_type": "line",
+            "common_filters": {"project_id": "dest-project-a"},
+            "series": [
+                {
+                    "metric": "run_count",
+                    "name": "Run count",
+                    "filters": {
+                        "project_id": "dest-project-b",
+                        "session_id": "dest-project-c",
+                        "session": ["dest-project-d"],
+                    },
+                }
+            ],
+        }
+    )
+
+    assert chart_id == "dest-chart"
+    payload = dest_client.post.call_args.args[1]
+    assert payload["common_filters"] == {"session": ["dest-project-a"]}
+    assert payload["series"][0]["filters"] == {
+        "session": ["dest-project-d", "dest-project-c", "dest-project-b"]
+    }
+
+
+def test_update_chart_normalizes_structured_project_filters_before_patch(
+    sample_config,
+    migration_state,
+):
+    """Chart updates should send the same normalized structured filters as creates."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+
+    assert migrator.update_chart(
+        "dest-chart",
+        {
+            "id": "source-chart",
+            "title": "Latency",
+            "chart_type": "line",
+            "series": [
+                {
+                    "metric": "run_count",
+                    "name": "Run count",
+                    "filters": {"project_id": "dest-project"},
+                }
+            ],
+        },
+    )
+
+    payload = dest_client.patch.call_args.args[1]
+    assert payload["series"][0]["filters"] == {"session": ["dest-project"]}
+
+
+def test_update_chart_strips_source_series_ids_before_patch(sample_config, migration_state):
+    """Destination PATCH should not reference source/server series IDs."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+
+    assert migrator.update_chart(
+        "dest-chart",
+        {
+            "id": "source-chart",
+            "title": "Latency",
+            "chart_type": "line",
+            "series": [
+                {
+                    "id": "source-series-id",
+                    "metric": "run_count",
+                    "name": "Run count",
+                    "filters": {"session": ["dest-project"]},
+                }
+            ],
+        },
+    )
+
+    payload = dest_client.patch.call_args.args[1]
+    assert payload["series"] == [
+        {
+            "metric": "run_count",
+            "name": "Run count",
+            "filters": {"session": ["dest-project"]},
+        }
+    ]
+
+
+def test_create_chart_uses_create_response_id_when_list_refetch_misses(
+    sample_config,
+    migration_state,
+):
+    """A create ack with an ID should verify when dashboard list refetch misses it."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.side_effect = [
+        [],  # find_existing_chart
+        {"id": "dest-chart"},  # POST /charts/create
+        [],  # _verify_chart list refetch misses the new chart
+    ]
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+
+    chart_id = migrator.create_chart(
+        {
+            "id": "source-chart",
+            "title": "Latency",
+            "chart_type": "line",
+            "series": [{"metric": "run_count", "name": "Run count"}],
+        }
+    )
+
+    assert chart_id == "dest-chart"
+    item = migration_state.items["chart_source-chart"]
+    assert item.outcome_code == "chart_migrated"
+    assert item.verification_state == "verified"
+
+
+def test_verify_chart_tolerates_server_normalized_null_and_id_fields(
+    sample_config,
+    migration_state,
+):
+    """Chart verification should ignore server IDs and null-normalized filter keys."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.return_value = [
+        {
+            "id": "dest-chart",
+            "title": "Latency",
+            "chart_type": "line",
+            "common_filters": {
+                "filter": "eq(is_root, true)",
+                "session": ["dest-project"],
+                "trace_filter": None,
+                "tree_filter": None,
+            },
+            "series": [
+                {
+                    "id": "server-series-id",
+                    "metric": "run_count",
+                    "name": "Run count",
+                    "filters": {
+                        "filter": None,
+                        "session": ["dest-project"],
+                        "trace_filter": None,
+                        "tree_filter": None,
+                    },
+                    "feedback_key": None,
+                    "group_by": None,
+                    "project_metric": None,
+                    "workspace_id": None,
+                }
+            ],
+        }
+    ]
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+
+    verified, mismatches = migrator._verify_chart(
+        "dest-chart",
+        {
+            "title": "Latency",
+            "chart_type": "line",
+            "common_filters": {
+                "filter": "eq(is_root, true)",
+                "session": ["dest-project"],
+            },
+            "series": [
+                {
+                    "metric": "run_count",
+                    "name": "Run count",
+                    "filters": {"session": ["dest-project"]},
+                }
+            ],
+        },
+    )
+
+    assert verified is True
+    assert mismatches == {}
+
+
+def test_create_chart_exports_filter_diagnostics_for_api_filter_errors(
+    sample_config,
+    migration_state,
+):
+    """Chart API 422 filter errors should be exported with actionable diagnostics."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.side_effect = [
+        [],  # find_existing_chart
+        APIError(
+            "API request failed: 422 - Parameter session_id__eq has conflicting values "
+            "dest-project-a and dest-project-b.",
+            status_code=422,
+            request_info={"endpoint": "/charts/create", "method": "POST"},
+        ),
+    ]
+
+    migrator = ChartMigrator(
+        source_client,
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+    migrator._export_chart_manual_apply = Mock(return_value="/tmp/chart.json")
+
+    chart_id = migrator.create_chart(
+        {
+            "id": "source-chart",
+            "title": "Latency",
+            "chart_type": "line",
+            "common_filters": {
+                "filter": (
+                    'and(eq(is_root, true), eq(session_id, "dest-project-a"), '
+                    'eq(session_id, "dest-project-b"))'
+                )
+            },
+            "series": [{"metric": "run_count", "name": "Run count"}],
+        }
+    )
+
+    assert chart_id is None
+    analysis = migrator._export_chart_manual_apply.call_args.kwargs["analysis"]
+    assert analysis["chart_filter_diagnostics"]["code"] == "conflicting_session_filter"
+    assert "session_id" in analysis["chart_filter_diagnostics"]["message"]
+    item = migration_state.items["chart_source-chart"]
+    assert item.evidence["chart_filter_diagnostics"]["code"] == "conflicting_session_filter"
 
 
 def test_build_project_mapping_skips_duplicate_names(sample_config, migration_state):
@@ -571,6 +933,8 @@ def test_migrate_chart_rewrites_project_ids_embedded_in_string_filters(
     assert "dest-project-a" in filter_expr
     assert "dest-project-b" in filter_expr
     assert "source-project" not in filter_expr
+    assert "project_id" not in filter_expr
+    assert filter_expr.count("session_id") == 2
     migrator._export_chart_manual_apply.assert_not_called()
 
 
