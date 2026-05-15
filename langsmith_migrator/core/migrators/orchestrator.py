@@ -399,11 +399,12 @@ class MigrationOrchestrator:
             return None
 
         if item is not None:
-            self.state.update_item_checkpoint(
-                item.id,
-                metadata={"time_shift_seconds": delta.total_seconds()},
-            )
-            self.state_manager.save()
+            with self._state_lock:
+                self.state.update_item_checkpoint(
+                    item.id,
+                    metadata={"time_shift_seconds": delta.total_seconds()},
+                )
+                self.state_manager.save()
         return delta
 
     def _resolve_experiment_item(
