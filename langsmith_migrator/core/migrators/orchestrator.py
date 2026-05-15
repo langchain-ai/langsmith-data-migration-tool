@@ -1,7 +1,8 @@
 """Migration orchestrator for coordinating migration operations."""
 
 import threading
-from typing import Dict, List, Optional
+from datetime import timedelta
+from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.progress import Progress
@@ -15,6 +16,7 @@ from ...utils.state import (
     VerificationState,
 )
 from ...utils.chart_mode import should_reuse_chart_ids
+from ...utils.time_shift import compute_delta
 from .dataset import DatasetMigrator
 from .experiment import ExperimentMigrator
 from .feedback import FeedbackMigrator
@@ -363,6 +365,47 @@ class MigrationOrchestrator:
             for name, err in failed_items:
                 self.console.print(f"  [red]✗[/red] {name}: {err}")
 
+    def _resolve_experiment_delta(
+        self,
+        experiment: Dict[str, Any],
+        item: Any,
+    ) -> Optional[timedelta]:
+        """Return the timedelta to apply to this experiment's timestamps.
+
+        On first encounter we compute `now - max(end_time, start_time)` and
+        persist it as `time_shift_seconds` on the experiment's state item.
+        On resume we reuse the persisted value so later batches receive the
+        same shift their already-created sibling runs got — preserving the
+        relative-offset invariant across resume boundaries.
+
+        Returns None when the experiment has neither end_time nor start_time
+        (no anchor available). Callers should log and proceed unshifted; the
+        platform will then enforce the 24h window on /runs/batch.
+        """
+        stored = item.metadata.get("time_shift_seconds") if item else None
+        if stored is not None:
+            return timedelta(seconds=float(stored))
+
+        delta = compute_delta(
+            end_time=experiment.get("end_time"),
+            start_time=experiment.get("start_time"),
+        )
+        if delta is None:
+            self.console.print(
+                f"[yellow]Experiment {experiment.get('name') or experiment.get('id')} "
+                "has no start_time or end_time; cannot anchor runs to now. "
+                "Runs older than 24h will be rejected by the destination.[/yellow]"
+            )
+            return None
+
+        if item is not None:
+            self.state.update_item_checkpoint(
+                item.id,
+                metadata={"time_shift_seconds": delta.total_seconds()},
+            )
+            self.state_manager.save()
+        return delta
+
     def _resolve_experiment_item(
         self,
         experiment: Dict[str, str],
@@ -379,6 +422,10 @@ class MigrationOrchestrator:
             return False, "missing experiment state item"
 
         dest_experiment_id = item.destination_id or item.metadata.get("destination_experiment_id")
+        time_delta = self._resolve_experiment_delta(experiment, item)
+        time_deltas = (
+            {source_experiment_id: time_delta} if time_delta is not None else None
+        )
 
         try:
             if not dest_experiment_id:
@@ -398,6 +445,7 @@ class MigrationOrchestrator:
                 dest_experiment_id = experiment_migrator.create_experiment(
                     experiment,
                     dest_dataset_id,
+                    time_delta=time_delta,
                 )
                 self.state.update_item_status(
                     item_id,
@@ -419,6 +467,7 @@ class MigrationOrchestrator:
                         "experiments": {source_experiment_id: dest_experiment_id},
                         "examples": self.state.id_mappings.get("examples", {}),
                     },
+                    time_deltas=time_deltas,
                 )
                 if failed_run_count > 0:
                     detail = f"{failed_run_count} run(s) failed during replay"

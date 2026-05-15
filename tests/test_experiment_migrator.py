@@ -1,10 +1,13 @@
 """Tests for ExperimentMigrator."""
 
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import Mock
 
 from langsmith_migrator.core.migrators.experiment import ExperimentMigrator
+from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
 from langsmith_migrator.utils.config import Config
+from langsmith_migrator.utils.state import StateManager
 
 
 def _make_migrator():
@@ -145,3 +148,106 @@ class TestMigrateRunsStreamingTimeShift:
         )
         sent = captured[0]["post"][0]
         assert sent["start_time"] == "2026-02-03T00:00:00+00:00"
+
+
+def _orchestrator(tmp_path: Path):
+    config = Config(
+        source_api_key="s", dest_api_key="d",
+        source_url="https://s.test", dest_url="https://d.test",
+    )
+    state_manager = StateManager(state_dir=tmp_path / "state")
+    return MigrationOrchestrator(config, state_manager), state_manager
+
+
+class TestOrchestratorDeltaPersistence:
+    def test_computes_and_persists_delta_on_first_attempt(self, tmp_path):
+        orchestrator, _ = _orchestrator(tmp_path)
+        state = orchestrator.ensure_state()
+        item = state.ensure_item(
+            "experiment_src-exp", "experiment", "exp", "src-exp",
+            stage="create_experiment",
+            workspace_pair={"source": None, "dest": None},
+            metadata={"source_dataset_id": "src-ds", "dest_dataset_id": "dst-ds"},
+        )
+
+        experiment_payload = {
+            "id": "src-exp", "name": "exp",
+            "start_time": "2026-02-03T00:00:00+00:00",
+            "end_time": "2026-02-03T01:00:00+00:00",
+        }
+
+        exp_mig = Mock()
+        exp_mig.create_experiment = Mock(return_value="dest-exp")
+        exp_mig.migrate_runs_streaming = Mock(return_value=(0, {}, 0))
+        fb_mig = Mock()
+        fb_mig.migrate_feedback_for_experiments = Mock(return_value=(0, 0))
+
+        ok, _ = orchestrator._resolve_experiment_item(
+            experiment_payload, "src-ds", "dst-ds", exp_mig, fb_mig,
+        )
+        assert ok is True
+
+        passed_to_create = exp_mig.create_experiment.call_args.kwargs["time_delta"]
+        passed_to_runs = exp_mig.migrate_runs_streaming.call_args.kwargs["time_deltas"]
+        assert passed_to_create is not None
+        assert passed_to_runs["src-exp"] == passed_to_create
+
+        stored = state.get_item(item.id).metadata["time_shift_seconds"]
+        assert isinstance(stored, (int, float))
+        assert stored > 0
+
+    def test_resume_reuses_persisted_delta(self, tmp_path):
+        orchestrator, _ = _orchestrator(tmp_path)
+        state = orchestrator.ensure_state()
+        state.ensure_item(
+            "experiment_src-exp", "experiment", "exp", "src-exp",
+            stage="migrate_runs",
+            workspace_pair={"source": None, "dest": None},
+            metadata={
+                "source_dataset_id": "src-ds",
+                "dest_dataset_id": "dst-ds",
+                "destination_experiment_id": "dest-exp",
+                "time_shift_seconds": 86400.0,
+            },
+        )
+
+        experiment_payload = {
+            "id": "src-exp", "name": "exp",
+            "start_time": "2026-02-03T00:00:00+00:00",
+        }
+        exp_mig = Mock()
+        exp_mig.create_experiment = Mock(return_value="dest-exp")
+        exp_mig.migrate_runs_streaming = Mock(return_value=(0, {}, 0))
+        fb_mig = Mock()
+        fb_mig.migrate_feedback_for_experiments = Mock(return_value=(0, 0))
+
+        orchestrator._resolve_experiment_item(
+            experiment_payload, "src-ds", "dst-ds", exp_mig, fb_mig,
+        )
+
+        passed = exp_mig.migrate_runs_streaming.call_args.kwargs["time_deltas"]
+        assert passed["src-exp"] == timedelta(seconds=86400.0)
+
+    def test_missing_anchor_skips_shift(self, tmp_path):
+        orchestrator, _ = _orchestrator(tmp_path)
+        state = orchestrator.ensure_state()
+        state.ensure_item(
+            "experiment_src-exp", "experiment", "exp", "src-exp",
+            stage="create_experiment",
+            workspace_pair={"source": None, "dest": None},
+            metadata={"source_dataset_id": "src-ds", "dest_dataset_id": "dst-ds"},
+        )
+
+        experiment_payload = {"id": "src-exp", "name": "exp"}
+        exp_mig = Mock()
+        exp_mig.create_experiment = Mock(return_value="dest-exp")
+        exp_mig.migrate_runs_streaming = Mock(return_value=(0, {}, 0))
+        fb_mig = Mock()
+        fb_mig.migrate_feedback_for_experiments = Mock(return_value=(0, 0))
+
+        orchestrator._resolve_experiment_item(
+            experiment_payload, "src-ds", "dst-ds", exp_mig, fb_mig,
+        )
+
+        assert exp_mig.create_experiment.call_args.kwargs["time_delta"] is None
+        assert exp_mig.migrate_runs_streaming.call_args.kwargs["time_deltas"] is None
