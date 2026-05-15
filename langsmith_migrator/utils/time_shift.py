@@ -84,8 +84,37 @@ def shift_iso(value: Optional[str], delta: timedelta) -> Optional[str]:
     return format_iso(parsed + delta)
 
 
-def shift_dotted_order(*args, **kwargs):
-    raise NotImplementedError
+def shift_dotted_order(
+    dotted_order: Optional[str],
+    delta: timedelta,
+) -> Optional[str]:
+    """Shift every timestamp segment of a `dotted_order` chain by `delta`.
+
+    Each segment has the form `YYYYMMDDTHHMMSSffffffZ{uuid}`. Segments are
+    joined by `.`. UUIDs are preserved verbatim. Segments that don't match
+    the expected shape are passed through unchanged so this stays safe to
+    apply to malformed historical data.
+    """
+    if dotted_order is None:
+        return None
+    if dotted_order == "":
+        return ""
+
+    new_parts = []
+    for part in dotted_order.split("."):
+        z_idx = part.rfind("Z")
+        if z_idx == -1 or z_idx == len(part) - 1 or z_idx < 19:
+            new_parts.append(part)
+            continue
+        timestamp_segment = part[: z_idx + 1]
+        suffix = part[z_idx + 1 :]
+        try:
+            parsed = parse_dotted_timestamp(timestamp_segment)
+        except ValueError:
+            new_parts.append(part)
+            continue
+        new_parts.append(format_dotted_timestamp(parsed + delta) + suffix)
+    return ".".join(new_parts)
 
 
 def shift_events(*args, **kwargs):

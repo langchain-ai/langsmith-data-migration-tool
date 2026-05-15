@@ -11,7 +11,7 @@ from langsmith_migrator.utils.time_shift import (
     format_dotted_timestamp,
     compute_delta,
     shift_iso,
-    shift_dotted_order,  # noqa: F401
+    shift_dotted_order,
     shift_events,  # noqa: F401
     shift_run_payload,  # noqa: F401
     shift_experiment_payload,  # noqa: F401
@@ -110,3 +110,42 @@ class TestShiftIso:
 
     def test_none_passthrough(self):
         assert shift_iso(None, timedelta(days=1)) is None
+
+
+class TestShiftDottedOrder:
+    def test_shifts_single_segment(self):
+        result = shift_dotted_order(
+            "20260203T000000000000Z" + "c9ba7a73-985a-4104-aad7-7e3c4fd27a5f",
+            timedelta(days=1),
+        )
+        assert result == (
+            "20260204T000000000000Z" + "c9ba7a73-985a-4104-aad7-7e3c4fd27a5f"
+        )
+
+    def test_shifts_all_segments(self):
+        original = (
+            "20260203T000000000000Zaaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa."
+            "20260203T000005000000Zbbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        )
+        shifted = shift_dotted_order(original, timedelta(days=1))
+        assert shifted == (
+            "20260204T000000000000Zaaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa."
+            "20260204T000005000000Zbbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        )
+
+    def test_none_returns_none(self):
+        assert shift_dotted_order(None, timedelta(days=1)) is None
+
+    def test_empty_string_returns_empty(self):
+        assert shift_dotted_order("", timedelta(days=1)) == ""
+
+    def test_unparseable_segment_left_as_is(self):
+        weird = "notatimestampuuid-1234"
+        assert shift_dotted_order(weird, timedelta(days=1)) == weird
+
+    def test_zero_delta_is_identity(self):
+        original = (
+            "20260203T000000000000Zaaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa."
+            "20260203T000005000000Zbbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        )
+        assert shift_dotted_order(original, timedelta(0)) == original
