@@ -18,6 +18,8 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
     if value is None:
         return None
     text = value.strip()
+    if not text:
+        return None
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     dt = datetime.fromisoformat(text)
