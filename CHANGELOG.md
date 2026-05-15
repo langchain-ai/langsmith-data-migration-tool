@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Experiment run migration now rewrites every run's `start_time`, `end_time`,
+  `dotted_order` timestamps, and `events[].time` (plus the parent experiment's
+  `start_time`/`end_time`) by a per-experiment delta so the newest timestamp
+  lands at "now" on the destination. This works around the destination's
+  `POST /runs/batch` 24-hour timestamp window; without it, historical
+  experiments would have zero runs migrated. Relative offsets between runs
+  within an experiment are preserved exactly. The delta is persisted in
+  migration state per experiment so resume replays use the same shift as the
+  initial attempt.
+
 ## [0.0.74] - 2026-05-04
 
 ### Fixed
