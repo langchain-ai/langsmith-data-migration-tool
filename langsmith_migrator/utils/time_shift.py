@@ -33,12 +33,20 @@ def format_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
-def parse_dotted_timestamp(*args, **kwargs):
-    raise NotImplementedError
+_DOTTED_FORMAT = "%Y%m%dT%H%M%S%fZ"
 
 
-def format_dotted_timestamp(*args, **kwargs):
-    raise NotImplementedError
+def parse_dotted_timestamp(value: str) -> datetime:
+    """Parse a dotted_order timestamp segment (`YYYYMMDDTHHMMSSffffffZ`)."""
+    dt = datetime.strptime(value, _DOTTED_FORMAT)
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def format_dotted_timestamp(dt: datetime) -> str:
+    """Format an aware datetime in the `dotted_order` segment encoding."""
+    if dt.tzinfo is None:
+        raise ValueError(f"format_dotted_timestamp requires a timezone-aware datetime, got {dt!r}")
+    return dt.astimezone(timezone.utc).strftime(_DOTTED_FORMAT)
 
 
 def compute_delta(*args, **kwargs):

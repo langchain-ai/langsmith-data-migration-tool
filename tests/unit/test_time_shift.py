@@ -45,3 +45,25 @@ class TestIsoParseFormat:
     def test_format_rejects_naive_datetime(self):
         with pytest.raises(ValueError, match="timezone-aware"):
             format_iso(datetime(2026, 2, 3, 0, 35, 19))
+
+
+class TestDottedTimestamp:
+    def test_parses_dotted_timestamp(self):
+        dt = parse_dotted_timestamp("20260203T003519695988Z")
+        assert dt == datetime(2026, 2, 3, 0, 35, 19, 695988, tzinfo=timezone.utc)
+
+    def test_format_dotted_timestamp(self):
+        dt = datetime(2026, 2, 3, 0, 35, 19, 695988, tzinfo=timezone.utc)
+        assert format_dotted_timestamp(dt) == "20260203T003519695988Z"
+
+    def test_dotted_round_trip(self):
+        original = "20260203T003519695988Z"
+        assert format_dotted_timestamp(parse_dotted_timestamp(original)) == original
+
+    def test_rejects_malformed(self):
+        with pytest.raises(ValueError):
+            parse_dotted_timestamp("not-a-timestamp")
+
+    def test_format_rejects_naive_datetime(self):
+        with pytest.raises(ValueError, match="timezone-aware"):
+            format_dotted_timestamp(datetime(2026, 2, 3, 0, 35, 19, 695988))
