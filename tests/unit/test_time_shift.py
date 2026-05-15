@@ -11,10 +11,10 @@ from langsmith_migrator.utils.time_shift import (
     format_dotted_timestamp,
     compute_delta,
     shift_iso,
-    shift_dotted_order,
-    shift_events,
-    shift_run_payload,
-    shift_experiment_payload,
+    shift_dotted_order,  # noqa: F401
+    shift_events,  # noqa: F401
+    shift_run_payload,  # noqa: F401
+    shift_experiment_payload,  # noqa: F401
 )
 
 
@@ -67,3 +67,42 @@ class TestDottedTimestamp:
     def test_format_rejects_naive_datetime(self):
         with pytest.raises(ValueError, match="timezone-aware"):
             format_dotted_timestamp(datetime(2026, 2, 3, 0, 35, 19, 695988))
+
+
+class TestComputeDelta:
+    def test_prefers_end_time_over_start_time(self):
+        now = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
+        delta = compute_delta(
+            end_time="2026-02-03T01:00:00+00:00",
+            start_time="2026-02-03T00:00:00+00:00",
+            now=now,
+        )
+        # Anchor is end_time, so delta = now - end_time
+        assert delta == now - datetime(2026, 2, 3, 1, 0, 0, tzinfo=timezone.utc)
+
+    def test_falls_back_to_start_time_when_end_missing(self):
+        now = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
+        delta = compute_delta(
+            end_time=None,
+            start_time="2026-02-03T00:00:00+00:00",
+            now=now,
+        )
+        assert delta == now - datetime(2026, 2, 3, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_returns_none_when_both_missing(self):
+        assert compute_delta(end_time=None, start_time=None) is None
+
+    def test_uses_real_now_when_omitted(self):
+        delta = compute_delta(
+            end_time="2026-02-03T00:00:00+00:00", start_time=None,
+        )
+        assert delta is not None and delta.total_seconds() > 0
+
+
+class TestShiftIso:
+    def test_shifts_iso_by_delta(self):
+        result = shift_iso("2026-02-03T00:00:00+00:00", timedelta(days=1))
+        assert result == "2026-02-04T00:00:00.000000+00:00"
+
+    def test_none_passthrough(self):
+        assert shift_iso(None, timedelta(days=1)) is None
