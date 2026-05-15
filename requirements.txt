@@ -57,7 +57,7 @@ langchain-openai==1.1.14
     # via langsmith-data-migration-tool (pyproject.toml)
 langchain-protocol==0.0.15
     # via langchain-core
-langsmith==0.8.3
+langsmith==0.8.5
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-core
@@ -140,7 +140,7 @@ typing-inspection==0.4.2
     # via pydantic
 uc-micro-py==2.0.0
     # via linkify-it-py
-urllib3==2.6.3
+urllib3==2.7.0
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   requests
