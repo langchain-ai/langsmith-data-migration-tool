@@ -1,10 +1,12 @@
 """Experiment migration logic."""
 
+from datetime import timedelta
 from typing import Dict, List, Any, Optional, Tuple
 import copy
 import uuid
 
 from .base import BaseMigrator
+from ...utils.time_shift import shift_experiment_payload, shift_run_payload  # noqa: F401
 
 
 class ExperimentMigrator(BaseMigrator):
@@ -279,9 +281,13 @@ class ExperimentMigrator(BaseMigrator):
         self.dest.patch(f"/sessions/{experiment_id}", payload)
         self.log(f"Updated experiment: {experiment['name']} ({experiment_id})", "success")
 
-    def create_experiment(self, experiment: Dict[str, Any], new_dataset_id: str) -> str:
-        """Create or update experiment in destination."""
-        # Check if experiment already exists
+    def create_experiment(
+        self,
+        experiment: Dict[str, Any],
+        new_dataset_id: str,
+        time_delta: Optional[timedelta] = None,
+    ) -> str:
+        """Create or update experiment in destination, optionally shifting times."""
         existing_id = self.find_existing_experiment(experiment["name"], new_dataset_id)
 
         if existing_id:
@@ -297,17 +303,23 @@ class ExperimentMigrator(BaseMigrator):
             self.log(f"[DRY RUN] Would create experiment: {experiment['name']}")
             return f"dry-run-{experiment['id']}"
 
+        source_view = (
+            shift_experiment_payload(experiment, time_delta)
+            if time_delta is not None
+            else experiment
+        )
+
         # Ensure evaluators in the extra field are properly typed
-        extra = self._ensure_evaluator_types(experiment.get("extra"))
+        extra = self._ensure_evaluator_types(source_view.get("extra"))
 
         payload = {
-            "name": experiment["name"],
-            "description": experiment.get("description") or None,
+            "name": source_view["name"],
+            "description": source_view.get("description") or None,
             "reference_dataset_id": new_dataset_id,
-            "start_time": experiment.get("start_time"),
-            "end_time": experiment.get("end_time"),
+            "start_time": source_view.get("start_time"),
+            "end_time": source_view.get("end_time"),
             "extra": extra,
-            "trace_tier": experiment.get("trace_tier")
+            "trace_tier": source_view.get("trace_tier"),
         }
 
         response = self.dest.post("/sessions", payload)
