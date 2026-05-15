@@ -12,9 +12,9 @@ from langsmith_migrator.utils.time_shift import (
     compute_delta,
     shift_iso,
     shift_dotted_order,
-    shift_events,  # noqa: F401
-    shift_run_payload,  # noqa: F401
-    shift_experiment_payload,  # noqa: F401
+    shift_events,
+    shift_run_payload,
+    shift_experiment_payload,
 )
 
 
@@ -149,3 +149,86 @@ class TestShiftDottedOrder:
             "20260203T000005000000Zbbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
         )
         assert shift_dotted_order(original, timedelta(0)) == original
+
+
+class TestShiftEvents:
+    def test_shifts_event_times(self):
+        events = [
+            {"name": "start", "time": "2026-02-03T00:00:00+00:00"},
+            {"name": "end", "time": "2026-02-03T00:00:05+00:00"},
+        ]
+        shifted = shift_events(events, timedelta(days=1))
+        assert shifted == [
+            {"name": "start", "time": "2026-02-04T00:00:00.000000+00:00"},
+            {"name": "end", "time": "2026-02-04T00:00:05.000000+00:00"},
+        ]
+
+    def test_events_without_time_passthrough(self):
+        events = [{"name": "noted"}]
+        assert shift_events(events, timedelta(days=1)) == [{"name": "noted"}]
+
+    def test_empty_or_none(self):
+        assert shift_events([], timedelta(days=1)) == []
+        assert shift_events(None, timedelta(days=1)) is None
+
+    def test_does_not_mutate_input(self):
+        events = [{"name": "start", "time": "2026-02-03T00:00:00+00:00"}]
+        shift_events(events, timedelta(days=1))
+        assert events[0]["time"] == "2026-02-03T00:00:00+00:00"
+
+
+class TestShiftRunPayload:
+    def test_shifts_all_timestamp_fields(self):
+        run = {
+            "id": "abc",
+            "name": "n",
+            "run_type": "chain",
+            "start_time": "2026-02-03T00:00:00+00:00",
+            "end_time": "2026-02-03T00:00:05+00:00",
+            "dotted_order": (
+                "20260203T000000000000Zaaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa."
+                "20260203T000005000000Zbbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            ),
+            "events": [{"name": "start", "time": "2026-02-03T00:00:00+00:00"}],
+            "inputs": {"x": 1},
+        }
+        shifted = shift_run_payload(run, timedelta(days=1))
+        assert shifted["start_time"] == "2026-02-04T00:00:00.000000+00:00"
+        assert shifted["end_time"] == "2026-02-04T00:00:05.000000+00:00"
+        assert shifted["dotted_order"].startswith("20260204T000000000000Z")
+        assert shifted["events"][0]["time"] == "2026-02-04T00:00:00.000000+00:00"
+        assert shifted["inputs"] == {"x": 1}
+
+    def test_missing_fields_ok(self):
+        run = {"id": "abc", "name": "n", "run_type": "chain"}
+        shifted = shift_run_payload(run, timedelta(days=1))
+        assert "start_time" not in shifted
+        assert "end_time" not in shifted
+
+    def test_does_not_mutate_input(self):
+        run = {
+            "id": "abc",
+            "start_time": "2026-02-03T00:00:00+00:00",
+            "events": [{"name": "x", "time": "2026-02-03T00:00:00+00:00"}],
+        }
+        shift_run_payload(run, timedelta(days=1))
+        assert run["start_time"] == "2026-02-03T00:00:00+00:00"
+        assert run["events"][0]["time"] == "2026-02-03T00:00:00+00:00"
+
+
+class TestShiftExperimentPayload:
+    def test_shifts_start_and_end(self):
+        exp = {
+            "name": "e",
+            "start_time": "2026-02-03T00:00:00+00:00",
+            "end_time": "2026-02-03T01:00:00+00:00",
+        }
+        shifted = shift_experiment_payload(exp, timedelta(days=1))
+        assert shifted["start_time"] == "2026-02-04T00:00:00.000000+00:00"
+        assert shifted["end_time"] == "2026-02-04T01:00:00.000000+00:00"
+
+    def test_missing_end_time_ok(self):
+        exp = {"name": "e", "start_time": "2026-02-03T00:00:00+00:00"}
+        shifted = shift_experiment_payload(exp, timedelta(days=1))
+        assert shifted["start_time"] == "2026-02-04T00:00:00.000000+00:00"
+        assert "end_time" not in shifted

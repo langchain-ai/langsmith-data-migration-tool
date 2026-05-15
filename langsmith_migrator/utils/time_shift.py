@@ -9,8 +9,9 @@ experiments would be rejected on replay.
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 def parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -117,13 +118,49 @@ def shift_dotted_order(
     return ".".join(new_parts)
 
 
-def shift_events(*args, **kwargs):
-    raise NotImplementedError
+def shift_events(
+    events: Optional[list],
+    delta: timedelta,
+) -> Optional[list]:
+    """Return a deep-copied list with each event's `time` shifted."""
+    if events is None:
+        return None
+    new_events = []
+    for event in events:
+        if not isinstance(event, dict) or "time" not in event:
+            new_events.append(copy.deepcopy(event))
+            continue
+        new_event = copy.deepcopy(event)
+        new_event["time"] = shift_iso(event.get("time"), delta)
+        new_events.append(new_event)
+    return new_events
 
 
-def shift_run_payload(*args, **kwargs):
-    raise NotImplementedError
+def shift_run_payload(run: Dict[str, Any], delta: timedelta) -> Dict[str, Any]:
+    """Return a copy of `run` with start_time, end_time, dotted_order, and
+    events[].time each shifted by `delta`. Missing fields are passed through
+    untouched. The input dict is not mutated.
+    """
+    shifted = dict(run)
+    if "start_time" in run:
+        shifted["start_time"] = shift_iso(run.get("start_time"), delta)
+    if "end_time" in run:
+        shifted["end_time"] = shift_iso(run.get("end_time"), delta)
+    if "dotted_order" in run:
+        shifted["dotted_order"] = shift_dotted_order(run.get("dotted_order"), delta)
+    if "events" in run:
+        shifted["events"] = shift_events(run.get("events"), delta)
+    return shifted
 
 
-def shift_experiment_payload(*args, **kwargs):
-    raise NotImplementedError
+def shift_experiment_payload(
+    experiment: Dict[str, Any],
+    delta: timedelta,
+) -> Dict[str, Any]:
+    """Return a copy of `experiment` with start_time/end_time shifted."""
+    shifted = dict(experiment)
+    if "start_time" in experiment:
+        shifted["start_time"] = shift_iso(experiment.get("start_time"), delta)
+    if "end_time" in experiment:
+        shifted["end_time"] = shift_iso(experiment.get("end_time"), delta)
+    return shifted
