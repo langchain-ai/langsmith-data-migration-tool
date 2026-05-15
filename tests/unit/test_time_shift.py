@@ -41,3 +41,7 @@ class TestIsoParseFormat:
 
     def test_none_returns_none(self):
         assert parse_iso(None) is None
+
+    def test_format_rejects_naive_datetime(self):
+        with pytest.raises(ValueError, match="timezone-aware"):
+            format_iso(datetime(2026, 2, 3, 0, 35, 19))

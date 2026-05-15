@@ -9,9 +9,8 @@ experiments would be rejected on replay.
 
 from __future__ import annotations
 
-import copy
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Optional
 
 
 def parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -29,6 +28,8 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
 
 def format_iso(dt: datetime) -> str:
     """Format an aware datetime as `YYYY-MM-DDTHH:MM:SS.ffffff+00:00`."""
+    if dt.tzinfo is None:
+        raise ValueError(f"format_iso requires a timezone-aware datetime, got {dt!r}")
     return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
