@@ -57,7 +57,7 @@ langchain-openai==1.1.14
     # via langsmith-data-migration-tool (pyproject.toml)
 langchain-protocol==0.0.15
     # via langchain-core
-langsmith==0.7.31
+langsmith==0.8.3
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-core
