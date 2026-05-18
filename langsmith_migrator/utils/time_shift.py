@@ -63,13 +63,23 @@ def compute_delta(
       1. `end_time` — typical for completed experiments. Anchoring on the
          experiment's end shifts the newest run to "now" and everything else
          into the past, comfortably inside the 24h replay window.
-      2. `start_time` — used when end_time is absent (in-flight experiments).
-         The oldest run lands at "now", later runs land slightly in the future.
+      2. `start_time` — used when end_time is absent or unparseable
+         (in-flight experiments or partially-corrupt data). The oldest run
+         lands at "now", later runs land slightly in the future.
 
-    Returns None when neither anchor exists; callers should warn and skip
-    shifting in that case.
+    Each candidate is parsed independently; a malformed `end_time` still
+    falls back to `start_time`. Returns None when no candidate yields a
+    usable timestamp; callers should warn and skip shifting in that case.
     """
-    anchor = parse_iso(end_time) or parse_iso(start_time)
+    anchor: Optional[datetime] = None
+    for candidate in (end_time, start_time):
+        try:
+            parsed = parse_iso(candidate)
+        except ValueError:
+            continue
+        if parsed is not None:
+            anchor = parsed
+            break
     if anchor is None:
         return None
     reference = now if now is not None else datetime.now(timezone.utc)

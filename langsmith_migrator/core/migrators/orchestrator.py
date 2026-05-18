@@ -381,32 +381,25 @@ class MigrationOrchestrator:
         same shift their already-created sibling runs got — preserving the
         relative-offset invariant across resume boundaries.
 
-        Returns None when the experiment has neither end_time nor start_time
-        (no anchor available), or when the timestamps are present but
-        unparseable. Callers should log and proceed unshifted; the platform
-        will then enforce the 24h window on /runs/batch.
+        Returns None when neither end_time nor start_time yields a usable
+        timestamp — either field absent or both malformed. Callers should
+        log and proceed unshifted; the platform will then enforce the 24h
+        window on /runs/batch.
         """
         stored = item.metadata.get(_TIME_SHIFT_SECONDS_KEY) if item else None
         if stored is not None:
             return timedelta(seconds=float(stored))
 
-        try:
-            delta = compute_delta(
-                end_time=experiment.get("end_time"),
-                start_time=experiment.get("start_time"),
-            )
-        except (ValueError, TypeError) as exc:
-            self.console.print(
-                f"[yellow]Experiment {experiment.get('name') or experiment.get('id')} "
-                f"has unparseable timestamps ({exc}); cannot anchor runs to now. "
-                "Runs older than 24h will be rejected by the destination.[/yellow]"
-            )
-            return None
+        delta = compute_delta(
+            end_time=experiment.get("end_time"),
+            start_time=experiment.get("start_time"),
+        )
 
         if delta is None:
             self.console.print(
                 f"[yellow]Experiment {experiment.get('name') or experiment.get('id')} "
-                "has no start_time or end_time; cannot anchor runs to now. "
+                "has no usable start_time or end_time (missing or malformed); "
+                "cannot anchor runs to now. "
                 "Runs older than 24h will be rejected by the destination.[/yellow]"
             )
             return None

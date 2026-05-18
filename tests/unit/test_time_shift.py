@@ -102,6 +102,21 @@ class TestComputeDelta:
         )
         assert delta is not None and delta.total_seconds() > 0
 
+    def test_falls_back_to_start_time_when_end_time_malformed(self):
+        now = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
+        delta = compute_delta(
+            end_time="not-a-real-timestamp",
+            start_time="2026-02-03T00:00:00+00:00",
+            now=now,
+        )
+        assert delta == now - datetime(2026, 2, 3, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_returns_none_when_both_malformed(self):
+        assert compute_delta(end_time="bad", start_time="also-bad") is None
+
+    def test_returns_none_when_end_malformed_and_start_missing(self):
+        assert compute_delta(end_time="bad", start_time=None) is None
+
 
 class TestShiftIso:
     def test_shifts_iso_by_delta(self):
