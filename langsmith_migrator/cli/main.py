@@ -262,24 +262,83 @@ def _persist_project_id_map(orchestrator, config, project_id_map: dict | None) -
     orchestrator.state_manager.save()
 
 
+def _ensure_chart_dependency_project_records(
+    orchestrator,
+    source_projects: list,
+    dest_projects: list,
+) -> tuple[list, list]:
+    """Fetch project records when chart dependency validation needs ID proof."""
+    if source_projects and dest_projects:
+        return source_projects, dest_projects
+
+    console.print("Fetching projects for chart dependency validation... ", end="")
+    source_records = source_projects or _list_projects(orchestrator.source_client)
+    dest_records = dest_projects or _list_projects(orchestrator.dest_client)
+    console.print(f"[green]✓[/green] ({len(source_records)} source, {len(dest_records)} destination)")
+    return source_records, dest_records
+
+
 def _unresolved_chart_project_dependencies(
     chart_migrator,
     dependency_ids: set[str],
     *,
     same_instance: bool,
+    dest_projects: list | None = None,
 ) -> list[str]:
     """Return dependency IDs that still cannot resolve to destination projects."""
     if same_instance:
         return []
+    dest_project_ids = set(_project_by_id(dest_projects or []))
     missing = []
     for dependency_id in sorted(dependency_ids):
         dest_id = chart_migrator.resolve_destination_session_id(
             dependency_id,
             same_instance=False,
         )
-        if not dest_id:
+        if not dest_id or (dest_project_ids and dest_id not in dest_project_ids):
             missing.append(dependency_id)
     return missing
+
+
+def _mark_chart_project_dependencies_resolved(
+    orchestrator,
+    config,
+    dependency_ids: set[str],
+    project_id_map: dict | None,
+) -> None:
+    """Clear a previous chart dependency checkpoint once all mappings resolve."""
+    if not dependency_ids:
+        return
+    if not orchestrator.state:
+        return
+
+    workspace_pair = _active_workspace_pair(orchestrator)
+    item_id = _state_item_id(
+        "chart_dependency",
+        "project_mappings",
+        workspace_pair["source"],
+    )
+    item = orchestrator.state.get_item(item_id)
+    if not item or item.terminal_state != ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value:
+        return
+
+    orchestrator.state.update_item_status(
+        item_id,
+        MigrationStatus.COMPLETED,
+        stage="resolved",
+    )
+    orchestrator.state.mark_terminal(
+        item_id,
+        ResolutionOutcome.MIGRATED,
+        "chart_project_mapping_resolved",
+        verification_state=VerificationState.VERIFIED,
+        evidence={
+            "resolved_dependency_ids": sorted(dependency_ids),
+            "project_map_size": len(project_id_map or {}),
+            "workspace_pair": workspace_pair,
+        },
+    )
+    orchestrator.state_manager.save()
 
 
 def _block_unresolved_chart_project_dependencies(
@@ -3807,6 +3866,14 @@ def _migrate_all_for_workspace(
                 _ensure_migration_session(orchestrator, config)
                 chart_migrator.state = orchestrator.state
                 if not same_instance:
+                    (
+                        source_projects_for_mapping,
+                        dest_projects_for_mapping,
+                    ) = _ensure_chart_dependency_project_records(
+                        orchestrator,
+                        source_projects_for_mapping,
+                        dest_projects_for_mapping,
+                    )
                     chart_dependency_ids = _chart_project_dependency_ids(
                         source_charts,
                         source_projects_for_mapping,
@@ -3833,6 +3900,7 @@ def _migrate_all_for_workspace(
                         chart_migrator,
                         chart_dependency_ids,
                         same_instance=False,
+                        dest_projects=dest_projects_for_mapping,
                     )
                     if missing_project_ids:
                         _block_unresolved_chart_project_dependencies(
@@ -3845,6 +3913,12 @@ def _migrate_all_for_workspace(
                             "[yellow]Skipped charts until mappings are resolved[/yellow]\n"
                         )
                         return
+                    _mark_chart_project_dependencies_resolved(
+                        orchestrator,
+                        config,
+                        chart_dependency_ids,
+                        chart_migrator._project_id_map,
+                    )
 
                 tracked_chart_items = {}
 
@@ -4149,14 +4223,14 @@ def charts(
             tracked_chart_items = {}
             source_charts = chart_migrator.list_charts()
             if not effective_same_instance:
-                if chart_migrator._project_id_map and not source_projects_for_mapping:
-                    console.print("Fetching projects for chart dependency validation... ", end="")
-                    source_projects_for_mapping = _list_projects(orchestrator.source_client)
-                    dest_projects_for_mapping = _list_projects(orchestrator.dest_client)
-                    console.print(
-                        f"[green]✓[/green] ({len(source_projects_for_mapping)} source, "
-                        f"{len(dest_projects_for_mapping)} destination)"
-                    )
+                (
+                    source_projects_for_mapping,
+                    dest_projects_for_mapping,
+                ) = _ensure_chart_dependency_project_records(
+                    orchestrator,
+                    source_projects_for_mapping,
+                    dest_projects_for_mapping,
+                )
 
                 chart_dependency_ids = _chart_project_dependency_ids(
                     source_charts,
@@ -4184,6 +4258,7 @@ def charts(
                     chart_migrator,
                     chart_dependency_ids,
                     same_instance=False,
+                    dest_projects=dest_projects_for_mapping,
                 )
                 if missing_project_ids:
                     _block_unresolved_chart_project_dependencies(
@@ -4194,6 +4269,12 @@ def charts(
                     )
                     console.print("[yellow]Skipped charts until mappings are resolved[/yellow]")
                     continue
+                _mark_chart_project_dependencies_resolved(
+                    orchestrator,
+                    config,
+                    chart_dependency_ids,
+                    chart_migrator._project_id_map,
+                )
 
             for chart in source_charts:
                 chart_id = chart.get("id")
