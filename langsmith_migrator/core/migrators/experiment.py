@@ -1,10 +1,12 @@
 """Experiment migration logic."""
 
+from datetime import timedelta
 from typing import Dict, List, Any, Optional, Tuple
 import copy
 import uuid
 
 from .base import BaseMigrator
+from ...utils.time_shift import shift_experiment_payload, shift_run_payload
 
 
 class ExperimentMigrator(BaseMigrator):
@@ -279,9 +281,13 @@ class ExperimentMigrator(BaseMigrator):
         self.dest.patch(f"/sessions/{experiment_id}", payload)
         self.log(f"Updated experiment: {experiment['name']} ({experiment_id})", "success")
 
-    def create_experiment(self, experiment: Dict[str, Any], new_dataset_id: str) -> str:
-        """Create or update experiment in destination."""
-        # Check if experiment already exists
+    def create_experiment(
+        self,
+        experiment: Dict[str, Any],
+        new_dataset_id: str,
+        time_delta: Optional[timedelta] = None,
+    ) -> str:
+        """Create or update experiment in destination, optionally shifting times."""
         existing_id = self.find_existing_experiment(experiment["name"], new_dataset_id)
 
         if existing_id:
@@ -297,17 +303,23 @@ class ExperimentMigrator(BaseMigrator):
             self.log(f"[DRY RUN] Would create experiment: {experiment['name']}")
             return f"dry-run-{experiment['id']}"
 
+        source_view = (
+            shift_experiment_payload(experiment, time_delta)
+            if time_delta is not None
+            else experiment
+        )
+
         # Ensure evaluators in the extra field are properly typed
-        extra = self._ensure_evaluator_types(experiment.get("extra"))
+        extra = self._ensure_evaluator_types(source_view.get("extra"))
 
         payload = {
-            "name": experiment["name"],
-            "description": experiment.get("description") or None,
+            "name": source_view["name"],
+            "description": source_view.get("description") or None,
             "reference_dataset_id": new_dataset_id,
-            "start_time": experiment.get("start_time"),
-            "end_time": experiment.get("end_time"),
+            "start_time": source_view.get("start_time"),
+            "end_time": source_view.get("end_time"),
             "extra": extra,
-            "trace_tier": experiment.get("trace_tier")
+            "trace_tier": source_view.get("trace_tier"),
         }
 
         response = self.dest.post("/sessions", payload)
@@ -325,7 +337,8 @@ class ExperimentMigrator(BaseMigrator):
     def migrate_runs_streaming(
         self,
         experiment_ids: List[str],
-        id_mappings: Dict[str, Dict[str, str]]
+        id_mappings: Dict[str, Dict[str, str]],
+        time_deltas: Optional[Dict[str, timedelta]] = None,
     ) -> Tuple[int, Dict[str, str], int]:
         """
         Migrate runs for experiments using streaming.
@@ -333,10 +346,16 @@ class ExperimentMigrator(BaseMigrator):
         Args:
             experiment_ids: List of source experiment IDs to migrate runs for
             id_mappings: Dict containing "experiments" and "examples" mappings
+            time_deltas: Mapping of source experiment ID -> timedelta to apply
+                to start_time, end_time, dotted_order, and events[].time on
+                every run in that experiment. Required for migrating historical
+                experiments because POST /runs/batch rejects timestamps outside
+                a 24h window of now. When None or missing for an experiment,
+                runs are sent with their original timestamps (which will fail
+                on the destination for any historical experiment).
 
         Returns:
             Tuple of (total_runs_migrated, run_id_mapping, failed_run_count)
-            where run_id_mapping maps source run IDs to destination run IDs
         """
         run_id_mapping: Dict[str, str] = {}
         if self.state:
@@ -359,6 +378,7 @@ class ExperimentMigrator(BaseMigrator):
         # Query runs for EACH experiment separately
         # The LangSmith /runs/query API only processes the first session ID when given a list
         for exp_idx, experiment_id in enumerate(experiment_ids, 1):
+            experiment_delta = (time_deltas or {}).get(experiment_id)
             experiment_item_id = self._experiment_item_id(experiment_id)
             experiment_item = self.state.get_item(experiment_item_id) if self.state else None
             start_cursor = experiment_item.metadata.get("run_cursor") if experiment_item else None
@@ -485,6 +505,9 @@ class ExperimentMigrator(BaseMigrator):
                         "reference_example_id": mapped_example_id,
                         "_source_run_id": source_run_id,
                     }
+
+                    if experiment_delta is not None:
+                        migrated_run = shift_run_payload(migrated_run, experiment_delta)
 
                     # Remove None values to avoid API validation errors (422)
                     migrated_run = {k: v for k, v in migrated_run.items() if v is not None}

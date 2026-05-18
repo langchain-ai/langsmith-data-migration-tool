@@ -48,6 +48,10 @@ This tool **does not support migrating trace data**. It migrates:
 
 For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
 
+### Experiment Timestamps Are Rewritten on Migration
+
+The destination's `POST /runs/batch` endpoint rejects runs with timestamps outside a 24-hour window of "now", so historical experiments cannot be replayed with their original timestamps. To migrate experiment runs at all, this tool shifts every run's `start_time`, `end_time`, `dotted_order`, and `events[].time` (and the parent experiment's `start_time`/`end_time`) by a per-experiment delta so the newest timestamp lands at migration time. **Relative offsets between runs within the same experiment are preserved exactly.** The delta is persisted in migration state so resumed migrations apply the same shift to remaining runs.
+
 ## Installation
 
 **Prerequisites**: Python 3.12+, [uv](https://docs.astral.sh/uv/)

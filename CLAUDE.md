@@ -107,6 +107,12 @@ Environment variables (can also use CLI flags or a `.env` file — auto-loaded o
 2. **Retry with exponential backoff**: All API calls use retry logic in `utils/retry.py`
 3. **ID Mapping**: Migrators track source→destination ID mappings for cross-references
 4. **Rules disabled by default**: Rules are created disabled by default in all flows to avoid secrets validation issues; use explicit flags (`--create-enabled` / `--rules-create-enabled`) to create enabled rules
+5. **Run timestamps anchored to "now" on migration**: When migrating experiment
+   data (datasets `--include-experiments` or `migrate-all`), every run is
+   shifted by `now - max(experiment.end_time, experiment.start_time)` so it
+   fits the destination's 24h `POST /runs/batch` window. Offsets between
+   runs in the same experiment are preserved. The shift is persisted per
+   experiment in state so resumes stay consistent.
 
 ## Testing
 
