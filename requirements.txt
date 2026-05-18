@@ -16,7 +16,7 @@ certifi==2026.4.22
     #   requests
 charset-normalizer==3.4.7
     # via requests
-click==8.3.1
+click==8.4.0
     # via langsmith-data-migration-tool (pyproject.toml)
 distro==1.9.0
     # via
@@ -33,7 +33,7 @@ httpx==0.28.1
     #   anthropic
     #   langsmith
     #   openai
-idna==3.14
+idna==3.15
     # via
     #   anyio
     #   httpx
@@ -46,14 +46,14 @@ jsonpatch==1.33
     # via langchain-core
 jsonpointer==3.1.1
     # via jsonpatch
-langchain-anthropic==1.2.0
+langchain-anthropic==1.4.3
     # via langsmith-data-migration-tool (pyproject.toml)
-langchain-core==1.3.3
+langchain-core==1.4.0
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-anthropic
     #   langchain-openai
-langchain-openai==1.1.14
+langchain-openai==1.2.1
     # via langsmith-data-migration-tool (pyproject.toml)
 langchain-protocol==0.0.15
     # via langchain-core
@@ -68,11 +68,11 @@ markdown-it-py==4.2.0
     #   mdit-py-plugins
     #   rich
     #   textual
-mdit-py-plugins==0.6.0
+mdit-py-plugins==0.6.1
     # via textual
 mdurl==0.1.2
     # via markdown-it-py
-openai==2.36.0
+openai==2.37.0
     # via langchain-openai
 orjson==3.11.9
     # via langsmith
@@ -101,7 +101,7 @@ pyyaml==6.0.3
     # via langchain-core
 regex==2026.5.9
     # via tiktoken
-requests==2.33.0
+requests==2.34.2
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langsmith
@@ -109,7 +109,7 @@ requests==2.33.0
     #   tiktoken
 requests-toolbelt==1.0.0
     # via langsmith
-rich==14.2.0
+rich==15.0.0
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   textual
@@ -119,7 +119,7 @@ sniffio==1.3.1
     #   openai
 tenacity==9.1.4
     # via langchain-core
-textual==6.7.1
+textual==8.2.6
     # via langsmith-data-migration-tool (pyproject.toml)
 tiktoken==0.13.0
     # via langchain-openai
