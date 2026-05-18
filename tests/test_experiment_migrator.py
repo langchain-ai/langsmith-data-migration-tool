@@ -251,3 +251,33 @@ class TestOrchestratorDeltaPersistence:
 
         assert exp_mig.create_experiment.call_args.kwargs["time_delta"] is None
         assert exp_mig.migrate_runs_streaming.call_args.kwargs["time_deltas"] is None
+
+    def test_malformed_timestamp_skips_shift(self, tmp_path):
+        orchestrator, _ = _orchestrator(tmp_path)
+        state = orchestrator.ensure_state()
+        state.ensure_item(
+            "experiment_src-exp", "experiment", "exp", "src-exp",
+            stage="create_experiment",
+            workspace_pair={"source": None, "dest": None},
+            metadata={"source_dataset_id": "src-ds", "dest_dataset_id": "dst-ds"},
+        )
+
+        # Non-empty, non-whitespace, but unparseable ISO timestamp.
+        experiment_payload = {
+            "id": "src-exp", "name": "exp",
+            "start_time": "not-a-real-timestamp",
+            "end_time": "also-bad",
+        }
+        exp_mig = Mock()
+        exp_mig.create_experiment = Mock(return_value="dest-exp")
+        exp_mig.migrate_runs_streaming = Mock(return_value=(0, {}, 0))
+        fb_mig = Mock()
+        fb_mig.migrate_feedback_for_experiments = Mock(return_value=(0, 0))
+
+        # Must NOT raise — should warn and proceed unshifted.
+        ok, _ = orchestrator._resolve_experiment_item(
+            experiment_payload, "src-ds", "dst-ds", exp_mig, fb_mig,
+        )
+        assert ok is True
+        assert exp_mig.create_experiment.call_args.kwargs["time_delta"] is None
+        assert exp_mig.migrate_runs_streaming.call_args.kwargs["time_deltas"] is None

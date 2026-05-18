@@ -379,17 +379,27 @@ class MigrationOrchestrator:
         relative-offset invariant across resume boundaries.
 
         Returns None when the experiment has neither end_time nor start_time
-        (no anchor available). Callers should log and proceed unshifted; the
-        platform will then enforce the 24h window on /runs/batch.
+        (no anchor available), or when the timestamps are present but
+        unparseable. Callers should log and proceed unshifted; the platform
+        will then enforce the 24h window on /runs/batch.
         """
         stored = item.metadata.get("time_shift_seconds") if item else None
         if stored is not None:
             return timedelta(seconds=float(stored))
 
-        delta = compute_delta(
-            end_time=experiment.get("end_time"),
-            start_time=experiment.get("start_time"),
-        )
+        try:
+            delta = compute_delta(
+                end_time=experiment.get("end_time"),
+                start_time=experiment.get("start_time"),
+            )
+        except (ValueError, TypeError) as exc:
+            self.console.print(
+                f"[yellow]Experiment {experiment.get('name') or experiment.get('id')} "
+                f"has unparseable timestamps ({exc}); cannot anchor runs to now. "
+                "Runs older than 24h will be rejected by the destination.[/yellow]"
+            )
+            return None
+
         if delta is None:
             self.console.print(
                 f"[yellow]Experiment {experiment.get('name') or experiment.get('id')} "
