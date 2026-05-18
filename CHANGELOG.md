@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.75] - 2026-05-18
+
 ### Changed
 - Experiment run migration now rewrites every run's `start_time`, `end_time`,
   `dotted_order` timestamps, and `events[].time` (plus the parent experiment's
@@ -16,7 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   experiments would have zero runs migrated. Relative offsets between runs
   within an experiment are preserved exactly. The delta is persisted in
   migration state per experiment so resume replays use the same shift as the
-  initial attempt.
+  initial attempt. When `end_time` is missing or malformed, the shift falls
+  back to `start_time` so partially-corrupt experiment metadata still gets
+  a valid anchor.
+- Bumped `langsmith` 0.7.31 → 0.8.5.
+
+### Security
+- Bumped `urllib3` 2.6.3 → 2.7.0 to pick up fixes for two high-severity
+  advisories: GHSA-mf9v-mfxr-j63j (decompression-bomb safeguard bypass on
+  `HTTPResponse.drain_conn()` and Brotli streaming reads) and
+  GHSA-qccp-gfcp-xxvc (sensitive headers not stripped on cross-host redirects
+  when using `ProxyManager.connection_from_url`).
 
 ## [0.0.74] - 2026-05-04
 
