@@ -2690,6 +2690,154 @@ def test_charts_blocks_once_when_all_chart_project_dependencies_are_unmapped(
     assert item.metadata["unmapped_dependency_ids"] == ["source-project-id"]
 
 
+def test_charts_map_projects_resolves_prior_chart_dependency_blocker(cli_harness):
+    """A successful remap should clear the stale chart-dependency checkpoint."""
+
+    source_project_id = "a3cee8e2-40bb-472e-8456-c660b5ea1f3d"
+    dest_project_id = "cc3ac580-destination-project"
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {
+            "id": "chart-1",
+            "title": "Chart One",
+            "project_id": source_project_id,
+        }
+    ]
+    cli_harness.migrators.chart._extract_session_id.side_effect = lambda chart: chart.get(
+        "project_id"
+    )
+
+    first_result = cli_harness.invoke(
+        [
+            "--non-interactive",
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+        ],
+        add_base_args=False,
+    )
+
+    assert first_result.exit_code == 2
+    state = cli_harness.orchestrator_factory.state
+    blocked_item = state.get_item("chart_dependency_src-ws_project_mappings")
+    assert blocked_item.terminal_state == ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value
+
+    cli_harness.controls.project_mapping_result = {source_project_id: dest_project_id}
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {
+            "id": source_project_id,
+            "name": "smoke-997-career-advisor-agent",
+            "tenant_id": "src-ws",
+        },
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {
+            "id": dest_project_id,
+            "name": "smoke-997-career-advisor-agent",
+            "tenant_id": "dst-ws",
+        },
+    ]
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        source_project_id: {"chart-1": "dest-chart-1"}
+    }
+
+    second_result = cli_harness.invoke(
+        [
+            "--non-interactive",
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+            "--map-projects",
+        ],
+        add_base_args=False,
+    )
+
+    assert second_result.exit_code == 0
+    resolved_item = state.get_item("chart_dependency_src-ws_project_mappings")
+    assert resolved_item.terminal_state == ResolutionOutcome.MIGRATED.value
+    assert resolved_item.outcome_code == "chart_project_mapping_resolved"
+    assert state.get_terminal_counts()[ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value] == 0
+
+
+def test_charts_rejects_stale_state_mapping_to_missing_destination_project(cli_harness):
+    """Stored project mappings should not bypass validation if the destination ID vanished."""
+
+    source_project_id = "source-project-id"
+    stale_dest_project_id = "deleted-dest-project"
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.state.set_mapped_id(
+        "project",
+        source_project_id,
+        stale_dest_project_id,
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {
+            "id": source_project_id,
+            "name": "Source Project",
+            "tenant_id": "src-ws",
+        },
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {
+            "id": "different-destination-project",
+            "name": "Different Project",
+            "tenant_id": "dst-ws",
+        },
+    ]
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {
+            "id": "chart-1",
+            "title": "Chart One",
+            "project_id": source_project_id,
+        }
+    ]
+    cli_harness.migrators.chart._extract_session_id.side_effect = lambda chart: chart.get(
+        "project_id"
+    )
+
+    result = cli_harness.invoke(
+        [
+            "--non-interactive",
+            "--source-key",
+            "shared-key",
+            "--dest-key",
+            "shared-key",
+            "--source-url",
+            "https://same.example",
+            "--dest-url",
+            "https://same.example/api/v1",
+            "charts",
+        ],
+        add_base_args=False,
+    )
+
+    assert result.exit_code == 2
+    cli_harness.migrators.chart.migrate_all_charts.assert_not_called()
+    assert "Unmapped source project IDs: source-p" in cli_harness.console.text
+
+
 def test_charts_map_projects_resolves_nested_session_filters_for_resume_metadata(
     cli_harness,
 ):

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.76] - 2026-05-18
+
+### Fixed
+- **Chart project mapper ID handoff**: Pressing `Enter` on a unique destination
+  suggestion in the `--map-projects` TUI now records the ID-bearing destination
+  row instead of the raw typed name, so charts and rules receive the source-ID
+  mapping that their dependency validators require.
+- **Chart mapping validation**: ID-based project mapping flows no longer count
+  unresolved text destinations as mapped, and chart dependency validation now
+  rejects saved mappings whose destination project ID is no longer present in
+  the active destination workspace.
+- **Chart remediation resume state**: A successful chart project remap now marks
+  the earlier chart-dependency blocker resolved so later `resume` runs do not
+  keep exiting on stale blocked migration state.
+
 ## [0.0.75] - 2026-05-18
 
 ### Changed
@@ -374,7 +389,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.74...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.76...HEAD
+[0.0.76]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.75...v0.0.76
+[0.0.75]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.74...v0.0.75
 [0.0.74]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.73...v0.0.74
 [0.0.73]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.72...v0.0.73
 [0.0.72]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.71...v0.0.72

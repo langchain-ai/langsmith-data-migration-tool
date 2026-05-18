@@ -216,9 +216,26 @@ class DestinationPickerScreen(ModalScreen[Optional[str]]):
         self._refresh_table()
         self._filter_timer = None
 
+    def _submitted_value(self, value: str) -> Optional[str]:
+        """Resolve Enter in the input to an unambiguous visible destination label."""
+        value = value.strip()
+        if not value:
+            return None
+        if value in self.dest_labels:
+            return value
+
+        value_lower = value.lower()
+        matching_labels = [
+            label for label in self.dest_labels if value_lower in label.lower()
+        ]
+        if len(matching_labels) == 1:
+            return matching_labels[0]
+
+        return value
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Confirm whatever text is in the input."""
-        value = event.value.strip()
+        value = self._submitted_value(event.value)
         if value:
             self.dismiss(value)
 
@@ -574,6 +591,9 @@ class ProjectMapperApp(App):
             mapping.dest_name = value
             mapping.dest_id = None
             mapping.dest_label = value
+            if self.return_ids:
+                mapping.status = MappingStatus.UNMAPPED
+                return
         mapping.status = (
             self._status_for_same_name(mapping.source_name)
             if mapping.dest_name == mapping.source_name
@@ -592,6 +612,9 @@ class ProjectMapperApp(App):
             mapping.dest_name = mapping.source_name
             mapping.dest_id = None
             mapping.dest_label = mapping.source_name
+            if self.return_ids:
+                mapping.status = MappingStatus.UNMAPPED
+                return
         mapping.status = self._status_for_same_name(mapping.source_name)
 
     def _refresh_and_stats(self) -> None:
