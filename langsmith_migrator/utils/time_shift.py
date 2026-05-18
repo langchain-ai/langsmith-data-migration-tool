@@ -9,7 +9,6 @@ experiments would be rejected on replay.
 
 from __future__ import annotations
 
-import copy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -122,16 +121,21 @@ def shift_events(
     events: Optional[list],
     delta: timedelta,
 ) -> Optional[list]:
-    """Return a deep-copied list with each event's `time` shifted."""
+    """Return a new list with each event's `time` shifted.
+
+    Events without a `time` field are passed through by reference (no copy).
+    Time-bearing events get a shallow copy with the `time` value replaced —
+    sufficient because we only overwrite a single string field.
+    """
     if events is None:
         return None
     new_events = []
     for event in events:
         if not isinstance(event, dict) or "time" not in event:
-            new_events.append(copy.deepcopy(event))
+            new_events.append(event)
             continue
-        new_event = copy.deepcopy(event)
-        new_event["time"] = shift_iso(event.get("time"), delta)
+        new_event = dict(event)
+        new_event["time"] = shift_iso(event["time"], delta)
         new_events.append(new_event)
     return new_events
 

@@ -22,6 +22,9 @@ from .experiment import ExperimentMigrator
 from .feedback import FeedbackMigrator
 
 
+_TIME_SHIFT_SECONDS_KEY = "time_shift_seconds"
+
+
 class MigrationOrchestrator:
     """Orchestrates the entire migration process."""
 
@@ -383,7 +386,7 @@ class MigrationOrchestrator:
         unparseable. Callers should log and proceed unshifted; the platform
         will then enforce the 24h window on /runs/batch.
         """
-        stored = item.metadata.get("time_shift_seconds") if item else None
+        stored = item.metadata.get(_TIME_SHIFT_SECONDS_KEY) if item else None
         if stored is not None:
             return timedelta(seconds=float(stored))
 
@@ -412,7 +415,7 @@ class MigrationOrchestrator:
             with self._state_lock:
                 self.state.update_item_checkpoint(
                     item.id,
-                    metadata={"time_shift_seconds": delta.total_seconds()},
+                    metadata={_TIME_SHIFT_SECONDS_KEY: delta.total_seconds()},
                 )
                 self.state_manager.save()
         return delta
