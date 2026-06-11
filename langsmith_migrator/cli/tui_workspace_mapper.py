@@ -70,6 +70,14 @@ WS_STATUS_STYLES = {
 # Modal: pick a destination workspace
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _step_table_cursor(table: DataTable, delta: int) -> None:
+    """Move a DataTable's row cursor by *delta*, clamped to valid rows."""
+    if table.row_count == 0:
+        return
+    row = max(0, min(table.cursor_row + delta, table.row_count - 1))
+    table.move_cursor(row=row)
+
+
 class WsDestinationPickerScreen(ModalScreen[Optional[str]]):
     """Modal screen for picking a destination workspace."""
 
@@ -88,7 +96,12 @@ class WsDestinationPickerScreen(ModalScreen[Optional[str]]):
     DataTable:focus > .datatable--cursor { background: $accent-darken-1; }
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel", show=True)]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+        # The search input keeps focus, so forward arrow keys to the table.
+        Binding("up", "cursor_up", "Browse up", show=False),
+        Binding("down", "cursor_down", "Browse down", show=False),
+    ]
 
     def __init__(
         self, source_name: str, dest_workspaces: List[Dict], reverse_map: Dict[str, str],
@@ -99,13 +112,13 @@ class WsDestinationPickerScreen(ModalScreen[Optional[str]]):
         self.dest_names = [_ws_label(ws) for ws in dest_workspaces]
         self.reverse_map = reverse_map
         self.filtered_indices: List[int] = list(range(len(self.dest_names)))
-        self.filter_text = source_name
+        self.filter_text = ""
         self._filter_timer = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ws-dest-dialog"):
             yield Static(f"Destination for: [bold]{self.source_name}[/bold]", id="ws-dest-title")
-            yield Input(value=self.source_name, id="ws-dest-input")
+            yield Input(placeholder="Search destination workspaces...", id="ws-dest-input")
             yield DataTable(id="ws-dest-table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="ws-dest-no-matches")
             yield Static("Enter: select | Up/Down: browse | Esc: cancel", id="ws-dest-help")
@@ -115,9 +128,7 @@ class WsDestinationPickerScreen(ModalScreen[Optional[str]]):
         table.add_column("Destination Workspace", width=40)
         table.add_column("Mapped From", width=30)
         self._refresh_table()
-        inp = self.query_one("#ws-dest-input", Input)
-        inp.focus()
-        inp.action_select_all()
+        self.query_one("#ws-dest-input", Input).focus()
 
     def _refresh_table(self) -> None:
         table = self.query_one(DataTable)
@@ -132,8 +143,16 @@ class WsDestinationPickerScreen(ModalScreen[Optional[str]]):
             indicator = f"<- {mapped_from}" if mapped_from else ""
             table.add_row(name, indicator, key=str(idx))
         no_matches = self.query_one("#ws-dest-no-matches", Static)
-        if search and not self.filtered_indices:
-            no_matches.update("[dim](no matching workspaces)[/dim]")
+        if not self.dest_names:
+            no_matches.update(
+                "[dim](no destination workspaces found — check destination "
+                "credentials and permissions)[/dim]"
+            )
+        elif search and not self.filtered_indices:
+            no_matches.update(
+                f"[dim](no matches — clear the search to see all "
+                f"{len(self.dest_names)} workspaces)[/dim]"
+            )
         else:
             no_matches.update("")
 
@@ -160,6 +179,12 @@ class WsDestinationPickerScreen(ModalScreen[Optional[str]]):
         if 0 <= cursor < len(self.filtered_indices):
             idx = self.filtered_indices[cursor]
             self.dismiss(self.dest_workspaces[idx].get("id"))
+
+    def action_cursor_up(self) -> None:
+        _step_table_cursor(self.query_one(DataTable), -1)
+
+    def action_cursor_down(self) -> None:
+        _step_table_cursor(self.query_one(DataTable), 1)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -390,6 +415,16 @@ class ProjectMappingScreen(Screen[Optional[Dict[str, str]]]):
 
     # -- key actions --
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Open the destination picker when Enter selects a row in the table.
+
+        The focused DataTable consumes the Enter key itself, so the screen-level
+        ``enter`` binding never fires; the table emits RowSelected instead.
+        """
+        if event.data_table.id != "pm-table":
+            return
+        self.action_assign()
+
     def action_assign(self) -> None:
         if self._modal_is_active():
             return
@@ -490,7 +525,12 @@ class _ProjectDestPickerScreen(ModalScreen[Optional[str]]):
     DataTable > .datatable--cursor { background: $accent; }
     DataTable:focus > .datatable--cursor { background: $accent-darken-1; }
     """
-    BINDINGS = [Binding("escape", "cancel", "Cancel", show=True)]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+        # The search input keeps focus, so forward arrow keys to the table.
+        Binding("up", "cursor_up", "Browse up", show=False),
+        Binding("down", "cursor_down", "Browse down", show=False),
+    ]
 
     def __init__(self, source_name: str, dest_names: List[str], reverse_map: Dict[str, str]) -> None:
         super().__init__()
@@ -560,6 +600,12 @@ class _ProjectDestPickerScreen(ModalScreen[Optional[str]]):
             inp.value = self.dest_names[idx]
             inp.focus()
             inp.action_end()
+
+    def action_cursor_up(self) -> None:
+        _step_table_cursor(self.query_one(DataTable), -1)
+
+    def action_cursor_down(self) -> None:
+        _step_table_cursor(self.query_one(DataTable), 1)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -774,6 +820,16 @@ class WorkspaceMapperApp(App):
         self._filter_timer = None
 
     # -- key actions --
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Open the destination picker when Enter selects a row in the main table.
+
+        The focused DataTable consumes the Enter key itself, so the screen-level
+        ``enter`` binding never fires; the table emits RowSelected instead.
+        """
+        if event.data_table.id != "ws-main-table":
+            return
+        self.action_assign()
 
     def action_assign(self) -> None:
         if self._modal_is_active():

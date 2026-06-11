@@ -23,6 +23,7 @@ langsmith-migrator datasets
 
 - **All-in-One Wizard**: Interactive migration of all resources (`migrate-all`)
 - **Users & Roles**: Migrate custom roles, org members, and workspace memberships between instances
+- **Export Users to CSV**: Export active org and workspace members to a members CSV (`export-users`) that round-trips into the `users --members-csv` importer
 - **Single-Instance Access Sync**: Apply CSV-driven add/update or authoritative access sync to one LangSmith instance (`users --csv ... [--sync]`), including multi-row workspace role unionization for custom ABAC roles
 - **Datasets**: Migrate datasets with examples and file attachments
 - **Experiments**: Include experiments, runs, and feedback during dataset migration (`datasets --include-experiments`) or through `migrate-all`
@@ -144,6 +145,7 @@ langsmith-migrator charts --map-projects        # Interactive TUI project mappin
 langsmith-migrator charts --same-instance       # Reuse source IDs only when both sides share IDs
 
 # Utilities
+langsmith-migrator export-users --source -o users.csv  # Export active members to a members CSV
 langsmith-migrator list-projects --source
 langsmith-migrator list_workspaces --source --dest
 langsmith-migrator resume  # Resume pending/failed items from a prior migration session
@@ -160,9 +162,36 @@ langsmith-migrator clean
 - `rules`: migrate automation rules with project mapping controls
 - `charts`: migrate monitoring charts, either all sessions or one named session/project
 - `users`: migrate users/roles between instances, or run single-instance CSV access sync
+- `export-users`: export active org and workspace members to a members CSV for import via `users --members-csv`
 - `resume`: retry resumable items from a prior session and show grouped manual blockers
 - `list-projects` / `list_workspaces`: inspect project and workspace IDs for mapping
 - `clean`: remove saved migration sessions
+
+### Exporting users to CSV
+
+Use `export-users` to write the active org and workspace members of an instance to a members CSV. The output uses the exact columns the importer expects (`email`, `langsmith_role`, `workspace_id`, `workspace_name`), so an export from one instance feeds straight into `users --members-csv` on another.
+
+```bash
+# Export everything from the source instance (default output: users.csv)
+langsmith-migrator export-users --source -o users.csv
+
+# Export from the destination instead
+langsmith-migrator export-users --dest -o dest_users.csv
+
+# Org-level memberships only (skip workspace members)
+langsmith-migrator export-users --source --org-only -o org_users.csv
+
+# Restrict workspace membership export to specific workspace IDs (repeatable)
+langsmith-migrator export-users --source --workspace ws_a --workspace ws_b -o subset.csv
+```
+
+Notes:
+- **Pending invites are not exported** — only accepted (`active`) memberships are included.
+- Built-in roles are written with their display label (e.g. `Organization Admin`); custom roles use their display name.
+- Members whose role can't be mapped to a CSV label are still exported but with an empty `langsmith_role`; the command lists them so you can fill the value in before importing.
+- `--source` is the default if neither `--source` nor `--dest` is given; `--org-only` cannot be combined with `--workspace`.
+
+When importing into a *different* instance, the CSV's `workspace_id` values are the source workspace IDs — map them to the destination with `users --members-csv ... --source-workspace <SRC> --dest-workspace <DST>` (or `--map-workspaces`).
 
 ### Users migration with CSV member input
 

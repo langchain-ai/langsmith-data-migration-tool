@@ -94,6 +94,14 @@ STATUS_STYLES = {
 # ---------------------------------------------------------------------------
 
 
+def _step_table_cursor(table: DataTable, delta: int) -> None:
+    """Move a DataTable's row cursor by *delta*, clamped to valid rows."""
+    if table.row_count == 0:
+        return
+    row = max(0, min(table.cursor_row + delta, table.row_count - 1))
+    table.move_cursor(row=row)
+
+
 class DestinationPickerScreen(ModalScreen[Optional[str]]):
     """Modal screen for picking a destination project via text input with suggestions."""
 
@@ -149,6 +157,9 @@ class DestinationPickerScreen(ModalScreen[Optional[str]]):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel", show=True),
+        # The search input keeps focus, so forward arrow keys to the table.
+        Binding("up", "cursor_up", "Browse up", show=False),
+        Binding("down", "cursor_down", "Browse down", show=False),
     ]
 
     def __init__(
@@ -249,6 +260,12 @@ class DestinationPickerScreen(ModalScreen[Optional[str]]):
             inp.value = self.dest_labels[idx]
             inp.focus()
             inp.action_end()
+
+    def action_cursor_up(self) -> None:
+        _step_table_cursor(self.query_one(DataTable), -1)
+
+    def action_cursor_down(self) -> None:
+        _step_table_cursor(self.query_one(DataTable), 1)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -642,6 +659,16 @@ class ProjectMapperApp(App):
         self.query_one("#search-input", Input).focus()
 
     # -- Key actions --------------------------------------------------------
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Open the destination picker when Enter selects a row in the main table.
+
+        The focused DataTable consumes the Enter key itself, so the app-level
+        ``enter`` binding never fires; the table emits RowSelected instead.
+        """
+        if event.data_table.id != "main-table":
+            return
+        self.action_assign()
 
     def action_assign(self) -> None:
         if self._modal_is_active():
