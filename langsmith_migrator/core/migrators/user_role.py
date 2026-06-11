@@ -4,9 +4,8 @@ import hashlib
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
-from .base import BaseMigrator
 from ...utils.retry import APIError, AuthenticationError, ConflictError
-
+from .base import BaseMigrator
 
 WORKSPACE_ROLE_UNION_PREFIX = "union::workspace::"
 WORKSPACE_ROLE_UNION_DISPLAY_PREFIX = "LangSmith Migrator Union"
@@ -40,7 +39,7 @@ def parse_workspace_role_union_id(role_id: str) -> set[str]:
     """Return source role IDs embedded in a synthetic workspace role union ID."""
     if not is_workspace_role_union_id(role_id):
         return set()
-    encoded = role_id[len(WORKSPACE_ROLE_UNION_PREFIX):]
+    encoded = role_id[len(WORKSPACE_ROLE_UNION_PREFIX) :]
     return {part for part in encoded.split(",") if part}
 
 
@@ -87,11 +86,7 @@ def select_effective_workspace_role_id(
     workspace_id: str,
 ) -> str:
     """Collapse one user's CSV rows for a workspace to one effective role ID."""
-    role_rows = [
-        row
-        for row in rows
-        if (row.get("role_id") or "").strip()
-    ]
+    role_rows = [row for row in rows if (row.get("role_id") or "").strip()]
     role_ids = {
         (row.get("role_id") or "").strip()
         for row in role_rows
@@ -126,8 +121,7 @@ def select_effective_workspace_role_id(
     if unknown_role_labels:
         raise ValueError(
             "Members CSV has unsupported workspace role type(s) for "
-            f"{email} in workspace {workspace_id}: "
-            + ", ".join(unknown_role_labels)
+            f"{email} in workspace {workspace_id}: " + ", ".join(unknown_role_labels)
         )
 
     if custom_role_ids:
@@ -151,9 +145,7 @@ def select_effective_workspace_role_id(
 
     best_row = max(
         builtin_rows,
-        key=lambda row: WORKSPACE_ROLE_PRECEDENCE[
-            (row.get("role_name") or "").strip().upper()
-        ],
+        key=lambda row: WORKSPACE_ROLE_PRECEDENCE[(row.get("role_name") or "").strip().upper()],
     )
     return (best_row.get("role_id") or "").strip()
 
@@ -286,7 +278,7 @@ class UserRoleMigrator(BaseMigrator):
     def list_source_workspace_members(self) -> List[Dict[str, Any]]:
         """Fetch active workspace members from source (requires X-Tenant-Id)."""
         members = []
-        for member in self.source.get_paginated("/tenants/current/members/active"):
+        for member in self.source.get_paginated("/workspaces/current/members/active"):
             if isinstance(member, dict):
                 members.append(member)
         return members
@@ -294,7 +286,7 @@ class UserRoleMigrator(BaseMigrator):
     def list_dest_workspace_members(self) -> List[Dict[str, Any]]:
         """Fetch active workspace members from destination (requires X-Tenant-Id)."""
         members = []
-        for member in self.dest.get_paginated("/tenants/current/members/active"):
+        for member in self.dest.get_paginated("/workspaces/current/members/active"):
             if isinstance(member, dict):
                 members.append(member)
         return members
@@ -336,9 +328,7 @@ class UserRoleMigrator(BaseMigrator):
         source_roles = self.list_source_roles()
         dest_roles = self.list_dest_roles()
 
-        self.log(
-            f"Found {len(source_roles)} source roles, {len(dest_roles)} destination roles"
-        )
+        self.log(f"Found {len(source_roles)} source roles, {len(dest_roles)} destination roles")
 
         mapping = dict(self._role_id_map)
         mapping.update(self._match_builtin_roles(source_roles, dest_roles))
@@ -362,9 +352,7 @@ class UserRoleMigrator(BaseMigrator):
 
     def get_source_custom_roles(self) -> List[Dict[str, Any]]:
         """Return only custom roles from the source organisation."""
-        return [
-            role for role in self.list_source_roles() if role.get("name") == "CUSTOM"
-        ]
+        return [role for role in self.list_source_roles() if role.get("name") == "CUSTOM"]
 
     def list_source_access_policies(self) -> List[Dict[str, Any]]:
         """Fetch ABAC access policies from the source organisation when supported."""
@@ -380,20 +368,14 @@ class UserRoleMigrator(BaseMigrator):
     ) -> Dict[str, str]:
         """Create/reuse managed destination roles for synthetic workspace role unions."""
         requested_union_ids = {
-            role_id
-            for role_id in union_role_ids
-            if is_workspace_role_union_id(role_id)
+            role_id for role_id in union_role_ids if is_workspace_role_union_id(role_id)
         }
         if not requested_union_ids:
             return {}
 
         source_roles = self.list_source_roles()
         dest_roles = self.list_dest_roles()
-        source_role_by_id = {
-            role["id"]: role
-            for role in source_roles
-            if role.get("id")
-        }
+        source_role_by_id = {role["id"]: role for role in source_roles if role.get("id")}
         dest_by_display = {
             role.get("display_name", ""): role
             for role in dest_roles
@@ -410,9 +392,7 @@ class UserRoleMigrator(BaseMigrator):
                 for role_id in sorted(source_role_ids)
                 if role_id in source_role_by_id
             ]
-            missing_role_ids = source_role_ids - {
-                role["id"] for role in source_union_roles
-            }
+            missing_role_ids = source_role_ids - {role["id"] for role in source_union_roles}
             if missing_role_ids:
                 raise APIError(
                     "Cannot create workspace role union because source role "
@@ -468,9 +448,7 @@ class UserRoleMigrator(BaseMigrator):
                 union_role_hash=self._workspace_union_hash(source_role_ids),
             )
             mapping[union_role_id] = dest_role_id
-            self.log(
-                f"Resolved workspace role union {union_role_id} -> {dest_role_id}"
-            )
+            self.log(f"Resolved workspace role union {union_role_id} -> {dest_role_id}")
 
         self._role_id_map.update(mapping)
         if self.state:
@@ -500,9 +478,7 @@ class UserRoleMigrator(BaseMigrator):
                 mapping[role["id"]] = dest_id
                 self.log(f"Matched built-in role: {name}")
             else:
-                self.log(
-                    f"Built-in role '{name}' not found on destination", "warning"
-                )
+                self.log(f"Built-in role '{name}' not found on destination", "warning")
 
         return mapping
 
@@ -580,9 +556,7 @@ class UserRoleMigrator(BaseMigrator):
             response = self.dest.post("/orgs/current/roles", payload)
             dest_id = response.get("id") if isinstance(response, dict) else None
             if not dest_id:
-                raise APIError(
-                    f"Invalid response creating role: {response}"
-                )
+                raise APIError(f"Invalid response creating role: {response}")
             self.log(f"Created custom role: {display_name}", "success")
             return dest_id
         except APIError as e:
@@ -595,9 +569,7 @@ class UserRoleMigrator(BaseMigrator):
             )
             return None
 
-    def _update_custom_role(
-        self, dest_role_id: str, source_role: Dict[str, Any]
-    ) -> bool:
+    def _update_custom_role(self, dest_role_id: str, source_role: Dict[str, Any]) -> bool:
         """Update a custom role's permissions on the destination.
 
         Returns True on success, False on failure.
@@ -618,9 +590,7 @@ class UserRoleMigrator(BaseMigrator):
             self.log(f"Updated custom role: {display_name}", "success")
             return True
         except APIError as e:
-            self.log(
-                f"Failed to update custom role '{display_name}': {e}", "error"
-            )
+            self.log(f"Failed to update custom role '{display_name}': {e}", "error")
             return False
 
     def _platform_url(self, client, endpoint: str) -> str:
@@ -682,8 +652,7 @@ class UserRoleMigrator(BaseMigrator):
             ]
             raise APIError(
                 "Cannot create workspace role union because built-in role "
-                "permissions were not exposed by the roles API for: "
-                + ", ".join(sorted(labels)),
+                "permissions were not exposed by the roles API for: " + ", ".join(sorted(labels)),
                 request_info={},
             )
         source_labels = [
@@ -765,27 +734,18 @@ class UserRoleMigrator(BaseMigrator):
         if not relevant_policies:
             return
 
-        dest_by_id = {
-            policy.get("id"): policy
-            for policy in dest_policies
-            if policy.get("id")
-        }
+        dest_by_id = {policy.get("id"): policy for policy in dest_policies if policy.get("id")}
         dest_by_signature = {
-            self._access_policy_signature(policy): policy
-            for policy in dest_policies
+            self._access_policy_signature(policy): policy for policy in dest_policies
         }
         dest_by_name = {
-            policy.get("name"): policy
-            for policy in dest_policies
-            if policy.get("name")
+            policy.get("name"): policy for policy in dest_policies if policy.get("name")
         }
 
         for source_policy in relevant_policies:
             dest_policy = dest_by_id.get(source_policy.get("id"))
             if not dest_policy:
-                dest_policy = dest_by_signature.get(
-                    self._access_policy_signature(source_policy)
-                )
+                dest_policy = dest_by_signature.get(self._access_policy_signature(source_policy))
             if not dest_policy:
                 dest_policy = dest_by_name.get(
                     self._managed_union_policy_name(
@@ -808,9 +768,7 @@ class UserRoleMigrator(BaseMigrator):
                     )
                 dest_policies.append(dest_policy)
                 dest_by_id[dest_policy["id"]] = dest_policy
-                dest_by_signature[
-                    self._access_policy_signature(dest_policy)
-                ] = dest_policy
+                dest_by_signature[self._access_policy_signature(dest_policy)] = dest_policy
                 dest_by_name[dest_policy["name"]] = dest_policy
                 continue
 
@@ -983,9 +941,7 @@ class UserRoleMigrator(BaseMigrator):
                 workspace_id for workspace_id in desired_workspace_ids if workspace_id
             ),
             "desired_workspace_role_id": desired_workspace_role_id,
-            "desired_workspace_access_representable": (
-                desired_workspace_access_representable
-            ),
+            "desired_workspace_access_representable": (desired_workspace_access_representable),
         }
         if error is not None:
             evidence.update(
@@ -1050,10 +1006,7 @@ class UserRoleMigrator(BaseMigrator):
         dest_members = self.list_dest_org_members()
         pending_dest_members = (
             self.list_dest_pending_org_members()
-            if (
-                remove_pending
-                or any(member.get("workspace_ids") for member in selected_members)
-            )
+            if (remove_pending or any(member.get("workspace_ids") for member in selected_members))
             else []
         )
 
@@ -1088,16 +1041,16 @@ class UserRoleMigrator(BaseMigrator):
 
             item_id = f"org_member_{email}"
             self.ensure_item(
-                item_id, "org_member", email,
+                item_id,
+                "org_member",
+                email,
                 member.get("id", email),
                 metadata={"member": member},
             )
 
             source_role_id = (member.get("role_id") or "").strip() or None
             mapped_role_id = self._role_id_map.get(source_role_id) if source_role_id else None
-            source_workspace_role_id = (
-                (member.get("workspace_role_id") or "").strip() or None
-            )
+            source_workspace_role_id = (member.get("workspace_role_id") or "").strip() or None
             mapped_workspace_role_id = (
                 self._role_id_map.get(source_workspace_role_id)
                 if source_workspace_role_id
@@ -1110,7 +1063,8 @@ class UserRoleMigrator(BaseMigrator):
                     "warning",
                 )
                 self.mark_blocked(
-                    item_id, "unmapped_role",
+                    item_id,
+                    "unmapped_role",
                     next_action="Run phase 1 (role sync) and retry.",
                     evidence={"email": email, "source_role_id": source_role_id},
                 )
@@ -1136,9 +1090,7 @@ class UserRoleMigrator(BaseMigrator):
             dest_member = dest_by_email.get(email)
             pending_member = pending_by_email.get(email)
             workspace_ids = [
-                workspace_id
-                for workspace_id in (member.get("workspace_ids") or [])
-                if workspace_id
+                workspace_id for workspace_id in (member.get("workspace_ids") or []) if workspace_id
             ]
             workspace_role_id = mapped_workspace_role_id
 
@@ -1152,9 +1104,7 @@ class UserRoleMigrator(BaseMigrator):
                 dest_role_id = dest_member.get("role_id")
                 if mapped_role_id and dest_role_id != mapped_role_id:
                     try:
-                        self._update_org_member_role(
-                            dest_member["id"], mapped_role_id
-                        )
+                        self._update_org_member_role(dest_member["id"], mapped_role_id)
                         self.mark_migrated(item_id, outcome_code="org_member_migrated")
                         migrated += 1
                     except (AuthenticationError, APIError) as e:
@@ -1172,7 +1122,8 @@ class UserRoleMigrator(BaseMigrator):
                             ),
                         )
                         self.mark_blocked(
-                            item_id, "org_member_role_update_failed",
+                            item_id,
+                            "org_member_role_update_failed",
                             next_action=next_action,
                             evidence=evidence,
                         )
@@ -1185,9 +1136,7 @@ class UserRoleMigrator(BaseMigrator):
                 dest_role_id = pending_member.get("role_id")
                 needs_workspace_access = bool(workspace_ids and workspace_role_id)
                 desired_workspace_ids = {
-                    workspace_id
-                    for workspace_id in workspace_ids
-                    if workspace_id
+                    workspace_id for workspace_id in workspace_ids if workspace_id
                 }
                 pending_workspace_ids = {
                     workspace_id
@@ -1195,8 +1144,8 @@ class UserRoleMigrator(BaseMigrator):
                     if workspace_id
                 }
                 pending_workspace_role_id = (
-                    (pending_member.get("workspace_role_id") or "").strip() or None
-                )
+                    pending_member.get("workspace_role_id") or ""
+                ).strip() or None
                 pending_covers_workspace_access = (
                     needs_workspace_access
                     and desired_workspace_ids.issubset(pending_workspace_ids)
@@ -1233,10 +1182,7 @@ class UserRoleMigrator(BaseMigrator):
                             reasons.append("org role differs")
                         if not pending_workspace_access_matches:
                             reasons.append("workspace access differs")
-                        self.log(
-                            f"Replacing pending invite for {email}: "
-                            + ", ".join(reasons)
-                        )
+                        self.log(f"Replacing pending invite for {email}: " + ", ".join(reasons))
                         pending_removed = self._remove_org_member(
                             pending_member["id"],
                             pending=True,
@@ -1418,7 +1364,8 @@ class UserRoleMigrator(BaseMigrator):
                         ),
                     )
                     self.mark_blocked(
-                        item_id, "org_member_invite_failed",
+                        item_id,
+                        "org_member_invite_failed",
                         next_action=next_action,
                         evidence=evidence,
                     )
@@ -1426,14 +1373,10 @@ class UserRoleMigrator(BaseMigrator):
 
         if remove_missing:
             extra_members = [
-                member
-                for email, member in dest_by_email.items()
-                if email not in desired_emails
+                member for email, member in dest_by_email.items() if email not in desired_emails
             ]
             extra_members.extend(
-                member
-                for email, member in pending_by_email.items()
-                if email not in desired_emails
+                member for email, member in pending_by_email.items() if email not in desired_emails
             )
             extra_members.sort(key=lambda member: (member.get("email") or "").lower())
 
@@ -1540,9 +1483,7 @@ class UserRoleMigrator(BaseMigrator):
             self.log(f"[DRY RUN] Would update org member role: {identity_id}")
             return
 
-        self.dest.patch(
-            f"/orgs/current/members/{identity_id}", {"role_id": role_id}
-        )
+        self.dest.patch(f"/orgs/current/members/{identity_id}", {"role_id": role_id})
         self.log(f"Updated org member role: {identity_id}", "success")
 
     def _remove_org_member(
@@ -1595,8 +1536,7 @@ class UserRoleMigrator(BaseMigrator):
                     if not (tolerate_missing and legacy_unsupported):
                         raise
                     self.log(
-                        "Pending org invite is not cancellable via known endpoints: "
-                        f"{identity_id}",
+                        f"Pending org invite is not cancellable via known endpoints: {identity_id}",
                         "warning",
                     )
                     return False
@@ -1666,9 +1606,7 @@ class UserRoleMigrator(BaseMigrator):
                 "full_name": first_row.get("full_name", ""),
             }
 
-        return self.migrate_workspace_members(
-            selected_members=list(selected_by_email.values())
-        )
+        return self.migrate_workspace_members(selected_members=list(selected_by_email.values()))
 
     def migrate_workspace_members(
         self,
@@ -1727,7 +1665,9 @@ class UserRoleMigrator(BaseMigrator):
 
             item_id = f"ws_member_{src_ws}_{email}"
             self.ensure_item(
-                item_id, "ws_member", email,
+                item_id,
+                "ws_member",
+                email,
                 member.get("id", email),
                 metadata={"member": member, "workspace_pair": ws_pair},
             )
@@ -1752,18 +1692,13 @@ class UserRoleMigrator(BaseMigrator):
                 continue
 
             source_role_id = (member.get("role_id") or "").strip() or None
-            mapped_role_id = (
-                self._role_id_map.get(source_role_id)
-                if source_role_id
-                else None
-            )
+            mapped_role_id = self._role_id_map.get(source_role_id) if source_role_id else None
 
             if source_role_id and not mapped_role_id:
-                self.log(
-                    f"No role mapping for workspace member {email}", "warning"
-                )
+                self.log(f"No role mapping for workspace member {email}", "warning")
                 self.mark_blocked(
-                    item_id, "unmapped_role",
+                    item_id,
+                    "unmapped_role",
                     next_action="Run phase 1 (role sync) and retry.",
                     evidence={"email": email, "source_role_id": source_role_id},
                 )
@@ -1792,9 +1727,7 @@ class UserRoleMigrator(BaseMigrator):
                 dest_role_id = dest_member.get("role_id")
                 if mapped_role_id and dest_role_id != mapped_role_id:
                     try:
-                        self._update_workspace_member_role(
-                            dest_member["id"], mapped_role_id
-                        )
+                        self._update_workspace_member_role(dest_member["id"], mapped_role_id)
                         self.mark_migrated(item_id, outcome_code="ws_member_migrated")
                         migrated += 1
                     except (AuthenticationError, APIError) as e:
@@ -1803,7 +1736,8 @@ class UserRoleMigrator(BaseMigrator):
                             "error",
                         )
                         self.mark_blocked(
-                            item_id, "ws_member_role_update_failed",
+                            item_id,
+                            "ws_member_role_update_failed",
                             next_action=(
                                 "Review the workspace role update error in the "
                                 "remediation bundle, then re-run "
@@ -1823,19 +1757,17 @@ class UserRoleMigrator(BaseMigrator):
                         "warning",
                     )
                     self.mark_blocked(
-                        item_id, "ws_member_not_in_org",
+                        item_id,
+                        "ws_member_not_in_org",
                         next_action="Migrate the user as an org member first, then retry.",
                         evidence={"email": email},
                     )
                     failed += 1
                     continue
                 pending_org_member = self._pending_org_email_to_identity.get(email)
-                pending_user_id = (
-                    pending_org_member
-                    and (
-                        pending_org_member.get("user_id")
-                        or (pending_org_member.get("user") or {}).get("id")
-                    )
+                pending_user_id = pending_org_member and (
+                    pending_org_member.get("user_id")
+                    or (pending_org_member.get("user") or {}).get("id")
                 )
                 if pending_org_member and not pending_user_id:
                     if email in self._pending_org_invite_wait_reported:
@@ -1883,11 +1815,10 @@ class UserRoleMigrator(BaseMigrator):
                     self.mark_migrated(item_id, outcome_code="ws_member_skipped_existing")
                     skipped += 1
                 except (AuthenticationError, APIError) as e:
-                    self.log(
-                        f"Failed to add '{email}' to workspace: {e}", "error"
-                    )
+                    self.log(f"Failed to add '{email}' to workspace: {e}", "error")
                     self.mark_blocked(
-                        item_id, "ws_member_add_failed",
+                        item_id,
+                        "ws_member_add_failed",
                         next_action=(
                             "Review the workspace membership create error in the "
                             "remediation bundle, then re-run "
@@ -1899,9 +1830,7 @@ class UserRoleMigrator(BaseMigrator):
 
         if remove_missing:
             extra_members = [
-                member
-                for email, member in dest_by_email.items()
-                if email not in desired_emails
+                member for email, member in dest_by_email.items() if email not in desired_emails
             ]
             extra_members.sort(key=lambda member: (member.get("email") or "").lower())
 
@@ -1951,10 +1880,7 @@ class UserRoleMigrator(BaseMigrator):
     ) -> Dict[str, Any]:
         """Add an org member to the current workspace."""
         org_identity_id = org_member.get("id", "")
-        user_id = (
-            org_member.get("user_id")
-            or (org_member.get("user") or {}).get("id")
-        )
+        user_id = org_member.get("user_id") or (org_member.get("user") or {}).get("id")
 
         if self.config.migration.dry_run:
             self.log(f"[DRY RUN] Would add workspace member: {org_identity_id}")
@@ -1966,7 +1892,11 @@ class UserRoleMigrator(BaseMigrator):
                 "workspace_ids": [workspace_id],
             }
             if role_id:
+                # The workspace endpoint's IdentityCreate schema reads "role_id";
+                # "workspace_role_id" is the org-endpoint field name and is
+                # silently dropped here, so send both for compatibility.
                 payload["workspace_role_id"] = role_id
+                payload["role_id"] = role_id
             try:
                 response = self.dest.post("/workspaces/current/members", payload)
                 self.log(f"Added workspace member: {org_identity_id}", "success")
@@ -1987,24 +1917,18 @@ class UserRoleMigrator(BaseMigrator):
         if role_id:
             payload["role_id"] = role_id
 
-        response = self.dest.post("/tenants/current/members", payload)
+        response = self.dest.post("/workspaces/current/members", payload)
         self.log(f"Added workspace member: {org_identity_id}", "success")
         return response
 
-    def _update_workspace_member_role(
-        self, identity_id: str, role_id: str
-    ) -> None:
+    def _update_workspace_member_role(self, identity_id: str, role_id: str) -> None:
         """Update a workspace member's role."""
         if self.config.migration.dry_run:
-            self.log(
-                f"[DRY RUN] Would update workspace member role: {identity_id}"
-            )
+            self.log(f"[DRY RUN] Would update workspace member role: {identity_id}")
             return
 
         try:
-            self.dest.patch(
-                f"/workspaces/current/members/{identity_id}", {"role_id": role_id}
-            )
+            self.dest.patch(f"/workspaces/current/members/{identity_id}", {"role_id": role_id})
         except APIError as e:
             status_code = getattr(e, "status_code", None)
             message = str(e).lower()
@@ -2014,9 +1938,7 @@ class UserRoleMigrator(BaseMigrator):
                 and "not allowed" not in message
             ):
                 raise
-            self.dest.patch(
-                f"/tenants/current/members/{identity_id}", {"role_id": role_id}
-            )
+            self.dest.patch(f"/workspaces/current/members/{identity_id}", {"role_id": role_id})
         self.log(f"Updated workspace member role: {identity_id}", "success")
 
     def _remove_workspace_member(self, identity_id: str) -> None:
@@ -2036,7 +1958,7 @@ class UserRoleMigrator(BaseMigrator):
                 and "not allowed" not in message
             ):
                 raise
-            self.dest.delete(f"/tenants/current/members/{identity_id}")
+            self.dest.delete(f"/workspaces/current/members/{identity_id}")
         self.log(f"Removed workspace member: {identity_id}", "success")
 
     # ------------------------------------------------------------------
@@ -2066,9 +1988,7 @@ class UserRoleMigrator(BaseMigrator):
 
             # Members endpoint
             try:
-                client.get(
-                    "/orgs/current/members/active", params={"limit": 1}
-                )
+                client.get("/orgs/current/members/active", params={"limit": 1})
                 self.record_capability(
                     scope,
                     "members_api",

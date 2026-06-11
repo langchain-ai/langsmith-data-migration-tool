@@ -105,3 +105,16 @@ def test_project_mapper_keeps_duplicate_source_project_ids_visible():
         "source-third-project",
     }
     assert any("a3cee8e2" in mapping.source_label for mapping in app.mappings)
+
+
+def test_enter_on_main_table_row_opens_destination_picker(monkeypatch):
+    """RowSelected from the main table (Enter key) must trigger action_assign."""
+
+    app = ProjectMapperApp([{"id": "src-1", "name": "Project A"}], [])
+    calls = []
+    monkeypatch.setattr(app, "action_assign", lambda: calls.append("assign"))
+
+    app.on_data_table_row_selected(SimpleNamespace(data_table=SimpleNamespace(id="main-table")))
+    app.on_data_table_row_selected(SimpleNamespace(data_table=SimpleNamespace(id="dest-table")))
+
+    assert calls == ["assign"]

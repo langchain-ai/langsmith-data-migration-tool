@@ -1,7 +1,9 @@
 """Unit tests for UserRoleMigrator."""
 
-import pytest
 from unittest.mock import Mock, call
+
+import pytest
+
 from langsmith_migrator.core.migrators import UserRoleMigrator
 from langsmith_migrator.core.migrators.user_role import make_workspace_role_union_id
 from langsmith_migrator.utils.retry import APIError, AuthenticationError, ConflictError
@@ -30,19 +32,54 @@ class TestUserRoleMigrator:
     @pytest.fixture
     def source_roles(self):
         return [
-            {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin", "permissions": []},
-            {"id": "src-user", "name": "ORGANIZATION_USER", "display_name": "User", "permissions": []},
-            {"id": "src-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin", "permissions": []},
-            {"id": "src-custom-1", "name": "CUSTOM", "display_name": "Data Scientist",
-             "description": "Custom DS role", "permissions": ["datasets:read", "datasets:create", "runs:read"]},
+            {
+                "id": "src-admin",
+                "name": "ORGANIZATION_ADMIN",
+                "display_name": "Admin",
+                "permissions": [],
+            },
+            {
+                "id": "src-user",
+                "name": "ORGANIZATION_USER",
+                "display_name": "User",
+                "permissions": [],
+            },
+            {
+                "id": "src-ws-admin",
+                "name": "WORKSPACE_ADMIN",
+                "display_name": "Workspace Admin",
+                "permissions": [],
+            },
+            {
+                "id": "src-custom-1",
+                "name": "CUSTOM",
+                "display_name": "Data Scientist",
+                "description": "Custom DS role",
+                "permissions": ["datasets:read", "datasets:create", "runs:read"],
+            },
         ]
 
     @pytest.fixture
     def dest_roles(self):
         return [
-            {"id": "dst-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin", "permissions": []},
-            {"id": "dst-user", "name": "ORGANIZATION_USER", "display_name": "User", "permissions": []},
-            {"id": "dst-ws-admin", "name": "WORKSPACE_ADMIN", "display_name": "Workspace Admin", "permissions": []},
+            {
+                "id": "dst-admin",
+                "name": "ORGANIZATION_ADMIN",
+                "display_name": "Admin",
+                "permissions": [],
+            },
+            {
+                "id": "dst-user",
+                "name": "ORGANIZATION_USER",
+                "display_name": "User",
+                "permissions": [],
+            },
+            {
+                "id": "dst-ws-admin",
+                "name": "WORKSPACE_ADMIN",
+                "display_name": "Workspace Admin",
+                "permissions": [],
+            },
         ]
 
     # ── Phase 1: Role mapping ──
@@ -77,8 +114,12 @@ class TestUserRoleMigrator:
         sample_config.migration.skip_existing = True
 
         dest_roles_with_custom = [
-            {"id": "dst-custom-1", "name": "CUSTOM", "display_name": "Data Scientist",
-             "permissions": ["datasets:read"]},  # Fewer permissions
+            {
+                "id": "dst-custom-1",
+                "name": "CUSTOM",
+                "display_name": "Data Scientist",
+                "permissions": ["datasets:read"],
+            },  # Fewer permissions
         ]
 
         mapping = migrator._sync_custom_roles(source_roles, dest_roles_with_custom)
@@ -92,8 +133,13 @@ class TestUserRoleMigrator:
         sample_config.migration.skip_existing = False
 
         dest_roles_with_custom = [
-            {"id": "dst-custom-1", "name": "CUSTOM", "display_name": "Data Scientist",
-             "description": "Old desc", "permissions": ["datasets:read"]},
+            {
+                "id": "dst-custom-1",
+                "name": "CUSTOM",
+                "display_name": "Data Scientist",
+                "description": "Old desc",
+                "permissions": ["datasets:read"],
+            },
         ]
 
         mapping = migrator._sync_custom_roles(source_roles, dest_roles_with_custom)
@@ -108,21 +154,29 @@ class TestUserRoleMigrator:
             },
         )
 
-    def test_sync_custom_roles_no_update_when_permissions_match(self, migrator, source_roles, sample_config):
+    def test_sync_custom_roles_no_update_when_permissions_match(
+        self, migrator, source_roles, sample_config
+    ):
         """No PATCH when permissions already match."""
         sample_config.migration.skip_existing = False
 
         dest_roles_with_custom = [
-            {"id": "dst-custom-1", "name": "CUSTOM", "display_name": "Data Scientist",
-             "description": "Custom DS role",
-             "permissions": ["datasets:read", "datasets:create", "runs:read"]},
+            {
+                "id": "dst-custom-1",
+                "name": "CUSTOM",
+                "display_name": "Data Scientist",
+                "description": "Custom DS role",
+                "permissions": ["datasets:read", "datasets:create", "runs:read"],
+            },
         ]
 
         migrator._sync_custom_roles(source_roles, dest_roles_with_custom)
 
         migrator.dest.patch.assert_not_called()
 
-    def test_build_role_mapping_persists_to_state(self, migrator, source_roles, dest_roles, migration_state):
+    def test_build_role_mapping_persists_to_state(
+        self, migrator, source_roles, dest_roles, migration_state
+    ):
         """Role mapping is persisted in state.id_mappings['roles']."""
         migrator.source.get.return_value = source_roles
         migrator.dest.get.return_value = dest_roles
@@ -147,7 +201,12 @@ class TestUserRoleMigrator:
     def test_build_role_mapping_accumulates_requested_custom_roles(self, migrator, dest_roles):
         """Repeated selective sync calls preserve custom roles already mapped earlier."""
         source_roles = [
-            {"id": "src-admin", "name": "ORGANIZATION_ADMIN", "display_name": "Admin", "permissions": []},
+            {
+                "id": "src-admin",
+                "name": "ORGANIZATION_ADMIN",
+                "display_name": "Admin",
+                "permissions": [],
+            },
             {
                 "id": "src-custom-1",
                 "name": "CUSTOM",
@@ -315,7 +374,9 @@ class TestUserRoleMigrator:
             "name": "Assistant project access",
             "description": "Restrict projects by assistant",
             "effect": "allow",
-            "condition_groups": [{"permission": "projects:read", "resource_type": "project", "conditions": []}],
+            "condition_groups": [
+                {"permission": "projects:read", "resource_type": "project", "conditions": []}
+            ],
             "role_ids": ["src-custom-1"],
         }
         dest_policy = {
@@ -381,7 +442,9 @@ class TestUserRoleMigrator:
             "name": "Assistant project access",
             "description": "Restrict projects by assistant",
             "effect": "allow",
-            "condition_groups": [{"permission": "projects:read", "resource_type": "project", "conditions": []}],
+            "condition_groups": [
+                {"permission": "projects:read", "resource_type": "project", "conditions": []}
+            ],
             "role_ids": ["src-custom-1"],
         }
 
@@ -391,9 +454,7 @@ class TestUserRoleMigrator:
             else {"access_policies": [source_policy]}
         )
         migrator.dest.get.side_effect = lambda endpoint, params=None: (
-            []
-            if endpoint == "/orgs/current/roles"
-            else {"access_policies": []}
+            [] if endpoint == "/orgs/current/roles" else {"access_policies": []}
         )
         migrator.dest.post.side_effect = [
             {"id": "dst-union-role"},
@@ -435,7 +496,9 @@ class TestUserRoleMigrator:
             "name": "Assistant project access",
             "description": "Restrict projects by assistant",
             "effect": "allow",
-            "condition_groups": [{"permission": "projects:read", "resource_type": "project", "conditions": []}],
+            "condition_groups": [
+                {"permission": "projects:read", "resource_type": "project", "conditions": []}
+            ],
             "role_ids": ["src-custom-1"],
         }
         dest_policy = {
@@ -474,8 +537,18 @@ class TestUserRoleMigrator:
         sample_config.migration.skip_existing = True
         union_role_id = make_workspace_role_union_id({"src-custom-1", "src-custom-2"})
         source_roles = [
-            {"id": "src-custom-1", "name": "CUSTOM", "display_name": "A", "permissions": ["projects:read"]},
-            {"id": "src-custom-2", "name": "CUSTOM", "display_name": "B", "permissions": ["datasets:read"]},
+            {
+                "id": "src-custom-1",
+                "name": "CUSTOM",
+                "display_name": "A",
+                "permissions": ["projects:read"],
+            },
+            {
+                "id": "src-custom-2",
+                "name": "CUSTOM",
+                "display_name": "B",
+                "permissions": ["datasets:read"],
+            },
         ]
         union_role = migrator._build_workspace_union_role(union_role_id, source_roles)
 
@@ -517,14 +590,10 @@ class TestUserRoleMigrator:
             },
         ]
         migrator.source.get.side_effect = lambda endpoint, params=None: (
-            source_roles
-            if endpoint == "/orgs/current/roles"
-            else {"access_policies": []}
+            source_roles if endpoint == "/orgs/current/roles" else {"access_policies": []}
         )
         migrator.dest.get.side_effect = lambda endpoint, params=None: (
-            []
-            if endpoint == "/orgs/current/roles"
-            else {"access_policies": []}
+            [] if endpoint == "/orgs/current/roles" else {"access_policies": []}
         )
 
         with pytest.raises(APIError, match="built-in role permissions were not exposed"):
@@ -557,7 +626,12 @@ class TestUserRoleMigrator:
         migrator.dest.post.return_value = {"id": "new-identity-1"}
 
         members = [
-            {"id": "src-m1", "email": "alice@example.com", "role_id": "src-role", "full_name": "Alice"},
+            {
+                "id": "src-m1",
+                "email": "alice@example.com",
+                "role_id": "src-role",
+                "full_name": "Alice",
+            },
         ]
 
         m, s, f = migrator.migrate_org_members(members)
@@ -602,7 +676,9 @@ class TestUserRoleMigrator:
             },
         )
         assert migrator._pending_workspace_invites == {("alice@example.com", "ws-1")}
-        assert migrator._pending_org_email_to_identity["alice@example.com"]["id"] == "new-identity-1"
+        assert (
+            migrator._pending_org_email_to_identity["alice@example.com"]["id"] == "new-identity-1"
+        )
 
     def test_ensure_dest_email_index_preserves_newly_invited_pending_identities(self, migrator):
         """A refresh keeps newly invited identities available for the workspace phase."""
@@ -618,9 +694,11 @@ class TestUserRoleMigrator:
     def test_migrate_org_members_update_role(self, migrator):
         """Existing members with different roles get updated."""
         migrator._role_id_map = {"src-role": "dst-role-new"}
-        migrator.dest.get_paginated.return_value = iter([
-            {"id": "dst-m1", "email": "alice@example.com", "role_id": "dst-role-old"},
-        ])
+        migrator.dest.get_paginated.return_value = iter(
+            [
+                {"id": "dst-m1", "email": "alice@example.com", "role_id": "dst-role-old"},
+            ]
+        )
 
         members = [
             {"id": "src-m1", "email": "alice@example.com", "role_id": "src-role"},
@@ -638,9 +716,11 @@ class TestUserRoleMigrator:
         """With skip_existing, existing members are skipped."""
         sample_config.migration.skip_existing = True
         migrator._role_id_map = {"src-role": "dst-role"}
-        migrator.dest.get_paginated.return_value = iter([
-            {"id": "dst-m1", "email": "alice@example.com", "role_id": "dst-role-old"},
-        ])
+        migrator.dest.get_paginated.return_value = iter(
+            [
+                {"id": "dst-m1", "email": "alice@example.com", "role_id": "dst-role-old"},
+            ]
+        )
 
         members = [
             {"id": "src-m1", "email": "alice@example.com", "role_id": "src-role"},
@@ -656,9 +736,7 @@ class TestUserRoleMigrator:
         """409 Conflict on invite is treated as skip."""
         migrator._role_id_map = {"src-role": "dst-role"}
         migrator.dest.get_paginated.return_value = iter([])
-        migrator.dest.post.side_effect = ConflictError(
-            "Already pending", request_info={}
-        )
+        migrator.dest.post.side_effect = ConflictError("Already pending", request_info={})
 
         members = [
             {"id": "src-m1", "email": "alice@example.com", "role_id": "src-role"},
@@ -690,9 +768,11 @@ class TestUserRoleMigrator:
         migrator._role_id_map = {"src-role": "dst-role-new"}
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
-            ]),
+            iter(
+                [
+                    {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
+                ]
+            ),
         ]
         migrator.dest.post.return_value = {"id": "new-identity-1"}
 
@@ -710,24 +790,22 @@ class TestUserRoleMigrator:
             "Replacing pending invite for alice@example.com" in call_args.args[0]
             for call_args in migrator.log.call_args_list
         )
-        migrator.dest.delete.assert_called_once_with(
-            "/orgs/current/members/pending/pending-1"
-        )
+        migrator.dest.delete.assert_called_once_with("/orgs/current/members/pending/pending-1")
         migrator.dest.post.assert_called_once_with(
             "/orgs/current/members",
             {"email": "alice@example.com", "role_id": "dst-role-new"},
         )
 
-    def test_migrate_org_members_reinvites_pending_falls_back_to_legacy_delete_path(
-        self, migrator
-    ):
+    def test_migrate_org_members_reinvites_pending_falls_back_to_legacy_delete_path(self, migrator):
         """Pending invite replacement should tolerate instances that only support the legacy delete path."""
         migrator._role_id_map = {"src-role": "dst-role-new"}
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
-            ]),
+            iter(
+                [
+                    {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
+                ]
+            ),
         ]
         migrator.dest.delete.side_effect = [
             APIError("Not found", status_code=404, request_info={}),
@@ -761,9 +839,11 @@ class TestUserRoleMigrator:
         migrator._role_id_map = {"src-role": "dst-role-new"}
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
-            ]),
+            iter(
+                [
+                    {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
+                ]
+            ),
         ]
         migrator.dest.delete.side_effect = [
             APIError("Not found", status_code=404, request_info={}),
@@ -798,9 +878,11 @@ class TestUserRoleMigrator:
         migrator._role_id_map = {"src-role": "dst-role-new"}
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
-            ]),
+            iter(
+                [
+                    {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
+                ]
+            ),
         ]
         migrator.dest.delete.side_effect = [
             APIError("Method not allowed", status_code=405, request_info={}),
@@ -825,9 +907,7 @@ class TestUserRoleMigrator:
         assert migrator._pending_org_blockers["alice@example.com"]["item_id"] == item.id
         migrator.dest.post.assert_not_called()
 
-    def test_migrate_org_members_reinvites_pending_when_workspace_access_is_needed(
-        self, migrator
-    ):
+    def test_migrate_org_members_reinvites_pending_when_workspace_access_is_needed(self, migrator):
         """Existing pending invites should be replaced when workspace access still needs to be attached."""
         migrator.log = Mock()
         migrator._role_id_map = {
@@ -836,9 +916,11 @@ class TestUserRoleMigrator:
         }
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role"},
-            ]),
+            iter(
+                [
+                    {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role"},
+                ]
+            ),
         ]
         migrator.dest.post.return_value = {"id": "new-identity-1"}
 
@@ -856,12 +938,11 @@ class TestUserRoleMigrator:
 
         assert (m, s, f) == (1, 0, 0)
         assert any(
-            "Pending invite for alice@example.com will include workspace access" in call_args.args[0]
+            "Pending invite for alice@example.com will include workspace access"
+            in call_args.args[0]
             for call_args in migrator.log.call_args_list
         )
-        migrator.dest.delete.assert_called_once_with(
-            "/orgs/current/members/pending/pending-1"
-        )
+        migrator.dest.delete.assert_called_once_with("/orgs/current/members/pending/pending-1")
         migrator.dest.post.assert_called_once_with(
             "/orgs/current/members",
             {
@@ -872,7 +953,9 @@ class TestUserRoleMigrator:
             },
         )
         assert migrator._pending_workspace_invites == {("alice@example.com", "ws-1")}
-        assert migrator._pending_org_email_to_identity["alice@example.com"]["id"] == "new-identity-1"
+        assert (
+            migrator._pending_org_email_to_identity["alice@example.com"]["id"] == "new-identity-1"
+        )
 
     def test_migrate_org_members_keeps_pending_invite_when_role_and_workspace_access_match(
         self, migrator
@@ -885,15 +968,17 @@ class TestUserRoleMigrator:
         }
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {
-                    "id": "pending-1",
-                    "email": "alice@example.com",
-                    "role_id": "dst-role",
-                    "workspace_ids": ["ws-1"],
-                    "workspace_role_id": "dst-ws-role",
-                },
-            ]),
+            iter(
+                [
+                    {
+                        "id": "pending-1",
+                        "email": "alice@example.com",
+                        "role_id": "dst-role",
+                        "workspace_ids": ["ws-1"],
+                        "workspace_role_id": "dst-ws-role",
+                    },
+                ]
+            ),
         ]
 
         members = [
@@ -928,15 +1013,17 @@ class TestUserRoleMigrator:
         }
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {
-                    "id": "pending-1",
-                    "email": "alice@example.com",
-                    "role_id": "dst-role",
-                    "workspace_ids": ["ws-1", "ws-2"],
-                    "workspace_role_id": "dst-ws-role",
-                },
-            ]),
+            iter(
+                [
+                    {
+                        "id": "pending-1",
+                        "email": "alice@example.com",
+                        "role_id": "dst-role",
+                        "workspace_ids": ["ws-1", "ws-2"],
+                        "workspace_role_id": "dst-ws-role",
+                    },
+                ]
+            ),
         ]
         migrator.dest.post.return_value = {"id": "new-identity-1"}
 
@@ -957,9 +1044,7 @@ class TestUserRoleMigrator:
         )
 
         assert (m, s, f) == (1, 0, 0)
-        migrator.dest.delete.assert_called_once_with(
-            "/orgs/current/members/pending/pending-1"
-        )
+        migrator.dest.delete.assert_called_once_with("/orgs/current/members/pending/pending-1")
         migrator.dest.post.assert_called_once_with(
             "/orgs/current/members",
             {
@@ -978,9 +1063,11 @@ class TestUserRoleMigrator:
         migrator._role_id_map = {"src-role": "dst-role-new"}
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
-            ]),
+            iter(
+                [
+                    {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
+                ]
+            ),
         ]
         migrator.dest.delete.side_effect = AuthenticationError(
             "Access denied for /orgs/current/members/pending/pending-1",
@@ -1013,9 +1100,11 @@ class TestUserRoleMigrator:
         migrator._role_id_map = {"src-role": "dst-role-new"}
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
-            ]),
+            iter(
+                [
+                    {"id": "pending-1", "email": "alice@example.com", "role_id": "dst-role-old"},
+                ]
+            ),
         ]
         migrator.dest.delete.side_effect = APIError(
             "not allowed to delete pending invite",
@@ -1054,15 +1143,17 @@ class TestUserRoleMigrator:
         }
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {
-                    "id": "pending-1",
-                    "email": "alice@example.com",
-                    "role_id": "dst-role-old",
-                    "workspace_ids": ["ws-old"],
-                    "workspace_role_id": "dst-ws-old",
-                },
-            ]),
+            iter(
+                [
+                    {
+                        "id": "pending-1",
+                        "email": "alice@example.com",
+                        "role_id": "dst-role-old",
+                        "workspace_ids": ["ws-old"],
+                        "workspace_role_id": "dst-ws-old",
+                    },
+                ]
+            ),
         ]
         migrator.dest.post.side_effect = ConflictError(
             "pending invite already exists",
@@ -1103,15 +1194,17 @@ class TestUserRoleMigrator:
         migrator._role_id_map = {"src-role": "dst-role"}
         migrator.dest.get_paginated.side_effect = [
             iter([]),
-            iter([
-                {
-                    "id": "pending-1",
-                    "email": "alice@example.com",
-                    "role_id": "dst-role",
-                    "workspace_ids": ["ws-1"],
-                    "workspace_role_id": "dst-ws-role",
-                },
-            ]),
+            iter(
+                [
+                    {
+                        "id": "pending-1",
+                        "email": "alice@example.com",
+                        "role_id": "dst-role",
+                        "workspace_ids": ["ws-1"],
+                        "workspace_role_id": "dst-ws-role",
+                    },
+                ]
+            ),
         ]
         migrator.dest.post.return_value = {"id": "new-identity-1"}
 
@@ -1126,9 +1219,7 @@ class TestUserRoleMigrator:
         )
 
         assert (m, s, f) == (1, 0, 0)
-        migrator.dest.delete.assert_called_once_with(
-            "/orgs/current/members/pending/pending-1"
-        )
+        migrator.dest.delete.assert_called_once_with("/orgs/current/members/pending/pending-1")
         migrator.dest.post.assert_called_once_with(
             "/orgs/current/members",
             {"email": "alice@example.com", "role_id": "dst-role"},
@@ -1138,13 +1229,17 @@ class TestUserRoleMigrator:
         """Authoritative mode removes extra active members and pending invites."""
         migrator._role_id_map = {"src-role": "dst-role"}
         migrator.dest.get_paginated.side_effect = [
-            iter([
-                {"id": "dst-keep", "email": "keep@example.com", "role_id": "dst-role"},
-                {"id": "dst-remove", "email": "remove@example.com", "role_id": "dst-role"},
-            ]),
-            iter([
-                {"id": "pending-remove", "email": "pending@example.com", "role_id": "dst-role"},
-            ]),
+            iter(
+                [
+                    {"id": "dst-keep", "email": "keep@example.com", "role_id": "dst-role"},
+                    {"id": "dst-remove", "email": "remove@example.com", "role_id": "dst-role"},
+                ]
+            ),
+            iter(
+                [
+                    {"id": "pending-remove", "email": "pending@example.com", "role_id": "dst-role"},
+                ]
+            ),
         ]
 
         members = [
@@ -1160,9 +1255,7 @@ class TestUserRoleMigrator:
         assert (m, s, f) == (2, 1, 0)
         assert migrator._last_org_member_removals == 2
         migrator.dest.delete.assert_any_call("/orgs/current/members/dst-remove")
-        migrator.dest.delete.assert_any_call(
-            "/orgs/current/members/pending/pending-remove"
-        )
+        migrator.dest.delete.assert_any_call("/orgs/current/members/pending/pending-remove")
 
     def test_migrate_org_members_remove_missing_treats_active_not_found_as_reconciled(
         self, migrator
@@ -1170,10 +1263,12 @@ class TestUserRoleMigrator:
         """Authoritative org member removal is idempotent when DELETE reports already absent."""
         migrator._role_id_map = {"src-role": "dst-role"}
         migrator.dest.get_paginated.side_effect = [
-            iter([
-                {"id": "dst-keep", "email": "keep@example.com", "role_id": "dst-role"},
-                {"id": "dst-remove", "email": "remove@example.com", "role_id": "dst-role"},
-            ]),
+            iter(
+                [
+                    {"id": "dst-keep", "email": "keep@example.com", "role_id": "dst-role"},
+                    {"id": "dst-remove", "email": "remove@example.com", "role_id": "dst-role"},
+                ]
+            ),
             iter([]),
         ]
         migrator.dest.delete.side_effect = APIError(
@@ -1204,9 +1299,11 @@ class TestUserRoleMigrator:
         migrator._dest_email_to_identity = {
             "alice@example.com": {"id": "dst-org-identity-1", "user_id": "dst-user-1"},
         }
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+            ]
+        )
         migrator.dest.get_paginated.return_value = iter([])
         migrator.dest.post.return_value = {"id": "dst-ws-identity-1"}
 
@@ -1219,18 +1316,23 @@ class TestUserRoleMigrator:
                 "user_id": "dst-user-1",
                 "workspace_ids": ["ws-default-dst"],
                 "workspace_role_id": "dst-ws-role",
+                "role_id": "dst-ws-role",
             },
         )
 
     def test_migrate_workspace_members_update_role(self, migrator):
         """Workspace members with wrong role get updated."""
         migrator._role_id_map = {"src-ws-role": "dst-ws-role-new"}
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-        ])
-        migrator.dest.get_paginated.return_value = iter([
-            {"id": "dst-ws-m1", "email": "alice@example.com", "role_id": "dst-ws-role-old"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+            ]
+        )
+        migrator.dest.get_paginated.return_value = iter(
+            [
+                {"id": "dst-ws-m1", "email": "alice@example.com", "role_id": "dst-ws-role-old"},
+            ]
+        )
 
         m, s, f = migrator.migrate_workspace_members()
 
@@ -1246,9 +1348,11 @@ class TestUserRoleMigrator:
         migrator._dest_email_to_identity = {
             "alice@example.com": {"id": "dst-org-identity-1", "user_id": "dst-user-1"},
         }
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+            ]
+        )
         migrator.dest.get_paginated.return_value = iter([])
         migrator.dest.post.side_effect = [
             APIError("Not found", status_code=404, request_info={}),
@@ -1265,10 +1369,11 @@ class TestUserRoleMigrator:
                     "user_id": "dst-user-1",
                     "workspace_ids": ["ws-default-dst"],
                     "workspace_role_id": "dst-ws-role",
+                    "role_id": "dst-ws-role",
                 },
             ),
             call(
-                "/tenants/current/members",
+                "/workspaces/current/members",
                 {"org_identity_id": "dst-org-identity-1", "role_id": "dst-ws-role"},
             ),
         ]
@@ -1278,12 +1383,16 @@ class TestUserRoleMigrator:
     ):
         """Workspace role updates should tolerate instances that only support the legacy tenant write path."""
         migrator._role_id_map = {"src-ws-role": "dst-ws-role-new"}
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-        ])
-        migrator.dest.get_paginated.return_value = iter([
-            {"id": "dst-ws-m1", "email": "alice@example.com", "role_id": "dst-ws-role-old"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+            ]
+        )
+        migrator.dest.get_paginated.return_value = iter(
+            [
+                {"id": "dst-ws-m1", "email": "alice@example.com", "role_id": "dst-ws-role-old"},
+            ]
+        )
         migrator.dest.patch.side_effect = [
             APIError("Not found", status_code=404, request_info={}),
             {},
@@ -1294,16 +1403,18 @@ class TestUserRoleMigrator:
         assert (m, s, f) == (1, 0, 0)
         assert migrator.dest.patch.call_args_list == [
             call("/workspaces/current/members/dst-ws-m1", {"role_id": "dst-ws-role-new"}),
-            call("/tenants/current/members/dst-ws-m1", {"role_id": "dst-ws-role-new"}),
+            call("/workspaces/current/members/dst-ws-m1", {"role_id": "dst-ws-role-new"}),
         ]
 
     def test_migrate_workspace_members_not_in_org(self, migrator):
         """User not an org member on dest is recorded as failed."""
         migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
         migrator._dest_email_to_identity = {}  # Not in org
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "bob@example.com", "role_id": "src-ws-role"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "bob@example.com", "role_id": "src-ws-role"},
+            ]
+        )
         migrator.dest.get_paginated.return_value = iter([])
 
         m, s, f = migrator.migrate_workspace_members()
@@ -1316,9 +1427,11 @@ class TestUserRoleMigrator:
         migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
         migrator._dest_email_to_identity = {}
         migrator._pending_workspace_invites = {("alice@example.com", "ws-default-dst")}
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+            ]
+        )
         migrator.dest.get_paginated.return_value = iter([])
 
         m, s, f = migrator.migrate_workspace_members()
@@ -1332,9 +1445,11 @@ class TestUserRoleMigrator:
         pending_identity = {"id": "pending-org-identity-1", "email": "alice@example.com"}
         migrator._pending_org_email_to_identity = {"alice@example.com": pending_identity}
         migrator._dest_email_to_identity = {"alice@example.com": pending_identity}
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+            ]
+        )
         migrator.dest.get_paginated.return_value = iter([])
 
         m, s, f = migrator.migrate_workspace_members()
@@ -1357,9 +1472,11 @@ class TestUserRoleMigrator:
                 "next_action": "Cancel or replace the pending org invite manually.",
             }
         }
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+            ]
+        )
         migrator.dest.get_paginated.return_value = iter([])
 
         m, s, f = migrator.migrate_workspace_members()
@@ -1377,10 +1494,12 @@ class TestUserRoleMigrator:
         migrator._dest_email_to_identity = {
             "keep@example.com": {"id": "dst-org-identity-1"},
         }
-        migrator.dest.get_paginated.return_value = iter([
-            {"id": "dst-ws-keep", "email": "keep@example.com", "role_id": "dst-ws-role"},
-            {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
-        ])
+        migrator.dest.get_paginated.return_value = iter(
+            [
+                {"id": "dst-ws-keep", "email": "keep@example.com", "role_id": "dst-ws-role"},
+                {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
+            ]
+        )
 
         selected = [
             {"id": "src-ws-m1", "email": "keep@example.com", "role_id": "src-ws-role"},
@@ -1393,17 +1512,17 @@ class TestUserRoleMigrator:
 
         assert (m, s, f) == (1, 1, 0)
         assert migrator._last_workspace_member_removals == 1
-        migrator.dest.delete.assert_called_once_with(
-            "/workspaces/current/members/dst-ws-remove"
-        )
+        migrator.dest.delete.assert_called_once_with("/workspaces/current/members/dst-ws-remove")
 
     def test_migrate_workspace_members_remove_missing_with_empty_selection(self, migrator):
         """Authoritative workspace sync can clear a workspace omitted from the CSV."""
         migrator._role_id_map = {}
         migrator._dest_email_to_identity = {}
-        migrator.dest.get_paginated.return_value = iter([
-            {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
-        ])
+        migrator.dest.get_paginated.return_value = iter(
+            [
+                {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
+            ]
+        )
 
         m, s, f = migrator.migrate_workspace_members(
             selected_members=[],
@@ -1412,9 +1531,7 @@ class TestUserRoleMigrator:
 
         assert (m, s, f) == (1, 0, 0)
         assert migrator._last_workspace_member_removals == 1
-        migrator.dest.delete.assert_called_once_with(
-            "/workspaces/current/members/dst-ws-remove"
-        )
+        migrator.dest.delete.assert_called_once_with("/workspaces/current/members/dst-ws-remove")
 
     def test_migrate_workspace_members_remove_missing_falls_back_to_legacy_tenant_endpoint(
         self, migrator
@@ -1422,9 +1539,11 @@ class TestUserRoleMigrator:
         """Workspace member removals should tolerate instances that only support the legacy tenant delete path."""
         migrator._role_id_map = {}
         migrator._dest_email_to_identity = {}
-        migrator.dest.get_paginated.return_value = iter([
-            {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
-        ])
+        migrator.dest.get_paginated.return_value = iter(
+            [
+                {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
+            ]
+        )
         migrator.dest.delete.side_effect = [
             APIError("Not found", status_code=404, request_info={}),
             {},
@@ -1438,7 +1557,7 @@ class TestUserRoleMigrator:
         assert (m, s, f) == (1, 0, 0)
         assert migrator.dest.delete.call_args_list == [
             call("/workspaces/current/members/dst-ws-remove"),
-            call("/tenants/current/members/dst-ws-remove"),
+            call("/workspaces/current/members/dst-ws-remove"),
         ]
 
     # ── Dry run ──
@@ -1475,13 +1594,17 @@ class TestUserRoleMigrator:
         sample_config.migration.dry_run = True
         migrator._role_id_map = {"src-role": "dst-role"}
         migrator.dest.get_paginated.side_effect = [
-            iter([
-                {"id": "dst-keep", "email": "keep@example.com", "role_id": "dst-role"},
-                {"id": "dst-remove", "email": "remove@example.com", "role_id": "dst-role"},
-            ]),
-            iter([
-                {"id": "pending-remove", "email": "pending@example.com", "role_id": "dst-role"},
-            ]),
+            iter(
+                [
+                    {"id": "dst-keep", "email": "keep@example.com", "role_id": "dst-role"},
+                    {"id": "dst-remove", "email": "remove@example.com", "role_id": "dst-role"},
+                ]
+            ),
+            iter(
+                [
+                    {"id": "pending-remove", "email": "pending@example.com", "role_id": "dst-role"},
+                ]
+            ),
         ]
 
         members = [
@@ -1502,9 +1625,11 @@ class TestUserRoleMigrator:
         """Dry run skips workspace role PATCH requests."""
         sample_config.migration.dry_run = True
         migrator._role_id_map = {"src-ws-role": "dst-ws-role-new"}
-        migrator.dest.get_paginated.return_value = iter([
-            {"id": "dst-ws-m1", "email": "alice@example.com", "role_id": "dst-ws-role-old"},
-        ])
+        migrator.dest.get_paginated.return_value = iter(
+            [
+                {"id": "dst-ws-m1", "email": "alice@example.com", "role_id": "dst-ws-role-old"},
+            ]
+        )
 
         members = [
             {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
@@ -1522,10 +1647,12 @@ class TestUserRoleMigrator:
         migrator._dest_email_to_identity = {
             "keep@example.com": {"id": "dst-org-identity-1"},
         }
-        migrator.dest.get_paginated.return_value = iter([
-            {"id": "dst-ws-keep", "email": "keep@example.com", "role_id": "dst-ws-role"},
-            {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
-        ])
+        migrator.dest.get_paginated.return_value = iter(
+            [
+                {"id": "dst-ws-keep", "email": "keep@example.com", "role_id": "dst-ws-role"},
+                {"id": "dst-ws-remove", "email": "remove@example.com", "role_id": "dst-ws-role"},
+            ]
+        )
 
         selected = [
             {"id": "src-ws-m1", "email": "keep@example.com", "role_id": "src-ws-role"},
@@ -1542,13 +1669,19 @@ class TestUserRoleMigrator:
 
     # ── Role update failure ──
 
-    def test_sync_custom_roles_update_failure_records_issue(self, migrator, source_roles, sample_config):
+    def test_sync_custom_roles_update_failure_records_issue(
+        self, migrator, source_roles, sample_config
+    ):
         """When _update_custom_role fails, role is still mapped but issue is recorded."""
         sample_config.migration.skip_existing = False
 
         dest_roles_with_custom = [
-            {"id": "dst-custom-1", "name": "CUSTOM", "display_name": "Data Scientist",
-             "permissions": ["datasets:read"]},  # Different permissions
+            {
+                "id": "dst-custom-1",
+                "name": "CUSTOM",
+                "display_name": "Data Scientist",
+                "permissions": ["datasets:read"],
+            },  # Different permissions
         ]
 
         migrator.dest.patch.side_effect = APIError("Permission denied", request_info={})
@@ -1652,6 +1785,7 @@ class TestUserRoleMigrator:
                 "user_id": "dst-user-1",
                 "workspace_ids": ["ws-default-dst"],
                 "workspace_role_id": "dst-ws-role",
+                "role_id": "dst-ws-role",
             },
         )
 
@@ -1690,9 +1824,11 @@ class TestUserRoleMigrator:
         migrator._dest_email_to_identity = {
             "alice@example.com": {"id": "dst-org-1"},
         }
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+            ]
+        )
         migrator.dest.get_paginated.return_value = iter([])
         migrator.dest.post.return_value = {"id": "dst-ws-1"}
 
@@ -1718,7 +1854,9 @@ class TestUserRoleMigrator:
                 ]
             )
 
-    def test_workspace_member_item_ids_do_not_collide_across_workspaces(self, migrator, migration_state):
+    def test_workspace_member_item_ids_do_not_collide_across_workspaces(
+        self, migrator, migration_state
+    ):
         """Same email in different source workspaces creates distinct state items."""
         migrator.state = migration_state
         migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
@@ -1751,9 +1889,7 @@ class TestUserRoleMigrator:
         migrator._dest_email_to_identity = {"alice@example.com": {"id": "dst-1"}}
         assert migrator._dest_email_to_identity["alice@example.com"]["id"] == "dst-1"
 
-    def test_migrate_workspace_members_from_csv_rows_combines_custom_roles(
-        self, migrator
-    ):
+    def test_migrate_workspace_members_from_csv_rows_combines_custom_roles(self, migrator):
         """CSV workspace rows with multiple custom roles collapse to a union role."""
         migrator.source.session.headers["X-Tenant-Id"] = "ws-src-1"
         migrator.migrate_workspace_members = Mock(return_value=(1, 0, 0))
@@ -1778,9 +1914,7 @@ class TestUserRoleMigrator:
                 {
                     "id": "ws-src-1:alice@example.com",
                     "email": "alice@example.com",
-                    "role_id": make_workspace_role_union_id(
-                        {"src-custom-1", "src-custom-2"}
-                    ),
+                    "role_id": make_workspace_role_union_id({"src-custom-1", "src-custom-2"}),
                     "full_name": "",
                 }
             ]
@@ -1794,9 +1928,11 @@ class TestUserRoleMigrator:
         migrator._dest_email_to_identity = {
             "alice@example.com": {"id": "dst-org-1"},
         }
-        migrator.source.get_paginated.return_value = iter([
-            {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-        ])
+        migrator.source.get_paginated.return_value = iter(
+            [
+                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
+            ]
+        )
         migrator.dest.get_paginated.return_value = iter([])
         migrator.dest.post.return_value = {"id": "dst-ws-1"}
 
@@ -1863,9 +1999,9 @@ class TestUserRoleMigrator:
             call("/orgs/current/members/active", params={"limit": 1}),
             call("/orgs/current/members/pending", params={"limit": 1}),
         ]
-        assert migration_state.capability_matrix["dest"]["org_member_management"][
-            "supported"
-        ] is False
+        assert (
+            migration_state.capability_matrix["dest"]["org_member_management"]["supported"] is False
+        )
         assert migration_state.issue_log[-1].code == "dest_org_admin_pat_required"
 
     def test_probe_capabilities_success(self, migrator):

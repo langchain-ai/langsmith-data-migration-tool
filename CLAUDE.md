@@ -41,6 +41,7 @@ uv run langsmith-migrator migrate-all --rules-create-enabled        # Create mig
 uv run langsmith-migrator resume       # Resume interrupted dataset migration
 uv run langsmith-migrator list-projects # List available projects
 uv run langsmith-migrator list_workspaces --source --dest           # List workspaces
+uv run langsmith-migrator export-users --source -o users.csv        # Export active org/workspace members to a members CSV (pending invites excluded)
 uv run langsmith-migrator clean        # Clean migration state
 
 # Workspace-scoped migration (available on all resource commands)

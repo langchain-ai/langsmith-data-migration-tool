@@ -49,6 +49,7 @@ def test_registered_command_names_match_public_cli_surface():
         "charts",
         "clean",
         "datasets",
+        "export-users",
         "list-projects",
         "list_workspaces",
         "migrate-all",

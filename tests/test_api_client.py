@@ -52,9 +52,7 @@ def _client() -> EnhancedAPIClient:
 def test_post_uses_prepared_url_payload_and_timeout(monkeypatch):
     client = _client()
     url = "https://langsmith.example.com/api/v1/orgs/current/members"
-    post_mock = Mock(
-        return_value=_response("POST", url, 201, json_body={"id": "member-1"})
-    )
+    post_mock = Mock(return_value=_response("POST", url, 201, json_body={"id": "member-1"}))
     monkeypatch.setattr(client.session, "post", post_mock)
 
     result = client.post("/orgs/current/members", {"email": "alice@example.com"})
@@ -70,9 +68,7 @@ def test_post_uses_prepared_url_payload_and_timeout(monkeypatch):
 def test_get_uses_prepared_url_query_params_and_timeout(monkeypatch):
     client = _client()
     url = "https://langsmith.example.com/api/v1/workspaces"
-    get_mock = Mock(
-        return_value=_response("GET", url, 200, json_body=[{"id": "ws-1"}])
-    )
+    get_mock = Mock(return_value=_response("GET", url, 200, json_body=[{"id": "ws-1"}]))
     monkeypatch.setattr(client.session, "get", get_mock)
 
     result = client.get("/workspaces", params={"limit": 10})
@@ -123,11 +119,11 @@ def test_get_translates_authentication_error_without_retry(monkeypatch):
 
 def test_patch_uses_fixed_timeout_and_handles_no_content(monkeypatch):
     client = _client()
-    url = "https://langsmith.example.com/api/v1/tenants/current/members/member-1"
+    url = "https://langsmith.example.com/api/v1/workspaces/current/members/member-1"
     patch_mock = Mock(return_value=_response("PATCH", url, 204))
     monkeypatch.setattr(client.session, "patch", patch_mock)
 
-    result = client.patch("/tenants/current/members/member-1", {"role_id": "role-1"})
+    result = client.patch("/workspaces/current/members/member-1", {"role_id": "role-1"})
 
     assert result == {}
     patch_mock.assert_called_once_with(
@@ -139,11 +135,11 @@ def test_patch_uses_fixed_timeout_and_handles_no_content(monkeypatch):
 
 def test_delete_uses_fixed_timeout_and_handles_no_content(monkeypatch):
     client = _client()
-    url = "https://langsmith.example.com/api/v1/tenants/current/members/member-1"
+    url = "https://langsmith.example.com/api/v1/workspaces/current/members/member-1"
     delete_mock = Mock(return_value=_response("DELETE", url, 204))
     monkeypatch.setattr(client.session, "delete", delete_mock)
 
-    result = client.delete("/tenants/current/members/member-1")
+    result = client.delete("/workspaces/current/members/member-1")
 
     assert result == {}
     delete_mock.assert_called_once_with(url, timeout=15)
@@ -152,9 +148,7 @@ def test_delete_uses_fixed_timeout_and_handles_no_content(monkeypatch):
 def test_delete_translates_not_found_to_not_found_error(monkeypatch):
     client = _client()
     url = "https://langsmith.example.com/api/v1/orgs/current/members/member-1"
-    delete_mock = Mock(
-        return_value=_response("DELETE", url, 404, json_body={"detail": "missing"})
-    )
+    delete_mock = Mock(return_value=_response("DELETE", url, 404, json_body={"detail": "missing"}))
     monkeypatch.setattr(client.session, "delete", delete_mock)
 
     with pytest.raises(NotFoundError, match="Resource not found"):
@@ -188,3 +182,4 @@ def test_get_raises_api_error_on_invalid_json_success_response(monkeypatch):
         client.get("/workspaces")
 
     assert get_mock.call_count == 1
+

@@ -11,18 +11,10 @@ from typing import Iterable
 import click
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.prompt import Confirm
 from rich.progress import Progress
+from rich.prompt import Confirm
 from rich.table import Table
 
-from ..utils.chart_mode import (
-    is_same_deployment as _chart_is_same_deployment,
-    normalize_deployment_url as _chart_normalize_deployment_url,
-    should_reuse_chart_ids,
-    workspace_pair_allows_same_instance as _chart_workspace_pair_allows_same_instance,
-)
-from ..utils.config import Config
-from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
 from ..core.migrators import (
     AnnotationQueueMigrator,
     ChartMigrator,
@@ -36,12 +28,28 @@ from ..core.migrators.user_role import (
     is_workspace_role_union_id,
     select_effective_workspace_role_id,
 )
-from .tui_project_mapper import build_project_id_mapping_tui, build_project_mapping_tui
-from .tui_selector import select_items
-from .tui_workspace_mapper import WorkspaceProjectResult
+from ..utils.chart_mode import (
+    is_same_deployment as _chart_is_same_deployment,
+)
+from ..utils.chart_mode import (
+    normalize_deployment_url as _chart_normalize_deployment_url,
+)
+from ..utils.chart_mode import (
+    should_reuse_chart_ids,
+)
+from ..utils.chart_mode import (
+    workspace_pair_allows_same_instance as _chart_workspace_pair_allows_same_instance,
+)
+from ..utils.config import Config
+from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
 from ..utils.workspace import (
     discover_workspaces,
+    get_workspace_name,
+)
+from ..utils.workspace import (
     list_projects as _list_projects,
+)
+from ..utils.workspace import (
     list_workspaces as _list_workspaces,
 )
 from ..utils.workspace_resolver import (
@@ -49,7 +57,9 @@ from ..utils.workspace_resolver import (
     display_workspaces,
     resolve_workspace_context,
 )
-
+from .tui_project_mapper import build_project_id_mapping_tui, build_project_mapping_tui
+from .tui_selector import select_items
+from .tui_workspace_mapper import WorkspaceProjectResult
 
 load_dotenv()
 
@@ -274,7 +284,9 @@ def _ensure_chart_dependency_project_records(
     console.print("Fetching projects for chart dependency validation... ", end="")
     source_records = source_projects or _list_projects(orchestrator.source_client)
     dest_records = dest_projects or _list_projects(orchestrator.dest_client)
-    console.print(f"[green]✓[/green] ({len(source_records)} source, {len(dest_records)} destination)")
+    console.print(
+        f"[green]✓[/green] ({len(source_records)} source, {len(dest_records)} destination)"
+    )
     return source_records, dest_records
 
 
@@ -1035,6 +1047,95 @@ def _effective_workspace_role_ids_for_rows(
         if effective_role_id:
             effective_role_ids.add(effective_role_id)
     return effective_role_ids
+
+
+_BUILTIN_ROLE_EXPORT_LABELS: dict[str, str] = {
+    builtin_name: alias.title() for alias, builtin_name in _BUILTIN_ROLE_ALIASES.items()
+}
+
+
+def _role_export_labels(roles: list[dict]) -> dict[str, str]:
+    """Map role IDs to ``langsmith_role`` labels accepted by the members CSV import.
+
+    Built-in roles use the documented aliases (e.g. ``Organization Admin``);
+    custom roles use their display name. Roles without a resolvable label map
+    to an empty string so callers can warn about them.
+    """
+    labels: dict[str, str] = {}
+    for role in roles:
+        role_id = (role.get("id") or "").strip()
+        if not role_id:
+            continue
+        role_name = role.get("name", "")
+        if role_name == "CUSTOM":
+            labels[role_id] = (role.get("display_name") or "").strip()
+        else:
+            labels[role_id] = _BUILTIN_ROLE_EXPORT_LABELS.get(role_name, role_name)
+    return labels
+
+
+def _collect_users_export_rows(
+    client, role_labels: dict[str, str], workspaces: list[dict]
+) -> tuple[list[dict], list[str]]:
+    """Collect members CSV rows for active org and workspace memberships.
+
+    Pending invites are deliberately excluded (only ``/active`` endpoints are
+    read). Returns ``(rows, unresolved)`` where *unresolved* describes members
+    whose role could not be mapped to a CSV role label; those rows are
+    exported with an empty ``langsmith_role``.
+    """
+    rows: list[dict] = []
+    unresolved: list[str] = []
+
+    def append_row(member: dict, workspace_id: str, workspace_name: str) -> None:
+        email = (member.get("email") or "").strip().lower()
+        if not email:
+            return
+        role_id = (member.get("role_id") or "").strip()
+        label = role_labels.get(role_id, "")
+        if not label:
+            scope = f"workspace {workspace_id}" if workspace_id else "org"
+            unresolved.append(f"{email} ({scope}, role_id={role_id or '<none>'})")
+        rows.append(
+            {
+                "email": email,
+                "langsmith_role": label,
+                "workspace_id": workspace_id,
+                "workspace_name": workspace_name,
+            }
+        )
+
+    for member in client.get_paginated("/orgs/current/members/active"):
+        if isinstance(member, dict):
+            append_row(member, "", "")
+
+    original_workspace = client.session.headers.get("X-Tenant-Id")
+    try:
+        for workspace in workspaces:
+            workspace_id = str(workspace.get("id") or "").strip()
+            if not workspace_id:
+                continue
+            workspace_name = get_workspace_name(workspace)
+            client.set_workspace(workspace_id)
+            for member in client.get_paginated("/workspaces/current/members/active"):
+                if isinstance(member, dict):
+                    append_row(member, workspace_id, workspace_name)
+    finally:
+        client.set_workspace(original_workspace)
+
+    return rows, unresolved
+
+
+def _write_members_csv(path: str, rows: list[dict]) -> None:
+    """Write members CSV rows with the columns the import path expects."""
+    fieldnames = ["email", "langsmith_role", "workspace_id", "workspace_name"]
+    try:
+        with Path(path).open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+    except OSError as e:
+        raise click.ClickException(f"Failed writing members CSV: {e}") from e
 
 
 def _csv_rows_to_org_members(
@@ -2868,6 +2969,99 @@ def list_workspaces_cmd(ctx, source, dest):
         display_workspaces(console, workspaces, "Destination")
 
     orchestrator.cleanup()
+
+
+@cli.command(name="export-users")
+@ssl_option
+@click.option("--source", is_flag=True, help="Export users from the source instance (default)")
+@click.option("--dest", is_flag=True, help="Export users from the destination instance")
+@click.option(
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=str),
+    default="users.csv",
+    show_default=True,
+    help="Path of the members CSV file to write",
+)
+@click.option(
+    "--workspace",
+    "workspace_ids",
+    multiple=True,
+    help="Restrict workspace membership export to these workspace IDs (repeatable)",
+)
+@click.option(
+    "--org-only",
+    is_flag=True,
+    help="Export only org-level memberships and skip workspace memberships",
+)
+@click.pass_context
+def export_users(ctx, source, dest, output_path, workspace_ids, org_only):
+    """Export active org and workspace members to a members CSV.
+
+    The CSV uses the same columns the ``users --members-csv`` import expects
+    (``email``, ``langsmith_role``, ``workspace_id``, ``workspace_name``), so
+    an export from one instance can be imported into another. Only accepted
+    memberships are exported; pending invites are excluded.
+    """
+    config = ctx.obj["config"]
+
+    if source and dest:
+        raise click.ClickException("Use only one of --source or --dest")
+    if org_only and workspace_ids:
+        raise click.ClickException("--org-only cannot be combined with --workspace")
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, ctx.obj["state_manager"])
+    client = orchestrator.dest_client if dest else orchestrator.source_client
+    side = "destination" if dest else "source"
+
+    try:
+        roles = client.get("/orgs/current/roles")
+        role_labels = _role_export_labels(roles if isinstance(roles, list) else [])
+
+        if org_only:
+            workspaces: list[dict] = []
+        else:
+            workspaces = _list_workspaces(client)
+            if workspace_ids:
+                requested = {ws_id.strip() for ws_id in workspace_ids if ws_id.strip()}
+                workspaces_by_id = {str(ws.get("id") or ""): ws for ws in workspaces}
+                # Unknown IDs are still exported: workspace discovery can miss
+                # workspaces the API key only has membership-level access to.
+                workspaces = [
+                    workspaces_by_id.get(ws_id, {"id": ws_id}) for ws_id in sorted(requested)
+                ]
+
+        rows, unresolved = _collect_users_export_rows(client, role_labels, workspaces)
+    finally:
+        orchestrator.cleanup()
+
+    rows.sort(
+        key=lambda row: (
+            bool(row["workspace_id"]),
+            row["workspace_name"].lower(),
+            row["workspace_id"],
+            row["email"],
+        )
+    )
+    _write_members_csv(output_path, rows)
+
+    org_row_count = sum(1 for row in rows if not row["workspace_id"])
+    console.print(
+        f"[green]Exported {org_row_count} org member(s) and "
+        f"{len(rows) - org_row_count} workspace membership(s) "
+        f"from {side} to {output_path}[/green]"
+    )
+    if unresolved:
+        console.print(
+            "[yellow]Some members have roles that could not be mapped to a CSV "
+            "role label; fill in langsmith_role for these rows before importing:[/yellow]"
+        )
+        for description in unresolved:
+            console.print(f"  [yellow]- {description}[/yellow]")
 
 
 @cli.command()
