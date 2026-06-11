@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.77] - 2026-06-11
+
+### Added
+- **User export CSV**: Added `export-users` to export active org and workspace
+  members to the same members CSV format accepted by `users --members-csv`,
+  with source/destination selection, org-only export, and workspace filtering.
+
+### Fixed
+- **Workspace member API compatibility**: User and role migration now reads
+  workspace memberships from the current `/workspaces/current/members/active`
+  endpoint, restoring workspace member migration against current LangSmith APIs.
+- **Workspace/project mapper keyboard UX**: Mapper tables now open assignment
+  dialogs when a focused row is selected with `Enter`, and destination pickers
+  support `Up`/`Down` browsing while search input keeps focus.
+
 ## [0.0.76] - 2026-05-18
 
 ### Fixed
@@ -389,7 +404,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.76...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.77...HEAD
+[0.0.77]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.76...v0.0.77
 [0.0.76]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.75...v0.0.76
 [0.0.75]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.74...v0.0.75
 [0.0.74]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.73...v0.0.74
