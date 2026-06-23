@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Headless chart project mapping (`charts --project-mapping`)**: The `charts`
+  command now accepts an explicit source->destination project ID mapping as a
+  JSON string or file path, mirroring the existing `rules --project-mapping`
+  flag. This runs the mapping with no interactive TUI, so chart migration can be
+  driven from a backend/CI onboarding job. Mutually exclusive with
+  `--map-projects`.
+- **`migrate-all --project-mapping`**: The same headless JSON/file mapping is now
+  available on `migrate-all`, feeding both rules and charts, so an entire
+  migration can run non-interactively. Mutually exclusive with `--map-projects`.
+
 ## [0.0.77] - 2026-06-11
 
 ### Added

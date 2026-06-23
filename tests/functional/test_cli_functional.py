@@ -2172,6 +2172,33 @@ def test_rules_command_uses_workspace_project_mappings(cli_harness):
     assert "Using workspace-scoped project mapping" in cli_harness.console.text
 
 
+def test_rules_command_empty_project_mapping_overrides_workspace_project_mappings(cli_harness):
+    """rules --project-mapping {} should not fall back to workspace mappings."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Source Project": "Destination Project"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "source-project-id", "name": "Source Project"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "dest-project-id", "name": "Destination Project"},
+    ]
+    cli_harness.migrators.rules.list_rules.return_value = [
+        {"id": "rule-1", "display_name": "Rule One", "dataset_id": "dataset-1"},
+    ]
+    cli_harness.migrators.rules.create_rule.return_value = "dest-rule-1"
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(["rules", "--all", "--project-mapping", "{}"])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.rules._project_id_map == {}
+    assert "Using workspace-scoped project mapping" not in cli_harness.console.text
+
+
 def test_migrate_all_runs_every_step_and_applies_workspace_project_mappings(cli_harness):
     """The all-in-one wizard should thread dataset and project mappings through later steps."""
 
@@ -2465,6 +2492,185 @@ def test_charts_command_uses_workspace_project_mappings(cli_harness):
     assert result.exit_code == 0
     assert cli_harness.migrators.chart._project_id_map == {"source-project-id": "dest-project-id"}
     assert "Using workspace-scoped project mapping" in cli_harness.console.text
+
+
+def test_charts_command_project_mapping_overrides_workspace_project_mappings(cli_harness):
+    """Explicit --project-mapping should take precedence over workspace/TUI mappings."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Workspace Source": "Workspace Destination"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "workspace-source-id", "name": "Workspace Source"},
+        {"id": "explicit-source-id", "name": "Explicit Source"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "workspace-dest-id", "name": "Workspace Destination"},
+        {"id": "explicit-dest-id", "name": "Explicit Destination"},
+    ]
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "session_id": "explicit-source-id"},
+    ]
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "explicit-source-id": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        ["charts", "--project-mapping", '{"explicit-source-id": "explicit-dest-id"}']
+    )
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {
+        "explicit-source-id": "explicit-dest-id"
+    }
+
+
+def test_charts_command_empty_project_mapping_overrides_workspace_project_mappings(cli_harness):
+    """An explicitly supplied empty mapping should not fall back to workspace mappings."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Workspace Source": "Workspace Destination"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "workspace-source-id", "name": "Workspace Source"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "workspace-dest-id", "name": "Workspace Destination"},
+    ]
+
+    result = cli_harness.invoke(["charts", "--project-mapping", "{}"])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {}
+    assert "Using custom project mapping with 0 source ID mapping(s)" in cli_harness.console.text
+    assert "Using workspace-scoped project mapping" not in cli_harness.console.text
+
+
+def test_charts_command_project_mapping_applies_headlessly(cli_harness):
+    """--project-mapping should apply an explicit ID map with no interactive TUI."""
+
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "session_id": "a3cee8e2"},
+    ]
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "a3cee8e2": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        ["charts", "--project-mapping", '{"a3cee8e2": "cc3ac580"}']
+    )
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {"a3cee8e2": "cc3ac580"}
+    assert "Using custom project mapping with 1 source ID mapping(s)" in cli_harness.console.text
+    # Headless: the interactive TUI project-fetch path must not run.
+    assert "Fetching projects from both instances" not in cli_harness.console.text
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
+
+
+def test_charts_command_project_mapping_accepts_file_path(cli_harness, tmp_path):
+    """--project-mapping should also accept a path to a JSON file."""
+
+    mapping_file = tmp_path / "mapping.json"
+    mapping_file.write_text('{"a3cee8e2": "cc3ac580"}')
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {}
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(["charts", "--project-mapping", str(mapping_file)])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {"a3cee8e2": "cc3ac580"}
+    assert f"Loaded project mapping from file: {mapping_file}" in cli_harness.console.text
+
+
+def test_charts_command_rejects_map_projects_with_project_mapping(cli_harness):
+    """--map-projects and --project-mapping are mutually exclusive."""
+
+    result = cli_harness.invoke(
+        ["charts", "--map-projects", "--project-mapping", '{"a": "b"}']
+    )
+
+    assert result.exit_code == 0
+    assert "mutually exclusive" in cli_harness.console.text
+    cli_harness.migrators.chart.migrate_all_charts.assert_not_called()
+
+
+def test_charts_command_invalid_project_mapping_json_aborts(cli_harness):
+    """Malformed --project-mapping JSON should abort before migrating charts."""
+
+    result = cli_harness.invoke(["charts", "--project-mapping", "{not valid json"])
+
+    assert result.exit_code == 0
+    assert "Error parsing project mapping JSON" in cli_harness.console.text
+    cli_harness.migrators.chart.migrate_all_charts.assert_not_called()
+
+
+def test_migrate_all_project_mapping_applies_headlessly(cli_harness):
+    """migrate-all --project-mapping should feed the chart migrator without a TUI."""
+
+    cli_harness.controls.confirm_answers = [True, True, True]
+
+    result = cli_harness.invoke(
+        [
+            "migrate-all",
+            "--skip-users",
+            "--skip-datasets",
+            "--skip-prompts",
+            "--skip-queues",
+            "--skip-rules",
+            "--project-mapping",
+            '{"a3cee8e2": "cc3ac580"}',
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert "Using custom project mapping with 1 source ID mapping(s)" in cli_harness.console.text
+    assert cli_harness.migrators.chart._project_id_map == {"a3cee8e2": "cc3ac580"}
+    assert "Fetching projects from both instances" not in cli_harness.console.text
+
+
+def test_migrate_all_empty_project_mapping_overrides_workspace_project_mappings(cli_harness):
+    """migrate-all --project-mapping {} should not fall back to workspace mappings."""
+
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={"src-ws": {"Workspace Source": "Workspace Destination"}},
+        workspaces_to_create=[],
+    )
+    cli_harness.orchestrator_factory.source_client.paginated_results = [
+        {"id": "workspace-source-id", "name": "Workspace Source"},
+    ]
+    cli_harness.orchestrator_factory.dest_client.paginated_results = [
+        {"id": "workspace-dest-id", "name": "Workspace Destination"},
+    ]
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "project_id": "workspace-source-id"},
+    ]
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        [
+            "migrate-all",
+            "--skip-users",
+            "--skip-datasets",
+            "--skip-prompts",
+            "--skip-queues",
+            "--skip-rules",
+            "--project-mapping",
+            "{}",
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert "Using custom project mapping with 0 source ID mapping(s)" in cli_harness.console.text
+    assert "Using workspace-scoped project mapping" not in cli_harness.console.text
+    assert cli_harness.migrators.chart._project_id_map == {}
 
 
 def test_charts_command_workspace_project_mapping_filters_duplicate_project_names(cli_harness):
