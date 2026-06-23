@@ -3210,9 +3210,15 @@ def rules(
             orchestrator.source_client, orchestrator.dest_client, None, config
         )
 
-        ws_project_id_map = _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
-        if ws_project_id_map:
-            rules_migrator._project_id_map = ws_project_id_map
+        ws_project_id_map = None
+        # Apply headless project mapping (no TUI) when provided via --project-mapping.
+        # Explicit CLI mappings take precedence over workspace/TUI mappings.
+        if custom_mapping is not None:
+            rules_migrator._project_id_map = dict(custom_mapping)
+        else:
+            ws_project_id_map = _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
+            if ws_project_id_map:
+                rules_migrator._project_id_map = ws_project_id_map
 
         # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
         if map_projects and not ws_project_id_map:
@@ -3237,10 +3243,6 @@ def rules(
             )
             rules_migrator._project_id_map = id_map
             console.print(f"Using interactive project mapping with {len(id_map)} project(s)")
-
-        # Apply custom project mapping if provided
-        if custom_mapping:
-            rules_migrator._project_id_map = custom_mapping
 
         console.print("Fetching rules... ", end="")
         rules = rules_migrator.list_rules()
@@ -3674,7 +3676,7 @@ def _migrate_all_for_workspace(
     source_projects_for_mapping = []
     dest_projects_for_mapping = []
     project_name_mapping = None
-    if custom_project_mapping:
+    if custom_project_mapping is not None:
         # Headless mapping supplied via --project-mapping: apply directly, no TUI.
         project_id_map = dict(custom_project_mapping)
         _persist_project_id_map(orchestrator, config, project_id_map)
@@ -4345,20 +4347,23 @@ def charts(
         dest_projects_for_mapping = []
         project_name_mapping = None
 
-        ws_project_id_map = _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
-        if ws_project_id_map:
-            chart_migrator._project_id_map = ws_project_id_map
-            _persist_project_id_map(orchestrator, config, ws_project_id_map)
-            if ws_result and src_ws:
-                project_name_mapping = ws_result.project_mappings.get(src_ws)
-
-        # Apply headless project mapping (no TUI) when provided via --project-mapping
-        if custom_mapping and not ws_project_id_map:
+        ws_project_id_map = None
+        # Apply headless project mapping (no TUI) when provided via --project-mapping.
+        # Explicit CLI mappings take precedence over workspace/TUI mappings.
+        if custom_mapping is not None:
             chart_migrator._project_id_map = dict(custom_mapping)
             _persist_project_id_map(orchestrator, config, custom_mapping)
             console.print(
                 f"Using custom project mapping with {len(custom_mapping)} source ID mapping(s)"
             )
+        else:
+            ws_project_id_map = _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
+
+        if ws_project_id_map:
+            chart_migrator._project_id_map = ws_project_id_map
+            _persist_project_id_map(orchestrator, config, ws_project_id_map)
+            if ws_result and src_ws:
+                project_name_mapping = ws_result.project_mappings.get(src_ws)
 
         # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
         if map_projects and not ws_project_id_map:
