@@ -142,6 +142,8 @@ langsmith-migrator rules --create-enabled      # Create rules enabled (default: 
 langsmith-migrator charts
 langsmith-migrator charts --session "project-name"
 langsmith-migrator charts --map-projects        # Interactive TUI project mapping
+langsmith-migrator charts --project-mapping '{"old-project-id": "new-project-id"}'  # Headless, no TUI
+langsmith-migrator charts --project-mapping mapping.json   # Headless, from file
 langsmith-migrator charts --same-instance       # Reuse source IDs only when both sides share IDs
 
 # Utilities
@@ -360,6 +362,7 @@ The prompt default is `No` (rules are created disabled).
 --include-all-commits   Include all prompt commit history
 --strip-projects        Strip project associations from rules
 --map-projects          Launch interactive TUI to map source projects to destination projects
+--project-mapping TEXT  JSON string or file path with project ID mapping (headless, no TUI; mutually exclusive with --map-projects)
 --rules-create-enabled  Create migrated rules as enabled instead of asking interactively
 ```
 
@@ -368,6 +371,7 @@ The prompt default is `No` (rules are created disabled).
 ```bash
 --session TEXT          Migrate charts for a specific session/project (by name or ID)
 --map-projects          Launch interactive TUI to map source projects to destination projects
+--project-mapping TEXT  JSON string or file path with project ID mapping (headless, no TUI; mutually exclusive with --map-projects)
 --same-instance         Reuse source project/session IDs on destination only when both sides truly share IDs
 ```
 
@@ -424,10 +428,10 @@ When `--skip-users` is omitted, `migrate-all` runs user/role migration as Step 0
 Rules and charts reference projects by ID. When migrating between instances, project IDs differ.
 
 - **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input, and pressing `Enter` on a unique suggestion records the destination project ID used by downstream chart/rule validation. Supports auto-match by name, skip, and custom name entry. For ID-based chart/rule remapping, unresolved text entries remain unmapped instead of being counted as resolved.
-- **Rules (`--project-mapping`)**: Supply an explicit source→destination project ID mapping as JSON or a file path. Use `list-projects --source` and `list-projects --dest` to get IDs. The mapping is applied to both top-level project associations and project IDs embedded inside rule filters. Mutually exclusive with `--map-projects`.
+- **Headless mapping (`--project-mapping`)**: Available on `rules`, `charts`, and `migrate-all`. Supply an explicit source->destination project ID mapping as a JSON string or a file path (e.g. `'{"<source-project-id>": "<dest-project-id>"}'`). Use `list-projects --source` and `list-projects --dest` to get IDs. This runs the mapping with no interactive TUI, so the migration can be driven from a backend/CI onboarding job. For `rules`, the mapping is applied to both top-level project associations and project IDs embedded inside rule filters. Mutually exclusive with `--map-projects`.
 - **Rules queue targets**: When a rule references an annotation queue, the migrator first reuses any saved queue migration mapping, then falls back to an exact-name queue match in the destination workspace. If neither is safe, the rule is exported for remediation instead of being posted with the source queue ID.
 - **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination. When both sides point at the same deployment URL but use different API keys/workspaces, charts still remap project/session IDs; the tool does not treat that as `--same-instance`. Workspace-scoped `--map-projects` mappings are resolved against the active workspace pair so duplicate project names in other workspaces are ignored. Chart dependency validation also verifies that saved destination project IDs still exist before migration. Chart filters are normalized to the destination API's `session`/`session_id` project-scoping shape before create or update.
-- **`migrate-all`**: Supports `--strip-projects`, `--map-projects`, and `--rules-create-enabled` for rules. Use the standalone `rules` command for `--project-mapping` JSON mappings.
+- **`migrate-all`**: Supports `--strip-projects`, `--map-projects`, `--project-mapping` (headless JSON/file mapping applied to both rules and charts), and `--rules-create-enabled` for rules.
 
 ### Interactive Selection
 

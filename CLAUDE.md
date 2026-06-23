@@ -34,9 +34,11 @@ uv run langsmith-migrator rules --map-projects                      # Interactiv
 uv run langsmith-migrator rules --create-enabled                    # Create rules enabled
 uv run langsmith-migrator charts       # Migrate charts
 uv run langsmith-migrator charts --map-projects                     # Charts with interactive project mapping
+uv run langsmith-migrator charts --project-mapping '{"old": "new"}' # Charts with headless project ID mapping (no TUI)
 uv run langsmith-migrator charts --same-instance                    # Reuse source session IDs
 uv run langsmith-migrator migrate-all  # Migrate everything
 uv run langsmith-migrator migrate-all --map-projects                # Migrate all with interactive project mapping
+uv run langsmith-migrator migrate-all --project-mapping '{"old": "new"}'  # Migrate all with headless project ID mapping (no TUI)
 uv run langsmith-migrator migrate-all --rules-create-enabled        # Create migrated rules enabled
 uv run langsmith-migrator resume       # Resume interrupted dataset migration
 uv run langsmith-migrator list-projects # List available projects

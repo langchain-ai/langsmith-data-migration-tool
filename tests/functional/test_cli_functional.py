@@ -2467,6 +2467,90 @@ def test_charts_command_uses_workspace_project_mappings(cli_harness):
     assert "Using workspace-scoped project mapping" in cli_harness.console.text
 
 
+def test_charts_command_project_mapping_applies_headlessly(cli_harness):
+    """--project-mapping should apply an explicit ID map with no interactive TUI."""
+
+    cli_harness.migrators.chart.list_charts.return_value = [
+        {"id": "chart-1", "title": "Chart One", "session_id": "a3cee8e2"},
+    ]
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {
+        "a3cee8e2": {"chart-1": "dest-chart-1"}
+    }
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(
+        ["charts", "--project-mapping", '{"a3cee8e2": "cc3ac580"}']
+    )
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {"a3cee8e2": "cc3ac580"}
+    assert "Using custom project mapping with 1 source ID mapping(s)" in cli_harness.console.text
+    # Headless: the interactive TUI project-fetch path must not run.
+    assert "Fetching projects from both instances" not in cli_harness.console.text
+    cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
+
+
+def test_charts_command_project_mapping_accepts_file_path(cli_harness, tmp_path):
+    """--project-mapping should also accept a path to a JSON file."""
+
+    mapping_file = tmp_path / "mapping.json"
+    mapping_file.write_text('{"a3cee8e2": "cc3ac580"}')
+    cli_harness.migrators.chart.migrate_all_charts.return_value = {}
+    cli_harness.controls.confirm_answers = [True]
+
+    result = cli_harness.invoke(["charts", "--project-mapping", str(mapping_file)])
+
+    assert result.exit_code == 0
+    assert cli_harness.migrators.chart._project_id_map == {"a3cee8e2": "cc3ac580"}
+    assert f"Loaded project mapping from file: {mapping_file}" in cli_harness.console.text
+
+
+def test_charts_command_rejects_map_projects_with_project_mapping(cli_harness):
+    """--map-projects and --project-mapping are mutually exclusive."""
+
+    result = cli_harness.invoke(
+        ["charts", "--map-projects", "--project-mapping", '{"a": "b"}']
+    )
+
+    assert result.exit_code == 0
+    assert "mutually exclusive" in cli_harness.console.text
+    cli_harness.migrators.chart.migrate_all_charts.assert_not_called()
+
+
+def test_charts_command_invalid_project_mapping_json_aborts(cli_harness):
+    """Malformed --project-mapping JSON should abort before migrating charts."""
+
+    result = cli_harness.invoke(["charts", "--project-mapping", "{not valid json"])
+
+    assert result.exit_code == 0
+    assert "Error parsing project mapping JSON" in cli_harness.console.text
+    cli_harness.migrators.chart.migrate_all_charts.assert_not_called()
+
+
+def test_migrate_all_project_mapping_applies_headlessly(cli_harness):
+    """migrate-all --project-mapping should feed the chart migrator without a TUI."""
+
+    cli_harness.controls.confirm_answers = [True, True, True]
+
+    result = cli_harness.invoke(
+        [
+            "migrate-all",
+            "--skip-users",
+            "--skip-datasets",
+            "--skip-prompts",
+            "--skip-queues",
+            "--skip-rules",
+            "--project-mapping",
+            '{"a3cee8e2": "cc3ac580"}',
+        ]
+    )
+
+    assert result.exit_code == 0
+    assert "Using custom project mapping with 1 source ID mapping(s)" in cli_harness.console.text
+    assert cli_harness.migrators.chart._project_id_map == {"a3cee8e2": "cc3ac580"}
+    assert "Fetching projects from both instances" not in cli_harness.console.text
+
+
 def test_charts_command_workspace_project_mapping_filters_duplicate_project_names(cli_harness):
     """Workspace-scoped project mappings should resolve the project in the active pair."""
 

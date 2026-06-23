@@ -272,6 +272,52 @@ def _persist_project_id_map(orchestrator, config, project_id_map: dict | None) -
     orchestrator.state_manager.save()
 
 
+# Sentinel returned by _load_project_mapping_arg when parsing/validation fails
+# (the error has already been printed). Distinct from None, which means "no
+# --project-mapping was supplied".
+_PROJECT_MAPPING_ERROR = object()
+
+
+def _load_project_mapping_arg(project_mapping: str | None):
+    """Parse a ``--project-mapping`` value into a source->destination ID dict.
+
+    Accepts either an inline JSON object string or a path to a JSON file, e.g.
+    ``'{"<source-project-id>": "<dest-project-id>"}'`` or ``./mapping.json``.
+
+    Returns the parsed dict on success, ``None`` when no mapping was supplied,
+    or ``_PROJECT_MAPPING_ERROR`` when parsing/validation failed (an error
+    message is printed before returning the sentinel). This enables fully
+    headless (non-interactive) project mapping for backend/CI migration jobs.
+    """
+    if not project_mapping:
+        return None
+
+    import json
+    import os
+
+    try:
+        if os.path.isfile(project_mapping):
+            with open(project_mapping, "r") as f:
+                custom_mapping = json.load(f)
+            console.print(f"Loaded project mapping from file: {project_mapping}")
+        else:
+            custom_mapping = json.loads(project_mapping)
+
+        if not isinstance(custom_mapping, dict):
+            console.print("[red]Error: Project mapping must be a JSON object/dict[/red]")
+            return _PROJECT_MAPPING_ERROR
+
+        console.print(f"Using custom project mapping with {len(custom_mapping)} project(s)")
+        return custom_mapping
+
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Error parsing project mapping JSON: {e}[/red]")
+        return _PROJECT_MAPPING_ERROR
+    except Exception as e:
+        console.print(f"[red]Error loading project mapping: {e}[/red]")
+        return _PROJECT_MAPPING_ERROR
+
+
 def _ensure_chart_dependency_project_records(
     orchestrator,
     source_projects: list,
@@ -3148,31 +3194,10 @@ def rules(
         return
 
     # Parse custom project mapping once (outside loop, not workspace-scoped)
-    custom_mapping = None
-    if project_mapping:
-        import json
-        import os
-
-        try:
-            if os.path.isfile(project_mapping):
-                with open(project_mapping, "r") as f:
-                    custom_mapping = json.load(f)
-                console.print(f"Loaded project mapping from file: {project_mapping}")
-            else:
-                custom_mapping = json.loads(project_mapping)
-
-            if not isinstance(custom_mapping, dict):
-                console.print("[red]Error: Project mapping must be a JSON object/dict[/red]")
-                return
-
-            console.print(f"Using custom project mapping with {len(custom_mapping)} project(s)")
-
-        except json.JSONDecodeError as e:
-            console.print(f"[red]Error parsing project mapping JSON: {e}[/red]")
-            return
-        except Exception as e:
-            console.print(f"[red]Error loading project mapping: {e}[/red]")
-            return
+    custom_mapping = _load_project_mapping_arg(project_mapping)
+    if custom_mapping is _PROJECT_MAPPING_ERROR:
+        orchestrator.cleanup()
+        return
 
     for src_ws, dst_ws in ws_pairs:
         if src_ws and dst_ws:
@@ -3414,6 +3439,15 @@ def rules(
     help="Launch interactive TUI to map source projects to destination projects",
 )
 @click.option(
+    "--project-mapping",
+    type=str,
+    help=(
+        "JSON string or file path with source->destination project ID mapping "
+        '(e.g., \'{"<source-project-id>": "<dest-project-id>"}\'). Runs project '
+        "mapping headlessly with no TUI. Mutually exclusive with --map-projects."
+    ),
+)
+@click.option(
     "--rules-create-enabled",
     "rules_create_enabled",
     flag_value=True,
@@ -3434,6 +3468,7 @@ def migrate_all(
     include_all_commits,
     strip_projects,
     map_projects,
+    project_mapping,
     rules_create_enabled,
     source_workspace,
     dest_workspace,
@@ -3476,6 +3511,20 @@ def migrate_all(
         return
     if ws_result is _WS_CANCELLED:
         console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    # --map-projects (TUI) and --project-mapping (headless JSON) are mutually exclusive
+    if map_projects and project_mapping:
+        console.print(
+            "[red]Error: --map-projects and --project-mapping are mutually exclusive[/red]"
+        )
+        orchestrator.cleanup()
+        return
+
+    # Parse headless project mapping once (shared across all workspace pairs)
+    custom_project_mapping = _load_project_mapping_arg(project_mapping)
+    if custom_project_mapping is _PROJECT_MAPPING_ERROR:
         orchestrator.cleanup()
         return
 
@@ -3577,6 +3626,7 @@ def migrate_all(
             ws_project_mapping,
             src_ws,
             dst_ws,
+            custom_project_mapping,
         )
 
     if ws_result:
@@ -3605,6 +3655,7 @@ def _migrate_all_for_workspace(
     ws_project_mapping=None,
     source_workspace_id=None,
     dest_workspace_id=None,
+    custom_project_mapping=None,
 ):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
@@ -3613,6 +3664,9 @@ def _migrate_all_for_workspace(
             (default prompt answer is No, i.e. rules disabled).
         ws_project_mapping: Optional name-based project mapping from workspace TUI.
             If provided, --map-projects is skipped (already done at workspace level).
+        custom_project_mapping: Optional explicit source->destination project ID dict
+            from the headless --project-mapping flag. If provided, the interactive
+            mapping flows are skipped entirely.
     """
 
     # Launch interactive TUI project mapper if requested (and not already done at workspace level)
@@ -3620,7 +3674,15 @@ def _migrate_all_for_workspace(
     source_projects_for_mapping = []
     dest_projects_for_mapping = []
     project_name_mapping = None
-    if ws_project_mapping:
+    if custom_project_mapping:
+        # Headless mapping supplied via --project-mapping: apply directly, no TUI.
+        project_id_map = dict(custom_project_mapping)
+        _persist_project_id_map(orchestrator, config, project_id_map)
+        console.print(
+            "Using custom project mapping with "
+            f"{len(project_id_map)} source ID mapping(s)\n"
+        )
+    elif ws_project_mapping:
         project_name_mapping = ws_project_mapping
         # Convert the name mapping from the workspace TUI to an ID mapping
         console.print("Fetching projects for project mapping... ", end="")
@@ -4185,10 +4247,26 @@ def _migrate_all_for_workspace(
     is_flag=True,
     help="Launch interactive TUI to map source projects to destination projects",
 )
+@click.option(
+    "--project-mapping",
+    type=str,
+    help=(
+        "JSON string or file path with source->destination project ID mapping "
+        '(e.g., \'{"<source-project-id>": "<dest-project-id>"}\'). Runs the '
+        "mapping headlessly with no TUI. Mutually exclusive with --map-projects."
+    ),
+)
 @workspace_options
 @click.pass_context
 def charts(
-    ctx, session, same_instance, map_projects, source_workspace, dest_workspace, map_workspaces
+    ctx,
+    session,
+    same_instance,
+    map_projects,
+    project_mapping,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
 ):
     """Migrate monitoring charts from sessions/projects."""
     config = ctx.obj["config"]
@@ -4231,6 +4309,20 @@ def charts(
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
 
+    # --map-projects (TUI) and --project-mapping (headless JSON) are mutually exclusive
+    if map_projects and project_mapping:
+        console.print(
+            "[red]Error: --map-projects and --project-mapping are mutually exclusive[/red]"
+        )
+        orchestrator.cleanup()
+        return
+
+    # Parse headless project mapping once (outside loop, not workspace-scoped)
+    custom_mapping = _load_project_mapping_arg(project_mapping)
+    if custom_mapping is _PROJECT_MAPPING_ERROR:
+        orchestrator.cleanup()
+        return
+
     for src_ws, dst_ws in ws_pairs:
         if src_ws and dst_ws:
             orchestrator.set_workspace_context(src_ws, dst_ws)
@@ -4259,6 +4351,14 @@ def charts(
             _persist_project_id_map(orchestrator, config, ws_project_id_map)
             if ws_result and src_ws:
                 project_name_mapping = ws_result.project_mappings.get(src_ws)
+
+        # Apply headless project mapping (no TUI) when provided via --project-mapping
+        if custom_mapping and not ws_project_id_map:
+            chart_migrator._project_id_map = dict(custom_mapping)
+            _persist_project_id_map(orchestrator, config, custom_mapping)
+            console.print(
+                f"Using custom project mapping with {len(custom_mapping)} source ID mapping(s)"
+            )
 
         # Launch interactive TUI project mapper (inside loop for workspace-scoped projects)
         if map_projects and not ws_project_id_map:
