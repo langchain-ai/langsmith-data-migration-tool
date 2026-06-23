@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.78] - 2026-06-23
+
 ### Added
 - **Headless chart project mapping (`charts --project-mapping`)**: The `charts`
   command now accepts an explicit source->destination project ID mapping as a
@@ -415,7 +417,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.77...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.78...HEAD
+[0.0.78]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.77...v0.0.78
 [0.0.77]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.76...v0.0.77
 [0.0.76]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.75...v0.0.76
 [0.0.75]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.74...v0.0.75
