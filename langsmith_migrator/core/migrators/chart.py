@@ -195,14 +195,18 @@ class ChartMigrator(BaseMigrator):
             return chart
 
         try:
-            start_time = (
-                datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)
-            ).isoformat()
+            now = datetime.datetime.now(datetime.UTC)
+            start_time = (now - datetime.timedelta(days=1)).isoformat()
+            # end_time must be non-null: the list-charts endpoint still runs its
+            # stats fan-out even with omit_data, and that path rejects a null
+            # end_time with 422 "end_time must be set". A bounded 1-day window at
+            # the 15-min stride is ~96 buckets, well under the server point cap.
+            end_time = now.isoformat()
             payload = {
                 "timezone": "UTC",
                 "omit_data": False,
                 "start_time": start_time,
-                "end_time": None,
+                "end_time": end_time,
                 "stride": {"days": 0, "hours": 0, "minutes": 15},
                 "after_index": None,
                 "tag_value_id": None,
@@ -596,17 +600,21 @@ class ChartMigrator(BaseMigrator):
     ) -> List[Dict[str, Any]]:
         """List charts from the requested instance using POST /api/v1/charts."""
         try:
-            # Prepare request body for listing charts according to schema
-            # Note: Some versions require start_time even if omit_data is True
-            start_time = (
-                datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)
-            ).isoformat()
+            # Prepare request body for listing charts according to schema.
+            # We only want metadata (omit_data=True), but the list-charts
+            # endpoint still runs its stats fan-out and rejects a null end_time
+            # with 422 "end_time must be set", so we send a bounded window.
+            # A 1-day range at the 15-min stride is ~96 buckets, well under the
+            # server point cap.
+            now = datetime.datetime.now(datetime.UTC)
+            start_time = (now - datetime.timedelta(days=1)).isoformat()
+            end_time = now.isoformat()
 
             payload = {
                 "timezone": "UTC",
                 "omit_data": True,  # Only fetch metadata, not full data
                 "start_time": start_time,
-                "end_time": None,
+                "end_time": end_time,
                 "stride": {"days": 0, "hours": 0, "minutes": 15},
                 "after_index": None,
                 "tag_value_id": None,
@@ -768,14 +776,17 @@ class ChartMigrator(BaseMigrator):
         """Fetch destination charts/sections and build a name->id map."""
         self._dest_section_map = {}
         try:
-            # We use the same payload as list_charts but against destination
-            start_time = (
-                datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)
-            ).isoformat()
+            # We use the same payload as list_charts but against destination.
+            # end_time must be non-null (see _list_charts): the endpoint runs
+            # its stats fan-out even with omit_data and 422s on a null end_time.
+            now = datetime.datetime.now(datetime.UTC)
+            start_time = (now - datetime.timedelta(days=1)).isoformat()
+            end_time = now.isoformat()
             payload = {
                 "timezone": "UTC",
                 "omit_data": True,
                 "start_time": start_time,
+                "end_time": end_time,
                 "stride": {"days": 0, "hours": 0, "minutes": 15},
             }
 

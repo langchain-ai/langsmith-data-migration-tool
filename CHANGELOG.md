@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.79] - 2026-07-06
+
+### Fixed
+- **Chart discovery `422 end_time must be set`**: Chart read/list requests
+  (`POST /charts`) now send a bounded, non-null `end_time` (a 1-day window) in
+  all three discovery paths (`_list_charts`, `_build_dest_section_map`, and the
+  `_enrich_chart` fallback) instead of `end_time: None`. The server's list
+  endpoint runs its stats fan-out even for metadata-only (`omit_data`) reads,
+  and that path rejects a null `end_time` with a 422, which caused source chart
+  discovery to fail so that no charts were migrated. Sending a bounded window
+  keeps the request well under the server's data-point cap and lets discovery
+  succeed while the server-side fix is pending.
+
 ## [0.0.78] - 2026-06-23
 
 ### Added
