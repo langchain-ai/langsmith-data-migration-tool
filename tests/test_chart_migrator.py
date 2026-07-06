@@ -1,5 +1,6 @@
 """Unit tests for ChartMigrator."""
 
+import datetime
 from unittest.mock import Mock
 
 import pytest
@@ -13,6 +14,15 @@ def _mock_client() -> Mock:
     client.session = Mock()
     client.session.headers = {}
     return client
+
+
+def _charts_payload(client: Mock) -> dict:
+    """Return the request body from the client's POST /charts (list) call."""
+    for call in client.post.call_args_list:
+        args = call.args
+        if args and args[0] == "/charts":
+            return args[1]
+    raise AssertionError("expected a POST /charts call")
 
 
 def test_find_existing_chart_checks_destination_not_source(sample_config, migration_state):
@@ -1129,3 +1139,75 @@ def test_migrate_session_charts_forwards_same_instance(
         "dest-session",
         same_instance=True,
     )
+
+
+def _assert_bounded_window(payload: dict) -> None:
+    """Chart-read payloads must send a non-null, bounded time window.
+
+    Regression guard for Pylon 16029 / LSO-3080: the POST /charts list endpoint
+    runs its stats fan-out even with omit_data=True, and that path rejects a
+    null end_time with 422 "end_time must be set". Sending end_time=None (the
+    prior behavior) made source chart discovery fail so 0 charts migrated.
+    """
+    assert payload.get("end_time") is not None, "end_time must be sent (non-null)"
+    assert payload.get("start_time") is not None
+    start = datetime.datetime.fromisoformat(payload["start_time"])
+    end = datetime.datetime.fromisoformat(payload["end_time"])
+    assert start <= end, "start_time must not be after end_time"
+
+
+def test_list_charts_sends_bounded_end_time(sample_config, migration_state):
+    """_list_charts must send a non-null bounded end_time (metadata-only read)."""
+
+    source_client = _mock_client()
+    source_client.post.return_value = []
+
+    migrator = ChartMigrator(
+        source_client,
+        _mock_client(),
+        migration_state,
+        sample_config,
+    )
+    migrator._list_charts(source_client, side="source")
+
+    payload = _charts_payload(source_client)
+    assert payload["omit_data"] is True
+    _assert_bounded_window(payload)
+
+
+def test_build_dest_section_map_sends_bounded_end_time(sample_config, migration_state):
+    """_build_dest_section_map must send a non-null bounded end_time on destination."""
+
+    dest_client = _mock_client()
+    dest_client.post.return_value = {"sections": []}
+
+    migrator = ChartMigrator(
+        _mock_client(),
+        dest_client,
+        migration_state,
+        sample_config,
+    )
+    migrator._build_dest_section_map()
+
+    payload = _charts_payload(dest_client)
+    assert payload["omit_data"] is True
+    _assert_bounded_window(payload)
+
+
+def test_enrich_chart_sends_bounded_end_time(sample_config, migration_state):
+    """_enrich_chart's fallback source fetch must send a non-null bounded end_time."""
+
+    source_client = _mock_client()
+    source_client.post.return_value = []
+
+    migrator = ChartMigrator(
+        source_client,
+        _mock_client(),
+        migration_state,
+        sample_config,
+    )
+    # A chart with no series triggers the enrichment fetch.
+    migrator._enrich_chart({"id": "chart-1", "title": "Latency"})
+
+    payload = _charts_payload(source_client)
+    _assert_bounded_window(payload)
