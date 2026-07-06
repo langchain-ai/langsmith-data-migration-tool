@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.79] - 2026-07-06
+
 ### Fixed
 - **Chart discovery `422 end_time must be set`**: Chart read/list requests
   (`POST /charts`) now send a bounded, non-null `end_time` (a 1-day window) in
