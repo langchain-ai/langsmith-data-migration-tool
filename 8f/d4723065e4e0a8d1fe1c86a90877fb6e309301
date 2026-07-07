@@ -1,0 +1,79 @@
+langsmith_migrator/cli/main.py
+  s_85ee419019e59a::t_1dded1242d6725 3741
+  s_143f80a2e029be::t_6e5ec6ca26739a 22
+  s_85ee419019e59a::t_3c4f9b15d63e08 24
+  s_143f80a2e029be::t_40a04a258e874a 2364-2507
+  s_85ee419019e59a::t_61a729354bdba5 3706
+  s_85ee419019e59a::t_f5daea3d3f7b8a 2240-2362
+  s_85ee419019e59a::t_c252178c9b7112 3896
+  s_85ee419019e59a::t_6e95b9693bb642 3926
+  s_85ee419019e59a::t_eaab7dc5c897ee 4512-4575
+  s_60758ea73a5d4d::t_9178eb7b829e6e 2363
+tests/functional/test_cli_functional.py
+  s_85ee419019e59a::t_6a5de1d66a070f 57
+  s_143f80a2e029be::t_fdd43e03eaad87 49
+langsmith_migrator/core/api_client.py
+  s_85ee419019e59a::t_bc080f6f57dbef 338-360
+  s_60758ea73a5d4d::t_62940cfda31054 337
+tests/test_model_price_map_migrator.py
+  s_85ee419019e59a::t_a08c41f38a9fdb 1-131,171-187
+  s_85ee419019e59a::t_76c27c54fa0e10 132-170
+CLAUDE.md
+  s_143f80a2e029be::t_12dc647281cf33 80-81,84-93
+  s_143f80a2e029be::t_07676c1c44250f 35-38
+  s_85ee419019e59a::t_bdeba13e973290 43
+  s_60758ea73a5d4d::t_0ef5b035cc1364 94
+CHANGELOG.md
+  s_143f80a2e029be::t_b8fd2e7ee8fa1d 10,19-28
+  s_85ee419019e59a::t_c1865048ce4324 11-18
+langsmith_migrator/core/migrators/model_price_map.py
+  s_85ee419019e59a::t_50320d81552f34 1-80,87-144
+  s_85ee419019e59a::t_066d20d2aa2687 81-86
+tests/test_fleet_agent_migrator.py
+  s_143f80a2e029be::t_a0f7d0407a5b49 1-305
+langsmith_migrator/core/migrators/fleet_agent.py
+  s_143f80a2e029be::t_82b251a9c642f3 1-370
+README.md
+  s_143f80a2e029be::t_5dec6345854567 34
+  s_143f80a2e029be::t_369dc4583469bf 50
+  s_143f80a2e029be::t_18766363e6d602 171-176
+  s_143f80a2e029be::t_3a3225d0ba4a7d 58-74
+  s_85ee419019e59a::t_59de2c33edcbad 168-170
+langsmith_migrator/core/migrators/__init__.py
+  s_85ee419019e59a::t_99f60900762f1f 12
+  s_85ee419019e59a::t_9e881e7c693f2e 26
+  s_143f80a2e029be::t_07667f05e1f35b 8
+  s_143f80a2e029be::t_203372de025c42 22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8fd4723065e4e0a8d1fe1c86a90877fb6e309301",
+  "prompts": {},
+  "sessions": {
+    "s_143f80a2e029be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "71f82681-85f3-462b-a599-8b6f26b5d8a6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_60758ea73a5d4d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3d17cc85-bd57-4d7b-94ca-0396cfc4abef",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    },
+    "s_85ee419019e59a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "037b1077-4c97-4f9b-a642-c8029704f06a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}
