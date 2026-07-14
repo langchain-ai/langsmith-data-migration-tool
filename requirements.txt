@@ -2,9 +2,9 @@
 #    uv pip compile pyproject.toml -o requirements.txt
 annotated-types==0.7.0
     # via pydantic
-anthropic==0.112.0
+anthropic==0.116.0
     # via langchain-anthropic
-anyio==4.14.1
+anyio==4.14.2
     # via
     #   anthropic
     #   httpx
@@ -15,7 +15,7 @@ certifi==2026.6.17
     #   httpcore
     #   httpx
     #   requests
-charset-normalizer==3.4.7
+charset-normalizer==3.4.9
     # via requests
 click==8.4.2
     # via langsmith-data-migration-tool (pyproject.toml)
@@ -50,16 +50,16 @@ jsonpointer==3.1.1
     # via jsonpatch
 langchain-anthropic==1.4.8
     # via langsmith-data-migration-tool (pyproject.toml)
-langchain-core==1.4.8
+langchain-core==1.4.9
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-anthropic
     #   langchain-openai
-langchain-openai==1.3.3
+langchain-openai==1.3.5
     # via langsmith-data-migration-tool (pyproject.toml)
 langchain-protocol==0.0.18
     # via langchain-core
-langsmith==0.9.3
+langsmith==0.10.2
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-core
@@ -74,7 +74,7 @@ mdit-py-plugins==0.6.1
     # via textual
 mdurl==0.1.2
     # via markdown-it-py
-openai==2.44.0
+openai==2.45.0
     # via langchain-openai
 orjson==3.11.9
     # via langsmith
@@ -91,7 +91,7 @@ pydantic==2.13.4
     #   langchain-core
     #   langsmith
     #   openai
-pydantic-core==2.46.4
+pydantic-core==2.47.0
     # via pydantic
 pygments==2.20.0
     # via
@@ -101,7 +101,7 @@ python-dotenv==1.2.2
     # via langsmith-data-migration-tool (pyproject.toml)
 pyyaml==6.0.3
     # via langchain-core
-regex==2026.6.28
+regex==2026.7.10
     # via tiktoken
 requests==2.34.2
     # via
@@ -122,13 +122,13 @@ sniffio==1.3.1
     #   openai
 tenacity==9.1.4
     # via langchain-core
-textual==8.2.7
+textual==8.2.8
     # via langsmith-data-migration-tool (pyproject.toml)
 tiktoken==0.13.0
     # via langchain-openai
-tqdm==4.68.3
+tqdm==4.68.4
     # via openai
-typing-extensions==4.15.0
+typing-extensions==4.16.0
     # via
     #   anthropic
     #   langchain-core
@@ -147,13 +147,13 @@ urllib3==2.7.0
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   requests
-uuid-utils==0.16.2
+uuid-utils==0.17.0
     # via
     #   langchain-core
     #   langsmith
-websockets==16.0
+websockets==16.1
     # via langsmith
-xxhash==3.8.0
+xxhash==3.8.1
     # via langsmith
 zstandard==0.25.0
     # via langsmith
