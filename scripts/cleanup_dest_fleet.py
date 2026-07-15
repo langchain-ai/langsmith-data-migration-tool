@@ -10,10 +10,13 @@ Usage:
 Reads LANGSMITH_NEW_API_KEY and LANGSMITH_NEW_BASE_URL from environment.
 """
 
+import logging
 import os
 import sys
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -57,14 +60,14 @@ def headers():
 def delete(path, label):
     url = make_url(path)
     if DRY_RUN:
-        print(f"  [DRY RUN] Would DELETE {label}")
+        logger.info("Would DELETE %s", label)
         return True
     status_code = _do_delete(url)
     if status_code in (200, 204, 404):
-        print(f"  Deleted {label}")
+        logger.info("Deleted %s", label)
         return True
     else:
-        print(f"  FAILED to delete {label}: HTTP {status_code}")
+        logger.warning("Failed to delete %s: HTTP %s", label, status_code)
         return False
 
 
@@ -115,6 +118,8 @@ def cursor_paginate(path, page_size=100):
 # ---------------------------------------------------------------------------
 # Safety check
 # ---------------------------------------------------------------------------
+
+logging.basicConfig(level=logging.INFO, format="  %(message)s")
 
 if not API_KEY:
     print("ERROR: LANGSMITH_NEW_API_KEY not set")
