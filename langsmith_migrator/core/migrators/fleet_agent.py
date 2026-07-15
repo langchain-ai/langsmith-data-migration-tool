@@ -76,7 +76,6 @@ class FleetAgentMigrator(BaseMigrator):
         agent: Dict[str, Any],
         id_mappings: Dict[str, Dict[str, str]],
         skip_skills: bool = False,
-        skip_mcp_servers: bool = False,
         dest_model_ids: Optional[List[str]] = None,
         dest_user_ids: Optional[set] = None,
     ) -> str:
@@ -85,10 +84,9 @@ class FleetAgentMigrator(BaseMigrator):
         Args:
             agent: Full agent record from source (must include files/system_prompt).
             id_mappings: Dictionary of ID mappings from prior migration phases.
-                Expected keys: "fleet_skills", "fleet_mcp_servers",
-                "fleet_sandbox_policies", "fleet_auth_providers".
+                Expected keys: "fleet_skills", "fleet_sandbox_policies",
+                "fleet_auth_providers".
             skip_skills: If True, strip skill file entries from the agent payload.
-            skip_mcp_servers: If True, leave original MCP server URLs in tool configs.
             dest_model_ids: Available model IDs on the destination. If provided,
                 the agent's model is validated and stripped if not recognized.
             dest_user_ids: Set of ls_user_id values that exist on the destination
@@ -109,7 +107,7 @@ class FleetAgentMigrator(BaseMigrator):
             return f"dry-run-{agent.get('id', name)}"
 
         payload = self._build_create_payload(
-            agent, id_mappings, skip_skills, skip_mcp_servers, dest_model_ids, dest_user_ids
+            agent, id_mappings, skip_skills, dest_model_ids, dest_user_ids
         )
 
         response = self.dest.post("/v1/fleet/agents", payload)
@@ -133,7 +131,6 @@ class FleetAgentMigrator(BaseMigrator):
         agent: Dict[str, Any],
         id_mappings: Dict[str, Dict[str, str]],
         skip_skills: bool,
-        skip_mcp_servers: bool,
         dest_model_ids: Optional[List[str]] = None,
         dest_user_ids: Optional[set] = None,
     ) -> Dict[str, Any]:
@@ -195,14 +192,13 @@ class FleetAgentMigrator(BaseMigrator):
 
         tools = agent.get("tools")
         if tools:
-            payload["tools"] = self._remap_tools(tools, id_mappings, skip_mcp_servers)
+            # MCP server URLs are stable external identities. Registering the
+            # same URL on the destination makes the copied tool config valid.
+            payload["tools"] = copy.deepcopy(tools)
 
         subagents = agent.get("subagents")
         if subagents:
-            payload["subagents"] = [
-                self._remap_subagent(sub, id_mappings, skip_mcp_servers)
-                for sub in subagents
-            ]
+            payload["subagents"] = copy.deepcopy(subagents)
 
         files = agent.get("files")
         if files:
@@ -211,44 +207,6 @@ class FleetAgentMigrator(BaseMigrator):
             )
 
         return payload
-
-    def _remap_tools(
-        self,
-        tools: Dict[str, Any],
-        id_mappings: Dict[str, Dict[str, str]],
-        skip_mcp_servers: bool,
-    ) -> Dict[str, Any]:
-        """Remap MCP server URLs in tool config."""
-        remapped = copy.deepcopy(tools)
-        tool_list = remapped.get("tools", [])
-
-        mcp_server_map = id_mappings.get("fleet_mcp_servers", {})
-
-        for tool in tool_list:
-            if not isinstance(tool, dict):
-                continue
-            url = tool.get("mcp_server_url")
-            if url and not skip_mcp_servers:
-                dest_url = self._find_dest_mcp_url(url, mcp_server_map)
-                if dest_url:
-                    tool["mcp_server_url"] = dest_url
-
-        return remapped
-
-    def _remap_subagent(
-        self,
-        subagent: Dict[str, Any],
-        id_mappings: Dict[str, Dict[str, str]],
-        skip_mcp_servers: bool,
-    ) -> Dict[str, Any]:
-        """Remap references in a subagent spec."""
-        remapped = copy.deepcopy(subagent)
-        tools = remapped.get("tools")
-        if tools:
-            remapped["tools"] = self._remap_tools(
-                tools, id_mappings, skip_mcp_servers
-            )
-        return remapped
 
     def _remap_files(
         self,
@@ -402,20 +360,4 @@ class FleetAgentMigrator(BaseMigrator):
                 if dest_id.startswith(source_prefix + ":"):
                     return dest_id
 
-        return None
-
-    @staticmethod
-    def _find_dest_mcp_url(
-        source_url: str, mcp_server_map: Dict[str, str]
-    ) -> Optional[str]:
-        """Find the destination URL for a source MCP server.
-
-        The mcp_server_map maps source server IDs to destination server IDs.
-        We need to resolve the destination server's URL from its ID, but
-        since we only have ID mappings, we store URL mappings separately
-        in the id_mappings under "fleet_mcp_server_urls".
-        """
-        # This is populated by the CLI orchestration layer after creating
-        # MCP servers, mapping source URLs to destination URLs.
-        # The caller passes this via id_mappings.
         return None

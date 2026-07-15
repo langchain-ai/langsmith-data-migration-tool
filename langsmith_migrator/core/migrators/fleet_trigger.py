@@ -22,6 +22,28 @@ class FleetTriggerMigrator(BaseMigrator):
             self.log(f"Failed to list Fleet triggers: {e}", "warning")
         return triggers
 
+    def find_existing_trigger(
+        self,
+        agent_id: str,
+        template_id: str,
+        config: Dict[str, Any],
+    ) -> Optional[str]:
+        """Find a destination trigger with the same agent, template, and config."""
+        triggers = self.dest_index(
+            "_dest_triggers",
+            "/v1/fleet/triggers",
+            "id",
+            error_label="trigger",
+        )
+        for trigger in triggers.values():
+            if (
+                trigger.get("agent_id") == agent_id
+                and trigger.get("template_id") == template_id
+                and trigger.get("config", {}) == config
+            ):
+                return trigger.get("id")
+        return None
+
     def create_trigger(
         self,
         trigger: Dict[str, Any],
@@ -46,6 +68,19 @@ class FleetTriggerMigrator(BaseMigrator):
             )
             return None
 
+        template_id = trigger.get("template_id", "")
+        trigger_config = trigger.get("config", {})
+        existing_id = self.find_existing_trigger(
+            dest_agent_id, template_id, trigger_config
+        )
+        if existing_id:
+            self.log(
+                f"Trigger for agent {dest_agent_id} and template "
+                f"{template_id} already exists, skipping",
+                "warning",
+            )
+            return existing_id
+
         if self.config.migration.dry_run:
             self.log(
                 f"[DRY RUN] Would create trigger '{trigger.get('name', '')}' "
@@ -55,8 +90,8 @@ class FleetTriggerMigrator(BaseMigrator):
 
         payload: Dict[str, Any] = {
             "agent_id": dest_agent_id,
-            "template_id": trigger.get("template_id", ""),
-            "config": trigger.get("config", {}),
+            "template_id": template_id,
+            "config": trigger_config,
         }
 
         name = trigger.get("name")
@@ -74,6 +109,9 @@ class FleetTriggerMigrator(BaseMigrator):
         try:
             response = self.dest.post("/v1/fleet/triggers", payload)
             if isinstance(response, dict) and "id" in response:
+                self.register_dest_item(
+                    "_dest_triggers", response["id"], {**payload, **response}
+                )
                 return response["id"]
         except Exception as e:
             self.log(

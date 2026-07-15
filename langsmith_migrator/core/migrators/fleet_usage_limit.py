@@ -30,6 +30,24 @@ class FleetUsageLimitMigrator(BaseMigrator):
             self.log(f"Failed to list Fleet usage limits: {e}", "warning")
         return limits
 
+    def find_existing_limit(
+        self, subject_type: str, subject_id: Optional[str]
+    ) -> Optional[str]:
+        """Find a destination limit for the same subject."""
+        limits = self.dest_index(
+            "_dest_limits",
+            "/v1/platform/fleet/usage/limits",
+            "id",
+            error_label="spend limit",
+        )
+        for limit in limits.values():
+            if (
+                limit.get("subject_type") == subject_type
+                and limit.get("subject_id") == subject_id
+            ):
+                return limit.get("id")
+        return None
+
     def create_limit(
         self,
         limit: Dict[str, Any],
@@ -61,6 +79,15 @@ class FleetUsageLimitMigrator(BaseMigrator):
             elif subject_type == "user" and user_id_map:
                 remapped_subject_id = user_id_map.get(subject_id, subject_id)
 
+        existing_id = self.find_existing_limit(subject_type, remapped_subject_id)
+        if existing_id:
+            self.log(
+                f"Spend limit for {subject_type} "
+                f"{remapped_subject_id or 'global'} already exists, skipping",
+                "warning",
+            )
+            return existing_id
+
         if self.config.migration.dry_run:
             self.log(
                 f"[DRY RUN] Would create spend limit for {subject_type} "
@@ -79,6 +106,9 @@ class FleetUsageLimitMigrator(BaseMigrator):
         try:
             response = self.dest.post("/v1/platform/fleet/usage/limits", payload)
             if isinstance(response, dict) and "id" in response:
+                self.register_dest_item(
+                    "_dest_limits", response["id"], {**payload, **response}
+                )
                 return response["id"]
         except Exception as e:
             self.log(

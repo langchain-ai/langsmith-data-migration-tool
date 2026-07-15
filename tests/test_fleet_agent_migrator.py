@@ -105,7 +105,7 @@ class TestFleetAgentMigrator:
         }
 
         result = agent_migrator.create_agent(
-            sample_agent, id_mappings, skip_skills=False, skip_mcp_servers=False
+            sample_agent, id_mappings, skip_skills=False
         )
 
         assert result == "new-agent-id"
@@ -123,27 +123,29 @@ class TestFleetAgentMigrator:
         # Sandbox policy ID should be remapped
         assert payload["backend"]["sandbox_config"]["policy_ids"] == ["dest-policy-id"]
 
+        # MCP server URLs are stable external identities and should be preserved.
+        assert (
+            payload["tools"]["tools"][0]["mcp_server_url"]
+            == "https://old.example.com/mcp"
+        )
+
     def test_create_agent_skip_skills_strips_skill_refs(self, agent_migrator, sample_agent):
         """When skills are skipped, skill file entries should be stripped."""
         agent_migrator.dest.get_cursor_paginated.return_value = []
         agent_migrator.dest.post.return_value = {"id": "new-agent-id"}
 
-        result = agent_migrator.create_agent(
-            sample_agent, {}, skip_skills=True, skip_mcp_servers=False
-        )
+        result = agent_migrator.create_agent(sample_agent, {}, skip_skills=True)
 
         assert result == "new-agent-id"
         payload = agent_migrator.dest.post.call_args[0][1]
         assert "skills/web-research" not in payload["files"]
 
-    def test_create_agent_skip_mcp_servers_keeps_urls(self, agent_migrator, sample_agent):
-        """When MCP servers are skipped, tool URLs should remain unchanged."""
+    def test_create_agent_preserves_mcp_server_urls(self, agent_migrator, sample_agent):
+        """MCP server URLs should remain unchanged in the agent payload."""
         agent_migrator.dest.get_cursor_paginated.return_value = []
         agent_migrator.dest.post.return_value = {"id": "new-agent-id"}
 
-        result = agent_migrator.create_agent(
-            sample_agent, {}, skip_skills=True, skip_mcp_servers=True
-        )
+        result = agent_migrator.create_agent(sample_agent, {}, skip_skills=True)
 
         assert result == "new-agent-id"
         payload = agent_migrator.dest.post.call_args[0][1]
@@ -180,7 +182,6 @@ class TestFleetAgentMigrator:
         result = agent_migrator.create_agent(
             sample_agent, {},
             skip_skills=True,
-            skip_mcp_servers=True,
             dest_model_ids=["anthropic:claude-sonnet-4-6"],
         )
 
@@ -199,7 +200,6 @@ class TestFleetAgentMigrator:
         result = agent_migrator.create_agent(
             sample_agent, {},
             skip_skills=True,
-            skip_mcp_servers=True,
             dest_model_ids=["anthropic:claude-opus-4-8"],
         )
 
@@ -216,7 +216,6 @@ class TestFleetAgentMigrator:
         result = agent_migrator.create_agent(
             sample_agent, {},
             skip_skills=True,
-            skip_mcp_servers=True,
             dest_model_ids=["openai:gpt-4o", "google:gemini-pro"],
         )
 
@@ -232,7 +231,6 @@ class TestFleetAgentMigrator:
         result = agent_migrator.create_agent(
             sample_agent, {},
             skip_skills=True,
-            skip_mcp_servers=True,
             dest_model_ids=None,
         )
 
@@ -240,17 +238,36 @@ class TestFleetAgentMigrator:
         payload = agent_migrator.dest.post.call_args[0][1]
         assert payload["model"]["id"] == "anthropic:claude-sonnet-4-6"
 
-    def test_remap_subagent_tools(self, agent_migrator):
-        """Subagent tool configs should be remapped."""
-        tools = {
-            "tools": [
-                {"name": "search", "mcp_server_url": "https://old.example.com/mcp"},
+    def test_create_agent_preserves_subagent_mcp_server_urls(self, agent_migrator):
+        """Subagent MCP server URLs should remain unchanged."""
+        agent = {
+            "id": "agent-123",
+            "name": "Research Assistant",
+            "subagents": [
+                {
+                    "name": "researcher",
+                    "tools": {
+                        "tools": [
+                            {
+                                "name": "search",
+                                "mcp_server_url": "https://old.example.com/mcp",
+                            },
+                        ],
+                    },
+                }
             ],
         }
-        result = agent_migrator._remap_tools(tools, {}, skip_mcp_servers=True)
+        agent_migrator.dest.get_cursor_paginated.return_value = []
+        agent_migrator.dest.post.return_value = {"id": "new-agent-id"}
 
-        # When skip_mcp_servers is True, URLs are left unchanged
-        assert result["tools"][0]["mcp_server_url"] == "https://old.example.com/mcp"
+        result = agent_migrator.create_agent(agent, {})
+
+        assert result == "new-agent-id"
+        payload = agent_migrator.dest.post.call_args[0][1]
+        assert (
+            payload["subagents"][0]["tools"]["tools"][0]["mcp_server_url"]
+            == "https://old.example.com/mcp"
+        )
 
     def test_remap_backend_remaps_policy_ids(self, agent_migrator):
         """Sandbox policy IDs should be remapped via id_mappings."""

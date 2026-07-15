@@ -69,6 +69,7 @@ class TestFleetUsageLimitMigrator:
 
     def test_create_agent_limit_with_remap(self, limit_migrator, sample_agent_limit):
         """Test creating an agent spend limit with remapped subject_id."""
+        limit_migrator.dest.get_cursor_paginated.return_value = []
         limit_migrator.dest.post.return_value = {"id": "new-limit-id"}
 
         agent_map = {"agent-123": "dest-agent-id"}
@@ -82,8 +83,32 @@ class TestFleetUsageLimitMigrator:
         assert payload["subject_id"] == "dest-agent-id"
         assert payload["limit_usd"] == 50.0
 
+    def test_create_agent_limit_existing_skip(
+        self, limit_migrator, sample_agent_limit
+    ):
+        """An existing limit for the remapped subject is reused without overwrite."""
+        limit_migrator.dest.get_cursor_paginated.return_value = [
+            {
+                "id": "existing-limit-id",
+                "subject_type": "agent",
+                "subject_id": "dest-agent-id",
+                "limit_usd": 25.0,
+            }
+        ]
+
+        result = limit_migrator.create_limit(
+            sample_agent_limit, {"agent-123": "dest-agent-id"}
+        )
+
+        assert result == "existing-limit-id"
+        limit_migrator.dest.post.assert_not_called()
+        limit_migrator.dest.get_cursor_paginated.assert_called_once_with(
+            "/v1/platform/fleet/usage/limits", params=None
+        )
+
     def test_create_global_limit(self, limit_migrator, sample_global_limit):
         """Global default limits (nil subject_id) should pass through without remapping."""
+        limit_migrator.dest.get_cursor_paginated.return_value = []
         limit_migrator.dest.post.return_value = {"id": "new-limit-id"}
 
         result = limit_migrator.create_limit(sample_global_limit, {})
@@ -93,6 +118,24 @@ class TestFleetUsageLimitMigrator:
         assert payload["subject_type"] == "agent"
         assert "subject_id" not in payload
         assert payload["limit_usd"] == 100.0
+
+    def test_create_global_limit_existing_skip(
+        self, limit_migrator, sample_global_limit
+    ):
+        """A destination global default is reused without creating a duplicate."""
+        limit_migrator.dest.get_cursor_paginated.return_value = [
+            {
+                "id": "existing-global-limit-id",
+                "subject_type": "agent",
+                "subject_id": None,
+                "limit_usd": 75.0,
+            }
+        ]
+
+        result = limit_migrator.create_limit(sample_global_limit, {})
+
+        assert result == "existing-global-limit-id"
+        limit_migrator.dest.post.assert_not_called()
 
     def test_create_agent_limit_agent_not_in_map(self, limit_migrator, sample_agent_limit):
         """Limit should be skipped when agent ID is not in the mapping."""

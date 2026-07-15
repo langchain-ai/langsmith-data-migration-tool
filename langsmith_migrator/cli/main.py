@@ -4983,12 +4983,6 @@ def _migrate_fleet_for_workspace(
             )
         else:
             console.print("  [dim]No integrations found[/dim]")
-    else:
-        if not skip_agents:
-            console.print(
-                "[yellow]Warning: MCP servers skipped, agent tool URLs cannot be remapped.[/yellow]"
-            )
-
     # --- Phase 5: Skills ---
     if not skip_skills:
         console.print("\n[bold]Fleet: Shared Skills[/bold]")
@@ -5058,7 +5052,6 @@ def _migrate_fleet_for_workspace(
                             agent,
                             id_mappings,
                             skip_skills=skip_skills,
-                            skip_mcp_servers=skip_mcp_servers,
                             dest_model_ids=dest_model_ids if dest_model_ids else None,
                             dest_user_ids=dest_user_ids,
                         )

@@ -7,13 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.80] - 2026-07-15
+
 ### Added
 - **Fleet resource migration (`fleet`)**: New `fleet` command migrates LangSmith
   Fleet resources between instances, including agents, shared skills, MCP servers,
   integrations, auth providers, schedules, triggers, webhooks, usage limits, and
   sandbox policies. Resources are migrated in dependency order with automatic
-  cross-reference remapping (agent tool URLs, skill repo handles, subagent IDs,
-  sandbox policy IDs, auth provider IDs). Secrets and auth provider client
+  cross-reference remapping (skill repo handles, agent IDs in dependent resources,
+  sandbox policy IDs, auth provider IDs). MCP server URLs are stable external
+  identities and are preserved. Secrets and auth provider client
   secrets are exported as placeholders with remediation steps since those values
   are write-only. Per-user OAuth connections and infrastructure-level OAuth
   provider configuration require manual re-setup on the destination. Also adds

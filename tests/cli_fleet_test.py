@@ -137,7 +137,14 @@ class _FakeFleetAgentMigrator:
             "files": {"skills/web-research": {"type": "skill", "repo_handle": "web-research"}},
         }
 
-    def create_agent(self, agent, id_mappings, skip_skills=False, skip_mcp_servers=False, dest_model_ids=None, dest_user_ids=None):
+    def create_agent(
+        self,
+        agent,
+        id_mappings,
+        skip_skills=False,
+        dest_model_ids=None,
+        dest_user_ids=None,
+    ):
         _FakeFleetAgentMigrator.create_calls.append(agent.get("id"))
         _FakeFleetAgentMigrator.id_mappings_received = dict(id_mappings)
         return "dest-agent-1"

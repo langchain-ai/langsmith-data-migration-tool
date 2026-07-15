@@ -58,6 +58,7 @@ class TestFleetTriggerMigrator:
 
     def test_create_trigger(self, trigger_migrator, sample_trigger):
         """Test creating a trigger with remapped agent ID."""
+        trigger_migrator.dest.get_cursor_paginated.return_value = []
         trigger_migrator.dest.post.return_value = {"id": "new-trigger-id"}
 
         agent_map = {"agent-123": "dest-agent-id"}
@@ -70,6 +71,28 @@ class TestFleetTriggerMigrator:
         assert payload["agent_id"] == "dest-agent-id"
         assert payload["template_id"] == "template-456"
         assert payload["config"] == {"channel_id": "C123", "channel_name": "general"}
+
+    def test_create_trigger_existing_skip(self, trigger_migrator, sample_trigger):
+        """An existing trigger for the same agent, template, and config is reused."""
+        trigger_migrator.dest.get_cursor_paginated.return_value = [
+            {
+                "id": "existing-trigger-id",
+                "agent_id": "dest-agent-id",
+                "template_id": "template-456",
+                "config": {"channel_id": "C123", "channel_name": "general"},
+                "status": "paused",
+            }
+        ]
+
+        result = trigger_migrator.create_trigger(
+            sample_trigger, {"agent-123": "dest-agent-id"}
+        )
+
+        assert result == "existing-trigger-id"
+        trigger_migrator.dest.post.assert_not_called()
+        trigger_migrator.dest.get_cursor_paginated.assert_called_once_with(
+            "/v1/fleet/triggers", params=None
+        )
 
     def test_create_trigger_agent_not_in_map(self, trigger_migrator, sample_trigger):
         """Trigger should be skipped when agent ID is not in the mapping."""
