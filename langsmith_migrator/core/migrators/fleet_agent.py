@@ -62,16 +62,14 @@ class FleetAgentMigrator(BaseMigrator):
 
         Searches both user and tenant audiences on the destination.
         """
-        try:
-            for audience in ("user", "tenant"):
-                for agent in self.dest.get_cursor_paginated(
-                    "/v1/fleet/agents", params={"audience": audience}
-                ):
-                    if isinstance(agent, dict) and agent.get("name") == name:
-                        return agent.get("id")
-        except Exception as e:
-            self.log(f"Failed to check for existing agent: {e}", "warning")
-        return None
+        agent = self.dest_index(
+            "_dest_agents",
+            "/v1/fleet/agents",
+            "name",
+            error_label="agent",
+            audiences=("user", "tenant"),
+        ).get(name)
+        return agent.get("id") if agent else None
 
     def create_agent(
         self,
@@ -127,6 +125,7 @@ class FleetAgentMigrator(BaseMigrator):
                 f"Invalid response creating agent: missing 'id'. Response: {response}"
             )
 
+        self.register_dest_item("_dest_agents", name, response)
         return response["id"]
 
     def _build_create_payload(

@@ -31,15 +31,13 @@ class FleetWebhookMigrator(BaseMigrator):
 
     def find_existing_webhook(self, name: str) -> Optional[str]:
         """Check if a webhook with the same name exists in destination."""
-        try:
-            for webhook in self.dest.get_cursor_paginated(
-                "/v1/platform/fleet-webhooks"
-            ):
-                if isinstance(webhook, dict) and webhook.get("name") == name:
-                    return webhook.get("id")
-        except Exception as e:
-            self.log(f"Failed to check for existing webhook: {e}", "warning")
-        return None
+        webhook = self.dest_index(
+            "_dest_webhooks",
+            "/v1/platform/fleet-webhooks",
+            "name",
+            error_label="webhook",
+        ).get(name)
+        return webhook.get("id") if webhook else None
 
     def create_webhook(self, webhook: Dict[str, Any]) -> Optional[str]:
         """Create a webhook in the destination workspace.
@@ -73,6 +71,7 @@ class FleetWebhookMigrator(BaseMigrator):
         try:
             response = self.dest.post("/v1/platform/fleet-webhooks", payload)
             if isinstance(response, dict) and "id" in response:
+                self.register_dest_item("_dest_webhooks", name, response)
                 return response["id"]
         except Exception as e:
             self.log(f"Failed to create webhook '{name}': {e}", "error")

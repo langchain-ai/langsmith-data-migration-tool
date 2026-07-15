@@ -37,23 +37,23 @@ class FleetMcpServerMigrator(BaseMigrator):
 
     def find_existing_mcp_server(self, name: str) -> Optional[str]:
         """Check if an MCP server with the same name exists in destination."""
-        try:
-            for server in self.dest.get_cursor_paginated("/v1/fleet/mcp-servers"):
-                if isinstance(server, dict) and server.get("name") == name:
-                    return server.get("id")
-        except Exception as e:
-            self.log(f"Failed to check for existing MCP server: {e}", "warning")
-        return None
+        server = self.dest_index(
+            "_dest_mcp_servers",
+            "/v1/fleet/mcp-servers",
+            "name",
+            error_label="MCP server",
+        ).get(name)
+        return server.get("id") if server else None
 
     def find_existing_integration(self, name: str) -> Optional[str]:
         """Check if an integration with the same name exists in destination."""
-        try:
-            for integration in self.dest.get_cursor_paginated("/v1/fleet/integrations"):
-                if isinstance(integration, dict) and integration.get("name") == name:
-                    return integration.get("id")
-        except Exception as e:
-            self.log(f"Failed to check for existing integration: {e}", "warning")
-        return None
+        integration = self.dest_index(
+            "_dest_integrations",
+            "/v1/fleet/integrations",
+            "name",
+            error_label="integration",
+        ).get(name)
+        return integration.get("id") if integration else None
 
     def create_mcp_server(
         self,
@@ -111,6 +111,7 @@ class FleetMcpServerMigrator(BaseMigrator):
                 f"Invalid response creating MCP server: missing 'id'. Response: {response}"
             )
 
+        self.register_dest_item("_dest_mcp_servers", name, response)
         return response["id"]
 
     def _update_mcp_server(
@@ -200,4 +201,5 @@ class FleetMcpServerMigrator(BaseMigrator):
                 f"Invalid response creating integration: expected dict, got {type(response)}"
             )
 
+        self.register_dest_item("_dest_integrations", name, response)
         return response.get("id")

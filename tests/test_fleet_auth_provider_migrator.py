@@ -65,6 +65,38 @@ class TestFleetAuthProviderMigrator:
 
         assert len(result) == 0
 
+    def test_existence_check_fetches_dest_list_once(self, auth_migrator, sample_provider):
+        """Regression: the destination list is fetched once, not per provider.
+
+        Guards against the O(n^2) N+1 pattern where every source provider
+        re-paginated the entire destination auth-provider list.
+        """
+        auth_migrator.dest.get_cursor_paginated.return_value = []
+        auth_migrator.dest.post.side_effect = (
+            lambda endpoint, payload: {"provider_slug": payload["provider_slug"]}
+        )
+
+        for i in range(5):
+            provider = {**sample_provider, "provider_slug": f"provider-{i}"}
+            auth_migrator.create_provider(provider)
+
+        assert auth_migrator.dest.get_cursor_paginated.call_count == 1
+
+    def test_created_provider_found_without_refetch(self, auth_migrator, sample_provider):
+        """A provider created in this run is detected on lookup without re-fetching."""
+        auth_migrator.dest.get_cursor_paginated.return_value = []
+        auth_migrator.dest.post.side_effect = (
+            lambda endpoint, payload: {"provider_slug": payload["provider_slug"]}
+        )
+
+        auth_migrator.create_provider(sample_provider)
+        # Cache now holds the created slug; a re-create should skip (returns existing).
+        result = auth_migrator.create_provider(sample_provider)
+
+        assert result == "google"
+        assert auth_migrator.dest.get_cursor_paginated.call_count == 1
+        assert auth_migrator.dest.post.call_count == 1
+
     def test_create_provider(self, auth_migrator, sample_provider):
         """Test creating an auth provider."""
         auth_migrator.dest.get_cursor_paginated.return_value = []

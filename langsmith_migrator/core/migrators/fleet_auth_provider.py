@@ -31,13 +31,13 @@ class FleetAuthProviderMigrator(BaseMigrator):
 
     def find_existing_provider(self, provider_slug: str) -> Optional[str]:
         """Check if a provider with the same slug exists in destination."""
-        try:
-            for provider in self.dest.get_cursor_paginated("/v1/fleet/auth-providers"):
-                if isinstance(provider, dict) and provider.get("provider_slug") == provider_slug:
-                    return provider.get("provider_slug")
-        except Exception as e:
-            self.log(f"Failed to check for existing auth provider: {e}", "warning")
-        return None
+        provider = self.dest_index(
+            "_dest_providers",
+            "/v1/fleet/auth-providers",
+            "provider_slug",
+            error_label="auth provider",
+        ).get(provider_slug)
+        return provider.get("provider_slug") if provider else None
 
     def create_provider(
         self,
@@ -112,7 +112,9 @@ class FleetAuthProviderMigrator(BaseMigrator):
         try:
             response = self.dest.post("/v1/fleet/auth-providers", payload)
             if isinstance(response, dict):
-                return response.get("provider_slug", provider_slug)
+                created_slug = response.get("provider_slug", provider_slug)
+                self.register_dest_item("_dest_providers", created_slug, response)
+                return created_slug
         except ConflictError:
             self.log(
                 f"Auth provider '{provider_slug}' conflicts with a built-in "

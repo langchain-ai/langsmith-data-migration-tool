@@ -31,15 +31,13 @@ class FleetSandboxPolicyMigrator(BaseMigrator):
 
     def find_existing_policy(self, name: str) -> Optional[str]:
         """Check if a policy with the same name exists in destination."""
-        try:
-            for policy in self.dest.get_cursor_paginated(
-                "/v1/platform/fleet/sandboxes/policies"
-            ):
-                if isinstance(policy, dict) and policy.get("name") == name:
-                    return policy.get("id")
-        except Exception as e:
-            self.log(f"Failed to check for existing sandbox policy: {e}", "warning")
-        return None
+        policy = self.dest_index(
+            "_dest_policies",
+            "/v1/platform/fleet/sandboxes/policies",
+            "name",
+            error_label="sandbox policy",
+        ).get(name)
+        return policy.get("id") if policy else None
 
     def create_policy(self, policy: Dict[str, Any]) -> Optional[str]:
         """Create a sandbox policy in the destination workspace.
@@ -71,6 +69,7 @@ class FleetSandboxPolicyMigrator(BaseMigrator):
                 "/v1/platform/fleet/sandboxes/policies", payload
             )
             if isinstance(response, dict) and "id" in response:
+                self.register_dest_item("_dest_policies", name, response)
                 return response["id"]
         except Exception as e:
             self.log(f"Failed to create sandbox policy '{name}': {e}", "error")

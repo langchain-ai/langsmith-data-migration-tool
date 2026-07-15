@@ -28,13 +28,13 @@ class FleetSkillMigrator(BaseMigrator):
 
     def find_existing_skill(self, name: str) -> Optional[str]:
         """Check if a skill with the same name already exists in destination."""
-        try:
-            for skill in self.dest.get_cursor_paginated("/v1/fleet/skills"):
-                if isinstance(skill, dict) and skill.get("name") == name:
-                    return skill.get("id")
-        except Exception as e:
-            self.log(f"Failed to check for existing skill: {e}", "warning")
-        return None
+        skill = self.dest_index(
+            "_dest_skills",
+            "/v1/fleet/skills",
+            "name",
+            error_label="skill",
+        ).get(name)
+        return skill.get("id") if skill else None
 
     def create_skill(self, skill: Dict[str, Any]) -> str:
         """Create or update a skill in the destination workspace.
@@ -70,6 +70,7 @@ class FleetSkillMigrator(BaseMigrator):
                 f"Invalid response creating skill: missing 'id' field. Response: {response}"
             )
 
+        self.register_dest_item("_dest_skills", name, response)
         return response["id"]
 
     def _update_skill_files(self, skill_id: str, skill: Dict[str, Any]) -> None:
