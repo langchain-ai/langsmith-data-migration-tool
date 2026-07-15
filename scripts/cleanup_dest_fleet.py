@@ -59,17 +59,22 @@ def delete(path, label):
     if DRY_RUN:
         print(f"  [DRY RUN] Would DELETE {label}")
         return True
+    status_code = _do_delete(url)
+    if status_code in (200, 204, 404):
+        print(f"  Deleted {label}")
+        return True
+    else:
+        print(f"  FAILED to delete {label}: HTTP {status_code}")
+        return False
+
+
+def _do_delete(url):
+    """Execute a DELETE request and return the status code."""
     try:
         resp = requests.delete(url, headers=headers(), timeout=15)
-        if resp.status_code in (200, 204, 404):
-            print(f"  Deleted {label}")
-            return True
-        else:
-            print(f"  FAILED to delete {label}: HTTP {resp.status_code}")
-            return False
-    except Exception as e:
-        print(f"  ERROR deleting {label}: {e}")
-        return False
+        return resp.status_code
+    except Exception:
+        return -1
 
 
 def get_json(path, params=None):
