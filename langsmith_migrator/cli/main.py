@@ -4701,6 +4701,62 @@ def _fetch_dest_user_ids(orchestrator) -> Optional[set]:
         return None
 
 
+def _fleet_migrate_items(
+    orchestrator,
+    config,
+    state,
+    items,
+    item_type,
+    label,
+    migrate_fn,
+    *,
+    id_field="id",
+    name_field="name",
+    id_mapping_key=None,
+):
+    """Run a Fleet migration loop with progress output.
+
+    Args:
+        items: List of source resource dicts to migrate.
+        item_type: State item type (e.g. "fleet_skill").
+        label: Human-readable label for the progress bar (e.g. "skills").
+        migrate_fn: Callable(item) -> dest_id_or_None.
+        id_field: Field name for the source ID.
+        name_field: Field name for the display name.
+        id_mapping_key: If set, stores source_id -> dest_id in state.id_mappings.
+
+    Returns the count of successfully migrated items.
+    """
+    if not items:
+        console.print(f"  [dim]No {label} found[/dim]")
+        return 0
+
+    created = 0
+    with Progress(console=console) as progress:
+        task = progress.add_task(f"Migrating {label}...", total=len(items))
+        for item in items:
+            source_id = item.get(id_field, "")
+            name = item.get(name_field, source_id)
+            item_id = _ensure_state_item(
+                orchestrator, config, item_type, source_id, name,
+            )
+            try:
+                _mark_state_item_started(orchestrator, item_id)
+                dest_id = migrate_fn(item)
+                if dest_id:
+                    created += 1
+                    if id_mapping_key:
+                        state.set_mapped_id(id_mapping_key, source_id, dest_id)
+                    _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                else:
+                    _mark_state_item_completed(orchestrator, item_id)
+            except Exception as e:
+                _mark_state_item_failed(orchestrator, item_id, e)
+            progress.advance(task)
+    console.print(f"  [green]{created} migrated[/green]")
+    return created
+
+
 def _migrate_fleet_for_workspace(
     orchestrator,
     config,
@@ -4766,35 +4822,41 @@ def _migrate_fleet_for_workspace(
         if secrets:
             console.print(f"  Found {len(secrets)} secret(s)")
             dest_names = set(secret_migrator.list_dest_secrets())
-            created = 0
-            for secret in secrets:
-                name = secret.get("name", "")
-                if name and name not in dest_names:
-                    item_id = _ensure_state_item(
-                        orchestrator, config, "fleet_secret", name, name,
-                    )
-                    try:
-                        _mark_state_item_started(orchestrator, item_id)
-                        secret_migrator.create_secret_placeholder(name)
-                        created += 1
-                        state.mark_terminal(
-                            item_id,
-                            ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
-                            "secret_value_write_only",
-                            verification_state=VerificationState.EXPORTED,
-                            next_action=f"Re-enter value for secret '{name}' on destination.",
-                            evidence={"name": name},
+            to_create = [s for s in secrets if s.get("name") and s.get("name") not in dest_names]
+            if to_create:
+                created = 0
+                with Progress(console=console) as progress:
+                    task = progress.add_task("Migrating secrets...", total=len(to_create))
+                    for secret in to_create:
+                        name = secret.get("name", "")
+                        item_id = _ensure_state_item(
+                            orchestrator, config, "fleet_secret", name, name,
                         )
-                        _mark_state_item_completed(orchestrator, item_id)
-                    except Exception as e:
-                        _mark_state_item_failed(orchestrator, item_id, e)
-            console.print(
-                f"  [green]{created} created[/green] (placeholders, values must be re-entered)"
-            )
-            if created:
+                        try:
+                            _mark_state_item_started(orchestrator, item_id)
+                            secret_migrator.create_secret_placeholder(name)
+                            created += 1
+                            state.mark_terminal(
+                                item_id,
+                                ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
+                                "secret_value_write_only",
+                                verification_state=VerificationState.EXPORTED,
+                                next_action=f"Re-enter value for secret '{name}' on destination.",
+                                evidence={"name": name},
+                            )
+                            _mark_state_item_completed(orchestrator, item_id)
+                        except Exception as e:
+                            _mark_state_item_failed(orchestrator, item_id, e)
+                        progress.advance(task)
                 console.print(
-                    "  [yellow]Manual step: re-enter secret values on destination[/yellow]"
+                    f"  [green]{created} created[/green] (placeholders, values must be re-entered)"
                 )
+                if created:
+                    console.print(
+                        "  [yellow]Manual step: re-enter secret values on destination[/yellow]"
+                    )
+            else:
+                console.print("  [dim]All secrets already exist on destination[/dim]")
         else:
             console.print("  [dim]No secrets found[/dim]")
 
@@ -4810,42 +4872,45 @@ def _migrate_fleet_for_workspace(
             console.print(f"  Found {len(providers)} auth provider(s)")
             dest_base_url = config.destination.base_url
             created = 0
-            for provider in providers:
-                slug = provider.get("provider_slug", "")
-                item_id = _ensure_state_item(
-                    orchestrator, config, "fleet_auth_provider", slug, slug,
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    dest_slug = auth_migrator.create_provider(provider, dest_base_url)
-                    if dest_slug:
-                        state.set_mapped_id("fleet_auth_providers", slug, dest_slug)
-                        created += 1
-                        state.mark_terminal(
-                            item_id,
-                            ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
-                            "client_secret_write_only",
-                            verification_state=VerificationState.EXPORTED,
-                            next_action=f"Re-enter client_secret for auth provider '{slug}' on destination.",
-                            evidence={"provider_slug": slug},
-                        )
-                        _mark_state_item_completed(orchestrator, item_id)
-                    else:
-                        state.mark_terminal(
-                            item_id,
-                            ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
-                            "auth_provider_create_failed",
-                            verification_state=VerificationState.EXPORTED,
-                            next_action=(
-                                f"Create auth provider '{slug}' manually on destination. "
-                                f"It may conflict with a built-in slug or the auth_url "
-                                f"may be blocked by SSRF policy."
-                            ),
-                            evidence={"provider_slug": slug},
-                        )
-                        _mark_state_item_completed(orchestrator, item_id)
-                except Exception as e:
-                    _mark_state_item_failed(orchestrator, item_id, e)
+            with Progress(console=console) as progress:
+                task = progress.add_task("Migrating auth providers...", total=len(providers))
+                for provider in providers:
+                    slug = provider.get("provider_slug", "")
+                    item_id = _ensure_state_item(
+                        orchestrator, config, "fleet_auth_provider", slug, slug,
+                    )
+                    try:
+                        _mark_state_item_started(orchestrator, item_id)
+                        dest_slug = auth_migrator.create_provider(provider, dest_base_url)
+                        if dest_slug:
+                            state.set_mapped_id("fleet_auth_providers", slug, dest_slug)
+                            created += 1
+                            state.mark_terminal(
+                                item_id,
+                                ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
+                                "client_secret_write_only",
+                                verification_state=VerificationState.EXPORTED,
+                                next_action=f"Re-enter client_secret for auth provider '{slug}' on destination.",
+                                evidence={"provider_slug": slug},
+                            )
+                            _mark_state_item_completed(orchestrator, item_id)
+                        else:
+                            state.mark_terminal(
+                                item_id,
+                                ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
+                                "auth_provider_create_failed",
+                                verification_state=VerificationState.EXPORTED,
+                                next_action=(
+                                    f"Create auth provider '{slug}' manually on destination. "
+                                    f"It may conflict with a built-in slug or the auth_url "
+                                    f"may be blocked by SSRF policy."
+                                ),
+                                evidence={"provider_slug": slug},
+                            )
+                            _mark_state_item_completed(orchestrator, item_id)
+                    except Exception as e:
+                        _mark_state_item_failed(orchestrator, item_id, e)
+                    progress.advance(task)
             console.print(
                 f"  [green]{created} migrated[/green] (client_secret must be re-entered)"
             )
@@ -4861,25 +4926,13 @@ def _migrate_fleet_for_workspace(
         policies = sandbox_migrator.list_policies()
         if policies:
             console.print(f"  Found {len(policies)} sandbox polic(ies)")
-            created = 0
-            for policy in policies:
-                name = policy.get("name", policy.get("id", ""))
-                item_id = _ensure_state_item(
-                    orchestrator, config, "fleet_sandbox_policy",
-                    policy.get("id", ""), name,
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    dest_id = sandbox_migrator.create_policy(policy)
-                    if dest_id:
-                        state.set_mapped_id(
-                            "fleet_sandbox_policies", policy.get("id", ""), dest_id
-                        )
-                        created += 1
-                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
-                except Exception as e:
-                    _mark_state_item_failed(orchestrator, item_id, e)
-            console.print(f"  [green]{created} migrated[/green]")
+            _fleet_migrate_items(
+                orchestrator, config, state, policies,
+                "fleet_sandbox_policy", "sandbox policies",
+                lambda p: sandbox_migrator.create_policy(p),
+                name_field="name",
+                id_mapping_key="fleet_sandbox_policies",
+            )
         else:
             console.print("  [dim]No sandbox policies found[/dim]")
 
@@ -4895,25 +4948,12 @@ def _migrate_fleet_for_workspace(
         if servers:
             console.print(f"  Found {len(servers)} MCP server(s)")
             oauth_map = id_mappings.get("fleet_auth_providers", {})
-            created = 0
-            for server in servers:
-                name = server.get("name", server.get("id", ""))
-                item_id = _ensure_state_item(
-                    orchestrator, config, "fleet_mcp_server",
-                    server.get("id", ""), name,
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    dest_id = mcp_migrator.create_mcp_server(server, oauth_map)
-                    if dest_id:
-                        state.set_mapped_id(
-                            "fleet_mcp_servers", server.get("id", ""), dest_id
-                        )
-                        created += 1
-                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
-                except Exception as e:
-                    _mark_state_item_failed(orchestrator, item_id, e)
-            console.print(f"  [green]{created} migrated[/green]")
+            _fleet_migrate_items(
+                orchestrator, config, state, servers,
+                "fleet_mcp_server", "MCP servers",
+                lambda s: mcp_migrator.create_mcp_server(s, oauth_map),
+                id_mapping_key="fleet_mcp_servers",
+            )
         else:
             console.print("  [dim]No MCP servers found[/dim]")
 
@@ -4921,22 +4961,11 @@ def _migrate_fleet_for_workspace(
         integrations = mcp_migrator.list_integrations()
         if integrations:
             console.print(f"  Found {len(integrations)} integration(s)")
-            created = 0
-            for integration in integrations:
-                name = integration.get("name", integration.get("id", ""))
-                item_id = _ensure_state_item(
-                    orchestrator, config, "fleet_integration",
-                    integration.get("id", ""), name,
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    dest_id = mcp_migrator.create_integration(integration)
-                    if dest_id:
-                        created += 1
-                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
-                except Exception as e:
-                    _mark_state_item_failed(orchestrator, item_id, e)
-            console.print(f"  [green]{created} migrated[/green]")
+            _fleet_migrate_items(
+                orchestrator, config, state, integrations,
+                "fleet_integration", "integrations",
+                lambda i: mcp_migrator.create_integration(i),
+            )
         else:
             console.print("  [dim]No integrations found[/dim]")
     else:
@@ -4954,28 +4983,18 @@ def _migrate_fleet_for_workspace(
         skills = skill_migrator.list_skills()
         if skills:
             console.print(f"  Found {len(skills)} skill(s)")
-            created = 0
-            for skill in skills:
-                name = skill.get("name", skill.get("id", ""))
-                item_id = _ensure_state_item(
-                    orchestrator, config, "fleet_skill",
-                    skill.get("id", ""), name,
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    # Fetch full skill with files if not already included
-                    if not skill.get("files"):
-                        skill = skill_migrator.get_skill(skill["id"])
-                    dest_id = skill_migrator.create_skill(skill)
-                    if dest_id:
-                        state.set_mapped_id(
-                            "fleet_skills", skill.get("id", ""), dest_id
-                        )
-                        created += 1
-                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
-                except Exception as e:
-                    _mark_state_item_failed(orchestrator, item_id, e)
-            console.print(f"  [green]{created} migrated[/green]")
+
+            def _migrate_skill(skill):
+                if not skill.get("files"):
+                    skill.update(skill_migrator.get_skill(skill.get("id", "")))
+                return skill_migrator.create_skill(skill)
+
+            _fleet_migrate_items(
+                orchestrator, config, state, skills,
+                "fleet_skill", "skills",
+                _migrate_skill,
+                id_mapping_key="fleet_skills",
+            )
         else:
             console.print("  [dim]No skills found[/dim]")
     else:
@@ -5009,31 +5028,33 @@ def _migrate_fleet_for_workspace(
                 console.print("[yellow]could not fetch (shared_users validation skipped)[/yellow]")
 
             created = 0
-            for agent_summary in agents:
-                agent_id = agent_summary.get("id", "")
-                name = agent_summary.get("name", "")
-                item_id = _ensure_state_item(
-                    orchestrator, config, "fleet_agent", agent_id, name,
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    # Fetch full agent detail with files
-                    agent = agent_migrator.get_agent(agent_id)
-                    dest_id = agent_migrator.create_agent(
-                        agent,
-                        id_mappings,
-                        skip_skills=skip_skills,
-                        skip_mcp_servers=skip_mcp_servers,
-                        dest_model_ids=dest_model_ids if dest_model_ids else None,
-                        dest_user_ids=dest_user_ids,
+            with Progress(console=console) as progress:
+                task = progress.add_task("Migrating agents...", total=len(agents))
+                for agent_summary in agents:
+                    agent_id = agent_summary.get("id", "")
+                    name = agent_summary.get("name", "")
+                    item_id = _ensure_state_item(
+                        orchestrator, config, "fleet_agent", agent_id, name,
                     )
-                    if dest_id:
-                        agent_id_map[agent_id] = dest_id
-                        state.set_mapped_id("fleet_agents", agent_id, dest_id)
-                        created += 1
-                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
-                except Exception as e:
-                    _mark_state_item_failed(orchestrator, item_id, e)
+                    try:
+                        _mark_state_item_started(orchestrator, item_id)
+                        agent = agent_migrator.get_agent(agent_id)
+                        dest_id = agent_migrator.create_agent(
+                            agent,
+                            id_mappings,
+                            skip_skills=skip_skills,
+                            skip_mcp_servers=skip_mcp_servers,
+                            dest_model_ids=dest_model_ids if dest_model_ids else None,
+                            dest_user_ids=dest_user_ids,
+                        )
+                        if dest_id:
+                            agent_id_map[agent_id] = dest_id
+                            state.set_mapped_id("fleet_agents", agent_id, dest_id)
+                            created += 1
+                            _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                    except Exception as e:
+                        _mark_state_item_failed(orchestrator, item_id, e)
+                    progress.advance(task)
             console.print(f"  [green]{created} migrated[/green]")
 
             # --- Phase 7: Schedules (depends on agent mapping) ---
@@ -5042,23 +5063,28 @@ def _migrate_fleet_for_workspace(
                 schedule_migrator = FleetScheduleMigrator(
                     orchestrator.source_client, orchestrator.dest_client, state, config
                 )
-                created = 0
+                all_schedules = []
                 for src_agent_id, dest_agent_id in agent_id_map.items():
-                    schedules = schedule_migrator.list_schedules(src_agent_id)
-                    for schedule in schedules:
-                        item_id = _ensure_state_item(
-                            orchestrator, config, "fleet_schedule",
-                            schedule.get("id", ""), schedule.get("display_name", ""),
-                        )
-                        try:
-                            _mark_state_item_started(orchestrator, item_id)
-                            dest_id = schedule_migrator.create_schedule(dest_agent_id, schedule)
-                            if dest_id:
-                                created += 1
-                                _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
-                        except Exception as e:
-                            _mark_state_item_failed(orchestrator, item_id, e)
-                if created:
+                    for schedule in schedule_migrator.list_schedules(src_agent_id):
+                        all_schedules.append((dest_agent_id, schedule))
+                if all_schedules:
+                    created = 0
+                    with Progress(console=console) as progress:
+                        task = progress.add_task("Migrating schedules...", total=len(all_schedules))
+                        for dest_agent_id, schedule in all_schedules:
+                            item_id = _ensure_state_item(
+                                orchestrator, config, "fleet_schedule",
+                                schedule.get("id", ""), schedule.get("display_name", ""),
+                            )
+                            try:
+                                _mark_state_item_started(orchestrator, item_id)
+                                dest_id = schedule_migrator.create_schedule(dest_agent_id, schedule)
+                                if dest_id:
+                                    created += 1
+                                    _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                            except Exception as e:
+                                _mark_state_item_failed(orchestrator, item_id, e)
+                            progress.advance(task)
                     console.print(f"  [green]{created} migrated[/green]")
                 else:
                     console.print("  [dim]No schedules found[/dim]")
@@ -5072,19 +5098,22 @@ def _migrate_fleet_for_workspace(
                 triggers = trigger_migrator.list_triggers()
                 if triggers:
                     created = 0
-                    for trigger in triggers:
-                        item_id = _ensure_state_item(
-                            orchestrator, config, "fleet_trigger",
-                            trigger.get("id", ""), trigger.get("name", ""),
-                        )
-                        try:
-                            _mark_state_item_started(orchestrator, item_id)
-                            dest_id = trigger_migrator.create_trigger(trigger, agent_id_map)
-                            if dest_id:
-                                created += 1
-                                _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
-                        except Exception as e:
-                            _mark_state_item_failed(orchestrator, item_id, e)
+                    with Progress(console=console) as progress:
+                        task = progress.add_task("Migrating triggers...", total=len(triggers))
+                        for trigger in triggers:
+                            item_id = _ensure_state_item(
+                                orchestrator, config, "fleet_trigger",
+                                trigger.get("id", ""), trigger.get("name", ""),
+                            )
+                            try:
+                                _mark_state_item_started(orchestrator, item_id)
+                                dest_id = trigger_migrator.create_trigger(trigger, agent_id_map)
+                                if dest_id:
+                                    created += 1
+                                    _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                            except Exception as e:
+                                _mark_state_item_failed(orchestrator, item_id, e)
+                            progress.advance(task)
                     console.print(f"  [green]{created} migrated[/green]")
                 else:
                     console.print("  [dim]No triggers found[/dim]")
@@ -5100,22 +5129,11 @@ def _migrate_fleet_for_workspace(
         webhooks = webhook_migrator.list_webhooks()
         if webhooks:
             console.print(f"  Found {len(webhooks)} webhook(s)")
-            created = 0
-            for webhook in webhooks:
-                name = webhook.get("name", webhook.get("id", ""))
-                item_id = _ensure_state_item(
-                    orchestrator, config, "fleet_webhook",
-                    webhook.get("id", ""), name,
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    dest_id = webhook_migrator.create_webhook(webhook)
-                    if dest_id:
-                        created += 1
-                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
-                except Exception as e:
-                    _mark_state_item_failed(orchestrator, item_id, e)
-            console.print(f"  [green]{created} migrated[/green]")
+            _fleet_migrate_items(
+                orchestrator, config, state, webhooks,
+                "fleet_webhook", "webhooks",
+                lambda w: webhook_migrator.create_webhook(w),
+            )
         else:
             console.print("  [dim]No webhooks found[/dim]")
 
@@ -5129,20 +5147,23 @@ def _migrate_fleet_for_workspace(
         if limits:
             console.print(f"  Found {len(limits)} spend limit(s)")
             created = 0
-            for limit in limits:
-                item_id = _ensure_state_item(
-                    orchestrator, config, "fleet_usage_limit",
-                    limit.get("id", ""),
-                    f"{limit.get('subject_type', '')}:{limit.get('subject_id', 'global')}",
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    dest_id = limit_migrator.create_limit(limit, agent_id_map)
-                    if dest_id:
-                        created += 1
-                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
-                except Exception as e:
-                    _mark_state_item_failed(orchestrator, item_id, e)
+            with Progress(console=console) as progress:
+                task = progress.add_task("Migrating usage limits...", total=len(limits))
+                for limit in limits:
+                    item_id = _ensure_state_item(
+                        orchestrator, config, "fleet_usage_limit",
+                        limit.get("id", ""),
+                        f"{limit.get('subject_type', '')}:{limit.get('subject_id', 'global')}",
+                    )
+                    try:
+                        _mark_state_item_started(orchestrator, item_id)
+                        dest_id = limit_migrator.create_limit(limit, agent_id_map)
+                        if dest_id:
+                            created += 1
+                            _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                    except Exception as e:
+                        _mark_state_item_failed(orchestrator, item_id, e)
+                    progress.advance(task)
             console.print(f"  [green]{created} migrated[/green]")
         else:
             console.print("  [dim]No usage limits found[/dim]")
