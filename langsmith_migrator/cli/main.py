@@ -4825,6 +4825,7 @@ def _migrate_fleet_for_workspace(
             to_create = [s for s in secrets if s.get("name") and s.get("name") not in dest_names]
             if to_create:
                 created = 0
+                failed = 0
                 with Progress(console=console) as progress:
                     task = progress.add_task("Migrating secrets...", total=len(to_create))
                     for secret in to_create:
@@ -4834,23 +4835,37 @@ def _migrate_fleet_for_workspace(
                         )
                         try:
                             _mark_state_item_started(orchestrator, item_id)
-                            secret_migrator.create_secret_placeholder(name)
-                            created += 1
-                            state.mark_terminal(
-                                item_id,
-                                ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
-                                "secret_value_write_only",
-                                verification_state=VerificationState.EXPORTED,
-                                next_action=f"Re-enter value for secret '{name}' on destination.",
-                                evidence={"name": name},
-                            )
-                            _mark_state_item_completed(orchestrator, item_id)
+                            if secret_migrator.create_secret_placeholder(name):
+                                created += 1
+                                state.mark_terminal(
+                                    item_id,
+                                    ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
+                                    "secret_value_write_only",
+                                    verification_state=VerificationState.EXPORTED,
+                                    next_action=f"Re-enter value for secret '{name}' on destination.",
+                                    evidence={"name": name},
+                                )
+                                _mark_state_item_completed(orchestrator, item_id)
+                            else:
+                                failed += 1
+                                _mark_state_item_failed(
+                                    orchestrator,
+                                    item_id,
+                                    f"Destination rejected the placeholder for secret '{name}' "
+                                    f"(the API key may lack the workspaces:manage-secrets permission).",
+                                )
                         except Exception as e:
+                            failed += 1
                             _mark_state_item_failed(orchestrator, item_id, e)
                         progress.advance(task)
                 console.print(
                     f"  [green]{created} created[/green] (placeholders, values must be re-entered)"
                 )
+                if failed:
+                    console.print(
+                        f"  [red]{failed} failed[/red] (destination rejected the create; "
+                        f"check the API key's workspaces:manage-secrets permission)"
+                    )
                 if created:
                     console.print(
                         "  [yellow]Manual step: re-enter secret values on destination[/yellow]"
