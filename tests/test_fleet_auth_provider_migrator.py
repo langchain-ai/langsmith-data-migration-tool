@@ -90,8 +90,11 @@ class TestFleetAuthProviderMigrator:
         auth_migrator.create_provider(sample_provider, dest_base_url="https://dest.example.com")
 
         payload = auth_migrator.dest.post.call_args[0][1]
-        assert all("dest.example.com" in uri for uri in payload["allowed_redirect_uris"])
-        assert "dest.example.com" in payload["default_redirect_uri"]
+        from urllib.parse import urlparse
+
+        for uri in payload["allowed_redirect_uris"]:
+            assert urlparse(uri).hostname == "dest.example.com"
+        assert urlparse(payload["default_redirect_uri"]).hostname == "dest.example.com"
 
     def test_create_provider_skips_platform_owned(self, auth_migrator):
         """Platform-owned providers should be skipped."""
@@ -162,8 +165,10 @@ class TestFleetAuthProviderMigrator:
             "https://source.example.com/api-host/v2/auth/callback/google",
             "https://dest.example.com",
         )
-        assert "dest.example.com" in result
-        assert "source.example.com" not in result
+        from urllib.parse import urlparse
+
+        assert urlparse(result).hostname == "dest.example.com"
+        assert urlparse(result).hostname != "source.example.com"
         # Path should be preserved
         assert "/api-host/v2/auth/callback/google" in result
 

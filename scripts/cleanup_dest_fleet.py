@@ -57,7 +57,7 @@ def headers():
 def delete(path, label):
     url = make_url(path)
     if DRY_RUN:
-        print(f"  [DRY RUN] Would DELETE {label}: {url}")
+        print(f"  [DRY RUN] Would DELETE {label}")
         return True
     try:
         resp = requests.delete(url, headers=headers(), timeout=15)
@@ -65,7 +65,7 @@ def delete(path, label):
             print(f"  Deleted {label}")
             return True
         else:
-            print(f"  FAILED to delete {label}: {resp.status_code} {resp.text[:200]}")
+            print(f"  FAILED to delete {label}: HTTP {resp.status_code}")
             return False
     except Exception as e:
         print(f"  ERROR deleting {label}: {e}")
