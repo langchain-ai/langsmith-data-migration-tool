@@ -13,7 +13,7 @@ from ..utils.retry import (
     AuthenticationError,
     ConflictError,
 )
-from ..utils.pagination import PaginationHelper
+from ..utils.pagination import CursorPaginationHelper, PaginationHelper
 
 
 class NotFoundError(APIError):
@@ -142,9 +142,22 @@ class EnhancedAPIClient:
             self.session.headers.pop("X-Tenant-Id", None)
 
     def _prepare_url(self, endpoint: str) -> str:
-        """Prepare full URL from endpoint."""
+        """Prepare full URL from endpoint.
+
+        If the endpoint starts with 'http', it is used as-is (absolute URL).
+        If the endpoint starts with '/v1/', it is treated as a root-relative
+        path on the same host, bypassing the /api/v1 base path. This is used
+        by Fleet endpoints which live at /v1/fleet/* rather than
+        /api/v1/fleet/*.
+        Otherwise the endpoint is appended to the base URL.
+        """
         if endpoint.startswith('http'):
             return endpoint
+        if endpoint.startswith('/v1/'):
+            from urllib.parse import urlparse
+
+            parsed = urlparse(self.base_url)
+            return f"{parsed.scheme}://{parsed.netloc}{endpoint}"
         return f"{self.base_url}{endpoint}"
 
     def _handle_response(self, response: requests.Response, endpoint: str) -> Dict[str, Any]:
@@ -356,6 +369,29 @@ class EnhancedAPIClient:
         response = self.session.delete(url, timeout=15)
         return self._handle_response(response, endpoint)
 
+    @retry_on_failure(max_retries=1)
+    def put(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Make a PUT request.
+
+        Args:
+            endpoint: API endpoint
+            data: JSON data to send
+
+        Returns:
+            JSON response as dictionary, or ``{}`` for empty successful responses.
+        """
+        url = self._prepare_url(endpoint)
+
+        if self.verbose:
+            self.console.print(f"[dim]PUT {url}[/dim]")
+
+        if self.rate_limit_delay > 0:
+            time.sleep(self.rate_limit_delay)
+
+        response = self.session.put(url, json=data, timeout=self.timeout)
+        return self._handle_response(response, endpoint)
+
     def get_paginated(
         self,
         endpoint: str,
@@ -374,6 +410,33 @@ class EnhancedAPIClient:
             Individual items from paginated results
         """
         yield from PaginationHelper.paginate(
+            self.get,
+            endpoint,
+            params,
+            page_size
+        )
+
+    def get_cursor_paginated(
+        self,
+        endpoint: str,
+        params: Optional[Dict] = None,
+        page_size: int = 100
+    ) -> Generator[Dict[str, Any], None, None]:
+        """
+        Get cursor-paginated results, yielding one item at a time.
+
+        Used by Fleet API endpoints that return ``{"items": [...], "next_cursor": ...}``
+        and accept ``page_size`` / ``cursor`` query parameters.
+
+        Args:
+            endpoint: API endpoint
+            params: Additional query parameters
+            page_size: Number of items per page
+
+        Yields:
+            Individual items from paginated results
+        """
+        yield from CursorPaginationHelper.paginate(
             self.get,
             endpoint,
             params,

@@ -1,6 +1,6 @@
 """Base migrator class with shared functionality."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 from rich.console import Console
 
 from ..api_client import EnhancedAPIClient
@@ -48,6 +48,46 @@ class BaseMigrator:
             "source": self.source.session.headers.get("X-Tenant-Id"),
             "dest": self.dest.session.headers.get("X-Tenant-Id"),
         }
+
+    def dest_index(
+        self,
+        cache_attr: str,
+        endpoint: str,
+        key_field: str,
+        *,
+        error_label: str = "resource",
+        audiences: Iterable[Optional[str]] = (None,),
+    ) -> Dict[str, Dict[str, Any]]:
+        """Fetch a destination list endpoint once and cache a ``{key_field: item}`` index.
+
+        Repeated existence checks in one run reuse a single fetch instead of
+        re-paginating the whole list per item. Only cached on success, so a failed
+        fetch can retry. ``audiences`` unions the Fleet ``audience`` query
+        values (agents are only fully listed across ``user`` and ``tenant``).
+        """
+        cached = getattr(self, cache_attr, None)
+        if cached is not None:
+            return cached
+        index: Dict[str, Dict[str, Any]] = {}
+        try:
+            for audience in audiences:
+                params = {"audience": audience} if audience else None
+                for item in self.dest.get_cursor_paginated(endpoint, params=params):
+                    if isinstance(item, dict) and item.get(key_field) is not None:
+                        index.setdefault(item[key_field], item)
+        except Exception as e:
+            self.log(f"Failed to check for existing {error_label}: {e}", "warning")
+            return index
+        setattr(self, cache_attr, index)
+        return index
+
+    def register_dest_item(
+        self, cache_attr: str, key: Optional[str], item: Dict[str, Any]
+    ) -> None:
+        """Add a just-created item to a cached index so later lookups in the same run see it."""
+        cached = getattr(self, cache_attr, None)
+        if cached is not None and key is not None:
+            cached[key] = item
 
     def persist_state(self) -> None:
         """Persist state if a state manager is attached to the config."""
