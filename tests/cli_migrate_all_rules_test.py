@@ -118,6 +118,7 @@ def test_migrate_all_rules_create_enabled_flag_sets_create_disabled_false():
             strip_projects=False,
             map_projects=False,
             rules_create_enabled=True,
+            skip_fleet=True,
         )
 
     assert _FakeRulesMigrator.create_rule_calls
@@ -146,6 +147,7 @@ def test_migrate_all_rules_prompt_defaults_to_disabled_when_flag_omitted():
             strip_projects=False,
             map_projects=False,
             rules_create_enabled=None,
+            skip_fleet=True,
         )
 
     assert _FakeRulesMigrator.create_rule_calls

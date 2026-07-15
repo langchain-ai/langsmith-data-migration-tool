@@ -1,6 +1,6 @@
 # LangSmith Data Migration Tool
 
-A Python CLI for migrating users and roles, datasets, experiments, annotation queues, project rules, prompts, and charts between LangSmith instances, plus CSV-driven access sync for a single LangSmith deployment.
+A Python CLI for migrating users and roles, datasets, experiments, annotation queues, project rules, prompts, charts, and Fleet resources between LangSmith instances, plus CSV-driven access sync for a single LangSmith deployment.
 
 ## Quick Start
 
@@ -31,6 +31,7 @@ langsmith-migrator datasets
 - **Project Rules**: Copy automation rules with project mapping and optional project creation in interactive flows
 - **Prompts**: Migrate prompts (latest by default, full history with `--include-all-commits`)
 - **Charts**: Migrate monitoring charts with filter preservation
+- **Fleet**: Migrate agents, shared skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, and workspace secrets (`fleet`)
 - **Workspace Scoping**: Run resource migrations per workspace pair with explicit IDs or interactive workspace mapping
 - **Remediation & Resume**: Persist migration state, write remediation bundles, print grouped actionable next steps, and retry pending/failed work with `resume`
 - **Interactive CLI**: TUI-based selection with search/filter, plus `--non-interactive` mode for automation
@@ -46,8 +47,37 @@ This tool **does not support migrating trace data**. It migrates:
 - Project rules
 - Prompts
 - Charts
+- Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets)
 
 For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
+
+### Fleet Secrets and Auth Provider Secrets Are Write-Only
+
+The Fleet API does not return secret values. When migrating workspace secrets, the tool creates placeholder entries on the destination with empty values. You must re-enter each secret's value manually on the destination after migration. Similarly, auth provider `client_secret` values cannot be read from the source and must be re-entered on the destination.
+
+### Fleet Per-User OAuth Connections Cannot Be Migrated
+
+Agent OAuth connections (Gmail, Slack, GitHub, etc.) are tied to individual user tokens and cannot be transferred between instances. After migration, each user must re-authenticate their OAuth connections on the destination. The tool prints remediation steps listing which agents need re-authentication.
+
+### Fleet Agent Ownership Requires a Personal Access Token
+
+Fleet agent ownership is determined by the authenticated user, not by a field in the request body. Workspace API keys (`lsv2_sk_*`) do not carry a user identity, so agents created with them have no owner and become invisible to everyone. To assign ownership of migrated agents, use a **Personal Access Token** (`lsv2_pt_*`) for `LANGSMITH_NEW_API_KEY`. The PAT creator becomes the owner of all migrated agents. After migration, individual users can clone their agents from the workspace to transfer ownership to themselves.
+
+### Fleet Agent Shared Users Are Filtered
+
+The `shared_users` permission (per-user read/run/write access lists) references user IDs that are org-scoped. The tool fetches the destination workspace's active member list and filters `shared_users` to keep only user IDs that exist on the destination. User IDs not found on the destination are removed, and the tool prints a warning. If the destination member list can't be fetched, all `shared_users` are stripped as a safety measure. Re-share agents with any missing users after migration via the Fleet UI.
+
+### Fleet Agent Models Are Substituted When Unavailable
+
+The destination instance may not support the same model IDs as the source (e.g. SaaS vs BYOC may offer different model providers). The tool fetches the destination's model catalog and substitutes unavailable models with a model from the same provider if available, or falls back to the first available model. A warning is logged for each substitution. Set the correct model manually after migration if needed.
+
+### Fleet Existing Resources Are Never Overwritten
+
+All Fleet migrators skip resources that already exist on the destination, regardless of the `--skip-existing` flag. This prevents overwriting org-scoped infrastructure (auth providers, MCP servers, integrations) that may already be correctly configured on the destination. Re-running `fleet` is safe and idempotent.
+
+### Fleet Infrastructure-Level Configuration Is Not API-Migratable
+
+OAuth providers, GitHub App, and Slack app configuration are set at the infrastructure level (Helm chart for self-hosted, or cloud provider console). The tool cannot migrate these. For BYOC deployments, configure OAuth providers in your `langsmith_config.yaml` as described in the [self-hosted Fleet setup docs](https://docs.langchain.com/langsmith/deploy-self-hosted-full-platform#enable-fleet-insights-and-chat).
 
 ### Experiment Timestamps Are Rewritten on Migration
 
@@ -146,6 +176,11 @@ langsmith-migrator charts --project-mapping '{"old-project-id": "new-project-id"
 langsmith-migrator charts --project-mapping mapping.json   # Headless, from file
 langsmith-migrator charts --same-instance       # Reuse source IDs only when both sides share IDs
 
+# Fleet resources (agents, skills, MCP servers, etc.)
+langsmith-migrator fleet                        # Migrate all Fleet resources
+langsmith-migrator fleet --skip-agents          # Skip agent migration
+langsmith-migrator fleet --skip-skills --skip-mcp-servers  # Skip specific resources
+
 # Utilities
 langsmith-migrator export-users --source -o users.csv  # Export active members to a members CSV
 langsmith-migrator list-projects --source
@@ -157,12 +192,13 @@ langsmith-migrator clean
 ### Command Overview
 
 - `test`: verify source and destination connectivity before running a migration
-- `migrate-all`: guided end-to-end wizard for users, datasets, prompts, queues, rules, and charts
+- `migrate-all`: guided end-to-end wizard for users, datasets, prompts, queues, rules, charts, and Fleet resources
 - `datasets`: migrate datasets; optionally include experiments, runs, and feedback
 - `queues`: migrate annotation queues
 - `prompts`: migrate prompts, optionally with full commit history
 - `rules`: migrate automation rules with project mapping controls
 - `charts`: migrate monitoring charts, either all sessions or one named session/project
+- `fleet`: migrate Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets) with `--skip-*` flags for each resource type
 - `users`: migrate users/roles between instances, or run single-instance CSV access sync
 - `export-users`: export active org and workspace members to a members CSV for import via `users --members-csv`
 - `resume`: retry resumable items from a prior session and show grouped manual blockers

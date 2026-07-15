@@ -6,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import click
 from dotenv import load_dotenv
@@ -23,6 +23,16 @@ from ..core.migrators import (
     PromptMigrator,
     RulesMigrator,
     UserRoleMigrator,
+    FleetAgentMigrator,
+    FleetAuthProviderMigrator,
+    FleetMcpServerMigrator,
+    FleetSandboxPolicyMigrator,
+    FleetScheduleMigrator,
+    FleetSecretMigrator,
+    FleetSkillMigrator,
+    FleetTriggerMigrator,
+    FleetUsageLimitMigrator,
+    FleetWebhookMigrator,
 )
 from ..core.migrators.user_role import (
     is_workspace_role_union_id,
@@ -3433,6 +3443,7 @@ def rules(
 @click.option("--skip-queues", is_flag=True, help="Skip annotation queue migration")
 @click.option("--skip-rules", is_flag=True, help="Skip rules migration")
 @click.option("--skip-charts", is_flag=True, help="Skip chart migration")
+@click.option("--skip-fleet", is_flag=True, help="Skip Fleet resource migration")
 @click.option("--include-all-commits", is_flag=True, help="Include all prompt commit history")
 @click.option("--strip-projects", is_flag=True, help="Strip project associations from rules")
 @click.option(
@@ -3467,6 +3478,7 @@ def migrate_all(
     skip_queues,
     skip_rules,
     skip_charts,
+    skip_fleet,
     include_all_commits,
     strip_projects,
     map_projects,
@@ -3629,6 +3641,7 @@ def migrate_all(
             src_ws,
             dst_ws,
             custom_project_mapping,
+            skip_fleet=skip_fleet,
         )
 
     if ws_result:
@@ -3658,6 +3671,7 @@ def _migrate_all_for_workspace(
     source_workspace_id=None,
     dest_workspace_id=None,
     custom_project_mapping=None,
+    skip_fleet=True,
 ):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
@@ -4235,6 +4249,12 @@ def _migrate_all_for_workspace(
     else:
         console.print("[dim]Skipping charts (--skip-charts)[/dim]\n")
 
+    # 6. Fleet resources
+    if not skip_fleet:
+        _migrate_fleet_for_workspace(orchestrator, config)
+    else:
+        console.print("[dim]Skipping Fleet (--skip-fleet)[/dim]\n")
+
 
 @cli.command()
 @ssl_option
@@ -4655,6 +4675,585 @@ def clean(ctx):
         console.print("[green]✓ All sessions deleted[/green]")
     else:
         console.print("[yellow]Cleanup cancelled[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# Fleet migration
+# ---------------------------------------------------------------------------
+
+
+def _fetch_dest_user_ids(orchestrator) -> Optional[set]:
+    """Fetch the set of ls_user_id values for active members on the destination workspace.
+
+    Returns None if the members list could not be fetched (so callers can
+    distinguish "no members" from "fetch failed").
+    """
+    try:
+        members = list(orchestrator.dest_client.get_paginated(
+            "/workspaces/current/members/active"
+        ))
+        return {
+            m.get("ls_user_id")
+            for m in members
+            if isinstance(m, dict) and m.get("ls_user_id")
+        }
+    except Exception:
+        return None
+
+
+def _migrate_fleet_for_workspace(
+    orchestrator,
+    config,
+    skip_secrets=False,
+    skip_auth_providers=False,
+    skip_mcp_servers=False,
+    skip_skills=False,
+    skip_agents=False,
+    skip_schedules=False,
+    skip_triggers=False,
+    skip_webhooks=False,
+    skip_usage_limits=False,
+    skip_sandbox_policies=False,
+):
+    """Run the Fleet migration flow for a single workspace pair.
+
+    Resources are migrated in dependency order. ID mappings from earlier
+    phases are stored in ``state.id_mappings`` and consumed by later
+    phases for cross-reference remapping.
+    """
+    _ensure_migration_session(orchestrator, config)
+    state = orchestrator.state
+
+    id_mappings = state.id_mappings
+
+    # Warn if the destination API key is not a PAT. Fleet agent ownership
+    # is determined by the authenticated user's LSUserID, which is only set
+    # for PATs (lsv2_pt_*). Workspace API keys (lsv2_sk_*) produce an empty
+    # owner, which creates orphaned agents that are invisible to everyone.
+    if not skip_agents:
+        dest_key = config.destination.api_key
+        if dest_key and not dest_key.startswith("lsv2_pt_"):
+            console.print(
+                "[yellow]Warning: Destination API key is not a Personal Access Token (lsv2_pt_*).[/yellow]"
+            )
+            console.print(
+                "[yellow]Fleet agents will be created with no owner and will be invisible.[/yellow]"
+            )
+            console.print(
+                "[yellow]Use a PAT for LANGSMITH_NEW_API_KEY to assign agent ownership.[/yellow]\n"
+            )
+
+    # Cascade: if agents are skipped, schedules/triggers/usage-limits are
+    # meaningless without their parent agents.
+    if skip_agents:
+        if not skip_schedules:
+            console.print("[dim]Skipping schedules (agents skipped)[/dim]")
+            skip_schedules = True
+        if not skip_triggers:
+            console.print("[dim]Skipping triggers (agents skipped)[/dim]")
+            skip_triggers = True
+        if not skip_usage_limits:
+            console.print("[dim]Skipping usage limits (agents skipped)[/dim]")
+            skip_usage_limits = True
+
+    # --- Phase 1: Secrets (names only, values are write-only) ---
+    if not skip_secrets:
+        console.print("\n[bold]Fleet: Secrets[/bold]")
+        secret_migrator = FleetSecretMigrator(
+            orchestrator.source_client, orchestrator.dest_client, state, config
+        )
+        secrets = secret_migrator.list_secrets()
+        if secrets:
+            console.print(f"  Found {len(secrets)} secret(s)")
+            dest_names = set(secret_migrator.list_dest_secrets())
+            created = 0
+            for secret in secrets:
+                name = secret.get("name", "")
+                if name and name not in dest_names:
+                    item_id = _ensure_state_item(
+                        orchestrator, config, "fleet_secret", name, name,
+                    )
+                    try:
+                        _mark_state_item_started(orchestrator, item_id)
+                        secret_migrator.create_secret_placeholder(name)
+                        created += 1
+                        state.mark_terminal(
+                            item_id,
+                            ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
+                            "secret_value_write_only",
+                            verification_state=VerificationState.EXPORTED,
+                            next_action=f"Re-enter value for secret '{name}' on destination.",
+                            evidence={"name": name},
+                        )
+                        _mark_state_item_completed(orchestrator, item_id)
+                    except Exception as e:
+                        _mark_state_item_failed(orchestrator, item_id, e)
+            console.print(
+                f"  [green]{created} created[/green] (placeholders, values must be re-entered)"
+            )
+            if created:
+                console.print(
+                    "  [yellow]Manual step: re-enter secret values on destination[/yellow]"
+                )
+        else:
+            console.print("  [dim]No secrets found[/dim]")
+
+    # --- Phase 2: Auth providers (org-scoped, client_secret is write-only) ---
+    if not skip_auth_providers:
+        console.print("\n[bold]Fleet: Auth Providers[/bold]")
+        console.print("  [dim]Auth providers are org-scoped, not workspace-scoped[/dim]")
+        auth_migrator = FleetAuthProviderMigrator(
+            orchestrator.source_client, orchestrator.dest_client, state, config
+        )
+        providers = auth_migrator.list_providers()
+        if providers:
+            console.print(f"  Found {len(providers)} auth provider(s)")
+            dest_base_url = config.destination.base_url
+            created = 0
+            for provider in providers:
+                slug = provider.get("provider_slug", "")
+                item_id = _ensure_state_item(
+                    orchestrator, config, "fleet_auth_provider", slug, slug,
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    dest_slug = auth_migrator.create_provider(provider, dest_base_url)
+                    if dest_slug:
+                        state.set_mapped_id("fleet_auth_providers", slug, dest_slug)
+                        created += 1
+                        state.mark_terminal(
+                            item_id,
+                            ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
+                            "client_secret_write_only",
+                            verification_state=VerificationState.EXPORTED,
+                            next_action=f"Re-enter client_secret for auth provider '{slug}' on destination.",
+                            evidence={"provider_slug": slug},
+                        )
+                        _mark_state_item_completed(orchestrator, item_id)
+                    else:
+                        state.mark_terminal(
+                            item_id,
+                            ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY,
+                            "auth_provider_create_failed",
+                            verification_state=VerificationState.EXPORTED,
+                            next_action=(
+                                f"Create auth provider '{slug}' manually on destination. "
+                                f"It may conflict with a built-in slug or the auth_url "
+                                f"may be blocked by SSRF policy."
+                            ),
+                            evidence={"provider_slug": slug},
+                        )
+                        _mark_state_item_completed(orchestrator, item_id)
+                except Exception as e:
+                    _mark_state_item_failed(orchestrator, item_id, e)
+            console.print(
+                f"  [green]{created} migrated[/green] (client_secret must be re-entered)"
+            )
+        else:
+            console.print("  [dim]No auth providers found[/dim]")
+
+    # --- Phase 3: Sandbox policies ---
+    if not skip_sandbox_policies:
+        console.print("\n[bold]Fleet: Sandbox Policies[/bold]")
+        sandbox_migrator = FleetSandboxPolicyMigrator(
+            orchestrator.source_client, orchestrator.dest_client, state, config
+        )
+        policies = sandbox_migrator.list_policies()
+        if policies:
+            console.print(f"  Found {len(policies)} sandbox polic(ies)")
+            created = 0
+            for policy in policies:
+                name = policy.get("name", policy.get("id", ""))
+                item_id = _ensure_state_item(
+                    orchestrator, config, "fleet_sandbox_policy",
+                    policy.get("id", ""), name,
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    dest_id = sandbox_migrator.create_policy(policy)
+                    if dest_id:
+                        state.set_mapped_id(
+                            "fleet_sandbox_policies", policy.get("id", ""), dest_id
+                        )
+                        created += 1
+                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                except Exception as e:
+                    _mark_state_item_failed(orchestrator, item_id, e)
+            console.print(f"  [green]{created} migrated[/green]")
+        else:
+            console.print("  [dim]No sandbox policies found[/dim]")
+
+    # --- Phase 4: MCP servers + integrations ---
+    if not skip_mcp_servers:
+        console.print("\n[bold]Fleet: MCP Servers & Integrations[/bold]")
+        mcp_migrator = FleetMcpServerMigrator(
+            orchestrator.source_client, orchestrator.dest_client, state, config
+        )
+
+        # MCP servers
+        servers = mcp_migrator.list_mcp_servers()
+        if servers:
+            console.print(f"  Found {len(servers)} MCP server(s)")
+            oauth_map = id_mappings.get("fleet_auth_providers", {})
+            created = 0
+            for server in servers:
+                name = server.get("name", server.get("id", ""))
+                item_id = _ensure_state_item(
+                    orchestrator, config, "fleet_mcp_server",
+                    server.get("id", ""), name,
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    dest_id = mcp_migrator.create_mcp_server(server, oauth_map)
+                    if dest_id:
+                        state.set_mapped_id(
+                            "fleet_mcp_servers", server.get("id", ""), dest_id
+                        )
+                        created += 1
+                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                except Exception as e:
+                    _mark_state_item_failed(orchestrator, item_id, e)
+            console.print(f"  [green]{created} migrated[/green]")
+        else:
+            console.print("  [dim]No MCP servers found[/dim]")
+
+        # Integrations (workspace-owned only)
+        integrations = mcp_migrator.list_integrations()
+        if integrations:
+            console.print(f"  Found {len(integrations)} integration(s)")
+            created = 0
+            for integration in integrations:
+                name = integration.get("name", integration.get("id", ""))
+                item_id = _ensure_state_item(
+                    orchestrator, config, "fleet_integration",
+                    integration.get("id", ""), name,
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    dest_id = mcp_migrator.create_integration(integration)
+                    if dest_id:
+                        created += 1
+                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                except Exception as e:
+                    _mark_state_item_failed(orchestrator, item_id, e)
+            console.print(f"  [green]{created} migrated[/green]")
+        else:
+            console.print("  [dim]No integrations found[/dim]")
+    else:
+        if not skip_agents:
+            console.print(
+                "[yellow]Warning: MCP servers skipped, agent tool URLs cannot be remapped.[/yellow]"
+            )
+
+    # --- Phase 5: Skills ---
+    if not skip_skills:
+        console.print("\n[bold]Fleet: Shared Skills[/bold]")
+        skill_migrator = FleetSkillMigrator(
+            orchestrator.source_client, orchestrator.dest_client, state, config
+        )
+        skills = skill_migrator.list_skills()
+        if skills:
+            console.print(f"  Found {len(skills)} skill(s)")
+            created = 0
+            for skill in skills:
+                name = skill.get("name", skill.get("id", ""))
+                item_id = _ensure_state_item(
+                    orchestrator, config, "fleet_skill",
+                    skill.get("id", ""), name,
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    # Fetch full skill with files if not already included
+                    if not skill.get("files"):
+                        skill = skill_migrator.get_skill(skill["id"])
+                    dest_id = skill_migrator.create_skill(skill)
+                    if dest_id:
+                        state.set_mapped_id(
+                            "fleet_skills", skill.get("id", ""), dest_id
+                        )
+                        created += 1
+                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                except Exception as e:
+                    _mark_state_item_failed(orchestrator, item_id, e)
+            console.print(f"  [green]{created} migrated[/green]")
+        else:
+            console.print("  [dim]No skills found[/dim]")
+    else:
+        if not skip_agents:
+            console.print(
+                "[yellow]Warning: Skills skipped, agent skill references will be stripped.[/yellow]"
+            )
+
+    # --- Phase 6: Agents ---
+    agent_id_map = {}
+    if not skip_agents:
+        console.print("\n[bold]Fleet: Agents[/bold]")
+        agent_migrator = FleetAgentMigrator(
+            orchestrator.source_client, orchestrator.dest_client, state, config
+        )
+        agents = agent_migrator.list_agents()
+        if agents:
+            console.print(f"  Found {len(agents)} agent(s)")
+            console.print("  Fetching destination model catalog... ", end="")
+            dest_model_ids = agent_migrator.list_dest_models()
+            if dest_model_ids:
+                console.print(f"[green]{len(dest_model_ids)} available[/green]")
+            else:
+                console.print("[yellow]could not fetch (model validation skipped)[/yellow]")
+
+            console.print("  Fetching destination workspace members... ", end="")
+            dest_user_ids = _fetch_dest_user_ids(orchestrator)
+            if dest_user_ids is not None:
+                console.print(f"[green]{len(dest_user_ids)} members[/green]")
+            else:
+                console.print("[yellow]could not fetch (shared_users validation skipped)[/yellow]")
+
+            created = 0
+            for agent_summary in agents:
+                agent_id = agent_summary.get("id", "")
+                name = agent_summary.get("name", "")
+                item_id = _ensure_state_item(
+                    orchestrator, config, "fleet_agent", agent_id, name,
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    # Fetch full agent detail with files
+                    agent = agent_migrator.get_agent(agent_id)
+                    dest_id = agent_migrator.create_agent(
+                        agent,
+                        id_mappings,
+                        skip_skills=skip_skills,
+                        skip_mcp_servers=skip_mcp_servers,
+                        dest_model_ids=dest_model_ids if dest_model_ids else None,
+                        dest_user_ids=dest_user_ids,
+                    )
+                    if dest_id:
+                        agent_id_map[agent_id] = dest_id
+                        state.set_mapped_id("fleet_agents", agent_id, dest_id)
+                        created += 1
+                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                except Exception as e:
+                    _mark_state_item_failed(orchestrator, item_id, e)
+            console.print(f"  [green]{created} migrated[/green]")
+
+            # --- Phase 7: Schedules (depends on agent mapping) ---
+            if not skip_schedules:
+                console.print("\n[bold]Fleet: Schedules[/bold]")
+                schedule_migrator = FleetScheduleMigrator(
+                    orchestrator.source_client, orchestrator.dest_client, state, config
+                )
+                created = 0
+                for src_agent_id, dest_agent_id in agent_id_map.items():
+                    schedules = schedule_migrator.list_schedules(src_agent_id)
+                    for schedule in schedules:
+                        item_id = _ensure_state_item(
+                            orchestrator, config, "fleet_schedule",
+                            schedule.get("id", ""), schedule.get("display_name", ""),
+                        )
+                        try:
+                            _mark_state_item_started(orchestrator, item_id)
+                            dest_id = schedule_migrator.create_schedule(dest_agent_id, schedule)
+                            if dest_id:
+                                created += 1
+                                _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                        except Exception as e:
+                            _mark_state_item_failed(orchestrator, item_id, e)
+                if created:
+                    console.print(f"  [green]{created} migrated[/green]")
+                else:
+                    console.print("  [dim]No schedules found[/dim]")
+
+            # --- Phase 8: Triggers (depends on agent mapping) ---
+            if not skip_triggers:
+                console.print("\n[bold]Fleet: Triggers[/bold]")
+                trigger_migrator = FleetTriggerMigrator(
+                    orchestrator.source_client, orchestrator.dest_client, state, config
+                )
+                triggers = trigger_migrator.list_triggers()
+                if triggers:
+                    created = 0
+                    for trigger in triggers:
+                        item_id = _ensure_state_item(
+                            orchestrator, config, "fleet_trigger",
+                            trigger.get("id", ""), trigger.get("name", ""),
+                        )
+                        try:
+                            _mark_state_item_started(orchestrator, item_id)
+                            dest_id = trigger_migrator.create_trigger(trigger, agent_id_map)
+                            if dest_id:
+                                created += 1
+                                _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                        except Exception as e:
+                            _mark_state_item_failed(orchestrator, item_id, e)
+                    console.print(f"  [green]{created} migrated[/green]")
+                else:
+                    console.print("  [dim]No triggers found[/dim]")
+        else:
+            console.print("  [dim]No agents found[/dim]")
+
+    # --- Phase 9: Webhooks (independent of agents) ---
+    if not skip_webhooks:
+        console.print("\n[bold]Fleet: Webhooks[/bold]")
+        webhook_migrator = FleetWebhookMigrator(
+            orchestrator.source_client, orchestrator.dest_client, state, config
+        )
+        webhooks = webhook_migrator.list_webhooks()
+        if webhooks:
+            console.print(f"  Found {len(webhooks)} webhook(s)")
+            created = 0
+            for webhook in webhooks:
+                name = webhook.get("name", webhook.get("id", ""))
+                item_id = _ensure_state_item(
+                    orchestrator, config, "fleet_webhook",
+                    webhook.get("id", ""), name,
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    dest_id = webhook_migrator.create_webhook(webhook)
+                    if dest_id:
+                        created += 1
+                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                except Exception as e:
+                    _mark_state_item_failed(orchestrator, item_id, e)
+            console.print(f"  [green]{created} migrated[/green]")
+        else:
+            console.print("  [dim]No webhooks found[/dim]")
+
+    # --- Phase 10: Usage limits (depends on agent mapping) ---
+    if not skip_usage_limits:
+        console.print("\n[bold]Fleet: Usage Limits[/bold]")
+        limit_migrator = FleetUsageLimitMigrator(
+            orchestrator.source_client, orchestrator.dest_client, state, config
+        )
+        limits = limit_migrator.list_limits()
+        if limits:
+            console.print(f"  Found {len(limits)} spend limit(s)")
+            created = 0
+            for limit in limits:
+                item_id = _ensure_state_item(
+                    orchestrator, config, "fleet_usage_limit",
+                    limit.get("id", ""),
+                    f"{limit.get('subject_type', '')}:{limit.get('subject_id', 'global')}",
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    dest_id = limit_migrator.create_limit(limit, agent_id_map)
+                    if dest_id:
+                        created += 1
+                        _mark_state_item_completed(orchestrator, item_id, destination_id=dest_id)
+                except Exception as e:
+                    _mark_state_item_failed(orchestrator, item_id, e)
+            console.print(f"  [green]{created} migrated[/green]")
+        else:
+            console.print("  [dim]No usage limits found[/dim]")
+
+    orchestrator.state_manager.save()
+
+
+@cli.command()
+@ssl_option
+@click.option("--skip-secrets", is_flag=True, help="Skip Fleet workspace secrets")
+@click.option("--skip-auth-providers", is_flag=True, help="Skip Fleet auth providers")
+@click.option("--skip-mcp-servers", is_flag=True, help="Skip MCP servers and integrations")
+@click.option("--skip-skills", is_flag=True, help="Skip shared skills")
+@click.option("--skip-agents", is_flag=True, help="Skip Fleet agents")
+@click.option("--skip-schedules", is_flag=True, help="Skip agent schedules")
+@click.option("--skip-triggers", is_flag=True, help="Skip triggers")
+@click.option("--skip-webhooks", is_flag=True, help="Skip webhooks")
+@click.option("--skip-usage-limits", is_flag=True, help="Skip spend limits")
+@click.option("--skip-sandbox-policies", is_flag=True, help="Skip sandbox policies")
+@workspace_options
+@click.pass_context
+def fleet(
+    ctx,
+    skip_secrets,
+    skip_auth_providers,
+    skip_mcp_servers,
+    skip_skills,
+    skip_agents,
+    skip_schedules,
+    skip_triggers,
+    skip_webhooks,
+    skip_usage_limits,
+    skip_sandbox_policies,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
+):
+    """Migrate Fleet resources (agents, skills, MCP servers, etc.)."""
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    # Test connections
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        if source_error:
+            console.print(f"[red]  {source_error}[/red]")
+        orchestrator.cleanup()
+        return
+    if not dest_ok:
+        console.print("[red]✗ Destination connection failed[/red]")
+        if dest_error:
+            console.print(f"[red]  {dest_error}[/red]")
+        orchestrator.cleanup()
+        return
+    console.print("[green]✓[/green]\n")
+
+    # Resolve workspace context
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
+    if ws_result is _WS_CANCELLED:
+        console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+
+    for src_ws, dst_ws in ws_pairs:
+        if src_ws and dst_ws:
+            orchestrator.set_workspace_context(src_ws, dst_ws)
+            console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+
+        _run_preflight(orchestrator, config, ["fleet"])
+
+        _migrate_fleet_for_workspace(
+            orchestrator,
+            config,
+            skip_secrets=skip_secrets,
+            skip_auth_providers=skip_auth_providers,
+            skip_mcp_servers=skip_mcp_servers,
+            skip_skills=skip_skills,
+            skip_agents=skip_agents,
+            skip_schedules=skip_schedules,
+            skip_triggers=skip_triggers,
+            skip_webhooks=skip_webhooks,
+            skip_usage_limits=skip_usage_limits,
+            skip_sandbox_policies=skip_sandbox_policies,
+        )
+
+    if ws_result:
+        orchestrator.clear_workspace_context()
+
+    _display_resolution_summary(orchestrator)
+    _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
 
 
 @cli.command()

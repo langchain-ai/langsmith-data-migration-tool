@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LangSmith Data Migration Tool - A Python CLI for migrating datasets, experiments, annotation queues, project rules, prompts, and charts between LangSmith instances. Built with Click CLI, Textual TUI, and the LangSmith SDK.
+LangSmith Data Migration Tool - A Python CLI for migrating datasets, experiments, annotation queues, project rules, prompts, charts, and Fleet resources between LangSmith instances. Built with Click CLI, Textual TUI, and the LangSmith SDK.
 
 ## Development Commands
 
@@ -40,6 +40,8 @@ uv run langsmith-migrator migrate-all  # Migrate everything
 uv run langsmith-migrator migrate-all --map-projects                # Migrate all with interactive project mapping
 uv run langsmith-migrator migrate-all --project-mapping '{"old": "new"}'  # Migrate all with headless project ID mapping (no TUI)
 uv run langsmith-migrator migrate-all --rules-create-enabled        # Create migrated rules enabled
+uv run langsmith-migrator fleet           # Migrate Fleet resources (agents, skills, MCP servers, etc.)
+uv run langsmith-migrator fleet --skip-agents --skip-skills          # Skip specific Fleet resources
 uv run langsmith-migrator resume       # Resume interrupted dataset migration
 uv run langsmith-migrator list-projects # List available projects
 uv run langsmith-migrator list_workspaces --source --dest           # List workspaces
@@ -72,19 +74,30 @@ BaseMigrator (core/migrators/base.py)
     ├── AnnotationQueueMigrator
     ├── PromptMigrator     - Uses LangSmith SDK for prompt operations
     ├── RulesMigrator      - Project automation rules (v3+ evaluators)
-    └── ChartMigrator      - Monitoring charts and dashboards
+    ├── ChartMigrator      - Monitoring charts and dashboards
+    ├── UserRoleMigrator   - Users, roles, and workspace memberships
+    ├── FleetSkillMigrator          - Fleet shared workspace skills
+    ├── FleetMcpServerMigrator      - Fleet MCP servers and integrations
+    ├── FleetAgentMigrator          - Fleet agents with cross-reference remapping
+    ├── FleetScheduleMigrator       - Fleet agent cron schedules
+    ├── FleetSecretMigrator         - Fleet workspace secrets (names only, write-only API)
+    ├── FleetAuthProviderMigrator   - Fleet OAuth auth providers (structure only, client_secret write-only)
+    ├── FleetTriggerMigrator        - Fleet triggers
+    ├── FleetWebhookMigrator        - Fleet platform webhooks
+    ├── FleetUsageLimitMigrator     - Fleet spend limits
+    └── FleetSandboxPolicyMigrator  - Fleet sandbox policies
 ```
 
 ### Key Components
 
-- **EnhancedAPIClient** (`core/api_client.py`): HTTP wrapper with retry logic, rate limiting, and pagination support
+- **EnhancedAPIClient** (`core/api_client.py`): HTTP wrapper with retry logic, rate limiting, and pagination support (offset-based and cursor-based)
 - **State Management** (`utils/state.py`): Session tracking, ID mappings, and resume capability
 - **TUI Selector** (`cli/tui_selector.py`): Textual-based interactive selection with search/filter
 - **TUI Project Mapper** (`cli/tui_project_mapper.py`): Text-input-first project mapping with suggestion filtering
 - **TUI Workspace Mapper** (`cli/tui_workspace_mapper.py`): Interactive N-to-N workspace mapping with create-new support
 - **Workspace Resolver** (`utils/workspace_resolver.py`): Auto-detection and resolution of multi-workspace environments
 - **Config** (`utils/config.py`): Environment variables, CLI arguments, and `.env` file handling
-- **Pagination** (`utils/pagination.py`): Pagination helpers for API list endpoints
+- **Pagination** (`utils/pagination.py`): `PaginationHelper` for offset-based APIs, `CursorPaginationHelper` for Fleet cursor-based APIs
 
 ### Entry Points
 

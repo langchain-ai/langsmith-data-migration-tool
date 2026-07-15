@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Fleet resource migration (`fleet`)**: New `fleet` command migrates LangSmith
+  Fleet resources between instances, including agents, shared skills, MCP servers,
+  integrations, auth providers, schedules, triggers, webhooks, usage limits, and
+  sandbox policies. Resources are migrated in dependency order with automatic
+  cross-reference remapping (agent tool URLs, skill repo handles, subagent IDs,
+  sandbox policy IDs, auth provider IDs). Secrets and auth provider client
+  secrets are exported as placeholders with remediation steps since those values
+  are write-only. Per-user OAuth connections and infrastructure-level OAuth
+  provider configuration require manual re-setup on the destination. Also adds
+  `--skip-fleet` to `migrate-all`, cursor-based pagination support
+  (`CursorPaginationHelper`), a `put` method on `EnhancedAPIClient`, and
+  root-relative URL construction in `_prepare_url` for Fleet endpoints at
+  `/v1/fleet/*` (bypassing the `/api/v1` base path).
+
+### Changed
+- **Fleet agents always skip existing**: All Fleet migrators skip resources that
+  already exist on the destination, regardless of the `--skip-existing` flag.
+  This prevents overwriting org-scoped infrastructure (auth providers, MCP servers)
+  that may already be correctly configured.
+- **Fleet agent model substitution**: When the source agent's model ID is not
+  available on the destination, the tool substitutes a model from the same
+  provider if available, or falls back to the first available model. A warning
+  is logged for each substitution.
+- **Fleet agent shared_users filtering**: The `shared_users` permission lists are
+  filtered against the destination workspace's active member list. Only user IDs
+  that exist on the destination are kept; others are removed with a warning. If
+  the member list can't be fetched, all `shared_users` are stripped as a safety
+  measure.
+- **Fleet agent ownership warning**: The tool warns when the destination API key
+  is not a Personal Access Token (`lsv2_pt_*`), since agent ownership requires a
+  PAT. Workspace API keys produce agents with no owner that are invisible.
+
+### Fixed
+- **Fleet agent listing**: Agent listing now queries both `audience=user` (owned
+  + directly-shared) and `audience=tenant` (workspace-shared) and merges with
+  dedup, since the default list only returns owned agents.
+- **Fleet schedule dedup**: Schedules are checked against existing destination
+  schedules by cron expression before creating, preventing duplicate cron
+  conflicts on re-runs.
+- **Fleet auth provider conflict handling**: Auth providers with reserved
+  built-in slugs (e.g. `salesforce-oauth-provider`) are skipped with a warning
+  instead of failing when the API returns a 409 conflict.
+
 ## [0.0.79] - 2026-07-06
 
 ### Fixed

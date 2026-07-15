@@ -183,3 +183,24 @@ def test_get_raises_api_error_on_invalid_json_success_response(monkeypatch):
 
     assert get_mock.call_count == 1
 
+
+def test_prepare_url_root_relative_bypasses_api_v1():
+    """Endpoints starting with /v1/ should resolve to the host root, not /api/v1."""
+    client = _client()
+    url = client._prepare_url("/v1/fleet/agents")
+    assert url == "https://langsmith.example.com/v1/fleet/agents"
+
+
+def test_prepare_url_normal_endpoint_uses_api_v1_base():
+    """Normal endpoints should still append to the /api/v1 base URL."""
+    client = _client()
+    url = client._prepare_url("/datasets")
+    assert url == "https://langsmith.example.com/api/v1/datasets"
+
+
+def test_prepare_url_absolute_url_passthrough():
+    """Absolute URLs should be used as-is."""
+    client = _client()
+    url = client._prepare_url("https://other.example.com/api/v1/foo")
+    assert url == "https://other.example.com/api/v1/foo"
+

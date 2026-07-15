@@ -94,3 +94,81 @@ class PaginationHelper:
                 items = [response]
             return items if isinstance(items, list) else []
         return []
+
+
+class CursorPaginationHelper:
+    """Helper for cursor-based pagination (Fleet APIs).
+
+    Fleet list endpoints return ``{"items": [...], "next_cursor": "..."}``
+    and accept ``page_size`` / ``cursor`` query parameters, unlike the
+    offset-based ``limit`` / ``offset`` scheme used by the core LangSmith API.
+    """
+
+    @staticmethod
+    def paginate(
+        fetch_fn: Callable,
+        endpoint: str,
+        params: Optional[Dict] = None,
+        page_size: int = 100,
+    ) -> Generator[Dict[str, Any], None, None]:
+        """
+        Paginate through cursor-based API results.
+
+        Args:
+            fetch_fn: Function to fetch data (e.g. client.get)
+            endpoint: API endpoint
+            params: Additional query parameters
+            page_size: Number of items per page
+
+        Yields:
+            Individual items from paginated results
+        """
+        if params is None:
+            params = {}
+
+        params["page_size"] = page_size
+        cursor: Optional[str] = None
+        seen_ids: set = set()
+        max_iterations = 10000
+        iterations = 0
+
+        while iterations < max_iterations:
+            iterations += 1
+            if cursor:
+                params["cursor"] = cursor
+            else:
+                params.pop("cursor", None)
+
+            try:
+                response = fetch_fn(endpoint, params)
+            except Exception:
+                break
+
+            items = PaginationHelper._extract_items(response)
+            if not items:
+                break
+
+            new_items_count = 0
+            for item in items:
+                if item is None:
+                    continue
+                item_id = None
+                if isinstance(item, dict):
+                    item_id = item.get("id") or item.get("_id") or item.get("uuid")
+                if item_id and item_id in seen_ids:
+                    continue
+                if item_id:
+                    seen_ids.add(item_id)
+                new_items_count += 1
+                yield item
+
+            if new_items_count == 0:
+                break
+
+            # Extract next cursor from response
+            next_cursor = None
+            if isinstance(response, dict):
+                next_cursor = response.get("next_cursor")
+            if not next_cursor:
+                break
+            cursor = next_cursor

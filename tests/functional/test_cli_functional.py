@@ -50,6 +50,7 @@ def test_registered_command_names_match_public_cli_surface():
         "clean",
         "datasets",
         "export-users",
+        "fleet",
         "list-projects",
         "list_workspaces",
         "migrate-all",

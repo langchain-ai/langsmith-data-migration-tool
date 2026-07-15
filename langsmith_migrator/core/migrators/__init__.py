@@ -10,6 +10,16 @@ from .rules import RulesMigrator
 from .chart import ChartMigrator
 from .user_role import UserRoleMigrator
 from .orchestrator import MigrationOrchestrator
+from .fleet_skill import FleetSkillMigrator
+from .fleet_mcp_server import FleetMcpServerMigrator
+from .fleet_agent import FleetAgentMigrator
+from .fleet_schedule import FleetScheduleMigrator
+from .fleet_secret import FleetSecretMigrator
+from .fleet_auth_provider import FleetAuthProviderMigrator
+from .fleet_trigger import FleetTriggerMigrator
+from .fleet_webhook import FleetWebhookMigrator
+from .fleet_usage_limit import FleetUsageLimitMigrator
+from .fleet_sandbox_policy import FleetSandboxPolicyMigrator
 
 __all__ = [
     "BaseMigrator",
@@ -22,4 +32,14 @@ __all__ = [
     "ChartMigrator",
     "UserRoleMigrator",
     "MigrationOrchestrator",
+    "FleetSkillMigrator",
+    "FleetMcpServerMigrator",
+    "FleetAgentMigrator",
+    "FleetScheduleMigrator",
+    "FleetSecretMigrator",
+    "FleetAuthProviderMigrator",
+    "FleetTriggerMigrator",
+    "FleetWebhookMigrator",
+    "FleetUsageLimitMigrator",
+    "FleetSandboxPolicyMigrator",
 ]
