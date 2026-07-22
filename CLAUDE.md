@@ -42,6 +42,11 @@ uv run langsmith-migrator migrate-all --project-mapping '{"old": "new"}'  # Migr
 uv run langsmith-migrator migrate-all --rules-create-enabled        # Create migrated rules enabled
 uv run langsmith-migrator fleet           # Migrate Fleet resources (agents, skills, MCP servers, etc.)
 uv run langsmith-migrator fleet --skip-agents --skip-skills          # Skip specific Fleet resources
+uv run langsmith-migrator contexts     # Migrate Context Hub agents & skills (latest commit)
+uv run langsmith-migrator contexts --agents-only                   # Only agent contexts
+uv run langsmith-migrator contexts --skills-only                   # Only skill contexts
+uv run langsmith-migrator contexts --same-instance                 # Preserve linked-repo commit pins
+uv run langsmith-migrator contexts --include-external              # Also migrate source=external repos (hidden by default to match the UI)
 uv run langsmith-migrator resume       # Resume interrupted dataset migration
 uv run langsmith-migrator list-projects # List available projects
 uv run langsmith-migrator list_workspaces --source --dest           # List workspaces
@@ -85,8 +90,26 @@ BaseMigrator (core/migrators/base.py)
     ├── FleetTriggerMigrator        - Fleet triggers
     ├── FleetWebhookMigrator        - Fleet platform webhooks
     ├── FleetUsageLimitMigrator     - Fleet spend limits
-    └── FleetSandboxPolicyMigrator  - Fleet sandbox policies
+    ├── FleetSandboxPolicyMigrator  - Fleet sandbox policies
+    └── ContextHubMigrator          - Context Hub agents & skills via the SDK directories API
 ```
+
+Note: `ContextHubMigrator` uses the LangSmith SDK for pulls/pushes
+(`push_agent`/`push_skill`, `pull_agent`/`pull_skill`) over managed sessions,
+mirroring `PromptMigrator`. It lists repos via the raw `/repos` hub endpoint
+(not the SDK's `list_agents`/`list_skills`) because that endpoint exposes the
+`source` field, which the SDK's typed model drops. By default the listing
+matches the Context Hub UI, which sends `exclude_source=external` and hides
+externally-created repos (e.g. Agent Builder drafts with UUID handles); the
+migrator both sends `exclude_source=external` and filters `source == "external"`
+client-side (the deployed backend may ignore the query param). Pass
+`include_external=True` (CLI `--include-external`) to migrate every repo.
+The Context Hub directories API has no commit-history endpoint, so each context
+is migrated at its **latest commit** only (single fresh commit on the
+destination) plus repo metadata. Cross-instance, linked-repo entries
+(`skills/...`, `agents/...`) have their source commit pins stripped so links
+resolve to the destination's latest commit of each linked repo (recorded as a
+`degraded` issue); `--same-instance` preserves them.
 
 ### Key Components
 
