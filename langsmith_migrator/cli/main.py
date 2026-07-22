@@ -5395,6 +5395,15 @@ def fleet(
         "reproduces the source's commit chain."
     ),
 )
+@click.option(
+    "--no-tags",
+    is_flag=True,
+    help=(
+        "Do not migrate commit tags. By default all commit tags (including the "
+        "production/staging environment tags behind the Context Hub promote "
+        "feature) are re-created on the destination pointing at the same commit."
+    ),
+)
 @ssl_option
 @workspace_options
 @click.pass_context
@@ -5406,6 +5415,7 @@ def contexts(
     same_instance,
     include_external,
     latest_only,
+    no_tags,
     source_workspace,
     dest_workspace,
     map_workspaces,
@@ -5467,6 +5477,7 @@ def contexts(
         same_instance=same_instance,
         include_external=include_external,
         include_all_commits=not latest_only,
+        migrate_tags=not no_tags,
     )
     if same_instance:
         console.print("[dim]Same-instance mode: preserving linked repo commit pins verbatim[/dim]")
@@ -5474,6 +5485,8 @@ def contexts(
         console.print("[dim]Including externally-sourced contexts (source=external)[/dim]")
     if latest_only:
         console.print("[dim]Latest-only mode: copying only each context's latest commit[/dim]")
+    if no_tags:
+        console.print("[dim]Skipping commit tags (--no-tags)[/dim]")
 
     include_agents = not skills_only
     include_skills = not agents_only

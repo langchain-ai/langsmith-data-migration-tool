@@ -18,6 +18,12 @@ are content-addressed, the same commit hashes. Repo metadata (``description``,
 ``include_all_commits=False`` to copy only the latest commit as a single fresh
 commit instead.
 
+Commit tags are copied by default too. This includes the ``production`` /
+``staging`` environment tags that back the Context Hub "promote" feature (a tag
+is just a named pointer to a commit). After a repo's commits are migrated, each
+source tag is re-created on the destination pointing at the commit with the same
+content-addressed hash. Set ``migrate_tags=False`` to skip tags.
+
 Listing goes through the raw ``/repos`` hub endpoint (via the shared
 ``EnhancedAPIClient``) rather than the SDK's ``list_agents`` / ``list_skills``,
 because ``/repos`` exposes the ``source`` field that the SDK's typed model
@@ -61,9 +67,16 @@ class ContextHubMigrator(BaseMigrator):
         same_instance: bool = False,
         include_external: bool = False,
         include_all_commits: bool = True,
+        migrate_tags: bool = True,
     ):
         super().__init__(source_client, dest_client, state, config)
         self.same_instance = same_instance
+        # Commit tags (including the environment tags ``production`` /
+        # ``staging`` that back the Context Hub "promote" feature) are copied by
+        # default: after a repo's commits are migrated, each source tag is
+        # re-created on the destination pointing at the same commit (matched by
+        # content-addressed commit hash). Set migrate_tags=False to skip tags.
+        self.migrate_tags = migrate_tags
         # By default, match the Context Hub UI, which lists contexts with
         # exclude_source=external (hiding externally-created agents/skills such
         # as Agent Builder drafts with UUID handles). Set include_external=True
@@ -382,6 +395,117 @@ class ContextHubMigrator(BaseMigrator):
         except Exception:  # noqa: BLE001 - head may not exist yet
             return None
 
+    # ------------------------------------------------------------------
+    # Commit tags (including production/staging environment tags)
+    # ------------------------------------------------------------------
+    def _tags_endpoint(self, summary: Dict[str, Any], tag_name: Optional[str] = None) -> str:
+        """Build the ``/repos/{owner}/{repo}/tags`` endpoint for a context.
+
+        Contexts are migrated under the current tenant, so the owner segment is
+        ``-`` (current tenant) to match how the repos were created.
+        """
+        base = f"/repos/-/{summary['repo_handle']}/tags"
+        return f"{base}/{tag_name}" if tag_name else base
+
+    def list_source_tags(self, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return the source repo's commit tags (name + target commit hash)."""
+        try:
+            resp = self.source.get(self._tags_endpoint(summary))
+        except Exception as e:  # noqa: BLE001 - tags are best-effort
+            self.log(f"Failed to list tags for {summary['repo_handle']}: {e}", "warning")
+            return []
+        tags = resp if isinstance(resp, list) else (resp or {}).get("tags") or []
+        return [
+            {"tag_name": t.get("tag_name"), "commit_hash": t.get("commit_hash")}
+            for t in tags
+            if isinstance(t, dict) and t.get("tag_name") and t.get("commit_hash")
+        ]
+
+    def _dest_commit_id_for_hash(
+        self, summary: Dict[str, Any], commit_hash: str
+    ) -> Optional[str]:
+        """Resolve a commit hash to the destination repo's commit_id, if present.
+
+        The destination reproduces the source's content-addressed commit hashes,
+        so the same hash identifies the corresponding destination commit.
+        """
+        puller = (
+            self.dest_ls_client.pull_agent
+            if summary["repo_type"] == "agent"
+            else self.dest_ls_client.pull_skill
+        )
+        try:
+            return str(puller(summary["repo_handle"], version=commit_hash).commit_id)
+        except Exception:  # noqa: BLE001 - hash may not exist on destination
+            return None
+
+    def migrate_context_tags(
+        self, summary: Dict[str, Any], *, item_id: Optional[str] = None
+    ) -> None:
+        """Re-create the source repo's commit tags on the destination.
+
+        Each source tag (environment tags ``production`` / ``staging`` and any
+        custom commit tags) is pointed at the destination commit with the same
+        content-addressed hash. Tags whose target commit is not present on the
+        destination (e.g. under ``--latest-only``) are skipped and reported.
+        """
+        self._sync_workspace_headers()
+        source_tags = self.list_source_tags(summary)
+        if not source_tags:
+            return
+
+        migrated: List[str] = []
+        skipped: List[str] = []
+        for tag in source_tags:
+            dest_commit_id = self._dest_commit_id_for_hash(summary, tag["commit_hash"])
+            if not dest_commit_id:
+                skipped.append(tag["tag_name"])
+                continue
+            endpoint = self._tags_endpoint(summary)
+            try:
+                # Create the tag; if it already exists, re-point it with PATCH.
+                self.dest.post(
+                    endpoint,
+                    {"tag_name": tag["tag_name"], "commit_id": dest_commit_id},
+                )
+            except Exception:  # noqa: BLE001 - fall back to update on conflict
+                try:
+                    self.dest.patch(
+                        self._tags_endpoint(summary, tag["tag_name"]),
+                        {"commit_id": dest_commit_id},
+                    )
+                except Exception as e:  # noqa: BLE001 - report and continue
+                    self.log(
+                        f"Failed to set tag {tag['tag_name']} on "
+                        f"{summary['repo_handle']}: {e}",
+                        "warning",
+                    )
+                    skipped.append(tag["tag_name"])
+                    continue
+            migrated.append(tag["tag_name"])
+
+        if migrated:
+            self.log(
+                f"Tagged {summary['repo_handle']}: {', '.join(sorted(migrated))}",
+                "success",
+            )
+        if skipped:
+            self.record_issue(
+                "degraded",
+                "context_tag_not_migrated",
+                (
+                    f"Could not migrate {len(skipped)} tag(s) for "
+                    f"{summary['repo_handle']}: {', '.join(sorted(skipped))}. "
+                    "The target commit is not present on the destination."
+                ),
+                item_id=item_id,
+                next_action=(
+                    "Re-run without --latest-only so the tagged commit is "
+                    "migrated, then set the tag on the destination."
+                ),
+                evidence={"tags": sorted(skipped)},
+            )
+
     def create_context(self, summary: Dict[str, Any], *, item_id: Optional[str] = None) -> str:
         """Push a context to the destination and return the final commit URL.
 
@@ -405,6 +529,8 @@ class ContextHubMigrator(BaseMigrator):
             files = self._prepare_files(snapshot["files"], item_id=item_id)
             url = self._push_commit(summary, files, with_metadata=True)
             self.log(f"Migrated context {identifier}: {url}", "success")
+            if self.migrate_tags:
+                self.migrate_context_tags(summary, item_id=item_id)
             return url
 
         url = ""
@@ -424,4 +550,6 @@ class ContextHubMigrator(BaseMigrator):
             f"Migrated context {identifier} with {len(commits)} commit(s): {url}",
             "success",
         )
+        if self.migrate_tags:
+            self.migrate_context_tags(summary, item_id=item_id)
         return url

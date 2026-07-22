@@ -46,6 +46,7 @@ uv run langsmith-migrator contexts     # Migrate Context Hub agents & skills (fu
 uv run langsmith-migrator contexts --agents-only                   # Only agent contexts
 uv run langsmith-migrator contexts --skills-only                   # Only skill contexts
 uv run langsmith-migrator contexts --latest-only                   # Copy only each context's latest commit (skip history)
+uv run langsmith-migrator contexts --no-tags                       # Skip commit tags (production/staging + custom); tags are migrated by default
 uv run langsmith-migrator contexts --same-instance                 # Preserve linked-repo commit pins
 uv run langsmith-migrator contexts --include-external              # Also migrate source=external repos (hidden by default to match the UI)
 uv run langsmith-migrator resume       # Resume interrupted dataset migration
@@ -111,7 +112,13 @@ and pushes each commit oldest->newest, chaining `parent_commit`. Because
 directory commits are content-addressed, this reproduces the source's commit
 hashes. Repo metadata is applied on the first commit. Pass
 `include_all_commits=False` (CLI `--latest-only`) to copy only the latest commit
-as a single fresh commit. Cross-instance, linked-repo entries
+as a single fresh commit. Commit tags are migrated by default (CLI `--no-tags`
+to skip): after a repo's commits are pushed, each source tag - including the
+`production` / `staging` environment tags behind the Context Hub promote feature
+- is re-created on the destination via `/repos/{owner}/{repo}/tags` pointing at
+the commit with the same content-addressed hash (tags whose target commit is not
+present on the destination are skipped and recorded as a `degraded` issue).
+Cross-instance, linked-repo entries
 (`skills/...`, `agents/...`) have their source commit pins stripped so links
 resolve to the destination's latest commit of each linked repo (recorded as a
 `degraded` issue); `--same-instance` preserves them.

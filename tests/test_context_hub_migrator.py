@@ -23,6 +23,7 @@ def _migrator(
     same_instance=False,
     include_external=False,
     include_all_commits=True,
+    migrate_tags=False,
 ):
     source = _mock_client()
     dest = _mock_client()
@@ -35,6 +36,7 @@ def _migrator(
             same_instance=same_instance,
             include_external=include_external,
             include_all_commits=include_all_commits,
+            migrate_tags=migrate_tags,
         )
     migrator.source_ls_client = Mock()
     migrator.dest_ls_client = Mock()
@@ -411,3 +413,113 @@ def test_context_exists_delegates_by_type(sample_config):
 
     assert migrator.context_exists({"repo_type": "agent", "repo_handle": "a"}) is True
     assert migrator.context_exists({"repo_type": "skill", "repo_handle": "s"}) is False
+
+
+# ---------------------------------------------------------------------------
+# Commit tags (environment tags)
+# ---------------------------------------------------------------------------
+def _single_commit_migrator(sample_config, migration_state=None, *, migrate_tags=True):
+    """A migrator set to latest-only so create_context does one push, plus tags."""
+    migrator = _migrator(
+        sample_config,
+        migration_state,
+        include_all_commits=False,
+        migrate_tags=migrate_tags,
+    )
+    migrator.source_ls_client.pull_skill.return_value = SkillContext(
+        commit_id="00000000-0000-0000-0000-000000000010",
+        commit_hash="c_latest",
+        files={"SKILL.md": FileEntry(content="latest")},
+    )
+    migrator.dest_ls_client.push_skill.return_value = "https://dest/commits/latest"
+    return migrator
+
+
+def _summary():
+    return {
+        "repo_type": "skill",
+        "repo_handle": "deep-research",
+        "description": None,
+        "readme": None,
+        "tags": [],
+        "is_public": None,
+    }
+
+
+def test_migrate_tags_recreates_env_tags_on_destination(sample_config):
+    migrator = _single_commit_migrator(sample_config)
+    # Source tags: production + staging both point at the latest commit hash.
+    migrator.source.get.return_value = [
+        {"tag_name": "production", "commit_hash": "c_latest"},
+        {"tag_name": "staging", "commit_hash": "c_latest"},
+    ]
+    # Destination resolves that hash to a dest commit_id.
+    migrator.dest_ls_client.pull_skill.return_value = SkillContext(
+        commit_id="00000000-0000-0000-0000-000000000099",
+        commit_hash="c_latest",
+        files={"SKILL.md": FileEntry(content="latest")},
+    )
+
+    migrator.create_context(_summary())
+
+    # Both tags POSTed to the destination tags endpoint with the dest commit_id.
+    tag_posts = [
+        c for c in migrator.dest.post.call_args_list if c.args[0].endswith("/tags")
+    ]
+    assert len(tag_posts) == 2
+    posted = {c.args[1]["tag_name"]: c.args[1]["commit_id"] for c in tag_posts}
+    assert posted == {
+        "production": "00000000-0000-0000-0000-000000000099",
+        "staging": "00000000-0000-0000-0000-000000000099",
+    }
+
+
+def test_migrate_tags_skipped_when_disabled(sample_config):
+    migrator = _single_commit_migrator(sample_config, migrate_tags=False)
+    migrator.source.get.return_value = [
+        {"tag_name": "production", "commit_hash": "c_latest"},
+    ]
+
+    migrator.create_context(_summary())
+
+    # No tag listing or creation happens when tags are disabled.
+    migrator.source.get.assert_not_called()
+    migrator.dest.post.assert_not_called()
+
+
+def test_migrate_tags_records_issue_when_commit_absent(sample_config, migration_state):
+    migrator = _single_commit_migrator(sample_config, migration_state)
+    # Source tag points at a commit that is NOT present on the destination.
+    migrator.source.get.return_value = [
+        {"tag_name": "production", "commit_hash": "missing_hash"},
+    ]
+
+    def dest_pull(identifier, version=None):
+        if version == "missing_hash":
+            raise ValueError("commit not found")
+        return SkillContext(
+            commit_id="00000000-0000-0000-0000-000000000099",
+            commit_hash="c_latest",
+            files={"SKILL.md": FileEntry(content="latest")},
+        )
+
+    migrator.dest_ls_client.pull_skill.side_effect = dest_pull
+
+    migrator.create_context(_summary())
+
+    # No tag POSTed, and a degraded issue is recorded.
+    assert not [c for c in migrator.dest.post.call_args_list if c.args[0].endswith("/tags")]
+    assert any(i.code == "context_tag_not_migrated" for i in migration_state.issue_log)
+
+
+def test_list_source_tags_filters_incomplete_entries(sample_config):
+    migrator = _migrator(sample_config)
+    migrator.source.get.return_value = [
+        {"tag_name": "production", "commit_hash": "abc"},
+        {"tag_name": "broken"},  # missing commit_hash -> dropped
+        {"commit_hash": "def"},  # missing tag_name -> dropped
+    ]
+
+    tags = migrator.list_source_tags({"repo_type": "skill", "repo_handle": "x"})
+
+    assert tags == [{"tag_name": "production", "commit_hash": "abc"}]
