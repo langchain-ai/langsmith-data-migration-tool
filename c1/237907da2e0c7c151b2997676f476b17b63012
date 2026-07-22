@@ -1,0 +1,23 @@
+langsmith_migrator/cli/main.py
+  s_4c5883607c1642::t_130e413ac611fd 5389-5397,5408,5413,5469,5475-5476
+tests/test_context_hub_migrator.py
+  s_4c5883607c1642::t_130e413ac611fd 19-26,37
+langsmith_migrator/core/migrators/context_hub.py
+  s_4c5883607c1642::t_130e413ac611fd 9-19,63,72-77,230-236,242-247,250-268,337-349,351-372,374-383,385-395,397-426
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "c1237907da2e0c7c151b2997676f476b17b63012",
+  "prompts": {},
+  "sessions": {
+    "s_4c5883607c1642": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8050cbb1-160d-4b2e-8665-420e0119c5b5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
