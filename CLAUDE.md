@@ -42,9 +42,10 @@ uv run langsmith-migrator migrate-all --project-mapping '{"old": "new"}'  # Migr
 uv run langsmith-migrator migrate-all --rules-create-enabled        # Create migrated rules enabled
 uv run langsmith-migrator fleet           # Migrate Fleet resources (agents, skills, MCP servers, etc.)
 uv run langsmith-migrator fleet --skip-agents --skip-skills          # Skip specific Fleet resources
-uv run langsmith-migrator contexts     # Migrate Context Hub agents & skills (latest commit)
+uv run langsmith-migrator contexts     # Migrate Context Hub agents & skills (full commit history by default)
 uv run langsmith-migrator contexts --agents-only                   # Only agent contexts
 uv run langsmith-migrator contexts --skills-only                   # Only skill contexts
+uv run langsmith-migrator contexts --latest-only                   # Copy only each context's latest commit (skip history)
 uv run langsmith-migrator contexts --same-instance                 # Preserve linked-repo commit pins
 uv run langsmith-migrator contexts --include-external              # Also migrate source=external repos (hidden by default to match the UI)
 uv run langsmith-migrator resume       # Resume interrupted dataset migration
@@ -104,9 +105,13 @@ externally-created repos (e.g. Agent Builder drafts with UUID handles); the
 migrator both sends `exclude_source=external` and filters `source == "external"`
 client-side (the deployed backend may ignore the query param). Pass
 `include_external=True` (CLI `--include-external`) to migrate every repo.
-The Context Hub directories API has no commit-history endpoint, so each context
-is migrated at its **latest commit** only (single fresh commit on the
-destination) plus repo metadata. Cross-instance, linked-repo entries
+By default the migrator replays the **full commit history**: it enumerates the
+commit chain with `list_prompt_commits` (which works for directory-type repos)
+and pushes each commit oldest->newest, chaining `parent_commit`. Because
+directory commits are content-addressed, this reproduces the source's commit
+hashes. Repo metadata is applied on the first commit. Pass
+`include_all_commits=False` (CLI `--latest-only`) to copy only the latest commit
+as a single fresh commit. Cross-instance, linked-repo entries
 (`skills/...`, `agents/...`) have their source commit pins stripped so links
 resolve to the destination's latest commit of each linked repo (recorded as a
 `degraded` issue); `--same-instance` preserves them.

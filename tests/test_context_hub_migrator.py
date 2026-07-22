@@ -16,7 +16,14 @@ def _mock_client() -> Mock:
     return client
 
 
-def _migrator(sample_config, migration_state=None, *, same_instance=False, include_external=False):
+def _migrator(
+    sample_config,
+    migration_state=None,
+    *,
+    same_instance=False,
+    include_external=False,
+    include_all_commits=True,
+):
     source = _mock_client()
     dest = _mock_client()
     with patch("langsmith_migrator.core.migrators.context_hub.Client"):
@@ -27,6 +34,7 @@ def _migrator(sample_config, migration_state=None, *, same_instance=False, inclu
             sample_config,
             same_instance=same_instance,
             include_external=include_external,
+            include_all_commits=include_all_commits,
         )
     migrator.source_ls_client = Mock()
     migrator.dest_ls_client = Mock()
@@ -239,8 +247,8 @@ def test_prepare_files_no_issue_for_unpinned_link(sample_config, migration_state
 # ---------------------------------------------------------------------------
 # Writes
 # ---------------------------------------------------------------------------
-def test_create_context_pushes_agent_with_metadata(sample_config):
-    migrator = _migrator(sample_config)
+def test_create_context_latest_only_pushes_agent_with_metadata(sample_config):
+    migrator = _migrator(sample_config, include_all_commits=False)
     ctx = AgentContext(
         commit_id="00000000-0000-0000-0000-000000000001",
         commit_hash="abc123",
@@ -260,15 +268,19 @@ def test_create_context_pushes_agent_with_metadata(sample_config):
     url = migrator.create_context(summary)
 
     assert url == "https://dest/commits/xyz"
+    # Latest-only: a single push, no commit-history enumeration.
+    migrator.source_ls_client.list_prompt_commits.assert_not_called()
+    migrator.dest_ls_client.push_agent.assert_called_once()
     _, kwargs = migrator.dest_ls_client.push_agent.call_args
     assert kwargs["description"] == "Triages email"
     assert kwargs["tags"] == ["email"]
     assert kwargs["is_public"] is False
     assert kwargs["files"]["AGENTS.md"].content == "hello"
+    assert "parent_commit" not in kwargs
 
 
-def test_create_context_pushes_skill(sample_config):
-    migrator = _migrator(sample_config)
+def test_create_context_latest_only_pushes_skill(sample_config):
+    migrator = _migrator(sample_config, include_all_commits=False)
     ctx = SkillContext(
         commit_id="00000000-0000-0000-0000-000000000002",
         commit_hash="def456",
@@ -292,6 +304,104 @@ def test_create_context_pushes_skill(sample_config):
     # Empty tag list is normalized to None so the SDK does not patch metadata.
     _, kwargs = migrator.dest_ls_client.push_skill.call_args
     assert kwargs["tags"] is None
+
+
+def test_create_context_replays_full_history_by_default(sample_config):
+    """Default: replay every source commit oldest->newest, chaining parents."""
+    migrator = _migrator(sample_config)  # include_all_commits=True by default
+
+    # Source has two commits (list_prompt_commits yields newest-first).
+    c_new = Mock(commit_hash="hash_new", parent_commit_hash="hash_old")
+    c_old = Mock(commit_hash="hash_old", parent_commit_hash=None)
+    migrator.source_ls_client.list_prompt_commits.return_value = [c_new, c_old]
+
+    def pull_by_version(identifier, version=None):
+        content = "v1" if version == "hash_old" else "v2"
+        return SkillContext(
+            commit_id="00000000-0000-0000-0000-000000000003",
+            commit_hash=version or "hash_new",
+            files={"SKILL.md": FileEntry(content=content)},
+        )
+
+    migrator.source_ls_client.pull_skill.side_effect = pull_by_version
+    # Destination head after each push, used to chain the next parent.
+    migrator.dest_ls_client.pull_skill.side_effect = [
+        SkillContext(
+            commit_id="00000000-0000-0000-0000-000000000004",
+            commit_hash="dest_old",
+            files={"SKILL.md": FileEntry(content="v1")},
+        ),
+        SkillContext(
+            commit_id="00000000-0000-0000-0000-000000000005",
+            commit_hash="dest_new",
+            files={"SKILL.md": FileEntry(content="v2")},
+        ),
+    ]
+    migrator.dest_ls_client.push_skill.side_effect = [
+        "https://dest/commits/old",
+        "https://dest/commits/new",
+    ]
+
+    summary = {
+        "repo_type": "skill",
+        "repo_handle": "deep-research",
+        "description": "Research",
+        "readme": None,
+        "tags": ["r"],
+        "is_public": False,
+    }
+    url = migrator.create_context(summary)
+
+    # Two pushes, oldest first, chaining parent from the destination head.
+    assert url == "https://dest/commits/new"
+    assert migrator.dest_ls_client.push_skill.call_count == 2
+    first_kwargs = migrator.dest_ls_client.push_skill.call_args_list[0].kwargs
+    second_kwargs = migrator.dest_ls_client.push_skill.call_args_list[1].kwargs
+    # First commit: oldest content, metadata applied, no parent.
+    assert first_kwargs["files"]["SKILL.md"].content == "v1"
+    assert first_kwargs["description"] == "Research"
+    assert "parent_commit" not in first_kwargs
+    # Second commit: newest content, parent chained to the destination head,
+    # and no redundant metadata.
+    assert second_kwargs["files"]["SKILL.md"].content == "v2"
+    assert second_kwargs["parent_commit"] == "dest_old"
+    assert "description" not in second_kwargs
+
+
+def test_create_context_history_falls_back_to_latest_when_no_commits(sample_config):
+    """If the commit chain can't be enumerated, fall back to a single push."""
+    migrator = _migrator(sample_config)  # include_all_commits=True
+    migrator.source_ls_client.list_prompt_commits.return_value = []
+    migrator.source_ls_client.pull_skill.return_value = SkillContext(
+        commit_id="00000000-0000-0000-0000-000000000006",
+        commit_hash="only",
+        files={"SKILL.md": FileEntry(content="just latest")},
+    )
+    migrator.dest_ls_client.push_skill.return_value = "https://dest/commits/only"
+
+    summary = {
+        "repo_type": "skill",
+        "repo_handle": "deep-research",
+        "description": None,
+        "readme": None,
+        "tags": [],
+        "is_public": None,
+    }
+    url = migrator.create_context(summary)
+
+    assert url == "https://dest/commits/only"
+    migrator.dest_ls_client.push_skill.assert_called_once()
+
+
+def test_list_context_commits_returns_oldest_first(sample_config):
+    migrator = _migrator(sample_config)
+    c_new = Mock(commit_hash="hash_new", parent_commit_hash="hash_old")
+    c_old = Mock(commit_hash="hash_old", parent_commit_hash=None)
+    migrator.source_ls_client.list_prompt_commits.return_value = [c_new, c_old]
+
+    commits = migrator.list_context_commits({"repo_type": "skill", "repo_handle": "x"})
+
+    assert [c["commit_hash"] for c in commits] == ["hash_old", "hash_new"]
 
 
 def test_context_exists_delegates_by_type(sample_config):

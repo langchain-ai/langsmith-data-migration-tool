@@ -6,15 +6,17 @@ LangSmith instances or workspaces. Contexts are the version-controlled bundles
 of agent instructions (``AGENTS.md``) and tools, or reusable skills
 (``SKILL.md``), that agents pull in production.
 
-The Context Hub directories API is served by the Go backend and exposes only
-three routes: GET a single commit's flattened file tree, POST a new commit, and
-DELETE a repo. Crucially, there is **no endpoint that enumerates a repo's
-commit history** (unlike the legacy prompt hub's ``list_prompt_commits``).
-Directory repos store a flattened file tree rather than prompt manifests, so
-their history cannot be replayed through the public API. This migrator
-therefore copies each context at its **latest commit** as a single fresh commit
-on the destination, along with repo metadata (``description``, ``readme``,
-``tags``, ``is_public``).
+The Context Hub directories API is served by the Go backend. Reads/writes of a
+commit's flattened file tree go through the directories endpoints (GET a single
+commit, POST a new commit, DELETE a repo), while the commit *chain* is
+enumerable via ``list_prompt_commits`` (which also works for directory-type
+repos). This migrator therefore replays the **full commit history** by default:
+each source commit is pulled by hash and pushed oldest->newest, so the
+destination reproduces the source's history - and, because directory commits
+are content-addressed, the same commit hashes. Repo metadata (``description``,
+``readme``, ``tags``, ``is_public``) is applied on the first commit. Set
+``include_all_commits=False`` to copy only the latest commit as a single fresh
+commit instead.
 
 Listing goes through the raw ``/repos`` hub endpoint (via the shared
 ``EnhancedAPIClient``) rather than the SDK's ``list_agents`` / ``list_skills``,
@@ -58,6 +60,7 @@ class ContextHubMigrator(BaseMigrator):
         *,
         same_instance: bool = False,
         include_external: bool = False,
+        include_all_commits: bool = True,
     ):
         super().__init__(source_client, dest_client, state, config)
         self.same_instance = same_instance
@@ -66,6 +69,12 @@ class ContextHubMigrator(BaseMigrator):
         # as Agent Builder drafts with UUID handles). Set include_external=True
         # to migrate every repo the API returns.
         self.include_external = include_external
+        # Full commit history is replayed by default: every source commit is
+        # pushed oldest->newest so the destination reproduces the source's
+        # history (and, because directory commits are content-addressed, the
+        # same commit hashes). Set include_all_commits=False to copy only the
+        # latest commit as a single fresh commit on the destination.
+        self.include_all_commits = include_all_commits
 
         # Managed sessions mirror PromptMigrator: the parent EnhancedAPIClient
         # may set X-Tenant-Id after init via orchestrator.set_workspace_context(),
@@ -218,18 +227,44 @@ class ContextHubMigrator(BaseMigrator):
             self.log(f"Returning {len(contexts)} context(s) fetched before error", "warning")
         return contexts
 
-    def get_context_files(self, summary: Dict[str, Any]) -> Dict[str, Any]:
-        """Pull the latest commit's file tree for a context summary.
+    def get_context_files(
+        self, summary: Dict[str, Any], *, version: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Pull a commit's file tree for a context summary.
+
+        Pulls the latest commit by default, or a specific commit hash/tag when
+        ``version`` is given.
 
         Returns a dict with ``commit_hash`` and ``files`` (path -> Entry model).
         """
         self._sync_workspace_headers()
         identifier = summary["repo_handle"]
-        if summary["repo_type"] == "agent":
-            ctx = self.source_ls_client.pull_agent(identifier)
-        else:
-            ctx = self.source_ls_client.pull_skill(identifier)
+        puller = (
+            self.source_ls_client.pull_agent
+            if summary["repo_type"] == "agent"
+            else self.source_ls_client.pull_skill
+        )
+        ctx = puller(identifier, version=version) if version else puller(identifier)
         return {"commit_hash": ctx.commit_hash, "files": dict(ctx.files)}
+
+    def list_context_commits(self, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return the source commit chain for a context, oldest commit first.
+
+        Uses ``list_prompt_commits`` (which works for directory-type repos too)
+        to enumerate the full history, then reverses it so callers can replay
+        commits in creation order.
+        """
+        self._sync_workspace_headers()
+        identifier = summary["repo_handle"]
+        commits = list(self.source_ls_client.list_prompt_commits(identifier))
+        # list_prompt_commits yields newest-first; replay needs oldest-first.
+        return [
+            {
+                "commit_hash": cm.commit_hash,
+                "parent_commit_hash": cm.parent_commit_hash,
+            }
+            for cm in reversed(commits)
+        ]
 
     def context_exists(self, summary: Dict[str, Any]) -> bool:
         """Check whether a context with this handle exists on the destination."""
@@ -299,28 +334,94 @@ class ContextHubMigrator(BaseMigrator):
     # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------
-    def create_context(self, summary: Dict[str, Any], *, item_id: Optional[str] = None) -> str:
-        """Push a context to the destination at its latest commit.
+    def _push_commit(
+        self,
+        summary: Dict[str, Any],
+        files: Dict[str, Any],
+        *,
+        parent_commit: Optional[str] = None,
+        with_metadata: bool = True,
+    ) -> str:
+        """Push one commit to the destination repo, returning the commit URL.
 
-        Creates the repo if it does not exist (with metadata) and commits the
-        prepared file tree. Returns the destination commit URL.
+        Repo metadata (description/readme/tags/is_public) is only sent on the
+        first commit (``with_metadata=True``); later commits in a history replay
+        omit it to avoid redundant metadata patches.
+        """
+        identifier = summary["repo_handle"]
+        push_kwargs: Dict[str, Any] = {"files": files}
+        if parent_commit:
+            push_kwargs["parent_commit"] = parent_commit
+        if with_metadata:
+            push_kwargs.update(
+                {
+                    "description": summary.get("description"),
+                    "readme": summary.get("readme"),
+                    "tags": summary.get("tags") or None,
+                    "is_public": summary.get("is_public"),
+                }
+            )
+        pusher = (
+            self.dest_ls_client.push_agent
+            if summary["repo_type"] == "agent"
+            else self.dest_ls_client.push_skill
+        )
+        return pusher(identifier, **push_kwargs)
+
+    def get_dest_head(self, summary: Dict[str, Any]) -> Optional[str]:
+        """Return the destination repo's current head commit hash, if any."""
+        self._sync_workspace_headers()
+        identifier = summary["repo_handle"]
+        puller = (
+            self.dest_ls_client.pull_agent
+            if summary["repo_type"] == "agent"
+            else self.dest_ls_client.pull_skill
+        )
+        try:
+            return puller(identifier).commit_hash
+        except Exception:  # noqa: BLE001 - head may not exist yet
+            return None
+
+    def create_context(self, summary: Dict[str, Any], *, item_id: Optional[str] = None) -> str:
+        """Push a context to the destination and return the final commit URL.
+
+        Replays the full source commit history by default: every source commit
+        is pulled by hash and pushed oldest->newest, chaining ``parent_commit``
+        so the destination reproduces the source's chain (and, because directory
+        commits are content-addressed, the same hashes). Repo metadata is
+        applied on the first commit. With ``include_all_commits=False`` only the
+        source's latest commit is copied as a single fresh commit.
         """
         self._sync_workspace_headers()
-        snapshot = self.get_context_files(summary)
-        files = self._prepare_files(snapshot["files"], item_id=item_id)
-
         identifier = summary["repo_handle"]
-        push_kwargs: Dict[str, Any] = {
-            "files": files,
-            "description": summary.get("description"),
-            "readme": summary.get("readme"),
-            "tags": summary.get("tags") or None,
-            "is_public": summary.get("is_public"),
-        }
 
-        if summary["repo_type"] == "agent":
-            url = self.dest_ls_client.push_agent(identifier, **push_kwargs)
-        else:
-            url = self.dest_ls_client.push_skill(identifier, **push_kwargs)
-        self.log(f"Migrated context {identifier}: {url}", "success")
+        # Determine the commits to replay (oldest-first). Latest-only mode, or a
+        # repo whose history cannot be enumerated, collapses to a single commit.
+        commits: List[Dict[str, Any]] = []
+        if self.include_all_commits:
+            commits = self.list_context_commits(summary)
+        if not commits:
+            snapshot = self.get_context_files(summary)
+            files = self._prepare_files(snapshot["files"], item_id=item_id)
+            url = self._push_commit(summary, files, with_metadata=True)
+            self.log(f"Migrated context {identifier}: {url}", "success")
+            return url
+
+        url = ""
+        parent: Optional[str] = None
+        for index, commit in enumerate(commits):
+            snapshot = self.get_context_files(summary, version=commit["commit_hash"])
+            files = self._prepare_files(snapshot["files"], item_id=item_id)
+            url = self._push_commit(
+                summary,
+                files,
+                parent_commit=parent,
+                with_metadata=(index == 0),
+            )
+            # Chain the next commit onto the destination's new head.
+            parent = self.get_dest_head(summary) or snapshot["commit_hash"]
+        self.log(
+            f"Migrated context {identifier} with {len(commits)} commit(s): {url}",
+            "success",
+        )
         return url

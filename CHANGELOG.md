@@ -11,14 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Context Hub migration (`contexts`)**: New command to migrate Context Hub
   agents and skills (the versioned agent/skill repos backing the LangSmith
   Context Hub) between instances/workspaces via the SDK directories API
-  (`push_agent`/`push_skill`, `pull_agent`/`pull_skill`, `list_agents`/`list_skills`).
-  Copies each context at its **latest commit** as a single fresh commit on the
-  destination, plus repo metadata (description, readme, tags, is_public). The
-  Context Hub directories API has no commit-history endpoint, so full per-repo
-  history cannot be replayed. Cross-instance, linked-repo references
-  (`skills/...`, `agents/...`) have their source commit pins stripped so links
-  resolve to the destination's latest commit of each linked repo, and the
-  downgrade is reported; `--same-instance` preserves pins verbatim. Use
+  (`push_agent`/`push_skill`, `pull_agent`/`pull_skill`). Replays the **full
+  commit history** by default: it enumerates each context's commit chain with
+  `list_prompt_commits` (which works for directory-type repos) and pushes every
+  commit oldest-to-newest, chaining `parent_commit`. Because directory commits
+  are content-addressed, the destination reproduces the source's exact commit
+  hashes and history. Repo metadata (description, readme, tags, is_public) is
+  applied on the first commit. Pass `--latest-only` to copy just the latest
+  commit as a single fresh commit instead. Cross-instance, linked-repo
+  references (`skills/...`, `agents/...`) have their source commit pins stripped
+  so links resolve to the destination's latest commit of each linked repo, and
+  the downgrade is reported; `--same-instance` preserves pins verbatim. Use
   `--agents-only` / `--skills-only` to scope by type and `--all` to skip the
   selection prompt. Also wired into `migrate-all` (Step 7) with a
   `--skip-contexts` flag. Listing matches the Context Hub UI: it lists via the

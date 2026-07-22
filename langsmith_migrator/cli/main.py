@@ -5386,6 +5386,15 @@ def fleet(
         "contexts."
     ),
 )
+@click.option(
+    "--latest-only",
+    is_flag=True,
+    help=(
+        "Copy only each context's latest commit as a single fresh commit. By "
+        "default the full source commit history is replayed so the destination "
+        "reproduces the source's commit chain."
+    ),
+)
 @ssl_option
 @workspace_options
 @click.pass_context
@@ -5396,11 +5405,12 @@ def contexts(
     skills_only,
     same_instance,
     include_external,
+    latest_only,
     source_workspace,
     dest_workspace,
     map_workspaces,
 ):
-    """Migrate Context Hub agents and skills (latest commit only)."""
+    """Migrate Context Hub agents and skills (full commit history by default)."""
     config = ctx.obj["config"]
     state_manager = ctx.obj["state_manager"]
 
@@ -5456,11 +5466,14 @@ def contexts(
         config,
         same_instance=same_instance,
         include_external=include_external,
+        include_all_commits=not latest_only,
     )
     if same_instance:
         console.print("[dim]Same-instance mode: preserving linked repo commit pins verbatim[/dim]")
     if include_external:
         console.print("[dim]Including externally-sourced contexts (source=external)[/dim]")
+    if latest_only:
+        console.print("[dim]Latest-only mode: copying only each context's latest commit[/dim]")
 
     include_agents = not skills_only
     include_skills = not agents_only

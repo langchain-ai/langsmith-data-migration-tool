@@ -32,7 +32,7 @@ langsmith-migrator datasets
 - **Prompts**: Migrate prompts (latest by default, full history with `--include-all-commits`)
 - **Charts**: Migrate monitoring charts with filter preservation
 - **Fleet**: Migrate agents, shared skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, and workspace secrets (`fleet`)
-- **Context Hub**: Migrate Context Hub agents and skills (the versioned agent/skill repos in the LangSmith Context Hub) at their latest commit, including files and repo metadata (description, readme, tags, is_public) (`contexts`). Lists the same contexts the Context Hub UI shows (external-source repos are hidden by default; use `--include-external` to migrate them too). Scope with `--agents-only` / `--skills-only`; linked-repo commit pins are stripped and reported cross-instance, or preserved with `--same-instance`
+- **Context Hub**: Migrate Context Hub agents and skills (the versioned agent/skill repos in the LangSmith Context Hub), including files and repo metadata (description, readme, tags, is_public) (`contexts`). Replays the **full commit history** by default so the destination reproduces the source's commit chain; use `--latest-only` to copy just the latest commit. Lists the same contexts the Context Hub UI shows (external-source repos are hidden by default; use `--include-external` to migrate them too). Scope with `--agents-only` / `--skills-only`; linked-repo commit pins are stripped and reported cross-instance, or preserved with `--same-instance`
 - **Workspace Scoping**: Run resource migrations per workspace pair with explicit IDs or interactive workspace mapping
 - **Remediation & Resume**: Persist migration state, write remediation bundles, print grouped actionable next steps, and retry pending/failed work with `resume`
 - **Interactive CLI**: TUI-based selection with search/filter, plus `--non-interactive` mode for automation
@@ -49,7 +49,7 @@ This tool **does not support migrating trace data**. It migrates:
 - Prompts
 - Charts
 - Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets)
-- Context Hub agents and skills (latest commit)
+- Context Hub agents and skills (full commit history)
 
 For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
 
@@ -85,11 +85,9 @@ OAuth providers, GitHub App, and Slack app configuration are set at the infrastr
 
 The destination's `POST /runs/batch` endpoint rejects runs with timestamps outside a 24-hour window of "now", so historical experiments cannot be replayed with their original timestamps. To migrate experiment runs at all, this tool shifts every run's `start_time`, `end_time`, `dotted_order`, and `events[].time` (and the parent experiment's `start_time`/`end_time`) by a per-experiment delta so the newest timestamp lands at migration time. **Relative offsets between runs within the same experiment are preserved exactly.** The delta is persisted in migration state so resumed migrations apply the same shift to remaining runs.
 
-### Context Hub: Latest Commit Only and Linked Repos
+### Context Hub: Commit History and Linked Repos
 
-The Context Hub directories API (`/platform/hub/repos/{owner}/{repo}/directories`) exposes only single-commit reads, commit creation, and repo deletion. It has **no commit-history endpoint** (unlike the legacy prompt hub's `list_prompt_commits`), and directory repos store a flattened file tree rather than replayable prompt manifests. As a result:
-
-- **Latest commit only**: each context is migrated as a single fresh commit on the destination containing the source's latest file tree. Full per-repo commit history is not replayed.
+- **Full commit history by default**: the tool enumerates each context's commit chain (via `list_prompt_commits`, which works for directory-type repos) and replays every commit oldest-to-newest on the destination, chaining `parent_commit`. Because Context Hub directory commits are content-addressed, this reproduces the source's exact commit hashes and history. Pass `--latest-only` to instead copy just the latest commit as a single fresh commit.
 - **Environment tags** (`staging` / `production`) are not carried over; re-promote commits on the destination after migration.
 - **Linked repos**: a context's `files` map can link to another agent/skill repo (`skills/<name>`, `agents/<name>`) instead of inlining content. Cross-instance, the source-instance commit pin on each link is stripped so the link resolves to the destination's latest commit of the linked repo, and the downgrade is reported. Migrate linked repos separately (and re-pin if you need reproducibility). Pass `--same-instance` to preserve link pins verbatim.
 - **External-source contexts hidden by default**: the tool lists contexts exactly as the Context Hub UI does, which excludes repos whose `source` is `external` (agents/skills created by an external harness such as the Agent Builder, typically with raw-UUID handles). These are hidden by default; pass `--include-external` to migrate them too. Note that externally-created repos often have UUID handles, and the destination rejects a repo handle that does not match `^[a-z][a-z0-9-_]*$` (must start with a lowercase letter), so such repos fail on create and are reported.
