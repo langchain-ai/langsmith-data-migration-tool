@@ -7,6 +7,7 @@ from .feedback import FeedbackMigrator
 from .annotation_queue import AnnotationQueueMigrator
 from .prompt import PromptMigrator
 from .rules import RulesMigrator
+from .issue import IssueMigrator
 from .chart import ChartMigrator
 from .user_role import UserRoleMigrator
 from .orchestrator import MigrationOrchestrator
@@ -29,6 +30,7 @@ __all__ = [
     "AnnotationQueueMigrator",
     "PromptMigrator",
     "RulesMigrator",
+    "IssueMigrator",
     "ChartMigrator",
     "UserRoleMigrator",
     "MigrationOrchestrator",

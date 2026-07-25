@@ -20,6 +20,7 @@ from ..core.migrators import (
     ChartMigrator,
     DatasetMigrator,
     MigrationOrchestrator,
+    IssueMigrator,
     PromptMigrator,
     RulesMigrator,
     UserRoleMigrator,
@@ -757,6 +758,84 @@ def _mark_state_item_failed(orchestrator, item_id, error):
             error=str(error),
         )
     orchestrator.state_manager.save()
+
+
+def _migrate_issue_agents(orchestrator, config, issue_migrator, agents):
+    """Migrate selected issues-agent configs. Returns (success, failed, skipped)."""
+    success_count = 0
+    failed_items = []
+    skipped_items = []
+    with Progress(console=console) as progress:
+        task = progress.add_task("Migrating issues-agent configs...", total=len(agents))
+        for agent in agents:
+            name = agent.get("session_name") or agent.get("session_id", "unknown")
+            item_id = _ensure_state_item(
+                orchestrator,
+                config,
+                "issue_agent",
+                agent.get("id", name),
+                name,
+                metadata={"issue_agent": agent},
+            )
+            try:
+                _mark_state_item_started(orchestrator, item_id)
+                result = issue_migrator.create_issue_agent(agent)
+                if result:
+                    success_count += 1
+                    _mark_state_item_completed(orchestrator, item_id, destination_id=result)
+                else:
+                    skipped_items.append((name, "project not found in destination"))
+                    _mark_state_item_failed(orchestrator, item_id, "project not found in destination")
+            except Exception as e:
+                failed_items.append((name, str(e)))
+                _mark_state_item_failed(orchestrator, item_id, e)
+            progress.advance(task)
+    return success_count, failed_items, skipped_items
+
+
+def _migrate_detected_issues(orchestrator, config, issue_migrator, detected):
+    """Migrate selected detected issues. Returns (success, failed, skipped)."""
+    success_count = 0
+    failed_items = []
+    skipped_items = []
+    with Progress(console=console) as progress:
+        task = progress.add_task("Migrating detected issues...", total=len(detected))
+        for issue in detected:
+            name = issue.get("name") or issue.get("id", "unnamed")
+            item_id = _ensure_state_item(
+                orchestrator,
+                config,
+                "issue",
+                issue.get("id", name),
+                name,
+                metadata={"issue": issue},
+            )
+            try:
+                _mark_state_item_started(orchestrator, item_id)
+                result = issue_migrator.create_issue(issue)
+                if result and getattr(issue_migrator, "last_issue_skipped_existing", False):
+                    skipped_items.append((name, "already exists in destination"))
+                    _mark_state_item_completed(orchestrator, item_id, destination_id=result)
+                elif result:
+                    success_count += 1
+                    _mark_state_item_completed(orchestrator, item_id, destination_id=result)
+                else:
+                    skipped_items.append((name, "project not found in destination"))
+                    _mark_state_item_failed(orchestrator, item_id, "project not found in destination")
+            except Exception as e:
+                failed_items.append((name, str(e)))
+                _mark_state_item_failed(orchestrator, item_id, e)
+            progress.advance(task)
+    return success_count, failed_items, skipped_items
+
+
+def _report_issue_items(config, skipped_items, failed_items):
+    """Print per-item skip/failure details when verbose."""
+    if (failed_items or skipped_items) and config.migration.verbose:
+        for name, err in skipped_items:
+            console.print(f"  [yellow]⊘[/yellow] {name}: {err}")
+        for name, err in failed_items:
+            console.print(f"  [red]✗[/red] {name}: {err}")
 
 
 def _apply_item_workspace(orchestrator, item):
@@ -3436,6 +3515,273 @@ def rules(
 
 @cli.command()
 @ssl_option
+@click.option("--all", "select_all", is_flag=True, help="Migrate all issues")
+@click.option(
+    "--session",
+    help="Migrate Engine issues for a specific tracing project/session (by name or ID)",
+)
+@click.option(
+    "--skip-agents",
+    is_flag=True,
+    help="Skip issues-agent (per-project engine config) migration",
+)
+@click.option(
+    "--skip-issues",
+    "skip_detected_issues",
+    is_flag=True,
+    help="Skip detected issue migration (only migrate issues-agent configs)",
+)
+@click.option(
+    "--project-mapping",
+    type=str,
+    help='JSON string or file path with project ID mapping (e.g., \'{"old-id": "new-id"}\')',
+)
+@click.option(
+    "--map-projects",
+    is_flag=True,
+    help="Launch interactive TUI to map source projects to destination projects",
+)
+@workspace_options
+@click.pass_context
+def issues(
+    ctx,
+    select_all,
+    session,
+    skip_agents,
+    skip_detected_issues,
+    project_mapping,
+    map_projects,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
+):
+    """Migrate LangSmith Engine issues and per-project issues-agent configs.
+
+    Detected issues are migrated as metadata only. Linked runs and trace
+    deep-links are NOT migrated (trace data is not portable across instances),
+    so run Engine on the destination to re-detect run links.
+    """
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        orchestrator.cleanup()
+        return
+    if not dest_ok:
+        console.print("[red]✗ Destination connection failed[/red]")
+        orchestrator.cleanup()
+        return
+    console.print("[green]✓[/green]")
+
+    if skip_agents and skip_detected_issues:
+        console.print("[yellow]Both --skip-agents and --skip-issues set; nothing to do[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    # Resolve workspace context
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
+    if ws_result is _WS_CANCELLED:
+        console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+
+    # --map-projects and --project-mapping are mutually exclusive
+    if map_projects and project_mapping:
+        console.print(
+            "[red]Error: --map-projects and --project-mapping are mutually exclusive[/red]"
+        )
+        orchestrator.cleanup()
+        return
+
+    # Parse custom project mapping once (outside loop, not workspace-scoped)
+    custom_mapping = _load_project_mapping_arg(project_mapping)
+    if custom_mapping is _PROJECT_MAPPING_ERROR:
+        orchestrator.cleanup()
+        return
+
+    # Call out the trace-link limitation up front.
+    console.print(
+        "\n[yellow]Note:[/yellow] Detected issues are migrated as metadata only. "
+        "Linked runs and trace deep-links are [bold]not[/bold] migrated because trace "
+        "data is not portable across instances."
+    )
+    console.print(
+        "[dim]Run Engine on the destination to re-detect run links. Tip: migrate "
+        "datasets/projects first so issues map onto existing projects.[/dim]\n"
+    )
+
+    for src_ws, dst_ws in ws_pairs:
+        if src_ws and dst_ws:
+            orchestrator.set_workspace_context(src_ws, dst_ws)
+            console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+
+        _run_preflight(orchestrator, config, ["issues"])
+
+        issue_migrator = IssueMigrator(
+            orchestrator.source_client, orchestrator.dest_client, None, config
+        )
+
+        # Resolve project ID mapping (mirrors the `rules` command).
+        if custom_mapping is not None:
+            issue_migrator._project_id_map = dict(custom_mapping)
+        else:
+            ws_project_id_map = _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
+            if ws_project_id_map:
+                issue_migrator._project_id_map = ws_project_id_map
+
+        if map_projects and issue_migrator._project_id_map is None:
+            console.print("Fetching projects from both instances... ", end="")
+            source_projects = _list_projects(orchestrator.source_client)
+            dest_projects = _list_projects(orchestrator.dest_client)
+            console.print(
+                f"[green]✓[/green] ({len(source_projects)} source, {len(dest_projects)} destination)"
+            )
+            name_mapping = build_project_mapping_tui(source_projects, dest_projects)
+            if name_mapping is None:
+                console.print("[yellow]Cancelled[/yellow]")
+                continue
+            id_map = _name_mapping_to_id_mapping(
+                name_mapping,
+                source_projects,
+                dest_projects,
+                source_workspace_id=src_ws,
+                dest_workspace_id=dst_ws,
+            )
+            issue_migrator._project_id_map = id_map
+            console.print(f"Using interactive project mapping with {len(id_map)} project(s)")
+
+        _ensure_migration_session(orchestrator, config)
+        issue_migrator.state = orchestrator.state
+
+        # Build (or reuse) the project mapping, auto-creating missing projects
+        # to match the `rules` command behavior.
+        issue_migrator.build_project_mapping(create_missing=True)
+
+        # Resolve --session (name or ID) to a source session ID to scope the
+        # migration to a single tracing project.
+        target_session_id = None
+        if session:
+            source_projects = _list_projects(orchestrator.source_client)
+            match = next(
+                (
+                    p
+                    for p in source_projects
+                    if p.get("id") == session or p.get("name") == session
+                ),
+                None,
+            )
+            if not match:
+                console.print(f"[red]Project not found in source workspace: {session}[/red]")
+                console.print("[yellow]Available projects:[/yellow]")
+                for p in source_projects[:10]:
+                    console.print(f"  - {p.get('name', 'unnamed')} ({p.get('id', 'no-id')})")
+                if len(source_projects) > 10:
+                    console.print(f"  ... and {len(source_projects) - 10} more")
+                continue
+            target_session_id = match["id"]
+            console.print(
+                f"[dim]Scoped to project '{match.get('name')}' ({target_session_id})[/dim]"
+            )
+
+        # --- Issues-agent configs ---
+        if not skip_agents:
+            console.print("Fetching issues-agent configs... ", end="")
+            agents = issue_migrator.list_issue_agents(target_session_id)
+            if not agents:
+                console.print("[yellow]none found[/yellow]")
+            else:
+                console.print(f"found {len(agents)}")
+                if select_all or config.migration.non_interactive:
+                    selected_agents = agents
+                else:
+                    selected_agents = _select_or_all(
+                        config,
+                        agents,
+                        select_all=False,
+                        title="Select Issues-Agent Configs to Migrate",
+                        columns=[
+                            {"key": "session_name", "title": "Project", "width": 30},
+                            {"key": "issue_count", "title": "Issues", "width": 10},
+                            {"key": "cron_enabled", "title": "Scheduled", "width": 12},
+                        ],
+                    )
+                if selected_agents and _confirm_action(
+                    config, "\nProceed with issues-agent configs?", default=True, non_interactive_value=True
+                ):
+                    a_success, a_failed, a_skipped = _migrate_issue_agents(
+                        orchestrator, config, issue_migrator, selected_agents
+                    )
+                    console.print(
+                        f"Issues-agent configs: {a_success} migrated, "
+                        f"{len(a_skipped)} skipped, {len(a_failed)} failed"
+                    )
+                    _report_issue_items(config, a_skipped, a_failed)
+
+        # --- Detected issues ---
+        if not skip_detected_issues:
+            console.print("Fetching detected issues... ", end="")
+            detected = issue_migrator.list_issues(target_session_id)
+            if not detected:
+                console.print("[yellow]none found[/yellow]")
+            else:
+                console.print(f"found {len(detected)}")
+                if select_all or config.migration.non_interactive:
+                    selected_issues = detected
+                else:
+                    selected_issues = _select_or_all(
+                        config,
+                        detected,
+                        select_all=False,
+                        title="Select Issues to Migrate",
+                        columns=[
+                            {"key": "name", "title": "Name", "width": 40},
+                            {"key": "severity", "title": "Severity", "width": 10},
+                            {"key": "status", "title": "Status", "width": 12},
+                        ],
+                    )
+                if selected_issues and _confirm_action(
+                    config, "\nProceed with detected issues?", default=True, non_interactive_value=True
+                ):
+                    i_success, i_failed, i_skipped = _migrate_detected_issues(
+                        orchestrator, config, issue_migrator, selected_issues
+                    )
+                    console.print(
+                        f"Detected issues: {i_success} migrated, "
+                        f"{len(i_skipped)} skipped, {len(i_failed)} failed"
+                    )
+                    _report_issue_items(config, i_skipped, i_failed)
+
+    if ws_result:
+        orchestrator.clear_workspace_context()
+
+    _display_resolution_summary(orchestrator)
+    _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
+
+
+@cli.command()
+@ssl_option
 @click.option("--skip-users", is_flag=True, help="Skip user and role migration")
 @click.option("--skip-datasets", is_flag=True, help="Skip dataset migration")
 @click.option("--skip-experiments", is_flag=True, help="Skip experiment migration")
@@ -3443,6 +3789,7 @@ def rules(
 @click.option("--skip-queues", is_flag=True, help="Skip annotation queue migration")
 @click.option("--skip-rules", is_flag=True, help="Skip rules migration")
 @click.option("--skip-charts", is_flag=True, help="Skip chart migration")
+@click.option("--skip-issues", is_flag=True, help="Skip LangSmith Engine issue migration")
 @click.option("--skip-fleet", is_flag=True, help="Skip Fleet resource migration")
 @click.option("--include-all-commits", is_flag=True, help="Include all prompt commit history")
 @click.option("--strip-projects", is_flag=True, help="Strip project associations from rules")
@@ -3478,6 +3825,7 @@ def migrate_all(
     skip_queues,
     skip_rules,
     skip_charts,
+    skip_issues,
     skip_fleet,
     include_all_commits,
     strip_projects,
@@ -3641,6 +3989,7 @@ def migrate_all(
             src_ws,
             dst_ws,
             custom_project_mapping,
+            skip_issues=skip_issues,
             skip_fleet=skip_fleet,
         )
 
@@ -3671,6 +4020,7 @@ def _migrate_all_for_workspace(
     source_workspace_id=None,
     dest_workspace_id=None,
     custom_project_mapping=None,
+    skip_issues=True,
     skip_fleet=True,
 ):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
@@ -4249,7 +4599,68 @@ def _migrate_all_for_workspace(
     else:
         console.print("[dim]Skipping charts (--skip-charts)[/dim]\n")
 
-    # 6. Fleet resources
+    # 6. LangSmith Engine issues
+    if not skip_issues:
+        console.print("[bold]Step 6: Engine Issues[/bold]")
+        console.print(
+            "[dim]Note: detected issues are migrated as metadata only. Linked runs "
+            "and trace deep-links are not migrated (trace data is not portable across "
+            "instances); run Engine on the destination to re-detect run links.[/dim]"
+        )
+
+        issue_migrator = IssueMigrator(
+            orchestrator.source_client, orchestrator.dest_client, orchestrator.state, config
+        )
+        if project_id_map:
+            issue_migrator._project_id_map = dict(project_id_map)
+            console.print(
+                f"[dim]Using project mapping ({len(project_id_map)} project(s))[/dim]"
+            )
+
+        _ensure_migration_session(orchestrator, config)
+        issue_migrator.state = orchestrator.state
+        issue_migrator.build_project_mapping(create_missing=True)
+
+        agents = issue_migrator.list_issue_agents()
+        if agents and _confirm_action(
+            config,
+            f"Migrate {len(agents)} issues-agent config(s)?",
+            default=True,
+            non_interactive_value=True,
+        ):
+            a_success, a_failed, a_skipped = _migrate_issue_agents(
+                orchestrator, config, issue_migrator, agents
+            )
+            console.print(
+                f"Issues-agent configs: {a_success} migrated, "
+                f"{len(a_skipped)} skipped, {len(a_failed)} failed"
+            )
+            _report_issue_items(config, a_skipped, a_failed)
+        elif not agents:
+            console.print("[dim]No issues-agent configs found[/dim]")
+
+        detected = issue_migrator.list_issues()
+        if detected and _confirm_action(
+            config,
+            f"Migrate {len(detected)} detected issue(s) (metadata only)?",
+            default=True,
+            non_interactive_value=True,
+        ):
+            i_success, i_failed, i_skipped = _migrate_detected_issues(
+                orchestrator, config, issue_migrator, detected
+            )
+            console.print(
+                f"Detected issues: {i_success} migrated, "
+                f"{len(i_skipped)} skipped, {len(i_failed)} failed"
+            )
+            _report_issue_items(config, i_skipped, i_failed)
+        elif not detected:
+            console.print("[dim]No detected issues found[/dim]")
+        console.print()
+    else:
+        console.print("[dim]Skipping engine issues (--skip-issues)[/dim]\n")
+
+    # 7. Fleet resources
     if not skip_fleet:
         _migrate_fleet_for_workspace(orchestrator, config)
     else:
