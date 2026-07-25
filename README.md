@@ -61,7 +61,9 @@ An issue's linked runs are **not** migrated. Issues reference runs by `run_id`/`
 
 Issues-agent configs are recreated with source-instance-only fields stripped (`latest_thread_id`, `latest_run_id`, issue counts, tenant, timestamps). GitHub/Context-Hub linkage (`github_repo_url`, `context_hub_repo_handle`, etc.) is carried over but only works if the destination has the corresponding integrations configured. Engine-generated advisory `actions` on an issue (e.g. suggested evaluators) are not migrated: the destination re-validates them strictly on create and regenerates them when Engine runs there. Tip: migrate datasets/projects first (or use `migrate-all`) so issues map onto existing projects instead of freshly-created empty ones.
 
-By default `issues` migrates every Engine issue and issues-agent config in the workspace. Use `--session <name-or-ID>` to scope the migration to a single tracing project (like the `charts` command's `--session` flag).
+By default `issues` migrates every Engine issue and issues-agent config in the workspace. Use `--session <name-or-ID>` to scope the migration to a single tracing project (like the `charts` command's `--session` flag). When scoped, only that one project is mapped/created on the destination rather than the whole workspace.
+
+Project mapping only considers real tracing projects (it applies the same `reference_free` filter the UI uses for "Exclude Experiments"), so experiment/test-run sessions are never recreated on the destination. Note that a raw `GET /api/v1/sessions` call returns both tracing projects and experiment sessions, so the API project count can be higher than what the UI shows by default.
 
 The command is idempotent. Issues-agent configs are skipped if the destination project already has one, and detected issues are skipped if an issue with the same name already exists in the destination project (issue names are unique within a project). Re-running `issues` only migrates what is missing, so it is safe to run repeatedly. If the destination issue list can't be fetched, the tool falls back to creating issues rather than blocking.
 

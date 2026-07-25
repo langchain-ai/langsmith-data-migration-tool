@@ -96,14 +96,22 @@ class IssueMigrator(BaseMigrator):
         self._project_id_map = {}
 
         try:
+            # Only map real tracing projects, not experiment/test-run sessions.
+            # ``reference_free=true`` mirrors the UI's default "Exclude
+            # Experiments" filter (WHERE reference_dataset_id IS NULL). The
+            # client-side guard defends against a backend that ignores the param.
             source_records: List[Dict[str, Any]] = []
-            for project in self.source.get_paginated("/sessions", page_size=100):
-                if isinstance(project, dict):
+            for project in self.source.get_paginated(
+                "/sessions", params={"reference_free": "true"}, page_size=100
+            ):
+                if isinstance(project, dict) and not project.get("reference_dataset_id"):
                     source_records.append(project)
 
             dest_records: List[Dict[str, Any]] = []
-            for project in self.dest.get_paginated("/sessions", page_size=100):
-                if isinstance(project, dict):
+            for project in self.dest.get_paginated(
+                "/sessions", params={"reference_free": "true"}, page_size=100
+            ):
+                if isinstance(project, dict) and not project.get("reference_dataset_id"):
                     dest_records.append(project)
 
             _, source_duplicates = unique_name_map(source_records)
@@ -175,6 +183,61 @@ class IssueMigrator(BaseMigrator):
             self._project_id_map = {}
 
         return self._project_id_map
+
+    def map_single_project(
+        self, source_project: Dict[str, Any], create_missing: bool = True
+    ) -> Optional[str]:
+        """Map (and optionally create) a single source project on the destination.
+
+        Used to scope a run to one tracing project so the whole workspace is
+        not created. Adds the resolved ID to ``self._project_id_map`` and
+        returns the destination project ID (or None if it could not be mapped).
+        """
+        if self._project_id_map is None:
+            self._project_id_map = {}
+
+        source_id = source_project["id"]
+        source_name = source_project.get("name")
+        if source_id in self._project_id_map:
+            return self._project_id_map[source_id]
+
+        # Prefer a persisted state mapping if one exists.
+        if self.state and self.state.get_mapped_id("project", source_id):
+            mapped_id = self.state.get_mapped_id("project", source_id)
+            self._project_id_map[source_id] = mapped_id
+            self.record_provenance(f"project:{source_id}", "state_mapping")
+            return mapped_id
+
+        # Match by name on the destination, restricted to real tracing
+        # projects (not experiment sessions), mirroring build_project_mapping.
+        try:
+            dest_records = [
+                p
+                for p in self.dest.get_paginated(
+                    "/sessions", params={"reference_free": "true"}, page_size=100
+                )
+                if isinstance(p, dict) and not p.get("reference_dataset_id")
+            ]
+        except Exception as e:
+            self.log(f"Failed to list destination projects: {e}", "error")
+            dest_records = []
+
+        for p in dest_records:
+            if p.get("name") == source_name:
+                self._project_id_map[source_id] = p["id"]
+                self.record_provenance(f"project:{source_id}", "exact_name_match")
+                return p["id"]
+
+        if not create_missing:
+            return None
+
+        self.log(f"Project '{source_name}' not found in destination, creating...", "info")
+        new_project = self._create_project(source_project)
+        if new_project:
+            self._project_id_map[source_id] = new_project["id"]
+            self.record_provenance(f"project:{source_id}", "created_on_destination")
+            return new_project["id"]
+        return None
 
     def _map_session_id(self, source_session_id: Optional[str]) -> Optional[str]:
         """Resolve a source session (project) ID to its destination ID."""

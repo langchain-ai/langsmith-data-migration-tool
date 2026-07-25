@@ -3674,10 +3674,6 @@ def issues(
         _ensure_migration_session(orchestrator, config)
         issue_migrator.state = orchestrator.state
 
-        # Build (or reuse) the project mapping, auto-creating missing projects
-        # to match the `rules` command behavior.
-        issue_migrator.build_project_mapping(create_missing=True)
-
         # Resolve --session (name or ID) to a source session ID to scope the
         # migration to a single tracing project.
         target_session_id = None
@@ -3703,6 +3699,21 @@ def issues(
             console.print(
                 f"[dim]Scoped to project '{match.get('name')}' ({target_session_id})[/dim]"
             )
+
+        # Build the project mapping, auto-creating missing projects (matches the
+        # `rules` command). When scoped to a single --session, only that project
+        # is mapped/created -- NOT the whole workspace. An explicit
+        # --project-mapping / --map-projects already populated the map above, so
+        # only build when no mapping was supplied.
+        if issue_migrator._project_id_map is None:
+            if target_session_id:
+                issue_migrator.map_single_project(match, create_missing=True)
+            else:
+                issue_migrator.build_project_mapping(create_missing=True)
+        elif target_session_id and target_session_id not in issue_migrator._project_id_map:
+            # A workspace-scoped mapping was supplied but doesn't cover the
+            # requested project; ensure that single project is mapped/created.
+            issue_migrator.map_single_project(match, create_missing=True)
 
         # --- Issues-agent configs ---
         if not skip_agents:

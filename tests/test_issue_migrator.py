@@ -66,6 +66,61 @@ class TestIssueMigrator:
     # ------------------------------------------------------------------
     # Issues
     # ------------------------------------------------------------------
+    def test_build_project_mapping_excludes_experiments(self, issue_migrator):
+        """Experiment sessions (reference_dataset_id set) are not mapped/created."""
+        issue_migrator._project_id_map = None
+        issue_migrator.state = None
+        source_sessions = [
+            {"id": "src-live", "name": "juji-prod"},
+            {"id": "src-exp", "name": "an-experiment", "reference_dataset_id": "ds-1"},
+        ]
+
+        issue_migrator.source.get_paginated.return_value = iter(source_sessions)
+        issue_migrator.dest.get_paginated.return_value = iter([])
+        issue_migrator.dest.post.return_value = {"id": "dst-live", "name": "juji-prod"}
+
+        result = issue_migrator.build_project_mapping(create_missing=True)
+
+        # Only the live project is mapped; the experiment is excluded.
+        assert result == {"src-live": "dst-live"}
+        # Exactly one project created (the live one, not the experiment).
+        assert issue_migrator.dest.post.call_count == 1
+        created_payload = issue_migrator.dest.post.call_args[0][1]
+        assert created_payload["name"] == "juji-prod"
+
+    def test_map_single_project_only_maps_one(self, issue_migrator):
+        """Scoped mapping must not create/list the whole workspace."""
+        issue_migrator._project_id_map = None
+        issue_migrator.state = None
+        # Destination has a same-named project already -> map by name, no create.
+        issue_migrator.dest.get_paginated.return_value = [
+            {"id": "dst-juji", "name": "juji-prod"},
+        ]
+        source_project = {"id": "src-juji", "name": "juji-prod"}
+
+        result = issue_migrator.map_single_project(source_project, create_missing=True)
+
+        assert result == "dst-juji"
+        assert issue_migrator._project_id_map == {"src-juji": "dst-juji"}
+        # Only the one project is mapped; no project creation happened.
+        issue_migrator.dest.post.assert_not_called()
+
+    def test_map_single_project_creates_when_missing(self, issue_migrator):
+        """When the project is absent on the destination it is created (only it)."""
+        issue_migrator._project_id_map = None
+        issue_migrator.state = None
+        issue_migrator.dest.get_paginated.return_value = []  # nothing on dest
+        issue_migrator.dest.post.return_value = {"id": "new-juji", "name": "juji-prod"}
+        source_project = {"id": "src-juji", "name": "juji-prod"}
+
+        result = issue_migrator.map_single_project(source_project, create_missing=True)
+
+        assert result == "new-juji"
+        assert issue_migrator._project_id_map == {"src-juji": "new-juji"}
+        # Exactly one project created.
+        assert issue_migrator.dest.post.call_count == 1
+        assert issue_migrator.dest.post.call_args[0][0] == "/sessions"
+
     def test_list_issue_agents_scoped_to_session(self, issue_migrator, sample_agent):
         """--session scoping uses the per-session agent endpoint."""
         issue_migrator.source.get.return_value = sample_agent

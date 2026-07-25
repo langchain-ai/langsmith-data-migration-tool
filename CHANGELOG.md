@@ -12,7 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LangSmith Engine resources between instances: per-project issues-agent
   configs (`/v1/platform/sessions/{id}/issues-agent`) and detected issues
   (`/v1/platform/issues`). Projects are mapped by name and auto-created on the
-  destination when missing (matching the `rules` command). Source-instance-only
+  destination when missing (matching the `rules` command); project mapping is
+  restricted to real tracing projects (`reference_free`), so experiment/test-run
+  sessions are never recreated. With `--session`, only that one project is
+  mapped/created rather than the whole workspace. Source-instance-only
   fields on issues-agent configs (`latest_thread_id`, `latest_run_id`, tenant,
   counters, timestamps) are stripped before recreation. Detected issues are
   migrated as metadata only; the `traces` array (linked runs) is never sent
