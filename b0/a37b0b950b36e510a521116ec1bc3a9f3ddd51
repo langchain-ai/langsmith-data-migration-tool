@@ -1,0 +1,12 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "b0a37b0b950b36e510a521116ec1bc3a9f3ddd51",
+  "prompts": {},
+  "humans": {
+    "h_255864e0abd836": {
+      "author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
