@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.81]
+
+### Added
+- **Context Hub migration (`contexts`)**: New command to migrate Context Hub
+  agents and skills (the versioned agent/skill repos backing the LangSmith
+  Context Hub) between instances/workspaces via the SDK directories API
+  (`push_agent`/`push_skill`, `pull_agent`/`pull_skill`). Replays the **full
+  commit history** by default: it enumerates each context's commit chain with
+  `list_prompt_commits` (which works for directory-type repos) and pushes every
+  commit oldest-to-newest, chaining `parent_commit`. Because directory commits
+  are content-addressed, the destination reproduces the source's exact commit
+  hashes and history. Repo metadata (description, readme, tags, is_public) is
+  applied on the first commit. Pass `--latest-only` to copy just the latest
+  commit as a single fresh commit instead. **Commit tags** are migrated by
+  default too - including the `production` / `staging` environment tags behind
+  the Context Hub promote feature - by re-creating each tag on the destination
+  pointing at the commit with the same content-addressed hash; pass `--no-tags`
+  to skip, and tags whose target commit is absent on the destination (e.g. under
+  `--latest-only`) are skipped and reported. Cross-instance, linked-repo
+  references (`skills/...`, `agents/...`) have their source commit pins stripped
+  so links resolve to the destination's latest commit of each linked repo, and
+  the downgrade is reported; `--same-instance` preserves pins verbatim. Use
+  `--agents-only` / `--skills-only` to scope by type and `--all` to skip the
+  selection prompt. Also wired into `migrate-all` (Step 7) with a
+  `--skip-contexts` flag. Listing matches the Context Hub UI: it lists via the
+  raw `/repos` endpoint and hides externally-sourced contexts
+  (`source=external`, e.g. Agent Builder drafts with UUID handles) by default
+  via `exclude_source=external` plus a client-side guard; pass
+  `--include-external` to migrate them too.
+
 ## [0.0.80] - 2026-07-15
 
 ### Added

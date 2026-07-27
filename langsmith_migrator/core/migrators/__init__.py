@@ -5,6 +5,7 @@ from .dataset import DatasetMigrator
 from .experiment import ExperimentMigrator
 from .feedback import FeedbackMigrator
 from .annotation_queue import AnnotationQueueMigrator
+from .context_hub import ContextHubMigrator
 from .prompt import PromptMigrator
 from .rules import RulesMigrator
 from .chart import ChartMigrator
@@ -27,6 +28,7 @@ __all__ = [
     "ExperimentMigrator",
     "FeedbackMigrator",
     "AnnotationQueueMigrator",
+    "ContextHubMigrator",
     "PromptMigrator",
     "RulesMigrator",
     "ChartMigrator",
