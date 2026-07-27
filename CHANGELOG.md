@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.82] - 2026-07-27
+
 ### Added
 - **Engine issue migration (`issues`)**: New `issues` command migrates
   LangSmith Engine resources between instances: per-project issues-agent
@@ -527,7 +529,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.78...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.82...HEAD
+[0.0.82]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.81...v0.0.82
+[0.0.81]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.80...v0.0.81
+[0.0.80]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.79...v0.0.80
+[0.0.79]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.78...v0.0.79
 [0.0.78]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.77...v0.0.78
 [0.0.77]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.76...v0.0.77
 [0.0.76]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.75...v0.0.76
