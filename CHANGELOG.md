@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `--session <name-or-ID>` scopes the migration to a single tracing project.
   - Adds `--session` and `--skip-issues` to `migrate-all` (Step 6, before Fleet).
 
-## [0.0.81]
+## [0.0.81] - 2026-07-27
 
 ### Added
 - **Context Hub migration (`contexts`)**: New command to migrate Context Hub
