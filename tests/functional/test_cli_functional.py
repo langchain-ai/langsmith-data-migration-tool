@@ -48,6 +48,7 @@ def test_registered_command_names_match_public_cli_surface():
     assert sorted(cli_main.cli.commands) == [
         "charts",
         "clean",
+        "contexts",
         "datasets",
         "export-users",
         "fleet",

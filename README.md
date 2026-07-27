@@ -6,7 +6,7 @@ A Python CLI for migrating users and roles, datasets, experiments, annotation qu
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.80-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -33,6 +33,7 @@ langsmith-migrator datasets
 - **Charts**: Migrate monitoring charts with filter preservation
 - **Engine Issues**: Migrate per-project LangSmith Engine issues-agent configs and detected issues as metadata (`issues`). Run links and trace deep-links are not migrated (see Limitations)
 - **Fleet**: Migrate agents, shared skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, and workspace secrets (`fleet`)
+- **Context Hub**: Migrate Context Hub agents and skills (the versioned agent/skill repos in the LangSmith Context Hub), including files and repo metadata (description, readme, tags, is_public) (`contexts`). Replays the **full commit history** by default so the destination reproduces the source's commit chain; use `--latest-only` to copy just the latest commit. Also copies **commit tags**, including the `production` / `staging` environment tags behind the Context Hub promote feature, pointing each at the same commit on the destination (`--no-tags` to skip). Lists the same contexts the Context Hub UI shows (external-source repos are hidden by default; use `--include-external` to migrate them too). Scope with `--agents-only` / `--skills-only`; linked-repo commit pins are stripped and reported cross-instance, or preserved with `--same-instance`
 - **Workspace Scoping**: Run resource migrations per workspace pair with explicit IDs or interactive workspace mapping
 - **Remediation & Resume**: Persist migration state, write remediation bundles, print grouped actionable next steps, and retry pending/failed work with `resume`
 - **Interactive CLI**: TUI-based selection with search/filter, plus `--non-interactive` mode for automation
@@ -50,6 +51,7 @@ This tool **does not support migrating trace data**. It migrates:
 - Charts
 - LangSmith Engine issues-agent configs and detected issue metadata
 - Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets)
+- Context Hub agents and skills (full commit history)
 
 For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
 
@@ -99,26 +101,34 @@ OAuth providers, GitHub App, and Slack app configuration are set at the infrastr
 
 The destination's `POST /runs/batch` endpoint rejects runs with timestamps outside a 24-hour window of "now", so historical experiments cannot be replayed with their original timestamps. To migrate experiment runs at all, this tool shifts every run's `start_time`, `end_time`, `dotted_order`, and `events[].time` (and the parent experiment's `start_time`/`end_time`) by a per-experiment delta so the newest timestamp lands at migration time. **Relative offsets between runs within the same experiment are preserved exactly.** The delta is persisted in migration state so resumed migrations apply the same shift to remaining runs.
 
+### Context Hub: Commit History and Linked Repos
+
+- **Full commit history by default**: the tool enumerates each context's commit chain (via `list_prompt_commits`, which works for directory-type repos) and replays every commit oldest-to-newest on the destination, chaining `parent_commit`. Because Context Hub directory commits are content-addressed, this reproduces the source's exact commit hashes and history. Pass `--latest-only` to instead copy just the latest commit as a single fresh commit.
+- **Commit tags and environments**: all commit tags are copied by default, including the `production` / `staging` environment tags that back the Context Hub promote feature. Each tag is re-created on the destination pointing at the commit with the same content-addressed hash. Under `--latest-only`, a tag whose target commit was not migrated is skipped and reported. Use `--no-tags` to skip tag migration entirely.
+- **Linked repos**: a context's `files` map can link to another agent/skill repo (`skills/<name>`, `agents/<name>`) instead of inlining content. Cross-instance, the source-instance commit pin on each link is stripped so the link resolves to the destination's latest commit of the linked repo, and the downgrade is reported. Migrate linked repos separately (and re-pin if you need reproducibility). Pass `--same-instance` to preserve link pins verbatim.
+- **External-source contexts hidden by default**: the tool lists contexts exactly as the Context Hub UI does, which excludes repos whose `source` is `external` (agents/skills created by an external harness such as the Agent Builder, typically with raw-UUID handles). These are hidden by default; pass `--include-external` to migrate them too. Note that externally-created repos often have UUID handles, and the destination rejects a repo handle that does not match `^[a-z][a-z0-9-_]*$` (must start with a lowercase letter), so such repos fail on create and are reported.
+- **Owner**: migrated contexts are owned by the identity behind the destination API key.
+
 ## Installation
 
 **Prerequisites**: Python 3.12+, [uv](https://docs.astral.sh/uv/)
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.80-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.80-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.80-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.80-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)

@@ -151,6 +151,7 @@ cython_debug/
 .DS_Store
 
 # Migration output files
+.langsmith-migrator/
 migration_report_*.json
 migration_mappings_*.json
 experiment_mappings_*.json

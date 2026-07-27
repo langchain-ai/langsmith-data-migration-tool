@@ -18,6 +18,7 @@ from rich.table import Table
 from ..core.migrators import (
     AnnotationQueueMigrator,
     ChartMigrator,
+    ContextHubMigrator,
     DatasetMigrator,
     MigrationOrchestrator,
     IssueMigrator,
@@ -3801,6 +3802,7 @@ def issues(
 @click.option("--skip-charts", is_flag=True, help="Skip chart migration")
 @click.option("--skip-issues", is_flag=True, help="Skip LangSmith Engine issue migration")
 @click.option("--skip-fleet", is_flag=True, help="Skip Fleet resource migration")
+@click.option("--skip-contexts", is_flag=True, help="Skip Context Hub (agents & skills) migration")
 @click.option("--include-all-commits", is_flag=True, help="Include all prompt commit history")
 @click.option("--strip-projects", is_flag=True, help="Strip project associations from rules")
 @click.option(
@@ -3837,6 +3839,7 @@ def migrate_all(
     skip_charts,
     skip_issues,
     skip_fleet,
+    skip_contexts,
     include_all_commits,
     strip_projects,
     map_projects,
@@ -4001,6 +4004,7 @@ def migrate_all(
             custom_project_mapping,
             skip_issues=skip_issues,
             skip_fleet=skip_fleet,
+            skip_contexts=skip_contexts,
         )
 
     if ws_result:
@@ -4032,6 +4036,7 @@ def _migrate_all_for_workspace(
     custom_project_mapping=None,
     skip_issues=True,
     skip_fleet=True,
+    skip_contexts=True,
 ):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
@@ -4684,6 +4689,70 @@ def _migrate_all_for_workspace(
         _migrate_fleet_for_workspace(orchestrator, config)
     else:
         console.print("[dim]Skipping Fleet (--skip-fleet)[/dim]\n")
+
+    # 7. Context Hub (agents & skills)
+    if not skip_contexts:
+        console.print("[bold]Step 7: Context Hub (agents & skills)[/bold]")
+        console.print("Fetching contexts... ", end="")
+
+        context_migrator = ContextHubMigrator(
+            orchestrator.source_client, orchestrator.dest_client, None, config
+        )
+        try:
+            context_list = context_migrator.list_contexts()
+        except Exception as e:
+            console.print(f"[red]failed: {e}[/red]\n")
+            context_list = []
+
+        if context_list:
+            console.print(f"found {len(context_list)}")
+            if _confirm_action(
+                config,
+                f"Migrate {len(context_list)} context(s)?",
+                default=True,
+                non_interactive_value=True,
+            ):
+                _ensure_migration_session(orchestrator, config)
+                context_migrator.state = orchestrator.state
+                success_count = 0
+                failed_items = []
+
+                with Progress(console=console) as progress:
+                    task = progress.add_task("Migrating contexts...", total=len(context_list))
+                    for summary in context_list:
+                        item_id = _ensure_state_item(
+                            orchestrator,
+                            config,
+                            "context",
+                            summary["id"],
+                            summary["repo_handle"],
+                            metadata={"context": summary},
+                        )
+                        try:
+                            _mark_state_item_started(orchestrator, item_id)
+                            url = context_migrator.create_context(summary, item_id=item_id)
+                            success_count += 1
+                            _mark_state_item_completed(
+                                orchestrator, item_id, destination_id=url
+                            )
+                        except Exception as e:
+                            failed_items.append((summary["repo_handle"], str(e)))
+                            _mark_state_item_failed(orchestrator, item_id, e)
+                        progress.advance(task)
+
+                console.print(
+                    f"Contexts: {success_count} migrated, {len(failed_items)} failed"
+                )
+                if failed_items and config.migration.verbose:
+                    for name, err in failed_items:
+                        console.print(f"  [red]✗[/red] {name}: {err}")
+                console.print()
+            else:
+                console.print("[yellow]Skipped contexts[/yellow]\n")
+        else:
+            console.print("[yellow]none found[/yellow]\n")
+    else:
+        console.print("[dim]Skipping contexts (--skip-contexts)[/dim]\n")
 
 
 @cli.command()
@@ -5706,6 +5775,219 @@ def fleet(
             skip_usage_limits=skip_usage_limits,
             skip_sandbox_policies=skip_sandbox_policies,
         )
+
+    if ws_result:
+        orchestrator.clear_workspace_context()
+
+    _display_resolution_summary(orchestrator)
+    _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
+
+
+@cli.command()
+@click.option("--all", "select_all", is_flag=True, help="Migrate all contexts without prompting")
+@click.option(
+    "--agents-only",
+    is_flag=True,
+    help="Migrate only agent contexts (skip skills)",
+)
+@click.option(
+    "--skills-only",
+    is_flag=True,
+    help="Migrate only skill contexts (skip agents)",
+)
+@click.option(
+    "--same-instance",
+    is_flag=True,
+    help=(
+        "Preserve source identifiers verbatim (linked repo commit pins). Use "
+        "only when source and destination share the same backend; otherwise "
+        "link pins are stripped so links resolve to the destination's latest "
+        "commit of each linked repo."
+    ),
+)
+@click.option(
+    "--include-external",
+    is_flag=True,
+    help=(
+        "Also migrate externally-sourced contexts (source=external, e.g. "
+        "Agent Builder drafts with UUID handles). By default these are hidden "
+        "to match the Context Hub UI, which lists only internal/authored "
+        "contexts."
+    ),
+)
+@click.option(
+    "--latest-only",
+    is_flag=True,
+    help=(
+        "Copy only each context's latest commit as a single fresh commit. By "
+        "default the full source commit history is replayed so the destination "
+        "reproduces the source's commit chain."
+    ),
+)
+@click.option(
+    "--no-tags",
+    is_flag=True,
+    help=(
+        "Do not migrate commit tags. By default all commit tags (including the "
+        "production/staging environment tags behind the Context Hub promote "
+        "feature) are re-created on the destination pointing at the same commit."
+    ),
+)
+@ssl_option
+@workspace_options
+@click.pass_context
+def contexts(
+    ctx,
+    select_all,
+    agents_only,
+    skills_only,
+    same_instance,
+    include_external,
+    latest_only,
+    no_tags,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
+):
+    """Migrate Context Hub agents and skills (full commit history by default)."""
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
+
+    display_banner()
+
+    if agents_only and skills_only:
+        console.print("[red]Error: --agents-only and --skills-only are mutually exclusive[/red]")
+        return
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    # Test connections
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+    if not source_ok:
+        console.print("[red]✗ Source connection failed[/red]")
+        if source_error:
+            console.print(f"[red]  {source_error}[/red]")
+        orchestrator.cleanup()
+        return
+    if not dest_ok:
+        console.print("[red]✗ Destination connection failed[/red]")
+        if dest_error:
+            console.print(f"[red]  {dest_error}[/red]")
+        orchestrator.cleanup()
+        return
+    console.print("[green]✓[/green]\n")
+
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
+    if ws_result is _WS_CANCELLED:
+        console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+
+    context_migrator = ContextHubMigrator(
+        orchestrator.source_client,
+        orchestrator.dest_client,
+        None,
+        config,
+        same_instance=same_instance,
+        include_external=include_external,
+        include_all_commits=not latest_only,
+        migrate_tags=not no_tags,
+    )
+    if same_instance:
+        console.print("[dim]Same-instance mode: preserving linked repo commit pins verbatim[/dim]")
+    if include_external:
+        console.print("[dim]Including externally-sourced contexts (source=external)[/dim]")
+    if latest_only:
+        console.print("[dim]Latest-only mode: copying only each context's latest commit[/dim]")
+    if no_tags:
+        console.print("[dim]Skipping commit tags (--no-tags)[/dim]")
+
+    include_agents = not skills_only
+    include_skills = not agents_only
+
+    for src_ws, dst_ws in ws_pairs:
+        if src_ws and dst_ws:
+            orchestrator.set_workspace_context(src_ws, dst_ws)
+            console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+
+        console.print("\n[bold]Fetching contexts from source...[/bold]")
+        try:
+            context_list = context_migrator.list_contexts(
+                include_agents=include_agents,
+                include_skills=include_skills,
+            )
+        except Exception as e:
+            console.print(f"[red]Failed to list contexts: {e}[/red]")
+            continue
+
+        if not context_list:
+            console.print("[yellow]No contexts found[/yellow]")
+            continue
+
+        selected = _select_or_all(
+            config,
+            context_list,
+            select_all=select_all or config.migration.non_interactive,
+            title="Select Contexts to Migrate",
+            columns=[
+                {"key": "repo_handle", "title": "Handle", "width": 32},
+                {"key": "repo_type", "title": "Type", "width": 8},
+                {"key": "description", "title": "Description", "width": 48},
+            ],
+        )
+
+        if not selected:
+            console.print("[yellow]No contexts selected[/yellow]")
+            continue
+
+        console.print(f"\n[bold]Migrating {len(selected)} context(s)...[/bold]")
+        _ensure_migration_session(orchestrator, config)
+        context_migrator.state = orchestrator.state
+
+        success_count = 0
+        failed_items = []
+
+        with Progress(console=console) as progress:
+            task = progress.add_task("Migrating contexts...", total=len(selected))
+            for summary in selected:
+                item_id = _ensure_state_item(
+                    orchestrator,
+                    config,
+                    "context",
+                    summary["id"],
+                    summary["repo_handle"],
+                    metadata={"context": summary},
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    url = context_migrator.create_context(summary, item_id=item_id)
+                    success_count += 1
+                    _mark_state_item_completed(orchestrator, item_id, destination_id=url)
+                except Exception as e:
+                    failed_items.append((summary["repo_handle"], str(e)))
+                    _mark_state_item_failed(orchestrator, item_id, e)
+                progress.advance(task)
+
+        console.print(f"Contexts: {success_count} migrated, {len(failed_items)} failed")
+        if failed_items and config.migration.verbose:
+            for name, err in failed_items:
+                console.print(f"  [red]✗[/red] {name}: {err}")
 
     if ws_result:
         orchestrator.clear_workspace_context()
