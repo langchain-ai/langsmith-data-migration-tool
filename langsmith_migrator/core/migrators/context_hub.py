@@ -519,6 +519,10 @@ class ContextHubMigrator(BaseMigrator):
         self._sync_workspace_headers()
         identifier = summary["repo_handle"]
 
+        if self.config.migration.dry_run:
+            self.log(f"[DRY RUN] Would migrate context: {identifier}")
+            return f"dry-run-{identifier}"
+
         # Determine the commits to replay (oldest-first). Latest-only mode, or a
         # repo whose history cannot be enumerated, collapses to a single commit.
         commits: List[Dict[str, Any]] = []

@@ -2,7 +2,6 @@
 
 from unittest.mock import Mock, patch
 
-import pytest
 from langsmith.schemas import AgentContext, FileEntry, SkillContext, SkillEntry
 
 from langsmith_migrator.core.api_client import EnhancedAPIClient
@@ -249,6 +248,26 @@ def test_prepare_files_no_issue_for_unpinned_link(sample_config, migration_state
 # ---------------------------------------------------------------------------
 # Writes
 # ---------------------------------------------------------------------------
+def test_create_context_dry_run_does_not_push(sample_config):
+    """Dry run should not push anything to the destination."""
+    migrator = _migrator(sample_config, include_all_commits=False)
+    migrator.config.migration.dry_run = True
+
+    summary = {
+        "repo_type": "agent",
+        "repo_handle": "email-assistant",
+        "description": "Triages email",
+        "readme": "# Email",
+        "tags": ["email"],
+        "is_public": False,
+    }
+    url = migrator.create_context(summary)
+
+    assert url.startswith("dry-run-")
+    migrator.dest_ls_client.push_agent.assert_not_called()
+    migrator.dest_ls_client.push_skill.assert_not_called()
+
+
 def test_create_context_latest_only_pushes_agent_with_metadata(sample_config):
     migrator = _migrator(sample_config, include_all_commits=False)
     ctx = AgentContext(
