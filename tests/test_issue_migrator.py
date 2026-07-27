@@ -38,6 +38,10 @@ class TestIssueMigrator:
             "status": "watching",
             "tags": ["latency"],
             "actions": ["investigate"],
+            "proposed_fix": "Add a retry with backoff on the checkout call.",
+            "fix_prompt": "Fix the latency in checkout.",
+            "fix_branch": "engine/fix-checkout-latency",
+            "fix_pr_number": 42,
             # Linked runs on the source — MUST NOT be sent to the destination.
             "traces": [
                 {"run_id": "run-1", "trace_id": "trace-1", "start_time": "2026-01-01T00:00:00Z"},
@@ -87,6 +91,30 @@ class TestIssueMigrator:
         assert issue_migrator.dest.post.call_count == 1
         created_payload = issue_migrator.dest.post.call_args[0][1]
         assert created_payload["name"] == "juji-prod"
+
+    def test_map_projects_for_sessions_only_maps_referenced(self, issue_migrator):
+        """Only sessions with Engine data are mapped/created, not the workspace."""
+        issue_migrator._project_id_map = None
+        issue_migrator.state = None
+        # Source workspace has 3 projects; only 1 has Engine data.
+        source_sessions = [
+            {"id": "src-a", "name": "has-engine"},
+            {"id": "src-b", "name": "no-engine-1"},
+            {"id": "src-c", "name": "no-engine-2"},
+        ]
+
+        # source returns the 3 projects; dest returns nothing.
+        issue_migrator.source.get_paginated.return_value = iter(source_sessions)
+        issue_migrator.dest.get_paginated.return_value = iter([])
+        issue_migrator.dest.post.return_value = {"id": "dst-a", "name": "has-engine"}
+
+        result = issue_migrator.map_projects_for_sessions(["src-a"], create_missing=True)
+
+        # Only src-a mapped; src-b/src-c are ignored.
+        assert result == {"src-a": "dst-a"}
+        # Exactly one project created (has-engine), not all three.
+        assert issue_migrator.dest.post.call_count == 1
+        assert issue_migrator.dest.post.call_args[0][1]["name"] == "has-engine"
 
     def test_map_single_project_only_maps_one(self, issue_migrator):
         """Scoped mapping must not create/list the whole workspace."""
@@ -168,10 +196,16 @@ class TestIssueMigrator:
         # Run links and Engine-generated advisory actions are never sent.
         assert "traces" not in payload
         assert "actions" not in payload
+        # Source-instance GitHub references are not sent.
+        assert "fix_branch" not in payload
+        assert "fix_pr_number" not in payload
         assert payload["session_id"] == "dst-session"
         assert payload["name"] == "High latency on checkout"
         assert payload["severity"] == 1
         assert payload["tags"] == ["latency"]
+        # Self-contained Engine-authored fix content is carried over.
+        assert payload["proposed_fix"] == "Add a retry with backoff on the checkout call."
+        assert payload["fix_prompt"] == "Fix the latency in checkout."
 
     def test_create_issue_patches_status_when_differs(self, issue_migrator, sample_issue):
         """Issues are created `open`; source status should be restored via PATCH."""

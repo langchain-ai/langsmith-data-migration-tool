@@ -15,7 +15,7 @@ re-linking runs from the source would be rejected. Callers should re-run the
 engine on the destination to re-detect run links. See ``README.md``.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .base import BaseMigrator
 from ..api_client import APIError, NotFoundError
@@ -181,6 +181,91 @@ class IssueMigrator(BaseMigrator):
         except Exception as e:
             self.log(f"Failed to build project mapping: {e}", "error")
             self._project_id_map = {}
+
+        return self._project_id_map
+
+    def map_projects_for_sessions(
+        self, source_session_ids: Iterable[str], create_missing: bool = True
+    ) -> Dict[str, str]:
+        """Map (and optionally create) only the given source sessions.
+
+        This is the on-demand equivalent of ``build_project_mapping`` scoped to
+        the projects that actually have Engine data, so the whole workspace is
+        not recreated on the destination. Source and destination project lists
+        are fetched once, filtered to real tracing projects (``reference_free``).
+        Adds resolved IDs to ``self._project_id_map`` and returns it.
+        """
+        if self._project_id_map is None:
+            self._project_id_map = {}
+
+        wanted = {sid for sid in source_session_ids if sid}
+        wanted -= set(self._project_id_map)  # already mapped
+        if not wanted:
+            return self._project_id_map
+
+        try:
+            source_by_id = {
+                p["id"]: p
+                for p in self.source.get_paginated(
+                    "/sessions", params={"reference_free": "true"}, page_size=100
+                )
+                if isinstance(p, dict) and not p.get("reference_dataset_id")
+            }
+        except Exception as e:
+            self.log(f"Failed to list source projects: {e}", "error")
+            source_by_id = {}
+
+        try:
+            dest_by_name: Dict[str, Dict[str, Any]] = {}
+            for p in self.dest.get_paginated(
+                "/sessions", params={"reference_free": "true"}, page_size=100
+            ):
+                if isinstance(p, dict) and not p.get("reference_dataset_id"):
+                    dest_by_name.setdefault(p.get("name"), p)
+        except Exception as e:
+            self.log(f"Failed to list destination projects: {e}", "error")
+            dest_by_name = {}
+
+        for source_id in wanted:
+            source_project = source_by_id.get(source_id)
+            if not source_project:
+                self.log(
+                    f"Source project {source_id} not found among tracing projects; "
+                    "cannot map",
+                    "warning",
+                )
+                continue
+            source_name = source_project.get("name")
+
+            if self.state and self.state.get_mapped_id("project", source_id):
+                self._project_id_map[source_id] = self.state.get_mapped_id(
+                    "project", source_id
+                )
+                self.record_provenance(f"project:{source_id}", "state_mapping")
+                continue
+
+            existing = dest_by_name.get(source_name)
+            if existing:
+                self._project_id_map[source_id] = existing["id"]
+                self.record_provenance(f"project:{source_id}", "exact_name_match")
+                continue
+
+            if not create_missing:
+                continue
+
+            self.log(
+                f"Project '{source_name}' not found in destination, creating...", "info"
+            )
+            new_project = self._create_project(source_project)
+            if new_project:
+                self._project_id_map[source_id] = new_project["id"]
+                self.record_provenance(f"project:{source_id}", "created_on_destination")
+                # Keep the dest cache consistent for later lookups in this run.
+                dest_by_name.setdefault(source_name, new_project)
+            else:
+                self.log(
+                    f"Failed to create project '{source_name}' in destination", "error"
+                )
 
         return self._project_id_map
 
@@ -453,10 +538,13 @@ class IssueMigrator(BaseMigrator):
             "description": issue.get("description"),
             "severity": issue.get("severity"),
         }
-        # Optional metadata carried over when present.
-        tags = issue.get("tags")
-        if tags is not None:
-            payload["tags"] = tags
+        # Optional metadata carried over when present. `proposed_fix` and
+        # `fix_prompt` are self-contained text accepted by the create endpoint
+        # (CreateIssueRequest), so the Engine-authored fix survives migration.
+        for field in ("tags", "proposed_fix", "fix_prompt"):
+            value = issue.get(field)
+            if value is not None:
+                payload[field] = value
 
         # NOTE: `traces` (run links) and `actions` are deliberately never
         # included. `traces` reference source runs that do not exist on the
@@ -465,6 +553,9 @@ class IssueMigrator(BaseMigrator):
         # strictly on create -- some require a `body` that is not present in
         # the source record -- and that Engine regenerates when it runs on the
         # destination. Sending them causes 400 validation errors.
+        # `fix_branch`/`fix_pr_number` are intentionally omitted too: they
+        # reference the source instance's GitHub repo/PR and do not resolve on
+        # the destination.
 
         response = self.dest.post("/v1/platform/issues", payload)
 

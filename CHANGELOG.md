@@ -11,17 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Engine issue migration (`issues`)**: New `issues` command migrates
   LangSmith Engine resources between instances: per-project issues-agent
   configs (`/v1/platform/sessions/{id}/issues-agent`) and detected issues
-  (`/v1/platform/issues`). Projects are mapped by name and auto-created on the
-  destination when missing (matching the `rules` command); project mapping is
-  restricted to real tracing projects (`reference_free`), so experiment/test-run
-  sessions are never recreated. With `--session`, only that one project is
-  mapped/created rather than the whole workspace. Source-instance-only
-  fields on issues-agent configs (`latest_thread_id`, `latest_run_id`, tenant,
-  counters, timestamps) are stripped before recreation. Detected issues are
-  migrated as metadata only; the `traces` array (linked runs) is never sent
-  because trace data is not portable across instances and the destination's
-  run resolver would reject the links. Also adds `--skip-issues` to `migrate-all`
-  (Step 6, before Fleet).
+  (`/v1/platform/issues`).
+  - Only tracing projects that have Engine data (an issues-agent config or
+    detected issues) are mapped/created on the destination; projects are
+    matched by name, auto-created when missing, and restricted to real tracing
+    projects (experiment/test-run sessions are excluded).
+  - Issues-agent configs are recreated with source-instance-only fields
+    (`latest_thread_id`, `latest_run_id`, tenant, counters, timestamps)
+    stripped.
+  - Detected issues are migrated as metadata (including the Engine-authored
+    `proposed_fix` and `fix_prompt`); run links (`traces`), `actions`, and
+    `fix_branch`/`fix_pr_number` are not carried over.
+  - Idempotent: issues-agent configs and issues already present on the
+    destination are skipped (issues dedup by `session_id` + `name`).
+  - `--session <name-or-ID>` scopes the migration to a single tracing project.
+  - Adds `--session` and `--skip-issues` to `migrate-all` (Step 6, before Fleet).
 
 ## [0.0.80] - 2026-07-15
 

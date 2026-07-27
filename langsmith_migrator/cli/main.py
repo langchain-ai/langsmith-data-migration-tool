@@ -3700,88 +3700,87 @@ def issues(
                 f"[dim]Scoped to project '{match.get('name')}' ({target_session_id})[/dim]"
             )
 
-        # Build the project mapping, auto-creating missing projects (matches the
-        # `rules` command). When scoped to a single --session, only that project
-        # is mapped/created -- NOT the whole workspace. An explicit
-        # --project-mapping / --map-projects already populated the map above, so
-        # only build when no mapping was supplied.
-        if issue_migrator._project_id_map is None:
-            if target_session_id:
-                issue_migrator.map_single_project(match, create_missing=True)
-            else:
-                issue_migrator.build_project_mapping(create_missing=True)
-        elif target_session_id and target_session_id not in issue_migrator._project_id_map:
-            # A workspace-scoped mapping was supplied but doesn't cover the
-            # requested project; ensure that single project is mapped/created.
-            issue_migrator.map_single_project(match, create_missing=True)
-
-        # --- Issues-agent configs ---
+        # Fetch the Engine data FIRST so we only map/create the projects that
+        # actually have issues-agent configs or detected issues -- not every
+        # tracing project in the workspace.
+        agents = []
         if not skip_agents:
             console.print("Fetching issues-agent configs... ", end="")
             agents = issue_migrator.list_issue_agents(target_session_id)
-            if not agents:
-                console.print("[yellow]none found[/yellow]")
-            else:
-                console.print(f"found {len(agents)}")
-                if select_all or config.migration.non_interactive:
-                    selected_agents = agents
-                else:
-                    selected_agents = _select_or_all(
-                        config,
-                        agents,
-                        select_all=False,
-                        title="Select Issues-Agent Configs to Migrate",
-                        columns=[
-                            {"key": "session_name", "title": "Project", "width": 30},
-                            {"key": "issue_count", "title": "Issues", "width": 10},
-                            {"key": "cron_enabled", "title": "Scheduled", "width": 12},
-                        ],
-                    )
-                if selected_agents and _confirm_action(
-                    config, "\nProceed with issues-agent configs?", default=True, non_interactive_value=True
-                ):
-                    a_success, a_failed, a_skipped = _migrate_issue_agents(
-                        orchestrator, config, issue_migrator, selected_agents
-                    )
-                    console.print(
-                        f"Issues-agent configs: {a_success} migrated, "
-                        f"{len(a_skipped)} skipped, {len(a_failed)} failed"
-                    )
-                    _report_issue_items(config, a_skipped, a_failed)
+            console.print(f"found {len(agents)}" if agents else "[yellow]none found[/yellow]")
 
-        # --- Detected issues ---
+        detected = []
         if not skip_detected_issues:
             console.print("Fetching detected issues... ", end="")
             detected = issue_migrator.list_issues(target_session_id)
-            if not detected:
-                console.print("[yellow]none found[/yellow]")
+            console.print(f"found {len(detected)}" if detected else "[yellow]none found[/yellow]")
+
+        # Map only the projects referenced by the Engine data. An explicit
+        # --project-mapping / --map-projects already populated the map above; in
+        # that case we still fill in any referenced sessions it does not cover.
+        referenced_session_ids = {
+            a.get("session_id") for a in agents if a.get("session_id")
+        } | {i.get("session_id") for i in detected if i.get("session_id")}
+        if referenced_session_ids:
+            issue_migrator.map_projects_for_sessions(
+                referenced_session_ids, create_missing=True
+            )
+
+        # --- Issues-agent configs ---
+        if not skip_agents and agents:
+            if select_all or config.migration.non_interactive:
+                selected_agents = agents
             else:
-                console.print(f"found {len(detected)}")
-                if select_all or config.migration.non_interactive:
-                    selected_issues = detected
-                else:
-                    selected_issues = _select_or_all(
-                        config,
-                        detected,
-                        select_all=False,
-                        title="Select Issues to Migrate",
-                        columns=[
-                            {"key": "name", "title": "Name", "width": 40},
-                            {"key": "severity", "title": "Severity", "width": 10},
-                            {"key": "status", "title": "Status", "width": 12},
-                        ],
-                    )
-                if selected_issues and _confirm_action(
-                    config, "\nProceed with detected issues?", default=True, non_interactive_value=True
-                ):
-                    i_success, i_failed, i_skipped = _migrate_detected_issues(
-                        orchestrator, config, issue_migrator, selected_issues
-                    )
-                    console.print(
-                        f"Detected issues: {i_success} migrated, "
-                        f"{len(i_skipped)} skipped, {len(i_failed)} failed"
-                    )
-                    _report_issue_items(config, i_skipped, i_failed)
+                selected_agents = _select_or_all(
+                    config,
+                    agents,
+                    select_all=False,
+                    title="Select Issues-Agent Configs to Migrate",
+                    columns=[
+                        {"key": "session_name", "title": "Project", "width": 30},
+                        {"key": "issue_count", "title": "Issues", "width": 10},
+                        {"key": "cron_enabled", "title": "Scheduled", "width": 12},
+                    ],
+                )
+            if selected_agents and _confirm_action(
+                config, "\nProceed with issues-agent configs?", default=True, non_interactive_value=True
+            ):
+                a_success, a_failed, a_skipped = _migrate_issue_agents(
+                    orchestrator, config, issue_migrator, selected_agents
+                )
+                console.print(
+                    f"Issues-agent configs: {a_success} migrated, "
+                    f"{len(a_skipped)} skipped, {len(a_failed)} failed"
+                )
+                _report_issue_items(config, a_skipped, a_failed)
+
+        # --- Detected issues ---
+        if not skip_detected_issues and detected:
+            if select_all or config.migration.non_interactive:
+                selected_issues = detected
+            else:
+                selected_issues = _select_or_all(
+                    config,
+                    detected,
+                    select_all=False,
+                    title="Select Issues to Migrate",
+                    columns=[
+                        {"key": "name", "title": "Name", "width": 40},
+                        {"key": "severity", "title": "Severity", "width": 10},
+                        {"key": "status", "title": "Status", "width": 12},
+                    ],
+                )
+            if selected_issues and _confirm_action(
+                config, "\nProceed with detected issues?", default=True, non_interactive_value=True
+            ):
+                i_success, i_failed, i_skipped = _migrate_detected_issues(
+                    orchestrator, config, issue_migrator, selected_issues
+                )
+                console.print(
+                    f"Detected issues: {i_success} migrated, "
+                    f"{len(i_skipped)} skipped, {len(i_failed)} failed"
+                )
+                _report_issue_items(config, i_skipped, i_failed)
 
     if ws_result:
         orchestrator.clear_workspace_context()
@@ -4630,9 +4629,19 @@ def _migrate_all_for_workspace(
 
         _ensure_migration_session(orchestrator, config)
         issue_migrator.state = orchestrator.state
-        issue_migrator.build_project_mapping(create_missing=True)
 
+        # Fetch Engine data first, then map/create only the projects it
+        # references -- not every tracing project in the workspace.
         agents = issue_migrator.list_issue_agents()
+        detected = issue_migrator.list_issues()
+        referenced_session_ids = {
+            a.get("session_id") for a in agents if a.get("session_id")
+        } | {i.get("session_id") for i in detected if i.get("session_id")}
+        if referenced_session_ids:
+            issue_migrator.map_projects_for_sessions(
+                referenced_session_ids, create_missing=True
+            )
+
         if agents and _confirm_action(
             config,
             f"Migrate {len(agents)} issues-agent config(s)?",
@@ -4650,7 +4659,6 @@ def _migrate_all_for_workspace(
         elif not agents:
             console.print("[dim]No issues-agent configs found[/dim]")
 
-        detected = issue_migrator.list_issues()
         if detected and _confirm_action(
             config,
             f"Migrate {len(detected)} detected issue(s) (metadata only)?",
