@@ -190,6 +190,8 @@ langsmith-migrator charts --same-instance       # Reuse source IDs only when bot
 langsmith-migrator fleet                        # Migrate all Fleet resources
 langsmith-migrator fleet --skip-agents          # Skip agent migration
 langsmith-migrator fleet --skip-skills --skip-mcp-servers  # Skip specific resources
+langsmith-migrator fleet --agent "My Agent" --agent agent-abc123  # Only these agents (by name or ID)
+langsmith-migrator fleet --agents-owned-only    # Only agents you own or are directly shared
 
 # Utilities
 langsmith-migrator export-users --source -o users.csv  # Export active members to a members CSV

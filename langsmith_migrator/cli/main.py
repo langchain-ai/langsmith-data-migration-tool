@@ -4839,12 +4839,19 @@ def _migrate_fleet_for_workspace(
     skip_webhooks=False,
     skip_usage_limits=False,
     skip_sandbox_policies=False,
+    agents_selected=None,
+    agents_owned_only=False,
 ):
     """Run the Fleet migration flow for a single workspace pair.
 
     Resources are migrated in dependency order. ID mappings from earlier
     phases are stored in ``state.id_mappings`` and consumed by later
     phases for cross-reference remapping.
+
+    ``agents_selected`` (a set of agent names or IDs) and
+    ``agents_owned_only`` scope Phase 6 to a subset of source agents.
+    Because schedules, triggers, and usage limits key off the resulting
+    ``agent_id_map``, they automatically scope to the selected agents too.
     """
     _ensure_migration_session(orchestrator, config)
     state = orchestrator.state
@@ -5088,7 +5095,11 @@ def _migrate_fleet_for_workspace(
         agent_migrator = FleetAgentMigrator(
             orchestrator.source_client, orchestrator.dest_client, state, config
         )
-        agents = agent_migrator.list_agents()
+        audiences = ("user",) if agents_owned_only else ("user", "tenant")
+        agents = agent_migrator.list_agents(
+            audiences=audiences,
+            select=agents_selected or None,
+        )
         if agents:
             console.print(f"  Found {len(agents)} agent(s)")
             console.print("  Fetching destination model catalog... ", end="")
@@ -5260,6 +5271,26 @@ def _migrate_fleet_for_workspace(
 @click.option("--skip-webhooks", is_flag=True, help="Skip webhooks")
 @click.option("--skip-usage-limits", is_flag=True, help="Skip spend limits")
 @click.option("--skip-sandbox-policies", is_flag=True, help="Skip sandbox policies")
+@click.option(
+    "--agent",
+    "agents_selected",
+    multiple=True,
+    help=(
+        "Only migrate the agent(s) with this name or ID. Repeat the flag to "
+        "select several. When omitted, all agents in scope are migrated. "
+        "Schedules, triggers, and usage limits are scoped to the selected "
+        "agents automatically."
+    ),
+)
+@click.option(
+    "--agents-owned-only",
+    is_flag=True,
+    help=(
+        "Only migrate agents owned by or directly shared with the "
+        "authenticated source user (Fleet 'user' audience), skipping "
+        "workspace-shared agents owned by others."
+    ),
+)
 @workspace_options
 @click.pass_context
 def fleet(
@@ -5274,6 +5305,8 @@ def fleet(
     skip_webhooks,
     skip_usage_limits,
     skip_sandbox_policies,
+    agents_selected,
+    agents_owned_only,
     source_workspace,
     dest_workspace,
     map_workspaces,
@@ -5283,6 +5316,14 @@ def fleet(
     state_manager = ctx.obj["state_manager"]
 
     display_banner()
+
+    agents_selected = set(agents_selected)
+    if skip_agents and (agents_selected or agents_owned_only):
+        console.print(
+            "[red]Error: --skip-agents cannot be combined with --agent or "
+            "--agents-owned-only[/red]"
+        )
+        return
 
     if not ensure_config(config):
         return
@@ -5344,6 +5385,8 @@ def fleet(
             skip_webhooks=skip_webhooks,
             skip_usage_limits=skip_usage_limits,
             skip_sandbox_policies=skip_sandbox_policies,
+            agents_selected=agents_selected,
+            agents_owned_only=agents_owned_only,
         )
 
     if ws_result:
