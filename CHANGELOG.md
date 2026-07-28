@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Selective Fleet agent migration (`fleet`)**: The `fleet` command could
+  previously migrate **all** agents in a workspace or **none**
+  (`--skip-agents`), with no way to target a subset. Two new options scope the
+  agents phase:
+  - **`--agent <name-or-id>`** (repeatable): migrate only the named agent(s),
+    matched against each source agent's name **or** ID, so the two forms can be
+    mixed in one invocation. Useful for relocating a handful of specific agents
+    into a team workspace without touching everyone else's.
+  - **`--agents-owned-only`**: restrict the listing to the Fleet `user`
+    audience (agents owned by or directly shared with the authenticated source
+    user), skipping workspace-shared agents owned by others. Without it, both
+    the `user` and `tenant` audiences are queried and merged with dedup by
+    agent ID.
+
+  `--skip-agents` is rejected when combined with either flag. Selectors that
+  match no source agent are reported as a warning under `--verbose`.
+  **Downstream cascade is automatic**: schedules, triggers, and usage limits
+  key off the agent map built in the agents phase, so they scope to the
+  selected agents with no extra flags. Default behavior with neither flag is
+  unchanged.
+
 ## [0.0.81] - 2026-07-27
 
 ### Added

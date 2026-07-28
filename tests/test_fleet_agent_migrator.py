@@ -80,6 +80,60 @@ class TestFleetAgentMigrator:
         assert len(result) == 1
         assert result[0]["id"] == "agent-1"
 
+    def test_list_agents_select_by_name(self, agent_migrator):
+        """select should keep only agents whose name matches."""
+        agent_migrator.source.get_cursor_paginated.side_effect = [
+            [{"id": "agent-1", "name": "Keep Me"}],
+            [{"id": "agent-2", "name": "Drop Me"}],
+        ]
+
+        result = agent_migrator.list_agents(select={"Keep Me"})
+
+        assert len(result) == 1
+        assert result[0]["id"] == "agent-1"
+
+    def test_list_agents_select_by_id(self, agent_migrator):
+        """select should keep only agents whose id matches."""
+        agent_migrator.source.get_cursor_paginated.side_effect = [
+            [{"id": "agent-1", "name": "Keep Me"}],
+            [{"id": "agent-2", "name": "Drop Me"}],
+        ]
+
+        result = agent_migrator.list_agents(select={"agent-2"})
+
+        assert len(result) == 1
+        assert result[0]["id"] == "agent-2"
+
+    def test_list_agents_owned_only_queries_user_audience(self, agent_migrator):
+        """Passing audiences=('user',) should issue exactly one list call."""
+        agent_migrator.source.get_cursor_paginated.side_effect = [
+            [{"id": "agent-1", "name": "Owned Agent"}],
+        ]
+
+        result = agent_migrator.list_agents(audiences=("user",))
+
+        assert len(result) == 1
+        assert agent_migrator.source.get_cursor_paginated.call_count == 1
+        called_params = agent_migrator.source.get_cursor_paginated.call_args.kwargs["params"]
+        assert called_params == {"audience": "user"}
+
+    def test_list_agents_unmatched_selector_warns(self, agent_migrator):
+        """A selector matching nothing should log a warning and return empty."""
+        agent_migrator.source.get_cursor_paginated.side_effect = [
+            [{"id": "agent-1", "name": "Keep Me"}],
+            [],
+        ]
+        agent_migrator.log = Mock()
+
+        result = agent_migrator.list_agents(select={"Nonexistent"})
+
+        assert result == []
+        warned = any(
+            "Nonexistent" in call.args[0]
+            for call in agent_migrator.log.call_args_list
+        )
+        assert warned
+
     def test_list_agents_user_audience_error(self, agent_migrator):
         """If user audience fails, tenant agents should still be returned."""
         from langsmith_migrator.core.api_client import NotFoundError

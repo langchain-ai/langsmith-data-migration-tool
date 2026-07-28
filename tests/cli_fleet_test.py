@@ -118,12 +118,23 @@ class _FakeFleetSkillMigrator:
 class _FakeFleetAgentMigrator:
     create_calls: list = []
     id_mappings_received: dict = {}
+    list_calls: list = []
+    catalog: list = [{"id": "agent-1", "name": "Test Agent"}]
 
     def __init__(self, source_client, dest_client, state, config):
         pass
 
-    def list_agents(self):
-        return [{"id": "agent-1", "name": "Test Agent"}]
+    def list_agents(self, *, audiences=("user", "tenant"), select=None):
+        _FakeFleetAgentMigrator.list_calls.append(
+            {"audiences": tuple(audiences), "select": set(select) if select else None}
+        )
+        agents = list(_FakeFleetAgentMigrator.catalog)
+        if select:
+            agents = [
+                a for a in agents
+                if a.get("id") in select or a.get("name") in select
+            ]
+        return agents
 
     def list_dest_models(self):
         return ["anthropic:claude-sonnet-4-6"]
@@ -330,6 +341,8 @@ def _reset_fake_calls():
     _FakeFleetSkillMigrator.create_calls = []
     _FakeFleetAgentMigrator.create_calls = []
     _FakeFleetAgentMigrator.id_mappings_received = {}
+    _FakeFleetAgentMigrator.list_calls = []
+    _FakeFleetAgentMigrator.catalog = [{"id": "agent-1", "name": "Test Agent"}]
     _FakeFleetScheduleMigrator.create_calls = []
     _FakeFleetTriggerMigrator.create_calls = []
     _FakeFleetWebhookMigrator.create_calls = []
@@ -642,3 +655,82 @@ def test_fleet_usage_limit_receives_agent_id_map():
     limit_id, agent_id_map = _FakeFleetUsageLimitMigrator.create_calls[0]
     assert limit_id == "limit-1"
     assert agent_id_map.get("agent-1") == "dest-agent-1"
+
+
+def test_fleet_agent_selection_migrates_only_selected():
+    """--agent selection should migrate only the chosen agent(s)."""
+    _reset_fake_calls()
+    _FakeFleetAgentMigrator.catalog = [
+        {"id": "agent-1", "name": "Test Agent"},
+        {"id": "agent-2", "name": "Other Agent"},
+    ]
+
+    with _patch_all():
+        cli_main._migrate_fleet_for_workspace(
+            orchestrator=_make_orchestrator(),
+            config=_make_config(),
+            skip_secrets=True,
+            skip_auth_providers=True,
+            skip_mcp_servers=True,
+            skip_skills=True,
+            skip_agents=False,
+            skip_schedules=True,
+            skip_triggers=True,
+            skip_webhooks=True,
+            skip_usage_limits=True,
+            skip_sandbox_policies=True,
+            agents_selected={"Test Agent"},
+        )
+
+    # Only the selected agent is created, even though two exist on the source.
+    assert _FakeFleetAgentMigrator.create_calls == ["agent-1"]
+    # The selection set is passed through to the migrator.
+    assert _FakeFleetAgentMigrator.list_calls[0]["select"] == {"Test Agent"}
+
+
+def test_fleet_agents_owned_only_restricts_audience():
+    """--agents-owned-only should query only the 'user' audience."""
+    _reset_fake_calls()
+
+    with _patch_all():
+        cli_main._migrate_fleet_for_workspace(
+            orchestrator=_make_orchestrator(),
+            config=_make_config(),
+            skip_secrets=True,
+            skip_auth_providers=True,
+            skip_mcp_servers=True,
+            skip_skills=True,
+            skip_agents=False,
+            skip_schedules=True,
+            skip_triggers=True,
+            skip_webhooks=True,
+            skip_usage_limits=True,
+            skip_sandbox_policies=True,
+            agents_owned_only=True,
+        )
+
+    assert _FakeFleetAgentMigrator.list_calls[0]["audiences"] == ("user",)
+
+
+def test_fleet_default_queries_both_audiences():
+    """Without owned-only, both 'user' and 'tenant' audiences are queried."""
+    _reset_fake_calls()
+
+    with _patch_all():
+        cli_main._migrate_fleet_for_workspace(
+            orchestrator=_make_orchestrator(),
+            config=_make_config(),
+            skip_secrets=True,
+            skip_auth_providers=True,
+            skip_mcp_servers=True,
+            skip_skills=True,
+            skip_agents=False,
+            skip_schedules=True,
+            skip_triggers=True,
+            skip_webhooks=True,
+            skip_usage_limits=True,
+            skip_sandbox_policies=True,
+        )
+
+    assert _FakeFleetAgentMigrator.list_calls[0]["audiences"] == ("user", "tenant")
+    assert _FakeFleetAgentMigrator.list_calls[0]["select"] is None
