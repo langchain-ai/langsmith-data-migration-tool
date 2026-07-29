@@ -176,21 +176,22 @@ Environment variables (can also use CLI flags or a `.env` file — auto-loaded o
 
 1. Update version in `pyproject.toml`
 2. Update `CHANGELOG.md` with new version section
-3. Commit and push changes (via PR if branch protection enabled)
-4. Create and push git tag:
+3. Update `README.md` alongside the release changes - CI (`test.yml`'s
+   "Ensure README updated for release changes" check) fails the PR if
+   `pyproject.toml`'s `version` line or `CHANGELOG.md` changed without a
+   corresponding `README.md` change
+4. Commit and push changes (via PR if branch protection enabled)
+5. Create and push git tag:
    ```bash
    git tag -a v0.0.x -m "Release v0.0.x"
    git push origin v0.0.x
    ```
-5. Create GitHub release:
-   ```bash
-   gh release create v0.0.x --title "v0.0.x" --notes "Release notes here"
-   ```
-6. Build and upload artifacts:
-   ```bash
-   uv build
-   gh release upload v0.0.x dist/langsmith_data_migration_tool-0.0.x-py3-none-any.whl dist/langsmith_data_migration_tool-0.0.x.tar.gz
-   ```
+
+Pushing the tag is the last manual step. `.github/workflows/release.yml`
+triggers on the tag push and handles the rest automatically: it builds the
+wheel/sdist, extracts that version's notes from `CHANGELOG.md`, and creates
+(or updates) the GitHub release with the artifacts uploaded - no need to run
+`uv build` or `gh release create`/`upload` by hand.
 
 ### Installing from Release
 
