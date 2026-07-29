@@ -1,5 +1,6 @@
 """Simplified API client with improved separation of concerns."""
 
+import re
 import time
 import requests
 from typing import Dict, Any, Optional, List, Generator, Tuple
@@ -12,6 +13,7 @@ from ..utils.retry import (
     RateLimitError,
     AuthenticationError,
     ConflictError,
+    UpstreamRejectionError,
 )
 from ..utils.pagination import CursorPaginationHelper, PaginationHelper
 
@@ -19,6 +21,26 @@ from ..utils.pagination import CursorPaginationHelper, PaginationHelper
 class NotFoundError(APIError):
     """Resource not found error."""
     pass
+
+
+# C0/C1 control characters, which covers ANSI escape sequence introducers.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def sanitize_upstream_text(text: Optional[str], limit: int = 200) -> str:
+    """Make an untrusted intermediary's response body safe to log and persist.
+
+    A body produced by a proxy or WAF is outside our control, and it lands both on
+    an ANSI-capable console and in on-disk session state and remediation bundles.
+    Strip control characters (so it cannot emit escape sequences), collapse
+    whitespace (HTML error pages are newline-heavy), and truncate.
+    """
+    if not text:
+        return "no response body"
+    cleaned = " ".join(_CONTROL_CHARS.sub("", text).split())
+    if not cleaned:
+        return "no response body"
+    return cleaned[:limit] + "..." if len(cleaned) > limit else cleaned
 
 
 @dataclass
@@ -189,6 +211,27 @@ class EnhancedAPIClient:
             except (ValueError, AttributeError):
                 return response.text[:500] if response.text else "No response body"
 
+        def body_is_json() -> bool:
+            try:
+                response.json()
+                return True
+            except (ValueError, AttributeError):
+                return False
+
+        # An auth-shaped status with a non-JSON body did not come from LangSmith,
+        # which always answers in JSON. Something in front of it refused the
+        # request, so treat it as retryable rather than as a bad API key.
+        if response.status_code in (401, 403) and not body_is_json():
+            self.error_count += 1
+            raise UpstreamRejectionError(
+                f"{response.status_code} for {endpoint} came from an intermediary, not from "
+                f"LangSmith (the response body was not JSON): "
+                f"{sanitize_upstream_text(response.text)}. A proxy, load balancer, or WAF in "
+                "front of LangSmith is refusing these requests. This is often transient.",
+                status_code=response.status_code,
+                request_info=request_info
+            )
+
         # 401 Unauthorized - invalid API key
         if response.status_code == 401:
             self.error_count += 1
@@ -269,8 +312,11 @@ class EnhancedAPIClient:
                 return {}
             return json_response
         except ValueError as e:
+            # Carry the status code so retry_on_failure can judge this. Without it
+            # the status check reads as falsy and even a 5xx becomes terminal.
             raise APIError(
                 f"Invalid JSON response from {endpoint}: {e}",
+                status_code=response.status_code,
                 request_info=request_info
             )
 

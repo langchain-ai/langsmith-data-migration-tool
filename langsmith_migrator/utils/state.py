@@ -418,7 +418,12 @@ class MigrationState:
         item = self.items[item_id]
         item.status = status
         item.last_attempt = _now()
-        item.attempts += 1
+        # Count failures only. This is the budget `get_failed_items` gates resume
+        # on, and a single pass through an item can move it through several
+        # non-failure states (in_progress -> in_progress -> completed), which
+        # would exhaust the budget before the item had failed even once.
+        if status == MigrationStatus.FAILED:
+            item.attempts += 1
 
         if destination_id:
             item.destination_id = destination_id
@@ -521,16 +526,24 @@ class MigrationState:
                     items.append(item)
         return items
 
-    def get_failed_items(self, max_attempts: int = 3) -> List[MigrationItem]:
-        """Get failed items that haven't exceeded max attempts."""
+    def get_failed_items(self, max_attempts: Optional[int] = 3) -> List[MigrationItem]:
+        """Get failed items that haven't exceeded max attempts.
+
+        Pass max_attempts=None to include items that have used up their budget.
+        """
         items = []
         for item in self.items.values():
-            if item.status == MigrationStatus.FAILED and item.attempts < max_attempts:
+            if item.status != MigrationStatus.FAILED:
+                continue
+            if max_attempts is None or item.attempts < max_attempts:
                 items.append(item)
         return items
 
-    def get_resume_items(self, max_attempts: int = 3) -> List[MigrationItem]:
-        """Return items that should be reconsidered by resume."""
+    def get_resume_items(self, max_attempts: Optional[int] = 3) -> List[MigrationItem]:
+        """Return items that should be reconsidered by resume.
+
+        Pass max_attempts=None to also retry items that have used up their budget.
+        """
         items = self.get_pending_items(include_in_progress=True)
         items.extend(self.get_failed_items(max_attempts=max_attempts))
         return items

@@ -12,8 +12,22 @@ from langsmith_migrator.core.api_client import (
     ConflictError,
     EnhancedAPIClient,
     NotFoundError,
+    sanitize_upstream_text,
 )
-from langsmith_migrator.utils.retry import APIError, AuthenticationError, RateLimitError
+from langsmith_migrator.utils.retry import (
+    APIError,
+    AuthenticationError,
+    RateLimitError,
+    UpstreamRejectionError,
+)
+
+# The verbatim body a Google Cloud Armor policy returned in front of a customer's
+# self-hosted LangSmith. LangSmith itself never answers in HTML.
+EDGE_403_BODY = (
+    '<!doctype html><meta charset="utf-8">'
+    '<meta name=viewport content="width=device-width, initial-scale=1">'
+    "<title>403</title>403 Forbidden"
+)
 
 
 def _response(
@@ -115,6 +129,99 @@ def test_get_translates_authentication_error_without_retry(monkeypatch):
         client.get("/orgs/current/members")
 
     assert get_mock.call_count == 1
+
+
+def test_html_bodied_403_is_an_upstream_rejection_and_is_retried(monkeypatch):
+    """A 403 whose body is not JSON came from a proxy/WAF, not from LangSmith."""
+    client = _client()
+    url = "https://langsmith.example.com/api/v1/sessions"
+    post_mock = Mock(
+        return_value=_response(
+            "POST", url, 403, text_body=EDGE_403_BODY, headers={"Content-Type": "text/html"}
+        )
+    )
+    monkeypatch.setattr(client.session, "post", post_mock)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    with pytest.raises(UpstreamRejectionError, match="came from an intermediary"):
+        client.post("/sessions", {"name": "experiment-1"})
+
+    # Retried rather than killing the caller's work item on the first refusal.
+    assert post_mock.call_count == 3
+
+
+def test_html_bodied_401_is_an_upstream_rejection(monkeypatch):
+    client = _client()
+    url = "https://langsmith.example.com/api/v1/sessions/abc"
+    get_mock = Mock(return_value=_response("GET", url, 401, text_body="<html>401</html>"))
+    monkeypatch.setattr(client.session, "get", get_mock)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    with pytest.raises(UpstreamRejectionError) as excinfo:
+        client.get("/sessions/abc")
+
+    assert excinfo.value.status_code == 401
+    assert get_mock.call_count == 3
+
+
+def test_json_bodied_403_stays_a_permission_error_without_retry(monkeypatch):
+    """A real LangSmith permission failure must still fail fast, in one request."""
+    client = _client()
+    url = "https://langsmith.example.com/api/v1/orgs/current/scim/tokens"
+    post_mock = Mock(
+        return_value=_response(
+            "POST",
+            url,
+            403,
+            json_body={"detail": "missing permission organization:manage"},
+        )
+    )
+    monkeypatch.setattr(client.session, "post", post_mock)
+
+    with pytest.raises(AuthenticationError, match="Access denied"):
+        client.post("/orgs/current/scim/tokens", {})
+
+    assert post_mock.call_count == 1
+
+
+def test_upstream_rejection_message_is_sanitized(monkeypatch):
+    """The borrowed body is untrusted, so it must not carry escape sequences through."""
+    client = _client()
+    url = "https://langsmith.example.com/api/v1/sessions"
+    hostile = "<html>\x1b[31mdenied\x1b[0m\n\n\tby   policy\x00</html>"
+    post_mock = Mock(return_value=_response("POST", url, 403, text_body=hostile))
+    monkeypatch.setattr(client.session, "post", post_mock)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    with pytest.raises(UpstreamRejectionError) as excinfo:
+        client.post("/sessions", {})
+
+    message = str(excinfo.value)
+    assert "\x1b" not in message
+    assert "\x00" not in message
+    assert "<html>[31mdenied[0m by policy</html>" in message
+
+
+def test_sanitize_upstream_text_truncates_and_handles_empty():
+    assert sanitize_upstream_text("") == "no response body"
+    assert sanitize_upstream_text(None) == "no response body"
+    assert sanitize_upstream_text("\x00\x01") == "no response body"
+    long_body = "a" * 500
+    sanitized = sanitize_upstream_text(long_body, limit=200)
+    assert sanitized == "a" * 200 + "..."
+
+
+def test_invalid_json_response_carries_status_code(monkeypatch):
+    """Without a status code the retry layer treats even a 5xx as terminal."""
+    client = _client()
+    url = "https://langsmith.example.com/api/v1/sessions"
+    get_mock = Mock(return_value=_response("GET", url, 200, text_body="not-json"))
+    monkeypatch.setattr(client.session, "get", get_mock)
+
+    with pytest.raises(APIError) as excinfo:
+        client.get("/sessions")
+
+    assert excinfo.value.status_code == 200
 
 
 def test_patch_uses_fixed_timeout_and_handles_no_content(monkeypatch):

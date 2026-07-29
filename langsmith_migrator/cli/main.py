@@ -5612,8 +5612,13 @@ def contexts(
 
 @cli.command()
 @ssl_option
+@click.option(
+    "--retry-exhausted",
+    is_flag=True,
+    help="Also retry items that have used up their retry budget",
+)
 @click.pass_context
-def resume(ctx):
+def resume(ctx, retry_exhausted):
     """Resume a previous migration session (retry pending/failed items)."""
     config = ctx.obj["config"]
     state_manager = ctx.obj["state_manager"]
@@ -5659,7 +5664,11 @@ def resume(ctx):
         config.state_manager = state_manager
 
         # Get resumable items
-        resume_items = state.get_resume_items()
+        resume_items = state.get_resume_items(
+            max_attempts=None if retry_exhausted else 3
+        )
+        if retry_exhausted:
+            console.print("[dim]Including items that used up their retry budget[/dim]")
         actionable_groups = state.get_actionable_groups()
 
         console.print(f"\nResumable items: {len(resume_items)}")

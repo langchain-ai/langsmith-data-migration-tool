@@ -54,6 +54,20 @@ class ConflictError(APIError):
         super().__init__(message, 409, request_info)
 
 
+class UpstreamRejectionError(APIError):
+    """An auth-shaped rejection (401/403) that did not come from LangSmith.
+
+    LangSmith always returns JSON error bodies, so a non-JSON body on a 401/403
+    means an intermediary - a proxy, load balancer, or WAF - refused the request
+    before it reached LangSmith. Those rejections are frequently transient
+    (rate-based rules, a dropped VPN, a changed egress IP), so unlike
+    AuthenticationError this is retryable.
+    """
+
+    def __init__(self, message: str, status_code: int, request_info: dict = None):
+        super().__init__(message, status_code, request_info)
+
+
 def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
     """
     Decorator to retry failed API calls with exponential backoff.
@@ -84,6 +98,16 @@ def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 
                         wait_time = min(current_delay * 2, MAX_BACKOFF_SECONDS)
                     time.sleep(wait_time)
                     current_delay = min(current_delay * backoff, MAX_BACKOFF_SECONDS)
+                except UpstreamRejectionError as e:
+                    # An intermediary refused this before LangSmith saw it. Often
+                    # transient, so retry rather than killing the caller's work item.
+                    # Must precede the APIError clause below, which would re-raise it.
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        wait_time = min(current_delay, MAX_BACKOFF_SECONDS)
+                        time.sleep(wait_time)
+                        current_delay = min(current_delay * backoff, MAX_BACKOFF_SECONDS)
+                    continue
                 except AuthenticationError:
                     # Never retry auth errors - they won't succeed without user intervention
                     raise

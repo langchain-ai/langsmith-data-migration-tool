@@ -409,8 +409,36 @@ class ExperimentMigrator(BaseMigrator):
                 try:
                     response = self.source.post("/runs/query", payload)
                 except Exception as e:
+                    # Do not swallow this. Breaking out leaves the failure counter at
+                    # zero, so the caller concludes the run stage succeeded and moves
+                    # on to feedback - producing an empty experiment on the destination
+                    # that gets reported as a feedback problem. Raise so the caller
+                    # marks the item failed with the real error. The per-page
+                    # run_cursor checkpoint above means resume picks up where we
+                    # stopped rather than re-walking the experiment.
                     self.log(f"Error querying runs for experiment {experiment_id}: {e}", "error")
-                    break
+                    if experiment_item:
+                        issue = self.record_issue(
+                            "transient",
+                            "run_query_failed",
+                            f"Could not query source runs for experiment {experiment_id}",
+                            item_id=experiment_item_id,
+                            next_action="Re-run `langsmith-migrator resume` to continue from the last cursor.",
+                            evidence={
+                                "error": str(e),
+                                "page": page_num,
+                                "cursor": payload.get("cursor"),
+                                "runs_migrated_before_failure": experiment_runs_created,
+                            },
+                        )
+                        if issue:
+                            self.queue_remediation(
+                                issue_id=issue.id,
+                                next_action=issue.next_action or "Retry the source run query.",
+                                item_id=experiment_item_id,
+                                command="langsmith-migrator resume",
+                            )
+                    raise
 
                 runs = response.get("runs", [])
 

@@ -186,7 +186,13 @@ class FeedbackMigrator(BaseMigrator):
             run_id_mapping: Mapping of source run IDs to destination IDs
 
         Returns:
-            Tuple of (total_feedback_found, total_feedback_migrated)
+            Tuple of (total_feedback_found, total_feedback_accounted_for).
+
+            The second element counts every record now present on the destination,
+            which is the records created on this pass plus those a previous pass
+            already replayed. Callers compare the two to decide whether an
+            experiment's feedback is complete, so counting only this pass would
+            report an already-complete experiment as failed.
         """
         if not experiment_id_mapping:
             self.log("No experiments to migrate feedback for", "info")
@@ -213,14 +219,16 @@ class FeedbackMigrator(BaseMigrator):
 
             # Transform feedback for destination
             migrated_feedbacks = []
-            skipped = 0
+            unmapped_runs = 0
+            already_replayed = 0
 
             for fb in feedbacks:
                 fingerprint = self._feedback_fingerprint(source_exp_id, fb)
                 if self.state and self.state.get_mapped_id("feedback_fingerprint", fingerprint):
+                    already_replayed += 1
                     self.log(
                         f"Skipping feedback '{fb.get('key')}' - already replayed in a prior attempt",
-                        "warning",
+                        "info",
                     )
                     continue
 
@@ -235,7 +243,7 @@ class FeedbackMigrator(BaseMigrator):
                             f"Skipping feedback '{fb.get('key')}' - run {source_run_id} not in mapping",
                             "warning"
                         )
-                        skipped += 1
+                        unmapped_runs += 1
                         continue
                 else:
                     dest_run_id = None
@@ -261,53 +269,70 @@ class FeedbackMigrator(BaseMigrator):
                 migrated_fb["_fingerprint"] = fingerprint
                 migrated_feedbacks.append(migrated_fb)
 
-            if skipped > 0:
-                self.log(f"Skipped {skipped} feedback records due to unmapped runs", "warning")
+            if unmapped_runs > 0:
+                self.log(f"Skipped {unmapped_runs} feedback records due to unmapped runs", "warning")
+            if already_replayed > 0:
+                self.log(
+                    f"{already_replayed} feedback record(s) were already replayed on an earlier pass",
+                    "info",
+                )
 
             # Create feedback in destination
+            created = 0
+            created_feedbacks: List[Dict[str, Any]] = []
             if migrated_feedbacks:
                 created, created_feedbacks = self.create_feedback_batch(migrated_feedbacks)
-                total_migrated += created
                 self.log(
                     f"Migrated {created}/{len(migrated_feedbacks)} feedback for experiment {source_exp_id}",
                     "success"
                 )
-                if self.state:
-                    for migrated_fb in created_feedbacks:
-                        fingerprint = migrated_fb.get("_fingerprint")
-                        if fingerprint:
-                            self.state.set_mapped_id(
-                                "feedback_fingerprint", fingerprint, fingerprint
-                            )
-                    if created == len(migrated_feedbacks):
-                        self.checkpoint_item(
-                            experiment_item_id,
-                            stage="completed",
-                            metadata={
-                                "feedback_found": len(feedbacks),
-                                "feedback_migrated": created,
-                                "feedback_verified": True,
-                            },
+
+            # Records replayed on an earlier pass are already on the destination, so
+            # they count toward this experiment being complete. Counting only the
+            # records created on *this* pass makes a fully-migrated experiment look
+            # like a failure on every subsequent run, and one that can never recover.
+            accounted = created + already_replayed
+            total_migrated += accounted
+
+            if self.state:
+                for migrated_fb in created_feedbacks:
+                    fingerprint = migrated_fb.get("_fingerprint")
+                    if fingerprint:
+                        self.state.set_mapped_id(
+                            "feedback_fingerprint", fingerprint, fingerprint
                         )
-                    elif created < len(migrated_feedbacks):
-                        issue = self.record_issue(
-                            "transient",
-                            "feedback_partial_replay",
-                            f"Some feedback could not be replayed for experiment {source_exp_id}",
+                if accounted == len(feedbacks):
+                    self.checkpoint_item(
+                        experiment_item_id,
+                        stage="completed",
+                        metadata={
+                            "feedback_found": len(feedbacks),
+                            "feedback_migrated": accounted,
+                            "feedback_verified": True,
+                        },
+                    )
+                else:
+                    issue = self.record_issue(
+                        "transient",
+                        "feedback_partial_replay",
+                        f"Some feedback could not be replayed for experiment {source_exp_id}",
+                        item_id=experiment_item_id,
+                        next_action="Re-run `langsmith-migrator resume` to retry feedback creation.",
+                        evidence={
+                            "feedback_found": len(feedbacks),
+                            "feedback_migrated": accounted,
+                            "already_replayed": already_replayed,
+                            "unmapped_runs": unmapped_runs,
+                            "create_failures": len(migrated_feedbacks) - created,
+                        },
+                    )
+                    if issue:
+                        self.queue_remediation(
+                            issue_id=issue.id,
+                            next_action=issue.next_action or "Retry feedback replay.",
                             item_id=experiment_item_id,
-                            next_action="Re-run `langsmith-migrator resume` to retry feedback creation.",
-                            evidence={
-                                "feedback_found": len(feedbacks),
-                                "feedback_migrated": created,
-                            },
+                            command="langsmith-migrator resume",
                         )
-                        if issue:
-                            self.queue_remediation(
-                                issue_id=issue.id,
-                                next_action=issue.next_action or "Retry feedback replay.",
-                                item_id=experiment_item_id,
-                                command="langsmith-migrator resume",
-                            )
-                    self.persist_state()
+                self.persist_state()
 
         return total_found, total_migrated
