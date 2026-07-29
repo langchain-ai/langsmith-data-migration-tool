@@ -1,6 +1,6 @@
 """Fleet agent migration logic."""
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Iterable, Optional
 import copy
 
 from .base import BaseMigrator
@@ -10,18 +10,33 @@ from ..api_client import NotFoundError
 class FleetAgentMigrator(BaseMigrator):
     """Handles migration of Fleet agents with cross-reference remapping."""
 
-    def list_agents(self) -> List[Dict[str, Any]]:
-        """List all agent summaries from the source workspace.
+    def list_agents(
+        self,
+        *,
+        audiences: Iterable[str] = ("user", "tenant"),
+        select: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        """List agent summaries from the source workspace.
 
         The Fleet API splits agent listing into two audiences: ``user``
         (owned + directly-shared, the default) and ``tenant``
         (workspace-shared). There is no single call that returns both,
         so we issue both and merge with dedup by agent ID.
+
+        Args:
+            audiences: Which Fleet audiences to query. Defaults to both
+                (``user`` and ``tenant``). Pass ``("user",)`` to restrict to
+                agents owned by or directly shared with the authenticated
+                user ("owned-only").
+            select: If provided, keep only agents whose ``id`` or ``name``
+                is in this set. Selectors that match nothing are logged as a
+                warning so typos surface instead of silently migrating
+                nothing.
         """
         agents: List[Dict[str, Any]] = []
         seen_ids: set = set()
 
-        for audience in ("user", "tenant"):
+        for audience in audiences:
             try:
                 for agent in self.source.get_cursor_paginated(
                     "/v1/fleet/agents", params={"audience": audience}
@@ -38,7 +53,40 @@ class FleetAgentMigrator(BaseMigrator):
             except Exception as e:
                 self.log(f"Failed to list Fleet agents (audience={audience}): {e}", "warning")
 
+        if select:
+            agents = self._filter_selected(agents, select)
+
         return agents
+
+    def _filter_selected(
+        self, agents: List[Dict[str, Any]], select: set
+    ) -> List[Dict[str, Any]]:
+        """Keep only agents whose id or name is in ``select``.
+
+        Warns about any selector value that matched no source agent, which
+        makes name typos visible rather than silently migrating nothing.
+        """
+        selected: List[Dict[str, Any]] = []
+        matched: set = set()
+        for agent in agents:
+            agent_id = agent.get("id")
+            name = agent.get("name")
+            if agent_id in select or name in select:
+                selected.append(agent)
+                if agent_id in select:
+                    matched.add(agent_id)
+                if name in select:
+                    matched.add(name)
+
+        unmatched = set(select) - matched
+        if unmatched:
+            self.log(
+                "No source agent matched selector(s): "
+                + ", ".join(sorted(unmatched)),
+                "warning",
+            )
+
+        return selected
 
     def list_dest_models(self) -> List[str]:
         """List available model IDs on the destination instance."""
