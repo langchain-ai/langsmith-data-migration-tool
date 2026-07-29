@@ -226,7 +226,8 @@ langsmith-migrator clean
 - `prompts`: migrate prompts, optionally with full commit history
 - `rules`: migrate automation rules with project mapping controls
 - `charts`: migrate monitoring charts, either all sessions or one named session/project
-- `fleet`: migrate Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets) with `--skip-*` flags for each resource type
+- `fleet`: migrate Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets) with `--skip-*` flags for each resource type, and `--agent <name-or-id>` / `--agents-owned-only` to scope which agents (and their schedules/triggers/usage limits) are migrated
+- `issues`: migrate Engine issues-agent configs and detected issues as metadata (`--session` to scope to one tracing project)
 - `contexts`: migrate Context Hub agents and skills, replaying full commit history and tags by default (`--latest-only`, `--no-tags`, `--agents-only`, `--skills-only`, `--include-external`, `--same-instance`)
 - `users`: migrate users/roles between instances, or run single-instance CSV access sync
 - `export-users`: export active org and workspace members to a members CSV for import via `users --members-csv`
