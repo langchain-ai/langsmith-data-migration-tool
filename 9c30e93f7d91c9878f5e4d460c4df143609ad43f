@@ -1,0 +1,19 @@
+README.md
+  s_ddcd30be794385::t_da524f9fa3def1 539-546
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "9c30e93f7d91c9878f5e4d460c4df143609ad43f",
+  "prompts": {},
+  "sessions": {
+    "s_ddcd30be794385": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "594becd1-a734-4706-b1b9-1bb9d2fd71dd",
+        "model": "claude-opus-5"
+      },
+      "human_author": "lc-chad <chad@langchain.dev>"
+    }
+  }
+}
