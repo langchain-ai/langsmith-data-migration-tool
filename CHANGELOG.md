@@ -57,8 +57,8 @@ and the summary misattributed the whole thing to feedback replay.
   experiment was created on the destination **containing no runs** and the only
   visible symptom was `feedback replay incomplete (0/N migrated)`. The failure
   now records a `run_query_failed` issue and propagates, so the item is marked
-  failed with the real error. Per-page `run_cursor` checkpointing is unchanged,
-  so `resume` continues from where it stopped.
+  failed with the real error. A page cursor advances only after its buffered runs
+  are written; failed writes retain the current cursor for a safe replay.
 - **One failed pass no longer exhausts an item's retry budget**:
   `update_item_status` incremented `attempts` on *every* status change,
   including `pending -> in_progress` and `-> completed`. A single failing pass
@@ -70,8 +70,9 @@ and the summary misattributed the whole thing to feedback replay.
   migrated. A fully migrated experiment therefore reported `0/N` and was marked
   failed on every subsequent run, and could never reach a verified state.
   Already-replayed records now count toward completion, and `feedback_verified`
-  is set only when every record is accounted for. Genuine gaps (unmapped runs,
-  failed creates) still report, now with a breakdown of each cause.
+  is set only when every record is accounted for. Source feedback query failures
+  propagate instead of verifying an empty or partial inventory. Genuine gaps
+  (unmapped runs, failed creates) still report with a per-cause breakdown.
 
 ## [0.0.81] - 2026-07-27
 

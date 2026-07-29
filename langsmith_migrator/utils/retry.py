@@ -68,6 +68,25 @@ class UpstreamRejectionError(APIError):
         super().__init__(message, status_code, request_info)
 
 
+def retry_upstream_rejections(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            current_delay = delay
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except UpstreamRejectionError:
+                    if attempt >= max_retries - 1:
+                        raise
+                    time.sleep(min(current_delay, MAX_BACKOFF_SECONDS))
+                    current_delay = min(current_delay * backoff, MAX_BACKOFF_SECONDS)
+
+        return wrapper
+
+    return decorator
+
+
 def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
     """
     Decorator to retry failed API calls with exponential backoff.

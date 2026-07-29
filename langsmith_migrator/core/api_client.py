@@ -9,6 +9,7 @@ from rich.console import Console
 
 from ..utils.retry import (
     retry_on_failure,
+    retry_upstream_rejections,
     APIError,
     RateLimitError,
     AuthenticationError,
@@ -368,7 +369,8 @@ class EnhancedAPIClient:
         response = self.session.post(url, json=data, timeout=self.timeout)
         return self._handle_response(response, endpoint)
 
-    @retry_on_failure(max_retries=1)  # Reduce retries for PATCH - if it fails once, likely to keep failing
+    @retry_upstream_rejections(max_retries=3)
+    @retry_on_failure(max_retries=1)
     def patch(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Make a PATCH request.
@@ -393,6 +395,7 @@ class EnhancedAPIClient:
         response = self.session.patch(url, json=data, timeout=15)
         return self._handle_response(response, endpoint)
 
+    @retry_upstream_rejections(max_retries=3)
     @retry_on_failure(max_retries=1)
     def delete(self, endpoint: str) -> Dict[str, Any]:
         """
@@ -415,6 +418,7 @@ class EnhancedAPIClient:
         response = self.session.delete(url, timeout=15)
         return self._handle_response(response, endpoint)
 
+    @retry_upstream_rejections(max_retries=3)
     @retry_on_failure(max_retries=1)
     def put(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """

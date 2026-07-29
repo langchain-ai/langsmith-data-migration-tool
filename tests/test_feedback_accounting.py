@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+import pytest
+
 from langsmith_migrator.core.api_client import EnhancedAPIClient
 from langsmith_migrator.core.migrators import FeedbackMigrator
 
@@ -56,7 +58,8 @@ def test_first_pass_reports_everything_migrated(sample_config, migration_state):
 
     assert (found, accounted) == (3, 3)
     item = migration_state.get_item("experiment_exp-src")
-    assert item.metadata["feedback_verified"] is True
+    assert item.metadata["feedback_migrated"] == 3
+    assert item.metadata.get("feedback_verified") is not True
 
 
 def test_second_pass_counts_already_replayed_records(sample_config, migration_state):
@@ -86,7 +89,9 @@ def test_second_pass_counts_already_replayed_records(sample_config, migration_st
     assert first_pass_posts == 3
     assert dest.post.call_count == 0, "already-replayed feedback must not be re-posted"
     assert (found, accounted) == (3, 3), "an already-complete experiment is not a failure"
-    assert migration_state.get_item("experiment_exp-src").metadata["feedback_verified"] is True
+    item = migration_state.get_item("experiment_exp-src")
+    assert item.metadata["feedback_migrated"] == 3
+    assert item.metadata.get("feedback_verified") is not True
 
 
 def test_partial_pass_still_reports_a_shortfall(sample_config, migration_state):
@@ -108,6 +113,30 @@ def test_partial_pass_still_reports_a_shortfall(sample_config, migration_state):
     assert item.metadata.get("feedback_verified") is not True
     issue = next(i for i in migration_state.issue_log if i.code == "feedback_partial_replay")
     assert issue.evidence["unmapped_runs"] == 2
+
+
+def test_source_query_failure_does_not_verify_a_partial_inventory(
+    sample_config,
+    migration_state,
+):
+    feedbacks = [_feedback(i) for i in range(100)]
+    source, dest = _clients(feedbacks)
+    source.get.side_effect = [feedbacks, RuntimeError("connection reset")]
+    migration_state.ensure_item(
+        "experiment_exp-src", "experiment", "exp-1", "exp-src", stage="migrate_feedback"
+    )
+    run_mapping = {f"run-{i}": f"dest-run-{i}" for i in range(100)}
+
+    with pytest.raises(RuntimeError, match="connection reset"):
+        _migrator(source, dest, sample_config, migration_state).migrate_feedback_for_experiments(
+            {"exp-src": "exp-dst"}, run_mapping
+        )
+
+    dest.post.assert_not_called()
+    item = migration_state.get_item("experiment_exp-src")
+    assert item.metadata.get("feedback_verified") is not True
+    issue = next(i for i in migration_state.issue_log if i.code == "feedback_query_failed")
+    assert issue.item_id == "experiment_exp-src"
 
 
 def test_create_failures_are_reported_and_retried_next_pass(sample_config, migration_state):
@@ -143,4 +172,6 @@ def test_create_failures_are_reported_and_retried_next_pass(sample_config, migra
 
     assert dest.post.call_count == 1
     assert (found, accounted) == (2, 2)
-    assert migration_state.get_item("experiment_exp-src").metadata["feedback_verified"] is True
+    item = migration_state.get_item("experiment_exp-src")
+    assert item.metadata["feedback_migrated"] == 2
+    assert item.metadata.get("feedback_verified") is not True

@@ -150,6 +150,52 @@ def test_html_bodied_403_is_an_upstream_rejection_and_is_retried(monkeypatch):
     assert post_mock.call_count == 3
 
 
+@pytest.mark.parametrize(
+    ("method_name", "payload"),
+    [
+        ("patch", {"name": "updated"}),
+        ("put", {"name": "updated"}),
+        ("delete", None),
+    ],
+)
+def test_idempotent_write_methods_retry_upstream_rejections(
+    monkeypatch,
+    method_name,
+    payload,
+):
+    client = _client()
+    endpoint = "/resources/resource-1"
+    url = f"https://langsmith.example.com/api/v1{endpoint}"
+    request_method = method_name.upper()
+    request_mock = Mock(
+        side_effect=[
+            _response(request_method, url, 403, text_body=EDGE_403_BODY),
+            _response(request_method, url, 204),
+        ]
+    )
+    monkeypatch.setattr(client.session, method_name, request_mock)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    if payload is None:
+        result = getattr(client, method_name)(endpoint)
+    else:
+        result = getattr(client, method_name)(endpoint, payload)
+
+    assert result == {}
+    assert request_mock.call_count == 2
+
+
+def test_patch_does_not_retry_ambiguous_network_failures(monkeypatch):
+    client = _client()
+    patch_mock = Mock(side_effect=requests.exceptions.ConnectionError("response lost"))
+    monkeypatch.setattr(client.session, "patch", patch_mock)
+
+    with pytest.raises(requests.exceptions.ConnectionError, match="response lost"):
+        client.patch("/resources/resource-1", {"name": "updated"})
+
+    assert patch_mock.call_count == 1
+
+
 def test_html_bodied_401_is_an_upstream_rejection(monkeypatch):
     client = _client()
     url = "https://langsmith.example.com/api/v1/sessions/abc"

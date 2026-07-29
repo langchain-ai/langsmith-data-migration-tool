@@ -49,6 +49,40 @@ def test_failed_run_query_raises_instead_of_reporting_zero_runs(
     dest.post.assert_not_called()
 
 
+def test_later_query_failure_does_not_skip_a_buffered_page(
+    sample_config,
+    migration_state,
+):
+    source, dest = _clients()
+    source_run = {
+        "id": "run-1",
+        "name": "run-1",
+        "run_type": "chain",
+        "session_id": "exp-src",
+        "dotted_order": "20260101T000000000000Z11111111-1111-1111-1111-111111111111",
+    }
+    source.post.side_effect = [
+        {"runs": [source_run], "cursors": {"next": "cursor-2"}},
+        RuntimeError("connection reset"),
+    ]
+    dest.post.return_value = {"errors": []}
+    migration_state.ensure_item(
+        "experiment_exp-src", "experiment", "exp-1", "exp-src", stage="migrate_runs"
+    )
+
+    migrator = ExperimentMigrator(source, dest, migration_state, sample_config)
+
+    with pytest.raises(RuntimeError, match="connection reset"):
+        migrator.migrate_runs_streaming(
+            ["exp-src"],
+            {"experiments": {"exp-src": "exp-dst"}, "examples": {}},
+        )
+
+    assert dest.post.call_count == 1
+    assert migration_state.get_mapped_id("run", "run-1") is not None
+    assert migration_state.get_item("experiment_exp-src").metadata["run_cursor"] == "cursor-2"
+
+
 def test_failed_run_query_records_a_run_query_issue(sample_config, migration_state):
     """The operator needs the real error, not a downstream feedback symptom."""
     source, dest = _clients()

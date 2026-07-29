@@ -70,8 +70,8 @@ class FeedbackMigrator(BaseMigrator):
                 offset += limit
 
             except Exception as e:
-                self.log(f"Error fetching feedback for session {session_id}: {e}", "warning")
-                break
+                self.log(f"Error fetching feedback for session {session_id}: {e}", "error")
+                raise
 
         return all_feedback
 
@@ -120,8 +120,8 @@ class FeedbackMigrator(BaseMigrator):
                     offset += limit
 
                 except Exception as e:
-                    self.log(f"Error fetching feedback for runs: {e}", "warning")
-                    break
+                    self.log(f"Error fetching feedback for runs: {e}", "error")
+                    raise
 
         return all_feedback
 
@@ -207,8 +207,26 @@ class FeedbackMigrator(BaseMigrator):
             if self.state:
                 self.checkpoint_item(experiment_item_id, stage="migrate_feedback")
 
-            # Fetch feedback for this experiment session
-            feedbacks = self.list_feedback_for_session(source_exp_id)
+            try:
+                feedbacks = self.list_feedback_for_session(source_exp_id)
+            except Exception as e:
+                if self.state:
+                    issue = self.record_issue(
+                        "transient",
+                        "feedback_query_failed",
+                        f"Could not query source feedback for experiment {source_exp_id}",
+                        item_id=experiment_item_id,
+                        next_action="Re-run `langsmith-migrator resume` to retry the feedback query.",
+                        evidence={"error": str(e)},
+                    )
+                    if issue:
+                        self.queue_remediation(
+                            issue_id=issue.id,
+                            next_action=issue.next_action or "Retry the source feedback query.",
+                            item_id=experiment_item_id,
+                            command="langsmith-migrator resume",
+                        )
+                raise
 
             if not feedbacks:
                 self.log(f"No feedback found for experiment {source_exp_id}", "info")
@@ -304,11 +322,10 @@ class FeedbackMigrator(BaseMigrator):
                 if accounted == len(feedbacks):
                     self.checkpoint_item(
                         experiment_item_id,
-                        stage="completed",
+                        stage="migrate_feedback",
                         metadata={
                             "feedback_found": len(feedbacks),
                             "feedback_migrated": accounted,
-                            "feedback_verified": True,
                         },
                     )
                 else:

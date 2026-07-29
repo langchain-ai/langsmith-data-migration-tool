@@ -500,6 +500,26 @@ class MigrationOrchestrator:
                 self.state_manager.save()
 
             current_item = self.state.get_item(item_id)
+            if (
+                current_item
+                and current_item.stage == "completed"
+                and current_item.metadata.get("feedback_verified")
+                and not current_item.terminal_state
+            ):
+                self.state.mark_terminal(
+                    item_id,
+                    ResolutionOutcome.MIGRATED,
+                    "experiment_migrated",
+                    verification_state=VerificationState.VERIFIED,
+                    evidence={
+                        "destination_experiment_id": dest_experiment_id,
+                        "feedback_found": current_item.metadata.get("feedback_found", 0),
+                        "feedback_migrated": current_item.metadata.get("feedback_migrated", 0),
+                    },
+                )
+                self.state_manager.save()
+                return True, "migrated"
+
             if current_item and (
                 current_item.stage in {"migrate_feedback", "completed"}
                 and not current_item.metadata.get("feedback_verified")
