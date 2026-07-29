@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.82] - 2026-07-29
+
 ### Added
 - **Selective Fleet agent migration (`fleet`)**: The `fleet` command could
   previously migrate **all** agents in a workspace or **none**
@@ -28,10 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key off the agent map built in the agents phase, so they scope to the
   selected agents with no extra flags. Default behavior with neither flag is
   unchanged.
-
-## [0.0.82] - 2026-07-27
-
-### Added
 - **Engine issue migration (`issues`)**: New `issues` command migrates
   LangSmith Engine resources between instances: per-project issues-agent
   configs (`/v1/platform/sessions/{id}/issues-agent`) and detected issues
