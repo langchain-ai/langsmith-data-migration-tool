@@ -67,6 +67,8 @@ By default `issues` migrates every Engine issue and issues-agent config in the w
 
 Only tracing projects that actually have Engine data (an issues-agent config or detected issues) are mapped/created on the destination -- the tool fetches the Engine data first and then maps only the projects it references, so other tracing projects in the workspace are never recreated. Project mapping also only considers real tracing projects (it applies the same `reference_free` filter the UI uses for "Exclude Experiments"), so experiment/test-run sessions are never recreated either. Note that a raw `GET /api/v1/sessions` call returns both tracing projects and experiment sessions, so the API project count can be higher than what the UI shows by default.
 
+In interactive mode, selecting a subset of issues-agent configs also scopes which projects' detected issues are migrated: if you pick a single project's config, only that project's issues are offered next. Use `--session` for a headless single-project run (which also skips the project-mapping prompt).
+
 The command is idempotent. Issues-agent configs are skipped if the destination project already has one, and detected issues are skipped if an issue with the same name already exists in the destination project (issue names are unique within a project). Re-running `issues` only migrates what is missing, so it is safe to run repeatedly. If the destination issue list can't be fetched, the tool falls back to creating issues rather than blocking.
 
 ### Fleet Secrets and Auth Provider Secrets Are Write-Only
