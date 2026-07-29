@@ -8,6 +8,7 @@ from .annotation_queue import AnnotationQueueMigrator
 from .context_hub import ContextHubMigrator
 from .prompt import PromptMigrator
 from .rules import RulesMigrator
+from .issue import IssueMigrator
 from .chart import ChartMigrator
 from .user_role import UserRoleMigrator
 from .orchestrator import MigrationOrchestrator
@@ -31,6 +32,7 @@ __all__ = [
     "ContextHubMigrator",
     "PromptMigrator",
     "RulesMigrator",
+    "IssueMigrator",
     "ChartMigrator",
     "UserRoleMigrator",
     "MigrationOrchestrator",

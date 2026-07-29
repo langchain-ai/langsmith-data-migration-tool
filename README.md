@@ -1,12 +1,12 @@
 # LangSmith Data Migration Tool
 
-A Python CLI for migrating users and roles, datasets, experiments, annotation queues, project rules, prompts, charts, and Fleet resources between LangSmith instances, plus CSV-driven access sync for a single LangSmith deployment.
+A Python CLI for migrating users and roles, datasets, experiments, annotation queues, project rules, prompts, charts, Engine issues, and Fleet resources between LangSmith instances, plus CSV-driven access sync for a single LangSmith deployment.
 
 ## Quick Start
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.82-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -31,6 +31,7 @@ langsmith-migrator datasets
 - **Project Rules**: Copy automation rules with project mapping and optional project creation in interactive flows
 - **Prompts**: Migrate prompts (latest by default, full history with `--include-all-commits`)
 - **Charts**: Migrate monitoring charts with filter preservation
+- **Engine Issues**: Migrate per-project LangSmith Engine issues-agent configs and detected issues as metadata (`issues`). Run links and trace deep-links are not migrated (see Limitations)
 - **Fleet**: Migrate agents, shared skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, and workspace secrets (`fleet`)
 - **Context Hub**: Migrate Context Hub agents and skills (the versioned agent/skill repos in the LangSmith Context Hub), including files and repo metadata (description, readme, tags, is_public) (`contexts`). Replays the **full commit history** by default so the destination reproduces the source's commit chain; use `--latest-only` to copy just the latest commit. Also copies **commit tags**, including the `production` / `staging` environment tags behind the Context Hub promote feature, pointing each at the same commit on the destination (`--no-tags` to skip). Lists the same contexts the Context Hub UI shows (external-source repos are hidden by default; use `--include-external` to migrate them too). Scope with `--agents-only` / `--skills-only`; linked-repo commit pins are stripped and reported cross-instance, or preserved with `--same-instance`
 - **Workspace Scoping**: Run resource migrations per workspace pair with explicit IDs or interactive workspace mapping
@@ -48,10 +49,25 @@ This tool **does not support migrating trace data**. It migrates:
 - Project rules
 - Prompts
 - Charts
+- LangSmith Engine issues-agent configs and detected issue metadata
 - Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets)
 - Context Hub agents and skills (full commit history)
 
 For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
+
+### Engine Issue Run Links and Trace Deep-Links Are Not Migrated
+
+The `issues` command migrates two LangSmith Engine resource types: per-project issues-agent configs and the detected issues themselves. Detected issues are migrated as **metadata only** (name, description, severity, status, tags, plus the Engine-authored `proposed_fix` and `fix_prompt`).
+
+An issue's linked runs are **not** migrated. Issues reference runs by `run_id`/`trace_id`, and trace data is not portable across instances (see "Trace Data Not Supported" above). The destination validates every `run_id` against its own run store, so links pointing at source runs would be rejected. The tool never sends the linked-run list when recreating an issue. To repopulate run links, run Engine on the destination so it re-detects issues against the destination's own traces. For the same reason, `fix_branch`/`fix_pr_number` (source-instance GitHub references) and Engine-generated advisory `actions` are also not sent on create.
+
+Issues-agent configs are recreated with source-instance-only fields stripped (`latest_thread_id`, `latest_run_id`, issue counts, tenant, timestamps). GitHub/Context-Hub linkage (`github_repo_url`, `context_hub_repo_handle`, etc.) is carried over but only works if the destination has the corresponding integrations configured. Engine-generated advisory `actions` on an issue (e.g. suggested evaluators) are not migrated: the destination re-validates them strictly on create and regenerates them when Engine runs there. Tip: migrate datasets/projects first (or use `migrate-all`) so issues map onto existing projects instead of freshly-created empty ones.
+
+By default `issues` migrates every Engine issue and issues-agent config in the workspace. Use `--session <name-or-ID>` to scope the migration to a single tracing project (like the `charts` command's `--session` flag).
+
+Only tracing projects that actually have Engine data (an issues-agent config or detected issues) are mapped/created on the destination -- the tool fetches the Engine data first and then maps only the projects it references, so other tracing projects in the workspace are never recreated. Project mapping also only considers real tracing projects (it applies the same `reference_free` filter the UI uses for "Exclude Experiments"), so experiment/test-run sessions are never recreated either. Note that a raw `GET /api/v1/sessions` call returns both tracing projects and experiment sessions, so the API project count can be higher than what the UI shows by default.
+
+The command is idempotent. Issues-agent configs are skipped if the destination project already has one, and detected issues are skipped if an issue with the same name already exists in the destination project (issue names are unique within a project). Re-running `issues` only migrates what is missing, so it is safe to run repeatedly. If the destination issue list can't be fetched, the tool falls back to creating issues rather than blocking.
 
 ### Fleet Secrets and Auth Provider Secrets Are Write-Only
 
@@ -99,20 +115,20 @@ The destination's `POST /runs/batch` endpoint rejects runs with timestamps outsi
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.82-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.82-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.82-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.81-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.82-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -476,7 +492,7 @@ When `--skip-users` is omitted, `migrate-all` runs user/role migration as Step 0
 
 Rules and charts reference projects by ID. When migrating between instances, project IDs differ.
 
-- **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input, and pressing `Enter` on a unique suggestion records the destination project ID used by downstream chart/rule validation. Supports auto-match by name, skip, and custom name entry. For ID-based chart/rule remapping, unresolved text entries remain unmapped instead of being counted as resolved.
+- **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, `issues`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input, and pressing `Enter` on a unique suggestion records the destination project ID used by downstream chart/rule validation. Supports auto-match by name, skip, and custom name entry. For ID-based chart/rule remapping, unresolved text entries remain unmapped instead of being counted as resolved.
 - **Headless mapping (`--project-mapping`)**: Available on `rules`, `charts`, and `migrate-all`. Supply an explicit source->destination project ID mapping as a JSON string or a file path (e.g. `'{"<source-project-id>": "<dest-project-id>"}'`). Use `list-projects --source` and `list-projects --dest` to get IDs. This runs the mapping with no interactive TUI, so the migration can be driven from a backend/CI onboarding job. For `rules`, the mapping is applied to both top-level project associations and project IDs embedded inside rule filters. Mutually exclusive with `--map-projects`.
 - **Rules queue targets**: When a rule references an annotation queue, the migrator first reuses any saved queue migration mapping, then falls back to an exact-name queue match in the destination workspace. If neither is safe, the rule is exported for remediation instead of being posted with the source queue ID.
 - **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination. When both sides point at the same deployment URL but use different API keys/workspaces, charts still remap project/session IDs; the tool does not treat that as `--same-instance`. Workspace-scoped `--map-projects` mappings are resolved against the active workspace pair so duplicate project names in other workspaces are ignored. Chart dependency validation also verifies that saved destination project IDs still exist before migration. Chart filters are normalized to the destination API's `session`/`session_id` project-scoping shape before create or update.
