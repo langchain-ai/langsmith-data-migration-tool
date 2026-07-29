@@ -1,0 +1,53 @@
+tests/test_api_client.py
+  s_ddcd30be794385::t_fa465b6395aa6f 15-29
+  s_ddcd30be794385::t_d6c96da803b123 214
+  s_ddcd30be794385::t_cdff7057ffa773 134-213,215-226
+langsmith_migrator/core/api_client.py
+  s_ddcd30be794385::t_7949d3b629f615 214-234
+  s_ddcd30be794385::t_a69478a4940d76 315-316,319
+  s_ddcd30be794385::t_cd1e11a105599d 3,16,26-43
+  s_ddcd30be794385::t_b8a62ec9832071 44-45
+langsmith_migrator/utils/retry.py
+  s_ddcd30be794385::t_01702c856c8c33 57-70
+  s_ddcd30be794385::t_bc6d767b68edc0 101-110
+tests/test_experiment_run_query_failure.py
+  s_ddcd30be794385::t_197c81ed5be30d 1-67,69,71-103
+  s_ddcd30be794385::t_b4b396d866857f 68,70
+langsmith_migrator/cli/main.py
+  s_ddcd30be794385::t_be5c69e02c8075 5667-5671
+  s_ddcd30be794385::t_029dde42a20c01 5615-5619,5621
+langsmith_migrator/core/migrators/feedback.py
+  s_ddcd30be794385::t_34480e0c5a9294 189-195
+  s_ddcd30be794385::t_3c7cdab1562bb5 246
+  s_ddcd30be794385::t_f759037f0e28ed 222-223,228,231
+  s_ddcd30be794385::t_2f2a5c91606422 272-278,281-282,289-302,304-332,334,336
+tests/test_state_attempts.py
+  s_ddcd30be794385::t_997b83c7a91457 1-116
+langsmith_migrator/utils/state.py
+  s_ddcd30be794385::t_cc4611f6e6eee3 529-533,536-538,542-546
+  s_ddcd30be794385::t_4c1380e11a8552 421-426
+tests/test_retry.py
+  s_ddcd30be794385::t_8573c26eeced8d 1-115
+CHANGELOG.md
+  s_ddcd30be794385::t_4bb7aa4805eacc 32-75
+langsmith_migrator/core/migrators/experiment.py
+  s_ddcd30be794385::t_54df587a451c3f 412-418,420-441
+tests/test_feedback_accounting.py
+  s_ddcd30be794385::t_2379cf501ff25d 1-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "63196beb7d18e59d467cd8c5624cbaa2cfacf9b9",
+  "prompts": {},
+  "sessions": {
+    "s_ddcd30be794385": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "594becd1-a734-4706-b1b9-1bb9d2fd71dd",
+        "model": "claude-opus-5"
+      },
+      "human_author": "lc-chad <chad@langchain.dev>"
+    }
+  }
+}
