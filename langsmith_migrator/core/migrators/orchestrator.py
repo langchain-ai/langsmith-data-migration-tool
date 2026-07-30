@@ -500,6 +500,8 @@ class MigrationOrchestrator:
                 self.state_manager.save()
 
             current_item = self.state.get_item(item_id)
+            # Pre-fix feedback migration persisted completed+verified before the
+            # orchestrator persisted terminal_state. Repair those legacy sessions.
             if (
                 current_item
                 and current_item.stage == "completed"

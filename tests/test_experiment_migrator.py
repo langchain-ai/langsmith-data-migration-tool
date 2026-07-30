@@ -160,8 +160,8 @@ def _orchestrator(tmp_path: Path):
 
 
 class TestOrchestratorDeltaPersistence:
-    def test_resume_finalizes_a_verified_completed_checkpoint(self, tmp_path):
-        orchestrator, _ = _orchestrator(tmp_path)
+    def test_resume_repairs_legacy_verified_checkpoint_without_terminal_state(self, tmp_path):
+        orchestrator, state_manager = _orchestrator(tmp_path)
         state = orchestrator.ensure_state()
         item = state.ensure_item(
             "experiment_src-exp",
@@ -180,6 +180,15 @@ class TestOrchestratorDeltaPersistence:
             },
         )
         item.destination_id = "dest-exp"
+        item.status = MigrationStatus.IN_PROGRESS
+        state_manager.save()
+
+        loaded_state = state_manager.load_session(state.session_id)
+        assert loaded_state is not None
+        orchestrator.state = loaded_state
+        loaded_item = loaded_state.get_item(item.id)
+        assert loaded_item is not None
+        assert loaded_item.terminal_state is None
 
         experiment_payload = {"id": "src-exp", "name": "exp"}
         exp_mig = Mock()
@@ -190,8 +199,8 @@ class TestOrchestratorDeltaPersistence:
         )
 
         assert ok is True
-        assert item.status == MigrationStatus.COMPLETED
-        assert item.terminal_state == ResolutionOutcome.MIGRATED.value
+        assert loaded_item.status == MigrationStatus.COMPLETED
+        assert loaded_item.terminal_state == ResolutionOutcome.MIGRATED.value
         fb_mig.migrate_feedback_for_experiments.assert_not_called()
 
     def test_computes_and_persists_delta_on_first_attempt(self, tmp_path):
