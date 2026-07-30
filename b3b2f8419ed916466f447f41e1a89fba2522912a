@@ -1,0 +1,19 @@
+CLAUDE.md
+  s_4de2ac2c242f7b::t_5fbacf890d121b 179-184,189-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "b3b2f8419ed916466f447f41e1a89fba2522912a",
+  "prompts": {},
+  "sessions": {
+    "s_4de2ac2c242f7b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5d3d7744-ea1f-4ba7-983e-6a8c7fa861b3",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
