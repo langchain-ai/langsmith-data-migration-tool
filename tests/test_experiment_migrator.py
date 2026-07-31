@@ -7,7 +7,7 @@ from unittest.mock import Mock
 from langsmith_migrator.core.migrators.experiment import ExperimentMigrator
 from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
 from langsmith_migrator.utils.config import Config
-from langsmith_migrator.utils.state import StateManager
+from langsmith_migrator.utils.state import MigrationStatus, ResolutionOutcome, StateManager
 
 
 def _make_migrator():
@@ -160,6 +160,49 @@ def _orchestrator(tmp_path: Path):
 
 
 class TestOrchestratorDeltaPersistence:
+    def test_resume_repairs_legacy_verified_checkpoint_without_terminal_state(self, tmp_path):
+        orchestrator, state_manager = _orchestrator(tmp_path)
+        state = orchestrator.ensure_state()
+        item = state.ensure_item(
+            "experiment_src-exp",
+            "experiment",
+            "exp",
+            "src-exp",
+            stage="completed",
+            workspace_pair={"source": None, "dest": None},
+            metadata={
+                "source_dataset_id": "src-ds",
+                "dest_dataset_id": "dst-ds",
+                "destination_experiment_id": "dest-exp",
+                "feedback_found": 2,
+                "feedback_migrated": 2,
+                "feedback_verified": True,
+            },
+        )
+        item.destination_id = "dest-exp"
+        item.status = MigrationStatus.IN_PROGRESS
+        state_manager.save()
+
+        loaded_state = state_manager.load_session(state.session_id)
+        assert loaded_state is not None
+        orchestrator.state = loaded_state
+        loaded_item = loaded_state.get_item(item.id)
+        assert loaded_item is not None
+        assert loaded_item.terminal_state is None
+
+        experiment_payload = {"id": "src-exp", "name": "exp"}
+        exp_mig = Mock()
+        fb_mig = Mock()
+
+        ok, _ = orchestrator._resolve_experiment_item(
+            experiment_payload, "src-ds", "dst-ds", exp_mig, fb_mig,
+        )
+
+        assert ok is True
+        assert loaded_item.status == MigrationStatus.COMPLETED
+        assert loaded_item.terminal_state == ResolutionOutcome.MIGRATED.value
+        fb_mig.migrate_feedback_for_experiments.assert_not_called()
+
     def test_computes_and_persists_delta_on_first_attempt(self, tmp_path):
         orchestrator, _ = _orchestrator(tmp_path)
         state = orchestrator.ensure_state()

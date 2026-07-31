@@ -387,6 +387,57 @@ class ExperimentMigrator(BaseMigrator):
             experiment_runs_created = 0
             experiment_failed_runs = 0
 
+            def flush_batch() -> int:
+                nonlocal total_runs, total_failed
+                nonlocal experiment_runs_created, experiment_failed_runs
+
+                if not batch:
+                    return 0
+
+                created_mapping, failed_runs = self._create_runs_batch(batch)
+                total_runs += len(created_mapping)
+                total_failed += len(failed_runs)
+                experiment_runs_created += len(created_mapping)
+                experiment_failed_runs += len(failed_runs)
+
+                if created_mapping:
+                    run_id_mapping.update(created_mapping)
+                    if self.state:
+                        for old_id, new_id in created_mapping.items():
+                            self.state.set_mapped_id("run", old_id, new_id)
+                        self.persist_state()
+                    self.log(
+                        f"Created batch of {len(created_mapping)} runs (total: {total_runs})",
+                        "info",
+                    )
+
+                if failed_runs:
+                    failed_ids = {entry["source_run_id"] for entry in failed_runs}
+                    for failed_id in failed_ids:
+                        pending_run_mapping.pop(failed_id, None)
+                    self.log(f"Failed to create {len(failed_runs)} run(s) in batch", "error")
+                    if experiment_item:
+                        issue = self.record_issue(
+                            "transient",
+                            "run_batch_failed",
+                            f"Run batch creation failed for experiment {experiment_id}",
+                            item_id=experiment_item_id,
+                            next_action="Re-run `langsmith-migrator resume` to replay the failed runs.",
+                            evidence={"failed_runs": failed_runs[:10], "failed_count": len(failed_runs)},
+                        )
+                        if issue:
+                            self.queue_remediation(
+                                issue_id=issue.id,
+                                next_action=issue.next_action or "Resume experiment runs.",
+                                item_id=experiment_item_id,
+                                command="langsmith-migrator resume",
+                            )
+
+                for created_id in created_mapping:
+                    pending_run_mapping.pop(created_id, None)
+                batch.clear()
+                return len(failed_runs)
+
             self.log(f"Fetching runs for experiment {exp_idx}/{len(experiment_ids)}: {experiment_id}", "info")
 
             payload = {
@@ -409,8 +460,36 @@ class ExperimentMigrator(BaseMigrator):
                 try:
                     response = self.source.post("/runs/query", payload)
                 except Exception as e:
+                    # Do not swallow this. Breaking out leaves the failure counter at
+                    # zero, so the caller concludes the run stage succeeded and moves
+                    # on to feedback - producing an empty experiment on the destination
+                    # that gets reported as a feedback problem. Raise so the caller
+                    # marks the item failed with the real error. The per-page
+                    # run_cursor checkpoint above means resume picks up where we
+                    # stopped rather than re-walking the experiment.
                     self.log(f"Error querying runs for experiment {experiment_id}: {e}", "error")
-                    break
+                    if experiment_item:
+                        issue = self.record_issue(
+                            "transient",
+                            "run_query_failed",
+                            f"Could not query source runs for experiment {experiment_id}",
+                            item_id=experiment_item_id,
+                            next_action="Re-run `langsmith-migrator resume` to continue from the last cursor.",
+                            evidence={
+                                "error": str(e),
+                                "page": page_num,
+                                "cursor": payload.get("cursor"),
+                                "runs_migrated_before_failure": experiment_runs_created,
+                            },
+                        )
+                        if issue:
+                            self.queue_remediation(
+                                issue_id=issue.id,
+                                next_action=issue.next_action or "Retry the source run query.",
+                                item_id=experiment_item_id,
+                                command="langsmith-migrator resume",
+                            )
+                    raise
 
                 runs = response.get("runs", [])
 
@@ -427,6 +506,9 @@ class ExperimentMigrator(BaseMigrator):
                     if page_num == 1:
                         self.log(f"No runs found for experiment {experiment_id}", "info")
                     break
+
+                failures_before_page = experiment_failed_runs
+                current_cursor = payload.get("cursor")
 
                 for run in runs:
                     source_session_id = run.get("session_id")
@@ -514,110 +596,32 @@ class ExperimentMigrator(BaseMigrator):
 
                     batch.append(migrated_run)
 
-                    # Process batch
                     if len(batch) >= self.config.migration.batch_size:
-                        created_mapping, failed_runs = self._create_runs_batch(batch)
-                        total_runs += len(created_mapping)
-                        total_failed += len(failed_runs)
-                        experiment_runs_created += len(created_mapping)
-                        experiment_failed_runs += len(failed_runs)
-                        if created_mapping:
-                            run_id_mapping.update(created_mapping)
-                            if self.state:
-                                for old_id, new_id in created_mapping.items():
-                                    self.state.set_mapped_id("run", old_id, new_id)
-                                self.persist_state()
-                            self.log(
-                                f"Created batch of {len(created_mapping)} runs (total: {total_runs})",
-                                "info",
-                            )
-                        if failed_runs:
-                            failed_ids = {entry["source_run_id"] for entry in failed_runs}
-                            for failed_id in failed_ids:
-                                pending_run_mapping.pop(failed_id, None)
-                            self.log(f"Failed to create {len(failed_runs)} run(s) in batch", "error")
-                            if experiment_item:
-                                issue = self.record_issue(
-                                    "transient",
-                                    "run_batch_failed",
-                                    f"Run batch creation failed for experiment {experiment_id}",
-                                    item_id=experiment_item_id,
-                                    next_action="Re-run `langsmith-migrator resume` to replay the failed runs.",
-                                    evidence={"failed_runs": failed_runs[:10], "failed_count": len(failed_runs)},
-                                )
-                                if issue:
-                                    self.queue_remediation(
-                                        issue_id=issue.id,
-                                        next_action=issue.next_action or "Resume experiment runs.",
-                                        item_id=experiment_item_id,
-                                        command="langsmith-migrator resume",
-                                    )
-                        for created_id in created_mapping:
-                            pending_run_mapping.pop(created_id, None)
-                        batch.clear()
+                        flush_batch()
 
-                # Check for next page
+                flush_batch()
+                page_had_failures = experiment_failed_runs > failures_before_page
+
                 cursors = response.get("cursors")
                 next_cursor = cursors.get("next") if cursors else None
+                checkpoint_cursor = current_cursor if page_had_failures else next_cursor
 
                 if experiment_item:
                     self.checkpoint_item(
                         experiment_item_id,
                         stage="migrate_runs",
                         metadata={
-                            "run_cursor": next_cursor,
+                            "run_cursor": checkpoint_cursor,
                             "run_failures": experiment_failed_runs,
                             "runs_migrated": experiment_runs_created,
                         },
                     )
-                if not next_cursor:
+
+                if page_had_failures or not next_cursor:
                     break
 
                 payload["cursor"] = next_cursor
                 self.log(f"Fetching next page with cursor: {next_cursor}", "info")
-
-            if batch:
-                created_mapping, failed_runs = self._create_runs_batch(batch)
-                total_runs += len(created_mapping)
-                total_failed += len(failed_runs)
-                experiment_runs_created += len(created_mapping)
-                experiment_failed_runs += len(failed_runs)
-                if created_mapping:
-                    run_id_mapping.update(created_mapping)
-                    if self.state:
-                        for old_id, new_id in created_mapping.items():
-                            self.state.set_mapped_id("run", old_id, new_id)
-                        self.persist_state()
-                    self.log(f"Created final batch of {len(created_mapping)} runs", "info")
-                if failed_runs:
-                    self.log(f"Failed to create {len(failed_runs)} run(s) in final batch", "error")
-                    if experiment_item:
-                        issue = self.record_issue(
-                            "transient",
-                            "run_batch_failed",
-                            f"Final run batch creation failed for experiment {experiment_id}",
-                            item_id=experiment_item_id,
-                            next_action="Re-run `langsmith-migrator resume` to replay the failed runs.",
-                            evidence={"failed_runs": failed_runs[:10], "failed_count": len(failed_runs)},
-                        )
-                        if issue:
-                            self.queue_remediation(
-                                issue_id=issue.id,
-                                next_action=issue.next_action or "Resume experiment runs.",
-                                item_id=experiment_item_id,
-                                command="langsmith-migrator resume",
-                            )
-                if experiment_item:
-                    next_stage = "migrate_feedback" if experiment_failed_runs == 0 else "migrate_runs"
-                    self.checkpoint_item(
-                        experiment_item_id,
-                        stage=next_stage,
-                        metadata={
-                            "run_cursor": None,
-                            "run_failures": experiment_failed_runs,
-                            "runs_migrated": experiment_runs_created,
-                        },
-                    )
 
         self.log(f"Run migration complete: {total_runs} migrated, {total_skipped} skipped", "success")
         return total_runs, run_id_mapping, total_failed

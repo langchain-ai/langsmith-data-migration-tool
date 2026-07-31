@@ -49,6 +49,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `--session <name-or-ID>` scopes the migration to a single tracing project.
   - Adds `--session` and `--skip-issues` to `migrate-all` (Step 6, before Fleet).
 
+- **`resume --retry-exhausted`**: Also retry items that have used up their retry
+  budget. Previously the only way to get such an item moving again was to edit
+  the session state JSON by hand.
+
+### Fixed
+These four defects compounded on a self-hosted migration where a WAF in front of
+both instances intermittently refused requests: ~2,700 items failed permanently,
+583 experiments were left empty on the destination without any error saying so,
+and the summary misattributed the whole thing to feedback replay.
+
+- **Proxy/WAF 403s are retried instead of killing the item**: LangSmith always
+  returns JSON error bodies, so a 401/403 whose body is **not** JSON came from an
+  intermediary (proxy, load balancer, WAF) that refused the request before it
+  reached LangSmith. Those now raise a new retryable `UpstreamRejectionError`
+  and go through the normal exponential backoff, and the error message says the
+  response did not come from LangSmith. Genuine LangSmith permission failures
+  still raise `AuthenticationError` and still fail fast in a single request, so
+  a misconfigured key is not slowed down. The borrowed response body is
+  sanitized (control characters and escape sequences stripped, whitespace
+  collapsed, truncated) before it reaches the console or on-disk state, since it
+  comes from a source outside our control.
+- **A failed source run query no longer reports success**: when
+  `POST /runs/query` against the source failed, `migrate_runs_streaming` logged
+  it and broke out of the loop, leaving the failed-run counter at zero. The
+  caller concluded the run stage had succeeded and advanced to feedback, so the
+  experiment was created on the destination **containing no runs** and the only
+  visible symptom was `feedback replay incomplete (0/N migrated)`. The failure
+  now records a `run_query_failed` issue and propagates, so the item is marked
+  failed with the real error. A page cursor advances only after its buffered runs
+  are written; failed writes retain the current cursor for a safe replay.
+- **One failed pass no longer exhausts an item's retry budget**:
+  `update_item_status` incremented `attempts` on *every* status change,
+  including `pending -> in_progress` and `-> completed`. A single failing pass
+  through an experiment burned four increments against a cap of three, making
+  the item permanently unresumable. `attempts` now counts failures only.
+- **Complete experiments are no longer reported as failed**: feedback replay
+  counted every record it fetched as "found" but did not count records a
+  previous pass had already replayed (which are skipped by fingerprint) as
+  migrated. A fully migrated experiment therefore reported `0/N` and was marked
+  failed on every subsequent run, and could never reach a verified state.
+  Already-replayed records now count toward completion, and `feedback_verified`
+  is set only when every record is accounted for. Source feedback query failures
+  propagate instead of verifying an empty or partial inventory. Genuine gaps
+  (unmapped runs, failed creates) still report with a per-cause breakdown.
+
 ## [0.0.81] - 2026-07-27
 
 ### Added

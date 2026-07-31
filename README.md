@@ -553,6 +553,14 @@ Every migration session persists state and writes a remediation bundle when ther
 - org members
 - workspace members
 
+Each item gets a budget of three failed attempts before `resume` stops picking it up automatically. Failures are what consume the budget, so an item that failed once still has two retries left. If an item does use up its budget and you want to try again anyway (for example once a network or permissions problem has been resolved), pass `--retry-exhausted`:
+
+```bash
+langsmith-migrator resume --retry-exhausted
+```
+
+Items that are *blocked* rather than failed (a missing dataset dependency, say) are not retried by `resume` at all, since retrying cannot resolve them. Those are listed separately under "Items requiring manual attention" along with the action needed.
+
 For chart items, `resume` revalidates saved `--same-instance` metadata against the current source/destination and workspace context. If the mode changed, it re-resolves the destination project/session before retrying; if that cannot be resolved safely, the item is checkpointed with guidance to rerun `charts` with project mapping. A later successful `charts --map-projects` run marks the prior chart dependency blocker resolved so `resume` does not keep looping on stale blocked state. Global or dataset-only charts that have no project/session dependency can resume with `dest_session_id=None`.
 
 Use `langsmith-migrator clean` to remove saved sessions once you no longer need their state or remediation bundles.
