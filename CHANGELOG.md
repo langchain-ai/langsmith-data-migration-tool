@@ -7,48 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.82] - 2026-07-29
+## [0.0.83] - 2026-07-31
 
 ### Added
-- **Selective Fleet agent migration (`fleet`)**: The `fleet` command could
-  previously migrate **all** agents in a workspace or **none**
-  (`--skip-agents`), with no way to target a subset. Two new options scope the
-  agents phase:
-  - **`--agent <name-or-id>`** (repeatable): migrate only the named agent(s),
-    matched against each source agent's name **or** ID, so the two forms can be
-    mixed in one invocation. Useful for relocating a handful of specific agents
-    into a team workspace without touching everyone else's.
-  - **`--agents-owned-only`**: restrict the listing to the Fleet `user`
-    audience (agents owned by or directly shared with the authenticated source
-    user), skipping workspace-shared agents owned by others. Without it, both
-    the `user` and `tenant` audiences are queried and merged with dedup by
-    agent ID.
-
-  `--skip-agents` is rejected when combined with either flag. Selectors that
-  match no source agent are reported as a warning under `--verbose`.
-  **Downstream cascade is automatic**: schedules, triggers, and usage limits
-  key off the agent map built in the agents phase, so they scope to the
-  selected agents with no extra flags. Default behavior with neither flag is
-  unchanged.
-- **Engine issue migration (`issues`)**: New `issues` command migrates
-  LangSmith Engine resources between instances: per-project issues-agent
-  configs (`/v1/platform/sessions/{id}/issues-agent`) and detected issues
-  (`/v1/platform/issues`).
-  - Only tracing projects that have Engine data (an issues-agent config or
-    detected issues) are mapped/created on the destination; projects are
-    matched by name, auto-created when missing, and restricted to real tracing
-    projects (experiment/test-run sessions are excluded).
-  - Issues-agent configs are recreated with source-instance-only fields
-    (`latest_thread_id`, `latest_run_id`, tenant, counters, timestamps)
-    stripped.
-  - Detected issues are migrated as metadata (including the Engine-authored
-    `proposed_fix` and `fix_prompt`); run links (`traces`), `actions`, and
-    `fix_branch`/`fix_pr_number` are not carried over.
-  - Idempotent: issues-agent configs and issues already present on the
-    destination are skipped (issues dedup by `session_id` + `name`).
-  - `--session <name-or-ID>` scopes the migration to a single tracing project.
-  - Adds `--session` and `--skip-issues` to `migrate-all` (Step 6, before Fleet).
-
 - **`resume --retry-exhausted`**: Also retry items that have used up their retry
   budget. Previously the only way to get such an item moving again was to edit
   the session state JSON by hand.
@@ -93,6 +54,48 @@ and the summary misattributed the whole thing to feedback replay.
   is set only when every record is accounted for. Source feedback query failures
   propagate instead of verifying an empty or partial inventory. Genuine gaps
   (unmapped runs, failed creates) still report with a per-cause breakdown.
+
+## [0.0.82] - 2026-07-29
+
+### Added
+- **Selective Fleet agent migration (`fleet`)**: The `fleet` command could
+  previously migrate **all** agents in a workspace or **none**
+  (`--skip-agents`), with no way to target a subset. Two new options scope the
+  agents phase:
+  - **`--agent <name-or-id>`** (repeatable): migrate only the named agent(s),
+    matched against each source agent's name **or** ID, so the two forms can be
+    mixed in one invocation. Useful for relocating a handful of specific agents
+    into a team workspace without touching everyone else's.
+  - **`--agents-owned-only`**: restrict the listing to the Fleet `user`
+    audience (agents owned by or directly shared with the authenticated source
+    user), skipping workspace-shared agents owned by others. Without it, both
+    the `user` and `tenant` audiences are queried and merged with dedup by
+    agent ID.
+
+  `--skip-agents` is rejected when combined with either flag. Selectors that
+  match no source agent are reported as a warning under `--verbose`.
+  **Downstream cascade is automatic**: schedules, triggers, and usage limits
+  key off the agent map built in the agents phase, so they scope to the
+  selected agents with no extra flags. Default behavior with neither flag is
+  unchanged.
+- **Engine issue migration (`issues`)**: New `issues` command migrates
+  LangSmith Engine resources between instances: per-project issues-agent
+  configs (`/v1/platform/sessions/{id}/issues-agent`) and detected issues
+  (`/v1/platform/issues`).
+  - Only tracing projects that have Engine data (an issues-agent config or
+    detected issues) are mapped/created on the destination; projects are
+    matched by name, auto-created when missing, and restricted to real tracing
+    projects (experiment/test-run sessions are excluded).
+  - Issues-agent configs are recreated with source-instance-only fields
+    (`latest_thread_id`, `latest_run_id`, tenant, counters, timestamps)
+    stripped.
+  - Detected issues are migrated as metadata (including the Engine-authored
+    `proposed_fix` and `fix_prompt`); run links (`traces`), `actions`, and
+    `fix_branch`/`fix_pr_number` are not carried over.
+  - Idempotent: issues-agent configs and issues already present on the
+    destination are skipped (issues dedup by `session_id` + `name`).
+  - `--session <name-or-ID>` scopes the migration to a single tracing project.
+  - Adds `--session` and `--skip-issues` to `migrate-all` (Step 6, before Fleet).
 
 ## [0.0.81] - 2026-07-27
 

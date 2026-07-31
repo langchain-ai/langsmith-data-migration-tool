@@ -1141,7 +1141,7 @@ wheels = [
 
 [[package]]
 name = "langsmith-data-migration-tool"
-version = "0.0.82"
+version = "0.0.83"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
