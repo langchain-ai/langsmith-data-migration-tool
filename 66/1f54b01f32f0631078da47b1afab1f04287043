@@ -1,0 +1,26 @@
+CHANGELOG.md
+  s_2d5b7fbc687bb7::t_e70a9f179e5f9a 10
+  s_2d5b7fbc687bb7::t_805e3afa72d9e2 58-99
+pyproject.toml
+  s_2d5b7fbc687bb7::t_0661a30874c2cf 3
+README.md
+  s_2d5b7fbc687bb7::t_43333e8101bb91 9,118,121,126,131
+uv.lock
+  s_2d5b7fbc687bb7::t_de7ee41e31eac1 1144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "661f54b01f32f0631078da47b1afab1f04287043",
+  "prompts": {},
+  "sessions": {
+    "s_2d5b7fbc687bb7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b2559c46-36b7-4442-a7fd-f15ee60bd6f0",
+        "model": "claude-opus-5"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
