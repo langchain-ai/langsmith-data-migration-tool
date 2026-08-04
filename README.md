@@ -31,6 +31,7 @@ langsmith-migrator datasets
 - **Project Rules**: Copy automation rules with project mapping and optional project creation in interactive flows
 - **Prompts**: Migrate prompts (latest by default, full history with `--include-all-commits`)
 - **Charts**: Migrate monitoring charts with filter preservation
+- **Custom Model Pricing**: Migrate workspace-custom model price entries (`model-pricing`). Global built-in prices are skipped since they already exist in every workspace. Idempotent: an equivalent entry on the destination is updated in place, or skipped with `--skip-existing`
 - **Engine Issues**: Migrate per-project LangSmith Engine issues-agent configs and detected issues as metadata (`issues`). Run links and trace deep-links are not migrated (see Limitations)
 - **Fleet**: Migrate agents, shared skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, and workspace secrets (`fleet`)
 - **Context Hub**: Migrate Context Hub agents and skills (the versioned agent/skill repos in the LangSmith Context Hub), including files and repo metadata (description, readme, tags, is_public) (`contexts`). Replays the **full commit history** by default so the destination reproduces the source's commit chain; use `--latest-only` to copy just the latest commit. Also copies **commit tags**, including the `production` / `staging` environment tags behind the Context Hub promote feature, pointing each at the same commit on the destination (`--no-tags` to skip). Lists the same contexts the Context Hub UI shows (external-source repos are hidden by default; use `--include-external` to migrate them too). Scope with `--agents-only` / `--skills-only`; linked-repo commit pins are stripped and reported cross-instance, or preserved with `--same-instance`
@@ -49,6 +50,7 @@ This tool **does not support migrating trace data**. It migrates:
 - Project rules
 - Prompts
 - Charts
+- Custom model pricing (workspace-custom model-price-map entries)
 - LangSmith Engine issues-agent configs and detected issue metadata
 - Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets)
 - Context Hub agents and skills (full commit history)
@@ -202,6 +204,9 @@ langsmith-migrator charts --project-mapping '{"old-project-id": "new-project-id"
 langsmith-migrator charts --project-mapping mapping.json   # Headless, from file
 langsmith-migrator charts --same-instance       # Reuse source IDs only when both sides share IDs
 
+# Custom model pricing (model-price-map)
+langsmith-migrator model-pricing                # Copy workspace-custom model prices (built-in prices are skipped)
+
 # Fleet resources (agents, skills, MCP servers, etc.)
 langsmith-migrator fleet                        # Migrate all Fleet resources
 langsmith-migrator fleet --skip-agents          # Skip agent migration
@@ -220,12 +225,13 @@ langsmith-migrator clean
 ### Command Overview
 
 - `test`: verify source and destination connectivity before running a migration
-- `migrate-all`: guided end-to-end wizard for users, datasets, prompts, queues, rules, charts, and Fleet resources
+- `migrate-all`: guided end-to-end wizard for users, datasets, prompts, queues, rules, charts, custom model pricing, and Fleet resources
 - `datasets`: migrate datasets; optionally include experiments, runs, and feedback
 - `queues`: migrate annotation queues
 - `prompts`: migrate prompts, optionally with full commit history
 - `rules`: migrate automation rules with project mapping controls
 - `charts`: migrate monitoring charts, either all sessions or one named session/project
+- `model-pricing`: migrate workspace-custom model price entries (global built-in prices are skipped; idempotent, with `--skip-existing`)
 - `fleet`: migrate Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets) with `--skip-*` flags for each resource type, and `--agent <name-or-id>` / `--agents-owned-only` to scope which agents (and their schedules/triggers/usage limits) are migrated
 - `issues`: migrate Engine issues-agent configs and detected issues as metadata (`--session` to scope to one tracing project)
 - `contexts`: migrate Context Hub agents and skills, replaying full commit history and tags by default (`--latest-only`, `--no-tags`, `--agents-only`, `--skills-only`, `--include-external`, `--same-instance`)
