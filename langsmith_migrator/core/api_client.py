@@ -397,31 +397,6 @@ class EnhancedAPIClient:
 
     @retry_upstream_rejections(max_retries=3)
     @retry_on_failure(max_retries=1)
-    def put(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Make a PUT request.
-
-        Args:
-            endpoint: API endpoint
-            data: JSON data to send
-
-        Returns:
-            JSON response as dictionary
-        """
-        url = self._prepare_url(endpoint)
-
-        if self.verbose:
-            self.console.print(f"[dim]PUT {url}[/dim]")
-
-        # Add rate limiting delay
-        if self.rate_limit_delay > 0:
-            time.sleep(self.rate_limit_delay)
-
-        response = self.session.put(url, json=data, timeout=self.timeout)
-        return self._handle_response(response, endpoint)
-
-    @retry_upstream_rejections(max_retries=3)
-    @retry_on_failure(max_retries=1)
     def delete(self, endpoint: str) -> Dict[str, Any]:
         """
         Make a DELETE request.
