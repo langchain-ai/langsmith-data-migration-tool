@@ -1,0 +1,28 @@
+CHANGELOG.md
+  h_255864e0abd836 10-19
+README.md
+  h_255864e0abd836 34,53,207-209,228,234
+langsmith_migrator/cli/main.py
+  h_255864e0abd836 25,2329-2451,3949,3987,4156,4189,4907-4969
+langsmith_migrator/core/api_client.py
+  h_255864e0abd836 397-421
+langsmith_migrator/core/migrators/__init__.py
+  h_255864e0abd836 13,38
+langsmith_migrator/core/migrators/model_price_map.py
+  h_255864e0abd836 1-144
+tests/functional/test_cli_functional.py
+  h_255864e0abd836 59
+tests/test_model_price_map_migrator.py
+  h_255864e0abd836 1-187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "4fe4523b1c7c1b6c946ab6b163e6e018e048a0d3",
+  "prompts": {},
+  "humans": {
+    "h_255864e0abd836": {
+      "author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
