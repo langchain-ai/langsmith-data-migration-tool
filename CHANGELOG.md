@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Custom model pricing migration (`model-pricing`)**: New command to migrate
+  workspace-custom model price entries between instances/workspaces via
+  `/model-price-map`. Only workspace-custom entries are copied; the global
+  built-in prices (which already exist in every workspace) are skipped.
+  Migration is idempotent — an equivalent entry already on the destination is
+  updated in place (or skipped with `--skip-existing`), and a server-side
+  uniqueness conflict is treated as already-migrated. Also wired into
+  `migrate-all` (Step 8) with a `--skip-model-pricing` flag.
+
 ## [0.0.83] - 2026-07-31
 
 ### Added

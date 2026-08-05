@@ -10,6 +10,7 @@ from .prompt import PromptMigrator
 from .rules import RulesMigrator
 from .issue import IssueMigrator
 from .chart import ChartMigrator
+from .model_price_map import ModelPriceMapMigrator
 from .user_role import UserRoleMigrator
 from .orchestrator import MigrationOrchestrator
 from .fleet_skill import FleetSkillMigrator
@@ -34,6 +35,7 @@ __all__ = [
     "RulesMigrator",
     "IssueMigrator",
     "ChartMigrator",
+    "ModelPriceMapMigrator",
     "UserRoleMigrator",
     "MigrationOrchestrator",
     "FleetSkillMigrator",

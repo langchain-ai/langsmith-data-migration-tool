@@ -22,6 +22,7 @@ from ..core.migrators import (
     DatasetMigrator,
     MigrationOrchestrator,
     IssueMigrator,
+    ModelPriceMapMigrator,
     PromptMigrator,
     RulesMigrator,
     UserRoleMigrator,
@@ -2325,6 +2326,129 @@ def queues(ctx, source_workspace, dest_workspace, map_workspaces):
     orchestrator.cleanup()
 
 
+@cli.command(name="model-pricing")
+@ssl_option
+@workspace_options
+@click.pass_context
+def model_pricing(ctx, source_workspace, dest_workspace, map_workspaces):
+    """Migrate custom model pricing (model-price-map) entries."""
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
+
+    display_banner()
+
+    if not ensure_config(config):
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    # Test connections
+    if not orchestrator.test_connections():
+        console.print("\n[red]Cannot proceed without valid connections[/red]")
+        orchestrator.cleanup()
+        return
+
+    # Resolve workspace context
+    ws_result = _resolve_workspaces(
+        orchestrator,
+        source_workspace,
+        dest_workspace,
+        map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
+    if ws_result is _WS_CANCELLED:
+        console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+
+    pricing_migrator = ModelPriceMapMigrator(
+        orchestrator.source_client, orchestrator.dest_client, None, config
+    )
+
+    for src_ws, dst_ws in ws_pairs:
+        if src_ws and dst_ws:
+            orchestrator.set_workspace_context(src_ws, dst_ws)
+            console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+
+        # Get custom model pricing entries (built-in/global prices are excluded)
+        console.print("\n[bold]Fetching custom model pricing from source...[/bold]")
+
+        price_maps = pricing_migrator.list_price_maps()
+
+        if not price_maps:
+            console.print("[yellow]No custom model pricing found[/yellow]")
+            continue
+
+        selected_prices = _select_or_all(
+            config,
+            price_maps,
+            select_all=config.migration.non_interactive,
+            title="Select Model Pricing Entries to Migrate",
+            columns=[
+                {"key": "name", "title": "Name", "width": 40},
+                {"key": "provider", "title": "Provider", "width": 20},
+                {"key": "match_pattern", "title": "Match", "width": 30},
+                {"key": "prompt_cost", "title": "Prompt", "width": 14},
+                {"key": "completion_cost", "title": "Completion", "width": 14},
+            ],
+        )
+
+        if not selected_prices:
+            console.print("[yellow]No model pricing entries selected[/yellow]")
+            continue
+
+        console.print(
+            f"\n[bold]Migrating {len(selected_prices)} model pricing entry(ies)...[/bold]"
+        )
+        _ensure_migration_session(orchestrator, config)
+        pricing_migrator.state = orchestrator.state
+
+        # Perform migration
+        success_count = 0
+        failed_items = []
+
+        with Progress(console=console) as progress:
+            task = progress.add_task("Migrating model pricing...", total=len(selected_prices))
+            for entry in selected_prices:
+                name = entry.get("name", "unnamed")
+                item_id = _ensure_state_item(
+                    orchestrator,
+                    config,
+                    "model_price",
+                    entry.get("id", name),
+                    name,
+                    metadata={"model_price": entry},
+                )
+                try:
+                    _mark_state_item_started(orchestrator, item_id)
+                    new_id = pricing_migrator.create_price_map(entry)
+                    success_count += 1
+                    _mark_state_item_completed(orchestrator, item_id, destination_id=new_id)
+                except Exception as e:
+                    failed_items.append((name, str(e)))
+                    _mark_state_item_failed(orchestrator, item_id, e)
+                progress.advance(task)
+
+        console.print(
+            f"Model pricing: {success_count} migrated, {len(failed_items)} failed"
+        )
+        if failed_items and config.migration.verbose:
+            for name, err in failed_items:
+                console.print(f"  [red]✗[/red] {name}: {err}")
+
+    if ws_result:
+        orchestrator.clear_workspace_context()
+
+    _display_resolution_summary(orchestrator)
+    _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
+
+
 @cli.command()
 @ssl_option
 @click.option(
@@ -3822,6 +3946,7 @@ def issues(
 @click.option("--skip-queues", is_flag=True, help="Skip annotation queue migration")
 @click.option("--skip-rules", is_flag=True, help="Skip rules migration")
 @click.option("--skip-charts", is_flag=True, help="Skip chart migration")
+@click.option("--skip-model-pricing", is_flag=True, help="Skip custom model pricing migration")
 @click.option("--skip-issues", is_flag=True, help="Skip LangSmith Engine issue migration")
 @click.option("--skip-fleet", is_flag=True, help="Skip Fleet resource migration")
 @click.option("--skip-contexts", is_flag=True, help="Skip Context Hub (agents & skills) migration")
@@ -3859,6 +3984,7 @@ def migrate_all(
     skip_queues,
     skip_rules,
     skip_charts,
+    skip_model_pricing,
     skip_issues,
     skip_fleet,
     skip_contexts,
@@ -4027,6 +4153,7 @@ def migrate_all(
             skip_issues=skip_issues,
             skip_fleet=skip_fleet,
             skip_contexts=skip_contexts,
+            skip_model_pricing=skip_model_pricing,
         )
 
     if ws_result:
@@ -4059,6 +4186,7 @@ def _migrate_all_for_workspace(
     skip_issues=True,
     skip_fleet=True,
     skip_contexts=True,
+    skip_model_pricing=True,
 ):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
@@ -4775,6 +4903,69 @@ def _migrate_all_for_workspace(
             console.print("[yellow]none found[/yellow]\n")
     else:
         console.print("[dim]Skipping contexts (--skip-contexts)[/dim]\n")
+
+    # 8. Custom Model Pricing (model-price-map)
+    if not skip_model_pricing:
+        console.print("[bold]Step 8: Custom Model Pricing[/bold]")
+        console.print("Fetching custom model pricing... ", end="")
+
+        pricing_migrator = ModelPriceMapMigrator(
+            orchestrator.source_client, orchestrator.dest_client, None, config
+        )
+        price_maps = pricing_migrator.list_price_maps()
+
+        if price_maps:
+            console.print(f"found {len(price_maps)}")
+            if _confirm_action(
+                config,
+                f"Migrate {len(price_maps)} model pricing entry(ies)?",
+                default=True,
+                non_interactive_value=True,
+            ):
+                _ensure_migration_session(orchestrator, config)
+                pricing_migrator.state = orchestrator.state
+                success_count = 0
+                failed_items = []
+
+                with Progress(console=console) as progress:
+                    task = progress.add_task(
+                        "Migrating model pricing...", total=len(price_maps)
+                    )
+                    for entry in price_maps:
+                        name = entry.get("name", "unnamed")
+                        item_id = _ensure_state_item(
+                            orchestrator,
+                            config,
+                            "model_price",
+                            entry.get("id", name),
+                            name,
+                            metadata={"model_price": entry},
+                        )
+                        try:
+                            _mark_state_item_started(orchestrator, item_id)
+                            new_id = pricing_migrator.create_price_map(entry)
+                            success_count += 1
+                            _mark_state_item_completed(
+                                orchestrator, item_id, destination_id=new_id
+                            )
+                        except Exception as e:
+                            failed_items.append((name, str(e)))
+                            _mark_state_item_failed(orchestrator, item_id, e)
+                        progress.advance(task)
+
+                console.print(
+                    f"Model pricing: {success_count} migrated, {len(failed_items)} failed"
+                )
+                if failed_items and config.migration.verbose:
+                    for name, err in failed_items:
+                        console.print(f"  [red]✗[/red] {name}: {err}")
+                console.print()
+            else:
+                console.print("[yellow]Skipped model pricing[/yellow]\n")
+        else:
+            console.print("[yellow]none found[/yellow]\n")
+    else:
+        console.print("[dim]Skipping model pricing (--skip-model-pricing)[/dim]\n")
 
 
 @cli.command()
