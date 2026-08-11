@@ -48,9 +48,9 @@ jsonpatch==1.33
     # via langchain-core
 jsonpointer==3.1.1
     # via jsonpatch
-langchain-anthropic==1.5.3
+langchain-anthropic==1.5.4
     # via langsmith-data-migration-tool (pyproject.toml)
-langchain-core==1.5.2
+langchain-core==1.5.3
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-anthropic
@@ -59,7 +59,7 @@ langchain-openai==1.4.1
     # via langsmith-data-migration-tool (pyproject.toml)
 langchain-protocol==0.0.18
     # via langchain-core
-langsmith==0.10.11
+langsmith==0.10.16
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-core
@@ -74,11 +74,11 @@ mdit-py-plugins==0.6.1
     # via textual
 mdurl==0.1.2
     # via markdown-it-py
-openai==2.49.0
+openai==2.53.0
     # via langchain-openai
 orjson==3.11.9
     # via langsmith
-packaging==26.2
+packaging==26.3
     # via
     #   langchain-core
     #   langsmith
@@ -91,7 +91,7 @@ pydantic==2.13.4
     #   langchain-core
     #   langsmith
     #   openai
-pydantic-core==2.47.0
+pydantic-core==2.48.0
     # via pydantic
 pygments==2.20.0
     # via
@@ -151,7 +151,7 @@ uuid-utils==0.17.0
     # via
     #   langchain-core
     #   langsmith
-websockets==16.1.1
+websockets==17.0.1
     # via langsmith
 xxhash==3.8.1
     # via langsmith
