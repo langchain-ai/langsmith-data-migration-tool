@@ -91,7 +91,7 @@ def test_payload_fetch_is_chunked_without_changing_the_result(sample_config):
     m = _migrator(sample_config)
     with patch("langsmith_migrator.core.migrators.trace._ID_CHUNK", 2):
         m.source.post.side_effect = _pages([_run("a"), _run("b")]) + _pages([_run("c")])
-        fetched = [r["id"] for r in m.fetch_runs("src", WINDOW, ["a", "b", "c"])]
+        fetched = [r["id"] for r in m.fetch_runs(m.source, "src", WINDOW, ["a", "b", "c"])]
     assert sorted(fetched) == ["a", "b", "c"]
     assert [len(call[0][1]["id"]) for call in m.source.post.call_args_list] == [2, 1]
 
@@ -398,8 +398,8 @@ def test_the_tier_is_not_restored_while_a_session_is_incomplete(sample_config):
     m.resolve_dest_session = Mock(return_value={"id": DEST, "trace_tier": "longlived"})
     m.restore_tier = Mock()
     m.migrate_slice = Mock(side_effect=lambda s, d, w: __import__(
-        "langsmith_migrator.core.trace_domain", fromlist=["SliceReconciliation"]
-    ).SliceReconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1))
+        "langsmith_migrator.core.trace_domain", fromlist=["Reconciliation"]
+    ).Reconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1))
     m.migrate_session({"id": "src", "name": "p", "trace_tier": "shortlived"}, now=NOW)
     m.restore_tier.assert_not_called()
 
@@ -499,20 +499,9 @@ def test_a_deferred_upgrade_leaves_the_session_tier_alone(sample_config):
 # --------------------------------------------------------------------------
 # Source and destination capability fallbacks
 # --------------------------------------------------------------------------
-def test_a_rejected_select_falls_back_to_no_projection_once(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state)
-    rejection = RuntimeError("422 body.select.3: Input should be 'id', 'name', ...")
-    m.source.post.side_effect = [rejection, {"runs": [_run("a")], "cursors": {}}, {"runs": [_run("b")], "cursors": {}}]
-
-    assert m.long_lived_run_ids(m.source, "src", WINDOW) == {"a"}
-    # retried without the projection, and the fallback is remembered, not re-probed
-    assert "select" not in m.source.post.call_args_list[1][0][1]
-    assert m.long_lived_run_ids(m.source, "src", WINDOW) == {"b"}
-    assert "select" not in m.source.post.call_args_list[2][0][1]
-    assert [i.code for i in migration_state.issue_log].count("run_query_select_unsupported") == 1
-
-
-def test_an_unrelated_query_failure_is_not_swallowed(sample_config):
+def test_a_query_failure_is_never_swallowed(sample_config):
+    # There is no select-rejection fallback: the derived select is built from
+    # the write contract, every name of which the endpoint accepts.
     m = _migrator(sample_config)
     m.source.post.side_effect = RuntimeError("503 Service unavailable")
     with pytest.raises(RuntimeError, match="503"):
@@ -677,3 +666,44 @@ def test_human_sizes_are_readable():
     assert TraceMigrator._human(512) == "512 B"
     assert TraceMigrator._human(1536) == "1.5 KB"
     assert TraceMigrator._human(5 * 1024 * 1024) == "5.0 MB"
+
+
+# --------------------------------------------------------------------------
+# Blob hosts are per side
+# --------------------------------------------------------------------------
+def test_the_destination_read_back_uses_the_destination_blob_host(sample_config):
+    """A destination presigned URL lives on the destination host.
+
+    Validating it against the *source* host refused every read-back, so the
+    fidelity digest compared N attachments against 0 and reported a mismatch
+    that was not real.
+    """
+    m = _migrator(sample_config)
+    m._source_blob_host, m._dest_blob_host = "source.api.test.com", "dest.api.test.com"
+    m.dest.session.get.return_value = _blob_response(b"attachment-bytes")
+
+    run = _run("a", s3_urls={"attachment.note": {"presigned_url": "https://dest.api.test.com/public/download?jwt=x"}})
+    overrides, issues = m.materialise(run, side="dest")
+
+    assert issues == []
+    assert overrides["attachments"]["note"] == ("text/plain", b"attachment-bytes")
+    m.source.session.get.assert_not_called()
+
+
+def test_a_source_url_is_still_refused_on_the_destination_side(sample_config):
+    m = _migrator(sample_config)
+    m._source_blob_host, m._dest_blob_host = "source.api.test.com", "dest.api.test.com"
+    run = _run("a", s3_urls={"attachment.note": {"presigned_url": "https://source.api.test.com/x"}})
+    assert m.materialise(run, side="dest")[1] == ["attachment_host_rejected"]
+
+
+def test_an_unreadable_read_back_is_not_reported_as_a_content_mismatch(sample_config, migration_state):
+    m = _migrator(sample_config, migration_state)
+    m._source_blob_host, m._dest_blob_host = "source.api.test.com", "dest.api.test.com"
+    m.dest.session.get.side_effect = RuntimeError("blob store down")
+    m.dest.post.side_effect = _pages([_run("a", s3_urls={"attachment.n": {"presigned_url": "https://dest.api.test.com/x"}})])
+
+    degraded = {}
+    m._check_content(DEST, WINDOW, {"a": {"attachments": "deadbeef"}}, degraded)
+    assert degraded == {}
+    assert not any(i.code == "run_fidelity_mismatch" for i in migration_state.issue_log)

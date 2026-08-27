@@ -25,6 +25,7 @@ Two backend facts drive most of the shape here:
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -41,9 +42,8 @@ from ..trace_domain import (
     LONGLIVED,
     RUN_QUERY_SELECT,
     S3_URL_PAYLOAD_FIELDS,
-    SessionReconciliation,
+    Reconciliation,
     SlicePlan,
-    SliceReconciliation,
     Window,
     batch_traces,
     digest_mismatches,
@@ -94,10 +94,6 @@ def _raise_if_tier_denied(error: Exception) -> None:
         )
 
 
-def _is_select_rejection(error: Exception) -> bool:
-    """True when the source refused a name in ``select`` rather than the query."""
-    text = str(error)
-    return "select" in text and ("422" in text or "Input should be" in text)
 _CANARY_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
 
 
@@ -147,9 +143,11 @@ class TraceMigrator(BaseMigrator):
             self.fidelity_reduced.add("without --skip-attachments")
         self.upgrade_rows: List[Tuple[str, str, str]] = []
 
-        self._dest_sessions: Dict[str, Dict[str, Any]] = {}
-        self._select_unsupported = False
+        # Blobs are proxied by whichever deployment stores them, so the
+        # allow-list is per side: the destination's read-back URLs live on the
+        # destination host, not the source's.
         self._source_blob_host = urlparse(self._host(config.source.base_url)).netloc
+        self._dest_blob_host = urlparse(self._host(config.destination.base_url)).netloc
 
         self._dest_session_http = requests.Session()
         if not config.destination.verify_ssl:
@@ -179,11 +177,9 @@ class TraceMigrator(BaseMigrator):
     @staticmethod
     def _shape(runs: Sequence[Dict[str, Any]]) -> Tuple[int, int, int]:
         """``(runs, distinct traces, serialized bytes)`` for a page or a batch."""
-        import json as _json
-
         traces = {str(r.get("trace_id")) for r in runs}
         size = sum(
-            len(_json.dumps({k: v for k, v in r.items() if k != "attachments"}, default=str))
+            len(json.dumps({k: v for k, v in r.items() if k != "attachments"}, default=str))
             + sum(len(data) for _, data in (r.get("attachments") or {}).values())
             for r in runs
         )
@@ -226,29 +222,10 @@ class TraceMigrator(BaseMigrator):
         }
         if ids is not None:
             body["id"] = [str(i) for i in ids]
-        if self._select_unsupported:
-            body.pop("select")
         side = "source" if client is self.source else "dest  "
         page_num, seen = 0, 0
         while True:
-            try:
-                response = client.post("/runs/query", body) or {}
-            except Exception as exc:
-                # One fallback, no cascade: a source that rejects a name in
-                # `select` gets the query again with no projection at all. The
-                # endpoint then returns every column, which is a superset of
-                # what we asked for, so nothing is lost but the narrowing.
-                if self._select_unsupported or "select" not in body or not _is_select_rejection(exc):
-                    raise
-                self._select_unsupported = True
-                self.record_issue(
-                    "degraded",
-                    "run_query_select_unsupported",
-                    "The source rejected the requested `select`; querying without a projection instead",
-                    evidence={"select": list(select), "error": str(exc)[:300]},
-                )
-                body.pop("select")
-                continue
+            response = client.post("/runs/query", body) or {}
             runs = response.get("runs") or []
             page_num += 1
             seen += len(runs)
@@ -287,18 +264,20 @@ class TraceMigrator(BaseMigrator):
     def long_lived_run_ids(self, client, session_id: str, window: Window, *, tier_filter: bool = True) -> Set[str]:
         return {str(r["id"]) for r in self.slice_runs(client, session_id, window, tier_filter=tier_filter)}
 
-    def fetch_runs(self, session_id: str, window: Window, run_ids: Sequence[str]) -> Iterator[Dict[str, Any]]:
+    def fetch_runs(
+        self, client, session_id: str, window: Window, run_ids: Sequence[str]
+    ) -> Iterator[Dict[str, Any]]:
         """Full payloads for a set of IDs, chunked so no request is oversized."""
         ids = list(run_ids)
         for start in range(0, len(ids), _ID_CHUNK):
             yield from self._query_runs(
-                self.source, session_id, window, select=RUN_QUERY_SELECT, ids=ids[start : start + _ID_CHUNK]
+                client, session_id, window, select=RUN_QUERY_SELECT, ids=ids[start : start + _ID_CHUNK]
             )
 
     # ------------------------------------------------------------------
     # Blobs
     # ------------------------------------------------------------------
-    def _fetch_blob(self, url: str, limit: int) -> Tuple[str, bytes]:
+    def _fetch_blob(self, url: str, limit: int, host: str, sess) -> Tuple[str, bytes]:
         """Download one presigned blob through the tool's configured session.
 
         Never the SDK's own conversion, which uses a bare ``requests.get`` that
@@ -308,9 +287,9 @@ class TraceMigrator(BaseMigrator):
         source steering us somewhere else.
         """
         parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.netloc != self._source_blob_host:
+        if parsed.scheme != "https" or parsed.netloc != host:
             raise PermissionError("attachment_host_rejected")
-        with self.source.session.get(url, stream=True, timeout=120, allow_redirects=False) as resp:
+        with sess.get(url, stream=True, timeout=120, allow_redirects=False) as resp:
             resp.raise_for_status()
             content_type = (resp.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
             with SpooledTemporaryFile(max_size=8 * 1024 * 1024) as buf:
@@ -323,7 +302,7 @@ class TraceMigrator(BaseMigrator):
                 buf.seek(0)
                 return content_type, buf.read()
 
-    def materialise(self, run: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    def materialise(self, run: Dict[str, Any], *, side: str = "source") -> Tuple[Dict[str, Any], List[str]]:
         """Re-inline anything the source left in blob storage, and fetch attachments.
 
         The query API usually resolves offloaded ``inputs`` / ``outputs`` /
@@ -334,15 +313,19 @@ class TraceMigrator(BaseMigrator):
         """
         overrides: Dict[str, Any] = {}
         issues: List[str] = []
-        import json as _json
+        host, sess = (
+            (self._source_blob_host, self.source.session)
+            if side == "source"
+            else (self._dest_blob_host, self.dest.session)
+        )
 
         def pull(field: str, ref: Dict[str, Any], limit: int) -> None:
             url = (ref or {}).get("presigned_url")
             if not url:
                 return
             try:
-                _, raw = self._fetch_blob(url, limit)
-                overrides[field] = _json.loads(raw)
+                _, raw = self._fetch_blob(url, limit, host, sess)
+                overrides[field] = json.loads(raw)
             except PermissionError:
                 issues.append("attachment_host_rejected")
             except Exception:
@@ -361,7 +344,9 @@ class TraceMigrator(BaseMigrator):
                     issues.append("attachments_skipped")
                     continue
                 try:
-                    attachments[name] = self._fetch_blob(ref.get("presigned_url", ""), _MAX_ATTACHMENT_BYTES)
+                    attachments[name] = self._fetch_blob(
+                        ref.get("presigned_url", ""), _MAX_ATTACHMENT_BYTES, host, sess
+                    )
                 except PermissionError:
                     issues.append("attachment_host_rejected")
                 except Exception:
@@ -375,14 +360,9 @@ class TraceMigrator(BaseMigrator):
     # ------------------------------------------------------------------
     # Write path
     # ------------------------------------------------------------------
-    @staticmethod
-    def _size_of(payload: Dict[str, Any]) -> int:
-        import json as _json
-
-        attachments = payload.get("attachments") or {}
-        blob_bytes = sum(len(data) for _, data in attachments.values())
-        body = {k: v for k, v in payload.items() if k != "attachments"}
-        return len(_json.dumps(body, default=str)) + blob_bytes
+    @classmethod
+    def _size_of(cls, payload: Dict[str, Any]) -> int:
+        return cls._shape([payload])[2]
 
     def _oversized_fields(self, payload: Dict[str, Any]) -> List[str]:
         """Fields the destination would silently replace with a placeholder.
@@ -391,13 +371,11 @@ class TraceMigrator(BaseMigrator):
         rejecting it, and does not advertise the limit, so this is checked
         against the operator-supplied value before sending.
         """
-        import json as _json
-
         return [
             field
             for field in ("inputs", "outputs")
             if payload.get(field) is not None
-            and len(_json.dumps(payload[field], default=str)) > self.max_field_bytes
+            and len(json.dumps(payload[field], default=str)) > self.max_field_bytes
         ]
 
     def ingest(self, payloads: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
@@ -664,21 +642,22 @@ class TraceMigrator(BaseMigrator):
         raise TracePreflightError(f"historical_ingest_rejected: {detail}")
 
     def _scratch_session(self) -> Dict[str, Any]:
-        for existing in self._dest_sessions_by_name().get(_CANARY_SESSION, []):
-            return existing
-        return self.dest.post("/sessions", {"name": _CANARY_SESSION, "description": "langsmith-migrator pre-flight canary"})
+        existing = next(iter(self._dest_sessions_by_name().get(_CANARY_SESSION, [])), None)
+        return existing or self.dest.post(
+            "/sessions", {"name": _CANARY_SESSION, "description": "langsmith-migrator pre-flight canary"}
+        )
 
     # ------------------------------------------------------------------
     # The unit of work
     # ------------------------------------------------------------------
     def migrate_slice(
         self, source_session: Dict[str, Any], dest_session: Dict[str, Any], window: Window
-    ) -> SliceReconciliation:
+    ) -> Reconciliation:
         """Diff, ingest the difference, confirm it is empty, sample content."""
         src_id, dst_id = str(source_session["id"]), str(dest_session["id"])
         population = self.slice_runs(self.source, src_id, window)
         if not population:
-            return SliceReconciliation(src_id, dst_id, window.label(), 0, 0, 0, 0, 0)
+            return Reconciliation(src_id, dst_id, window.label(), 0, 0, 0, 0, 0)
         source_ids = {str(r["id"]) for r in population}
 
         # With --emit-upgrade-list the destination sessions stay at their
@@ -728,13 +707,13 @@ class TraceMigrator(BaseMigrator):
 
         # A run can be both degraded and blocked; blocked wins, so the parts
         # stay a partition of the source total.
-        degraded_ids = set().union(*degraded.values()) if degraded else set()
+        degraded_ids = set().union(*degraded.values())
         degraded_only = degraded_ids - blocked
-        return SliceReconciliation(
+        return Reconciliation(
             session_id=src_id,
             dest_session_id=dst_id,
             window=window.label(),
-            source_total=len(plan.source_ids),
+            source_total=len(source_ids),
             ingested=len(plan.to_ingest) - len(degraded_only) - len(blocked),
             already_present=len(plan.already_present),
             degraded=len(degraded_only),
@@ -757,7 +736,7 @@ class TraceMigrator(BaseMigrator):
             return digests
 
         prepared: List[Dict[str, Any]] = []
-        for run in self.fetch_runs(src_id, window, sorted(plan.to_ingest)):
+        for run in self.fetch_runs(self.source, src_id, window, sorted(plan.to_ingest)):
             run_id = str(run["id"])
             overrides, issues = self.materialise(run)
             payload_obj, dropped = to_ingest_payload(run, dst_id, overrides)
@@ -815,11 +794,16 @@ class TraceMigrator(BaseMigrator):
     ) -> None:
         """Compare sampled per-field digests. Reports field names, never values."""
         mismatched: Dict[str, List[str]] = {}
-        for run in self.fetch_runs_dest(dest_session_id, window, sorted(digests)):
+        for run in self.fetch_runs(self.dest, dest_session_id, window, sorted(digests)):
             run_id = str(run["id"])
             if run_id not in digests:
                 continue
-            overrides, _ = self.materialise(run)
+            overrides, issues = self.materialise(run, side="dest")
+            if issues:
+                # Otherwise a read-back failure is indistinguishable from the
+                # destination genuinely holding different content.
+                self.log(f"Could not read back run {run_id} for comparison: {sorted(set(issues))}", "warning")
+                continue
             fields = digest_mismatches(digests[run_id], self._digest_of(run, overrides))
             if fields:
                 mismatched[run_id] = list(fields)
@@ -832,13 +816,6 @@ class TraceMigrator(BaseMigrator):
                 next_action="Re-migrate this window into a fresh destination project.",
                 # Field names and counts only - never values.
                 evidence={"window": window.label(), "runs": dict(list(mismatched.items())[:20])},
-            )
-
-    def fetch_runs_dest(self, session_id: str, window: Window, run_ids: Sequence[str]) -> Iterator[Dict[str, Any]]:
-        ids = list(run_ids)
-        for start in range(0, len(ids), _ID_CHUNK):
-            yield from self._query_runs(
-                self.dest, session_id, window, select=RUN_QUERY_SELECT, ids=ids[start : start + _ID_CHUNK]
             )
 
     def _report_degraded(self, window: Window, degraded: Dict[str, Set[str]]) -> None:
@@ -873,7 +850,7 @@ class TraceMigrator(BaseMigrator):
     # ------------------------------------------------------------------
     # Per-session driver
     # ------------------------------------------------------------------
-    def migrate_session(self, source_session: Dict[str, Any], now: Optional[datetime] = None) -> Optional[SessionReconciliation]:
+    def migrate_session(self, source_session: Dict[str, Any], now: Optional[datetime] = None) -> Optional[Reconciliation]:
         """Raise tier -> migrate windows oldest-first -> verify -> restore."""
         dest_session = self.resolve_dest_session(source_session)
         if not dest_session:
@@ -893,7 +870,7 @@ class TraceMigrator(BaseMigrator):
                     f" + degraded {recon.degraded} + blocked {recon.blocked}",
                     "info",
                 )
-        recon = SessionReconciliation.of(str(source_session["id"]), str(dest_session["id"]), slices)
+        recon = Reconciliation.of(str(source_session["id"]), str(dest_session["id"]), slices)
 
         source_tier = source_session.get("trace_tier")
         restore = self.restore_session_tier

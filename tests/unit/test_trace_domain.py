@@ -12,8 +12,7 @@ from langsmith_migrator.core.trace_domain import (
     RUN_QUERY_SELECT,
     SKEW_BUFFER,
     RunIngestPayload,
-    SessionReconciliation,
-    SliceReconciliation,
+    Reconciliation,
     Window,
     batch_traces,
     digest_mismatches,
@@ -264,23 +263,23 @@ def test_a_run_already_on_the_destination_is_never_re_sent():
 
 
 def test_reconciliation_parts_must_account_for_the_source_total():
-    ok = SliceReconciliation("S", "D", "w", source_total=10, ingested=6, already_present=2, degraded=1, blocked=1)
+    ok = Reconciliation("S", "D", "w", source_total=10, ingested=6, already_present=2, degraded=1, blocked=1)
     assert ok.source_total == 10
     with pytest.raises(ValueError):
-        SliceReconciliation("S", "D", "w", source_total=10, ingested=6, already_present=2, degraded=1, blocked=0)
+        Reconciliation("S", "D", "w", source_total=10, ingested=6, already_present=2, degraded=1, blocked=0)
 
 
 def test_session_reconciliation_sums_its_slices_and_reports_both_ids():
     slices = [
-        SliceReconciliation("S", "D", "w1", 4, 4, 0, 0, 0),
-        SliceReconciliation("S", "D", "w2", 6, 3, 2, 1, 0),
+        Reconciliation("S", "D", "w1", 4, 4, 0, 0, 0),
+        Reconciliation("S", "D", "w2", 6, 3, 2, 1, 0),
     ]
-    total = SessionReconciliation.of("S", "D", slices)
+    total = Reconciliation.of("S", "D", slices)
     assert (total.source_total, total.ingested, total.already_present, total.degraded) == (10, 7, 2, 1)
     assert (total.session_id, total.dest_session_id) == ("S", "D")
     assert total.complete
 
 
 def test_a_session_with_blocked_runs_is_not_complete():
-    blocked = SessionReconciliation.of("S", "D", [SliceReconciliation("S", "D", "w", 2, 1, 0, 0, 1)])
+    blocked = Reconciliation.of("S", "D", [Reconciliation("S", "D", "w", 2, 1, 0, 0, 1)])
     assert not blocked.complete

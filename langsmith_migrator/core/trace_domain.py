@@ -24,9 +24,11 @@ LONGLIVED = "longlived"
 SKEW_BUFFER = timedelta(seconds=60)
 
 # Read-only fields the query API returns that we need to materialise a payload
-# but must never forward: blob references, and the source-only example pointer.
-BLOB_REF_FIELDS = ("inputs_s3_urls", "outputs_s3_urls", "s3_urls")
-READ_ONLY_SELECT = BLOB_REF_FIELDS + ("trace_tier", "reference_example_id")
+# but must never forward: blob references, the tier, and the source-only
+# example pointer.
+READ_ONLY_SELECT = (
+    "inputs_s3_urls", "outputs_s3_urls", "s3_urls", "trace_tier", "reference_example_id",
+)
 
 # Fields of the write contract that the query API cannot project. Attachments
 # come back as ``s3_urls["attachment.<name>"]`` entries instead.
@@ -251,8 +253,6 @@ def batch_traces(
 class SlicePlan:
     """What one ``(session, window)`` diff says to do."""
 
-    source_ids: Set[str]
-    dest_ids: Set[str]
     to_ingest: Set[str]
     already_present: Set[str]
     extra_on_dest: Set[str]
@@ -266,23 +266,23 @@ def plan_slice(source_ids: Set[str], dest_ids: Set[str]) -> SlicePlan:
     on the destination cannot repair it. Repair means writing into a *different*
     destination session, because run identity includes ``session_id``.
     """
-    present = source_ids & dest_ids
     return SlicePlan(
-        source_ids=source_ids,
-        dest_ids=dest_ids,
         to_ingest=source_ids - dest_ids,
-        already_present=present,
+        already_present=source_ids & dest_ids,
         extra_on_dest=dest_ids - source_ids,
     )
 
 
 @dataclass(frozen=True)
-class SliceReconciliation:
-    """Counts for one window. The parts must account for the source total."""
+class Reconciliation:
+    """Counts for one window, or a session's total. The parts must account for
+    the source total, so the "counts add up" rule holds on every real run
+    rather than only in a test.
+    """
 
     session_id: str
     dest_session_id: str
-    window: str
+    window: str  # "" for a session-level total
     source_total: int
     ingested: int
     already_present: int
@@ -293,41 +293,21 @@ class SliceReconciliation:
     def __post_init__(self) -> None:
         total = self.ingested + self.already_present + self.degraded + self.blocked
         if total != self.source_total:
+            scope = f"window {self.window}" if self.window else f"session {self.session_id}"
             raise ValueError(
-                f"reconciliation does not add up for {self.window}: "
-                f"source_total={self.source_total} but parts sum to {total}"
-            )
-
-
-@dataclass(frozen=True)
-class SessionReconciliation:
-    """Sum of a session's slices, with the same invariant."""
-
-    session_id: str
-    dest_session_id: str
-    source_total: int
-    ingested: int
-    already_present: int
-    degraded: int
-    blocked: int
-    extra_on_dest: int = 0
-
-    def __post_init__(self) -> None:
-        total = self.ingested + self.already_present + self.degraded + self.blocked
-        if total != self.source_total:
-            raise ValueError(
-                f"reconciliation does not add up for session {self.session_id}: "
+                f"reconciliation does not add up for {scope}: "
                 f"source_total={self.source_total} but parts sum to {total}"
             )
 
     @classmethod
-    def of(cls, session_id: str, dest_session_id: str, slices: Sequence[SliceReconciliation]):
+    def of(cls, session_id: str, dest_session_id: str, slices: Sequence["Reconciliation"]) -> "Reconciliation":
         def s(attr: str) -> int:
             return sum(getattr(x, attr) for x in slices)
 
         return cls(
             session_id=session_id,
             dest_session_id=dest_session_id,
+            window="",
             source_total=s("source_total"),
             ingested=s("ingested"),
             already_present=s("already_present"),
