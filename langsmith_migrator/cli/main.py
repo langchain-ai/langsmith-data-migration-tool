@@ -6379,6 +6379,7 @@ def traces(
     upgrade_rows = []
     session_reports = []
     fidelity_notes = set()
+    failed_projects = []
 
     for src_ws, dst_ws in ws_pairs:
         if src_ws and dst_ws:
@@ -6407,9 +6408,20 @@ def traces(
 
         try:
             migrator.canary()
-        except TracePreflightError as exc:
+        except Exception as exc:
+            # Any pre-flight failure, not just a refused timestamp: a 403 on the
+            # scratch project used to escape as a raw traceback with no recorded
+            # outcome.
             console.print(f"[red]Pre-flight failed: {exc}[/red]")
             console.print("[red]Nothing was migrated.[/red]")
+            if not isinstance(exc, TracePreflightError):
+                migrator.record_issue(
+                    "blocked",
+                    "trace_preflight_failed",
+                    f"Pre-flight failed before any run was migrated: {str(exc)[:200]}",
+                    next_action="Resolve the destination error above and re-run `langsmith-migrator traces`.",
+                    evidence={"error": str(exc)[:500]},
+                )
             _display_resolution_summary(orchestrator)
             orchestrator.cleanup()
             ctx.exit(1)
@@ -6436,17 +6448,25 @@ def traces(
             continue
 
         for source_session in selected:
-            console.print(f"\n[bold]{source_session.get('name')}[/bold] ({source_session['id']})")
+            label = _trace_session_label(source_session)
+            console.print(f"\n[bold]{label}[/bold] ({source_session['id']})")
             try:
                 report = migrator.migrate_session(source_session)
-            except TracePreflightError as exc:
-                console.print(f"  [red]blocked: {exc}[/red]")
-                continue
-            except Exception as e:
-                console.print(f"  [red]failed: {e}[/red]")
+            except Exception as exc:
+                # Not just printed: a project that failed must leave a blocked
+                # outcome behind and fail the exit code, or a run that migrated
+                # nothing looks indistinguishable from a clean one.
+                blocked = isinstance(exc, TracePreflightError)
+                console.print(f"  [red]{'blocked' if blocked else 'failed'}: {exc}[/red]")
+                failed_projects.append((label, str(exc)))
+                _record_trace_session_failure(
+                    orchestrator, config, migrator, source_session,
+                    "trace_session_blocked" if blocked else "trace_session_failed", exc,
+                )
                 continue
             if report is None:
                 console.print("  [yellow]skipped: supply an explicit --project-mapping for this project[/yellow]")
+                failed_projects.append((label, "unresolved destination project"))
                 continue
             session_reports.append((source_session.get("name"), report))
             _record_trace_session_outcome(orchestrator, config, migrator, source_session, report)
@@ -6460,10 +6480,12 @@ def traces(
     if emit_upgrade_list and upgrade_rows:
         _write_upgrade_list(emit_upgrade_list, upgrade_rows)
 
-    _print_trace_summary(session_reports, fidelity_notes, no_verify)
+    _print_trace_summary(session_reports, fidelity_notes, no_verify, failed_projects)
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
     orchestrator.cleanup()
+    if failed_projects:
+        ctx.exit(1)
 
 
 def _select_trace_sessions(config: Config, migrator, projects, select_all: bool) -> list:
@@ -6527,14 +6549,8 @@ def _record_trace_session_outcome(orchestrator, config, migrator, source_session
     Deliberately not one per run: state is rewritten on every update, and the
     per-run detail is already in the reconciliation counts.
     """
-    item_id = _ensure_state_item(
-        orchestrator,
-        config,
-        "trace_session",
-        str(source_session["id"]),
-        source_session.get("name") or str(source_session["id"]),
-        metadata={"dest_session_id": report.dest_session_id},
-    )
+    item_id = _trace_item_id(orchestrator, config, source_session,
+                             metadata={"dest_session_id": report.dest_session_id})
     evidence = {
         "source_total": report.source_total,
         "ingested": report.ingested,
@@ -6555,6 +6571,31 @@ def _record_trace_session_outcome(orchestrator, config, migrator, source_session
         migrator.mark_migrated(item_id, evidence=evidence)
 
 
+def _trace_session_label(source_session) -> str:
+    return source_session.get("name") or str(source_session["id"])
+
+
+def _trace_item_id(orchestrator, config, source_session, metadata=None):
+    return _ensure_state_item(
+        orchestrator,
+        config,
+        "trace_session",
+        str(source_session["id"]),
+        _trace_session_label(source_session),
+        metadata=metadata,
+    )
+
+
+def _record_trace_session_failure(orchestrator, config, migrator, source_session, code, exc) -> None:
+    """Persist a blocked outcome so remediation and the exit code can see it."""
+    migrator.mark_blocked(
+        _trace_item_id(orchestrator, config, source_session),
+        code,
+        next_action="Re-run `langsmith-migrator traces` for this project once the cause is resolved.",
+        evidence={"error": str(exc)[:500]},
+    )
+
+
 def _print_trace_reconciliation(report) -> None:
     console.print(
         f"  source {report.source_total} = ingested {report.ingested}"
@@ -6564,7 +6605,9 @@ def _print_trace_reconciliation(report) -> None:
     )
 
 
-def _print_trace_summary(session_reports, fidelity_notes, no_verify) -> None:
+def _print_trace_summary(session_reports, fidelity_notes, no_verify, failed_projects=()) -> None:
+    for name, err in failed_projects:
+        console.print(f"[red]x[/red] {name} did not migrate: {err[:160]}")
     if not session_reports:
         console.print("\n[yellow]No traces migrated[/yellow]")
         return

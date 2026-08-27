@@ -313,11 +313,9 @@ class TraceMigrator(BaseMigrator):
         """
         overrides: Dict[str, Any] = {}
         issues: List[str] = []
-        host, sess = (
-            (self._source_blob_host, self.source.session)
-            if side == "source"
-            else (self._dest_blob_host, self.dest.session)
-        )
+        src = side == "source"
+        host = self._source_blob_host if src else self._dest_blob_host
+        sess = (self.source if src else self.dest).session
 
         def pull(field: str, ref: Dict[str, Any], limit: int) -> None:
             url = (ref or {}).get("presigned_url")
@@ -563,12 +561,12 @@ class TraceMigrator(BaseMigrator):
             time.sleep(_VERIFY_BACKOFF * (attempt + 1))
         raise TracePreflightError(f"trace_tier_not_observed for session {session_id}")
 
-    def restore_tier(self, dest_session: Dict[str, Any], source_tier: Optional[str]) -> None:
-        """Put a raised session back, so only the session being migrated is exposed."""
-        if self.config.migration.dry_run or not source_tier or source_tier == LONGLIVED:
+    def restore_tier(self, dest_session: Dict[str, Any], tier: Optional[str]) -> None:
+        """Put a raised session back to the tier it had before we touched it."""
+        if self.config.migration.dry_run or not tier or tier == LONGLIVED:
             return
         try:
-            self.dest.patch(f"/sessions/{dest_session['id']}", {"trace_tier": source_tier})
+            self.dest.patch(f"/sessions/{dest_session['id']}", {"trace_tier": tier})
         except Exception as exc:
             self.log(f"Could not restore trace tier on {dest_session['id']}: {exc}", "warning")
 
@@ -851,32 +849,74 @@ class TraceMigrator(BaseMigrator):
     # Per-session driver
     # ------------------------------------------------------------------
     def migrate_session(self, source_session: Dict[str, Any], now: Optional[datetime] = None) -> Optional[Reconciliation]:
-        """Raise tier -> migrate windows oldest-first -> verify -> restore."""
+        """Raise tier -> migrate windows oldest-first -> verify -> restore.
+
+        The tier is settled in a ``finally``: once an existing project has been
+        raised, walking away without deciding what to do about it would leave a
+        project long-lived indefinitely on any mid-run failure, silently
+        changing retention for traffic that has nothing to do with this
+        migration.
+        """
         dest_session = self.resolve_dest_session(source_session)
         if not dest_session:
             return None
+        prior_tier = dest_session.get("trace_tier")
         self.ensure_long_lived(dest_session)
 
-        slices = []
-        for window in iter_windows(now or datetime.now(timezone.utc), self.max_age_days, self.window_days):
-            recon = self.migrate_slice(source_session, dest_session, window)
-            slices.append(recon)
-            if recon.source_total:
-                # Per-slice detail is verbose-only: the range can be 180
-                # windows wide, and the per-session total is always printed.
-                self.log(
-                    f"  {recon.window}: source {recon.source_total} = ingested {recon.ingested}"
-                    f" + already present {recon.already_present}"
-                    f" + degraded {recon.degraded} + blocked {recon.blocked}",
-                    "info",
-                )
-        recon = Reconciliation.of(str(source_session["id"]), str(dest_session["id"]), slices)
+        recon = None
+        try:
+            slices = []
+            for window in iter_windows(now or datetime.now(timezone.utc), self.max_age_days, self.window_days):
+                sliced = self.migrate_slice(source_session, dest_session, window)
+                slices.append(sliced)
+                if sliced.source_total:
+                    # Per-slice detail is verbose-only: the range can be 180
+                    # windows wide, and the per-session total is always printed.
+                    self.log(
+                        f"  {sliced.window}: source {sliced.source_total} = ingested {sliced.ingested}"
+                        f" + already present {sliced.already_present}"
+                        f" + degraded {sliced.degraded} + blocked {sliced.blocked}",
+                        "info",
+                    )
+            recon = Reconciliation.of(str(source_session["id"]), str(dest_session["id"]), slices)
+            return recon
+        finally:
+            self._settle_tier(dest_session, prior_tier, source_session.get("trace_tier"), recon)
 
-        source_tier = source_session.get("trace_tier")
+    def _settle_tier(
+        self,
+        dest_session: Dict[str, Any],
+        prior_tier: Optional[str],
+        source_tier: Optional[str],
+        recon: Optional[Reconciliation],
+    ) -> None:
+        """Restore a raised destination tier, or say why it was left raised.
+
+        ``ensure_long_lived`` only mutates the session dict on a real raise, so
+        a changed tier is exactly "we raised this one".
+        """
+        if dest_session.get("trace_tier") == prior_tier:
+            return
         restore = self.restore_session_tier
         if restore is None:
             restore = source_tier != LONGLIVED
-        # Never restore an incomplete session: a re-run must still ingest long-lived.
-        if restore and recon.complete:
-            self.restore_tier(dest_session, source_tier)
-        return recon
+        if not restore:
+            return
+        if recon is not None and recon.complete:
+            self.restore_tier(dest_session, prior_tier)
+            return
+        # Left raised on purpose - a re-run must still ingest long-lived - but
+        # recorded, because an operator otherwise has no way to know this
+        # project's retention was changed and not put back.
+        reason = "the migration did not finish" if recon is None else "the project has blocked runs"
+        self.record_issue(
+            "degraded",
+            "dest_tier_left_raised",
+            f"Destination project {dest_session['id']} was raised to {LONGLIVED} and left raised "
+            f"because {reason}",
+            next_action=(
+                f"Re-run `langsmith-migrator traces` to finish it, or set the tier back to "
+                f"'{prior_tier}' by hand once you no longer need it raised."
+            ),
+            evidence={"dest_session_id": str(dest_session["id"]), "prior_tier": prior_tier, "reason": reason},
+        )

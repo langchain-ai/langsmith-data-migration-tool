@@ -12,7 +12,7 @@ import pytest
 
 from langsmith_migrator.core.api_client import EnhancedAPIClient
 from langsmith_migrator.core.migrators.trace import TraceMigrator, TracePreflightError
-from langsmith_migrator.core.trace_domain import Window
+from langsmith_migrator.core.trace_domain import Reconciliation, Window
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
 WINDOW = Window(NOW - timedelta(days=1), NOW)
@@ -707,3 +707,63 @@ def test_an_unreadable_read_back_is_not_reported_as_a_content_mismatch(sample_co
     m._check_content(DEST, WINDOW, {"a": {"attachments": "deadbeef"}}, degraded)
     assert degraded == {}
     assert not any(i.code == "run_fidelity_mismatch" for i in migration_state.issue_log)
+
+
+# --------------------------------------------------------------------------
+# A raised destination tier is always settled
+# --------------------------------------------------------------------------
+def _raisable(m, source_tier="shortlived"):
+    """A destination project that ensure_long_lived() has to raise."""
+    dest = {"id": DEST, "trace_tier": "shortlived"}
+    m.resolve_dest_session = Mock(return_value=dest)
+    m.dest.get.return_value = {"trace_tier": "longlived"}
+    m.restore_tier = Mock()
+    return {"id": "src", "name": "p", "trace_tier": source_tier}, dest
+
+
+def test_a_raised_tier_is_restored_after_a_clean_migration(sample_config):
+    m = _migrator(sample_config)
+    src, dest = _raisable(m)
+    m.migrate_slice = Mock(side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 0, 0, 0, 0, 0))
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        m.migrate_session(src, now=NOW)
+    m.restore_tier.assert_called_once_with(dest, "shortlived")
+
+
+def test_a_raised_tier_is_settled_even_when_the_migration_raises(sample_config, migration_state):
+    # Walking away here would leave the project long-lived indefinitely,
+    # changing retention for traffic unrelated to this migration.
+    m = _migrator(sample_config, migration_state)
+    src, dest = _raisable(m)
+    m.migrate_slice = Mock(side_effect=RuntimeError("source query blew up"))
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        with pytest.raises(RuntimeError, match="blew up"):
+            m.migrate_session(src, now=NOW)
+    # deliberately left raised so a re-run still ingests long-lived...
+    m.restore_tier.assert_not_called()
+    # ...but never silently
+    issue = next(i for i in migration_state.issue_log if i.code == "dest_tier_left_raised")
+    assert "did not finish" in issue.summary
+    assert issue.evidence["prior_tier"] == "shortlived"
+
+
+def test_an_incomplete_migration_leaves_the_tier_raised_and_says_so(sample_config, migration_state):
+    m = _migrator(sample_config, migration_state)
+    src, dest = _raisable(m)
+    m.migrate_slice = Mock(side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1))
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        m.migrate_session(src, now=NOW)
+    m.restore_tier.assert_not_called()
+    assert any(i.code == "dest_tier_left_raised" and "blocked runs" in i.summary
+               for i in migration_state.issue_log)
+
+
+def test_a_tier_we_never_raised_is_never_touched(sample_config, migration_state):
+    m = _migrator(sample_config, migration_state)
+    m.resolve_dest_session = Mock(return_value={"id": DEST, "trace_tier": "longlived"})
+    m.restore_tier = Mock()
+    m.migrate_slice = Mock(side_effect=RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        m.migrate_session({"id": "src", "name": "p", "trace_tier": "shortlived"}, now=NOW)
+    m.restore_tier.assert_not_called()
+    assert not any(i.code == "dest_tier_left_raised" for i in migration_state.issue_log)
