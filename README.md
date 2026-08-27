@@ -34,6 +34,7 @@ langsmith-migrator datasets
 - **Custom Model Pricing**: Migrate workspace-custom model price entries (`model-pricing`). Global built-in prices are skipped since they already exist in every workspace. Idempotent: an equivalent entry on the destination is updated in place, or skipped with `--skip-existing`
 - **Engine Issues**: Migrate per-project LangSmith Engine issues-agent configs and detected issues as metadata (`issues`). Run links and trace deep-links are not migrated (see Limitations)
 - **Fleet**: Migrate agents, shared skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, and workspace secrets (`fleet`)
+- **Long-lived traces**: Migrate traces whose tier is `longlived` between deployments (`traces`), preserving run IDs, `dotted_order` and timestamps verbatim, carrying attachments and re-inlining offloaded payloads. Stateless — work is a destination diff per time window, so re-run instead of resuming. Not part of `migrate-all`
 - **Context Hub**: Migrate Context Hub agents and skills (the versioned agent/skill repos in the LangSmith Context Hub), including files and repo metadata (description, readme, tags, is_public) (`contexts`). Replays the **full commit history** by default so the destination reproduces the source's commit chain; use `--latest-only` to copy just the latest commit. Also copies **commit tags**, including the `production` / `staging` environment tags behind the Context Hub promote feature, pointing each at the same commit on the destination (`--no-tags` to skip). Lists the same contexts the Context Hub UI shows (external-source repos are hidden by default; use `--include-external` to migrate them too). Scope with `--agents-only` / `--skills-only`; linked-repo commit pins are stripped and reported cross-instance, or preserved with `--same-instance`
 - **Workspace Scoping**: Run resource migrations per workspace pair with explicit IDs or interactive workspace mapping
 - **Remediation & Resume**: Persist migration state, write remediation bundles, print grouped actionable next steps, and retry pending/failed work with `resume`
@@ -41,27 +42,91 @@ langsmith-migrator datasets
 
 ## Limitations
 
-### Trace Data Not Supported
+### Long-Lived Traces Only
 
-This tool **does not support migrating trace data**. It migrates:
-- Datasets and examples (including file attachments)
-- Experiments, runs, and feedback
-- Annotation queues
-- Project rules
-- Prompts
-- Charts
-- Custom model pricing (workspace-custom model-price-map entries)
-- LangSmith Engine issues-agent configs and detected issue metadata
-- Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets)
-- Context Hub agents and skills (full commit history)
+The `traces` command migrates **long-lived traces only** (`trace_tier == "longlived"`)
+— the ones deliberately retained for up to 180 days. Short-lived traces are out of
+scope.
 
-For trace data, use LangSmith's **Bulk Export** functionality: [LangSmith Bulk Export Documentation](https://docs.langchain.com/langsmith/data-export#bulk-exporting-trace-data)
+What `traces` guarantees:
+
+- **Run IDs are preserved.** `id`, `trace_id`, `parent_run_id` and `dotted_order` are
+  copied verbatim, so run references keep meaning across the move.
+- **Timestamps are preserved.** There is no time-shifting option, flag, or fallback.
+  (Contrast `datasets --include-experiments`, which *does* shift experiment run
+  timestamps — see "Experiment Timestamps Are Rewritten on Migration".)
+- **Tracing projects are mapped, not preserved.** Creating a destination project
+  attempts the source's UUID because a match is convenient, but a rejection is normal
+  progress — nothing depends on the two being equal. Resolution order is
+  `--project-mapping` / `--map-projects` → destination name match → create.
+- **Completeness is verified per project.** For each `(project, time window)` slice the
+  tool compares the source's long-lived run IDs against the destination's and reports
+  `source = ingested + already present + degraded + blocked`.
+- **Attachments and offloaded payloads are carried.** Blobs are fetched through the
+  tool's own configured HTTP session (SSL settings, CA bundles, proxies) and re-inlined;
+  a failed fetch is reported, never silently replaced with a placeholder.
+
+**Statelessness: there is no resume.** Work is derived from a destination diff per time
+window, not from a checkpoint. If a run is interrupted, just re-run the same command —
+finished windows produce an empty difference. `--max-age-days` sets the range to walk
+(default 180, the retention ceiling) and `--window` the size of one slice of it
+(default 1 day); widen `--window` when migrating many projects. `langsmith-migrator
+resume` does not apply and will say so.
+
+**Ordering dependency: run `model-pricing` before `traces`.** Token and cost rollups are
+not replayed — the destination recomputes them from each run's `usage_metadata` against
+its own price map, so the custom prices must be in place first.
+
+**Same-workspace refusal.** The destination's run identity is
+`(tenant, project, start_time, run id)`, so re-ingesting runs under their original IDs
+into the *same* deployment and workspace duplicates or overwrites the source rather than
+replacing it. The command refuses, regardless of how projects map. Cross-workspace on one
+deployment is fine.
+
+**Retention tier.** The ingest contract has no per-run tier field, so the destination
+*project's* tier is the only lever — and it must be right at ingest time, because the row
+TTL and the blob key prefix are both baked in at insert. Destination projects are
+therefore created with an explicit long-lived tier, and an existing short-lived project is
+raised (and re-read until the raise is observable) before anything is written into it.
+Exposure is scoped to one project at a time: raise → migrate → verify → restore.
+`--restore-session-tier` defaults on when the source project was not itself long-lived.
+
+**Fidelity repair means a new project, not a re-send.** A run is immutable once fully
+ingested so re-sending a run the destination already holds cannot repair it.
+
+#### Destination configuration checklist
+
+The tool reports rather than requires: the pre-flight prints the destination's advertised
+limits, runs a historical-ingest canary, and names the setting behind any value that will
+hurt. Fixing the destination and re-running costs nothing.
+
+| Setting | Default | Why it matters |
+| --- | --- | --- |
+| `V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS` | `["*"]` | Historical timestamps are rejected outright when the ±24h ingest window is enforced, and the *whole* multipart request fails. Keep `*` or add the org. The pre-flight canary — one run stamped at the far end of the requested range, read back by ID — enforces this before anything is migrated, and stops with `historical_ingest_rejected` if it fails. |
+| `MAX_FIELD_SIZE_BYTES` | 25 MB | An oversized `inputs`/`outputs` is **silently replaced with a placeholder**, not rejected, and the limit is not advertised. Tell the tool via `--max-field-bytes`; a larger re-inlined payload is then reported as `payload_oversized_for_destination` instead of quietly stubbed. |
+| `MAX_ATTACHMENT_SIZE_BYTES` | 200 MB | Attachments above this are refused. |
+| `TRACE_TIER_TTL_DURATION_SEC_MAP`, `S3_TRACE_TIER_PREFIX_MAP` | `""` | Both need a `longlived` entry or tier handling errors. |
+| `FF_BLOB_STORAGE_ENABLED` | false (auto-true with S3) | Gates the blob side of tier handling. |
+| `DEFAULT_TRACE_TIER` | `shortlived` | Decides whether the explicit long-lived create counts as a tier *increase*. |
+| Destination key's role | — | Needs `PROJECTS_INCREASE_TRACE_TIER`, plus `PROJECTS_DECREASE_TRACE_TIER` when restoring. A 403 stops the pre-flight with `trace_tier_permission_denied`. |
+| Tenant long-lived usage limit | — | Checked once per multipart request; a breach fails the whole request. Confirm headroom for the expected volume. |
+
+Worth tuning for the transfer and reverting afterwards: `BATCH_INGEST_SIZE_LIMIT_BYTES`
+(20 MB default, binding for trace payloads with inlined blobs), `BATCH_INGEST_SIZE_LIMIT`
+(100 runs), `BATCH_INGEST_SCALE_UP_NTHREADS_LIMIT` (16),
+`BATCH_INGEST_SCALE_UP_QSIZE_TRIGGER` (1000, lower it so workers scale before a backlog
+builds), and `TRACER_SESSION_CACHE_SOFT_TTL_SEC` (60, only relevant when raising an
+existing project's tier).
+
+Not migrated by `traces`: short-lived traces, threads, and run-level sharing links.
+`migrate-all` deliberately does not run it — trace volume makes it a separately scoped
+operation.
 
 ### Engine Issue Run Links and Trace Deep-Links Are Not Migrated
 
 The `issues` command migrates two LangSmith Engine resource types: per-project issues-agent configs and the detected issues themselves. Detected issues are migrated as **metadata only** (name, description, severity, status, tags, plus the Engine-authored `proposed_fix` and `fix_prompt`).
 
-An issue's linked runs are **not** migrated. Issues reference runs by `run_id`/`trace_id`, and trace data is not portable across instances (see "Trace Data Not Supported" above). The destination validates every `run_id` against its own run store, so links pointing at source runs would be rejected. The tool never sends the linked-run list when recreating an issue. To repopulate run links, run Engine on the destination so it re-detects issues against the destination's own traces. For the same reason, `fix_branch`/`fix_pr_number` (source-instance GitHub references) and Engine-generated advisory `actions` are also not sent on create.
+An issue's linked runs are **not** migrated. Issues reference runs by `run_id`/`trace_id`, and the destination validates every `run_id` against its own run store, so links pointing at source runs would be rejected. Migrating traces first with the `traces` command preserves run IDs (see "Long-Lived Traces Only" above), but re-pointing issue run links is not yet automated. The tool never sends the linked-run list when recreating an issue. To repopulate run links, run Engine on the destination so it re-detects issues against the destination's own traces. For the same reason, `fix_branch`/`fix_pr_number` (source-instance GitHub references) and Engine-generated advisory `actions` are also not sent on create.
 
 Issues-agent configs are recreated with source-instance-only fields stripped (`latest_thread_id`, `latest_run_id`, issue counts, tenant, timestamps). GitHub/Context-Hub linkage (`github_repo_url`, `context_hub_repo_handle`, etc.) is carried over but only works if the destination has the corresponding integrations configured. Engine-generated advisory `actions` on an issue (e.g. suggested evaluators) are not migrated: the destination re-validates them strictly on create and regenerates them when Engine runs there. Tip: migrate datasets/projects first (or use `migrate-all`) so issues map onto existing projects instead of freshly-created empty ones.
 
@@ -214,6 +279,12 @@ langsmith-migrator fleet --skip-skills --skip-mcp-servers  # Skip specific resou
 langsmith-migrator fleet --agent "My Agent" --agent agent-abc123  # Only these agents (by name or ID)
 langsmith-migrator fleet --agents-owned-only    # Only agents you own or are directly shared
 
+# Long-lived traces (run model-pricing first)
+langsmith-migrator traces                       # Interactive project selection
+langsmith-migrator traces --all                 # All tracing projects
+langsmith-migrator traces --project "my-project" --max-age-days 90 --window 7
+langsmith-migrator traces --emit-upgrade-list upgrade.csv  # Leave tiers alone, hand the list to an operator
+
 # Utilities
 langsmith-migrator export-users --source -o users.csv  # Export active members to a members CSV
 langsmith-migrator list-projects --source
@@ -235,6 +306,7 @@ langsmith-migrator clean
 - `fleet`: migrate Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets) with `--skip-*` flags for each resource type, and `--agent <name-or-id>` / `--agents-owned-only` to scope which agents (and their schedules/triggers/usage limits) are migrated
 - `issues`: migrate Engine issues-agent configs and detected issues as metadata (`--session` to scope to one tracing project)
 - `contexts`: migrate Context Hub agents and skills, replaying full commit history and tags by default (`--latest-only`, `--no-tags`, `--agents-only`, `--skills-only`, `--include-external`, `--same-instance`)
+- `traces`: migrate long-lived traces (`trace_tier == "longlived"`) with run IDs and timestamps preserved; stateless, so re-run rather than resume (`--max-age-days`, `--window`, `--skip-attachments`, `--emit-upgrade-list`). Not part of `migrate-all`
 - `users`: migrate users/roles between instances, or run single-instance CSV access sync
 - `export-users`: export active org and workspace members to a members CSV for import via `users --members-csv`
 - `resume`: retry resumable items from a prior session and show grouped manual blockers
@@ -446,6 +518,28 @@ The prompt default is `No` (rules are created disabled).
 --project-mapping TEXT  JSON string or file path with project ID mapping (headless, no TUI; mutually exclusive with --map-projects)
 --same-instance         Reuse source project/session IDs on destination only when both sides truly share IDs
 ```
+
+### Trace Options
+
+```bash
+--project TEXT                  Tracing project (session) name or ID; repeatable
+--all                           Migrate all tracing projects without prompting
+--max-age-days FLOAT            How far back to walk, the range (default: 180, the retention ceiling)
+--window FLOAT                  Size in days of one slice of the range (default: 1)
+--max-field-bytes INTEGER       Destination MAX_FIELD_SIZE_BYTES; not advertised, so it must be supplied (default: 25 MB)
+--no-verify                     Skip the confirming re-query after ingest (the pre-diff still runs)
+--verify-content-sample INTEGER Runs per window to content-check (default: 100)
+--skip-attachments              Migrate runs without their attachments (recorded as degraded)
+--map-projects                  Launch interactive TUI to map source projects to destination projects
+--project-mapping TEXT          JSON string or file path with project ID mapping (headless, no TUI)
+--restore-session-tier/--no-restore-session-tier
+                                Restore each destination project's trace tier after verifying it
+                                (defaults on when the source project was not long-lived)
+--into-session-suffix TEXT      Migrate into a separate long-lived project named with this suffix (foo -> fooSuffix)
+--emit-upgrade-list FILE        Leave project tiers alone and write (dest_session_id, trace_id, start_time) per trace
+```
+
+There are deliberately **no timestamp options**: run timestamps are copied verbatim.
 
 ### Users Options
 

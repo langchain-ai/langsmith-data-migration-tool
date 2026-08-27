@@ -25,6 +25,7 @@ from ..core.migrators import (
     ModelPriceMapMigrator,
     PromptMigrator,
     RulesMigrator,
+    TraceMigrator,
     UserRoleMigrator,
     FleetAgentMigrator,
     FleetAuthProviderMigrator,
@@ -37,6 +38,7 @@ from ..core.migrators import (
     FleetUsageLimitMigrator,
     FleetWebhookMigrator,
 )
+from ..core.migrators.trace import TracePreflightError
 from ..core.migrators.user_role import (
     is_workspace_role_union_id,
     select_effective_workspace_role_id,
@@ -6254,6 +6256,357 @@ def contexts(
 
 
 @cli.command()
+@click.option("--project", "projects", multiple=True, help="Tracing project (session) name or ID; repeatable")
+@click.option("--all", "select_all", is_flag=True, help="Migrate all tracing projects without prompting")
+@click.option(
+    "--max-age-days",
+    type=float,
+    default=180.0,
+    show_default=True,
+    help="How far back to walk (the range). 180 days is the long-lived retention ceiling.",
+)
+@click.option(
+    "--window",
+    "window_days",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Size in days of one slice of the range. Widen it for a many-project run.",
+)
+@click.option(
+    "--max-field-bytes",
+    type=int,
+    default=25 * 1024 * 1024,
+    show_default=True,
+    help=(
+        "Destination MAX_FIELD_SIZE_BYTES. Not advertised by the destination, so it must be "
+        "supplied; a larger re-inlined payload is reported instead of being silently stubbed."
+    ),
+)
+@click.option("--no-verify", is_flag=True, help="Skip the confirming re-query after ingest (the pre-diff still runs)")
+@click.option("--verify-content-sample", type=int, default=100, show_default=True, help="Runs per window to content-check")
+@click.option("--skip-attachments", is_flag=True, help="Migrate runs without their attachments (recorded as degraded)")
+@click.option("--map-projects", is_flag=True, help="Interactively map source projects to destination projects")
+@click.option("--project-mapping", help='Headless project mapping: JSON object or file, {"src-id": "dest-id"}')
+@click.option(
+    "--restore-session-tier/--no-restore-session-tier",
+    default=None,
+    help="Restore each destination project's trace tier after verifying it. Defaults on when the source project was not long-lived.",
+)
+@click.option("--into-session-suffix", help="Migrate into a separate long-lived project named with this suffix, leaving the live one's tier alone")
+@click.option("--emit-upgrade-list", type=click.Path(dir_okay=False), help="Leave project tiers alone and write (dest_session_id, trace_id, start_time) per trace for an operator upgrade")
+@ssl_option
+@workspace_options
+@click.pass_context
+def traces(
+    ctx,
+    projects,
+    select_all,
+    max_age_days,
+    window_days,
+    max_field_bytes,
+    no_verify,
+    verify_content_sample,
+    skip_attachments,
+    map_projects,
+    project_mapping,
+    restore_session_tier,
+    into_session_suffix,
+    emit_upgrade_list,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
+):
+    """Migrate long-lived traces between deployments.
+
+    Run IDs and timestamps are preserved verbatim; tracing projects (sessions)
+    are mapped. Stateless: there is no resume, just re-run the command.
+    Run `model-pricing` first so migrated runs' costs are computed against the
+    right price map.
+    """
+    config = ctx.obj["config"]
+    state_manager = ctx.obj["state_manager"]
+
+    display_banner()
+    if not ensure_config(config):
+        return
+
+    project_id_map = _load_project_mapping_arg(project_mapping)
+    if project_id_map is _PROJECT_MAPPING_ERROR:
+        ctx.exit(1)
+        return
+
+    orchestrator = MigrationOrchestrator(config, state_manager)
+
+    console.print("Testing connections... ", end="")
+    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
+    if not source_ok or not dest_ok:
+        console.print(f"[red]✗ {'Source' if not source_ok else 'Destination'} connection failed[/red]")
+        if source_error or dest_error:
+            console.print(f"[red]  {source_error or dest_error}[/red]")
+        orchestrator.cleanup()
+        return
+    console.print("[green]✓[/green]\n")
+
+    ws_result = _resolve_workspaces(
+        orchestrator, source_workspace, dest_workspace, map_workspaces,
+        non_interactive=config.migration.non_interactive,
+    )
+    if ws_result is _WS_ABORTED:
+        ctx.exit(1)
+        return
+    if ws_result is _WS_CANCELLED:
+        console.print("[yellow]Cancelled[/yellow]")
+        orchestrator.cleanup()
+        return
+
+    ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+
+    # Run identity on the destination is (tenant, session, start_time, id), so
+    # re-ingesting preserved IDs into the same tenant duplicates rather than
+    # replaces - whatever the session mapping says. Cross-workspace on one
+    # deployment is fine.
+    if _is_same_deployment(config) and any(src == dst for src, dst in ws_pairs):
+        console.print(
+            "[red]Refusing to migrate traces into the same deployment and workspace they were read from.[/red]\n"
+            "[red]Runs keep their original IDs, so the destination would duplicate or overwrite the source.[/red]"
+        )
+        orchestrator.cleanup()
+        ctx.exit(1)
+        return
+
+    _ensure_migration_session(orchestrator, config)
+    upgrade_rows = []
+    session_reports = []
+    fidelity_notes = set()
+
+    for src_ws, dst_ws in ws_pairs:
+        if src_ws and dst_ws:
+            orchestrator.set_workspace_context(src_ws, dst_ws)
+            console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+
+        migrator = TraceMigrator(
+            orchestrator.source_client,
+            orchestrator.dest_client,
+            orchestrator.state,
+            config,
+            max_age_days=max_age_days,
+            window_days=window_days,
+            max_field_bytes=max_field_bytes,
+            verify=not no_verify,
+            verify_content_sample=verify_content_sample,
+            skip_attachments=skip_attachments,
+            restore_session_tier=restore_session_tier,
+            into_session_suffix=into_session_suffix,
+            emit_upgrade_list=emit_upgrade_list,
+            project_id_map=project_id_map
+            or _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
+            or (build_project_id_mapping_tui(orchestrator.source_client, orchestrator.dest_client) if map_projects else None),
+        )
+        _print_trace_preflight(migrator, config, max_age_days, window_days, max_field_bytes, no_verify, into_session_suffix)
+
+        try:
+            migrator.canary()
+        except TracePreflightError as exc:
+            console.print(f"[red]Pre-flight failed: {exc}[/red]")
+            console.print("[red]Nothing was migrated.[/red]")
+            _display_resolution_summary(orchestrator)
+            orchestrator.cleanup()
+            ctx.exit(1)
+            return
+
+        try:
+            selected = _select_trace_sessions(config, migrator, projects, select_all)
+        except Exception as e:
+            # Not a skip: an explicitly named project that could not be
+            # resolved must not exit zero looking like a clean no-op run.
+            console.print(f"[red]Failed to resolve tracing projects: {e}[/red]")
+            if projects:
+                orchestrator.cleanup()
+                ctx.exit(1)
+                return
+            continue
+        if projects and not selected:
+            console.print("[red]None of the requested --project values resolved to a tracing project[/red]")
+            orchestrator.cleanup()
+            ctx.exit(1)
+            return
+        if not selected:
+            console.print("[yellow]No tracing projects selected[/yellow]")
+            continue
+
+        for source_session in selected:
+            console.print(f"\n[bold]{source_session.get('name')}[/bold] ({source_session['id']})")
+            try:
+                report = migrator.migrate_session(source_session)
+            except TracePreflightError as exc:
+                console.print(f"  [red]blocked: {exc}[/red]")
+                continue
+            except Exception as e:
+                console.print(f"  [red]failed: {e}[/red]")
+                continue
+            if report is None:
+                console.print("  [yellow]skipped: supply an explicit --project-mapping for this project[/yellow]")
+                continue
+            session_reports.append((source_session.get("name"), report))
+            _record_trace_session_outcome(orchestrator, config, migrator, source_session, report)
+            _print_trace_reconciliation(report)
+        upgrade_rows.extend(migrator.upgrade_rows)
+        fidelity_notes |= migrator.fidelity_reduced
+
+    if ws_result:
+        orchestrator.clear_workspace_context()
+
+    if emit_upgrade_list and upgrade_rows:
+        _write_upgrade_list(emit_upgrade_list, upgrade_rows)
+
+    _print_trace_summary(session_reports, fidelity_notes, no_verify)
+    _display_resolution_summary(orchestrator)
+    _exit_for_remediation_if_needed(ctx, config, orchestrator)
+    orchestrator.cleanup()
+
+
+def _select_trace_sessions(config: Config, migrator, projects, select_all: bool) -> list:
+    """Resolve ``--project`` (name or ID), else offer the TUI over all projects.
+
+    A project given by ID is fetched directly. Enumerating every tracing
+    project on a busy deployment takes minutes, and naming one is the common
+    case for a trace migration.
+    """
+    if projects:
+        chosen = []
+        for value in projects:
+            session, reason = migrator.find_source_session(value)
+            if session:
+                chosen.append(session)
+            elif reason == "ambiguous":
+                console.print(
+                    f"[yellow]More than one source tracing project is named '{value}'; "
+                    f"pass its ID instead[/yellow]"
+                )
+            else:
+                console.print(f"[yellow]No source tracing project matched '{value}'[/yellow]")
+        return chosen
+    return _select_or_all(
+        config,
+        migrator.list_source_sessions(),
+        select_all=select_all,
+        title="Select Tracing Projects to Migrate",
+        columns=[
+            {"key": "name", "title": "Project", "width": 44},
+            {"key": "trace_tier", "title": "Tier", "width": 12},
+            {"key": "id", "title": "ID", "width": 38},
+        ],
+    )
+
+
+def _print_trace_preflight(migrator, config, max_age_days, window_days, max_field_bytes, no_verify, into_session_suffix):
+    """Report the destination's configuration before writing anything."""
+    max_runs, max_bytes = migrator.batch_limits()
+    table = Table(title="Destination pre-flight", show_header=True)
+    table.add_column("Setting")
+    table.add_column("Value")
+    table.add_column("Source")
+    table.add_row("Batch runs per request", str(max_runs), "GET /info (BATCH_INGEST_SIZE_LIMIT)")
+    table.add_row("Batch bytes per request", f"{max_bytes:,}", "GET /info (BATCH_INGEST_SIZE_LIMIT_BYTES)")
+    table.add_row("Max field bytes", f"{max_field_bytes:,}", "--max-field-bytes (not advertised by the destination)")
+    table.add_row("Range / window", f"{max_age_days:g}d / {window_days:g}d", "--max-age-days / --window")
+    table.add_row("Trace tier", "longlived" if not migrator.emit_upgrade_list else "left as-is (--emit-upgrade-list)", "destination session")
+    console.print(table)
+    if config.migration.dry_run:
+        console.print("[yellow]Dry run: no session creation, no canary, no ingest[/yellow]")
+    if no_verify:
+        console.print("[yellow]--no-verify: runs are reported as ingested, not verified; the completeness guarantee is off[/yellow]")
+    if into_session_suffix:
+        console.print(f"[dim]Migrating into separate projects suffixed '{into_session_suffix}'[/dim]")
+
+
+def _record_trace_session_outcome(orchestrator, config, migrator, source_session, report) -> None:
+    """One state item per project, carrying its reconciliation.
+
+    Deliberately not one per run: state is rewritten on every update, and the
+    per-run detail is already in the reconciliation counts.
+    """
+    item_id = _ensure_state_item(
+        orchestrator,
+        config,
+        "trace_session",
+        str(source_session["id"]),
+        source_session.get("name") or str(source_session["id"]),
+        metadata={"dest_session_id": report.dest_session_id},
+    )
+    evidence = {
+        "source_total": report.source_total,
+        "ingested": report.ingested,
+        "already_present": report.already_present,
+        "degraded": report.degraded,
+        "blocked": report.blocked,
+        "dest_session_id": report.dest_session_id,
+    }
+    if report.blocked:
+        migrator.mark_blocked(
+            item_id, "run_not_ingested",
+            next_action="Re-run `langsmith-migrator traces` for this project.",
+            evidence=evidence,
+        )
+    elif report.degraded:
+        migrator.mark_degraded(item_id, "migrated_with_reduced_fidelity", evidence=evidence)
+    else:
+        migrator.mark_migrated(item_id, evidence=evidence)
+
+
+def _print_trace_reconciliation(report) -> None:
+    console.print(
+        f"  source {report.source_total} = ingested {report.ingested}"
+        f" + already present {report.already_present}"
+        f" + degraded {report.degraded} + blocked {report.blocked}"
+        + (f"  [dim](destination also holds {report.extra_on_dest} run(s) the source did not)[/dim]" if report.extra_on_dest else "")
+    )
+
+
+def _print_trace_summary(session_reports, fidelity_notes, no_verify) -> None:
+    if not session_reports:
+        console.print("\n[yellow]No traces migrated[/yellow]")
+        return
+    table = Table(title="Trace migration", show_header=True)
+    for column in ("Project", "Source", "Ingested", "Present", "Degraded", "Blocked"):
+        table.add_column(column)
+    for name, r in session_reports:
+        table.add_row(name or "?", str(r.source_total), str(r.ingested), str(r.already_present), str(r.degraded), str(r.blocked))
+    console.print(table)
+    if no_verify:
+        console.print("[yellow]Completeness was not verified (--no-verify).[/yellow]")
+    if fidelity_notes:
+        # A run already on the destination is immutable, so there is no
+        # in-place repair: the only fix is to write into a different session.
+        console.print(
+            "[yellow]Fidelity was reduced for some runs. A fully ingested run cannot be modified, "
+            "so repair means re-migrating the affected window into a fresh destination project "
+            "(a new --into-session-suffix), "
+            + ", ".join(sorted(fidelity_notes))
+            + ".[/yellow]"
+        )
+
+
+def _write_upgrade_list(path: str, rows) -> None:
+    """Owner-only file of (dest_session_id, trace_id, start_time). No payload values."""
+    import os
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["dest_session_id", "trace_id", "start_time"])
+        writer.writerows(sorted(set(rows)))
+    console.print(f"Wrote {len(set(rows))} trace(s) to {target} for operator upgrade")
+    console.print(
+        "[yellow]Long-lived retention is NOT yet in effect for these traces: destination project tiers "
+        "were left as they were. Feed the list to POST /internal/runs/upgrade-trace-tier.[/yellow]"
+    )
+
+
+@cli.command()
 @ssl_option
 @click.option(
     "--retry-exhausted",
@@ -6281,6 +6634,15 @@ def resume(ctx, retry_exhausted):
     state = state_manager.load_session(session_id)
     if not state:
         console.print(f"[red]Failed to load session {session_id}[/red]")
+        return
+
+    # Trace migration derives its work from a destination diff per time window,
+    # so there is no checkpoint to resume from.
+    if any(item.type == "trace_session" for item in state.items.values()):
+        console.print(
+            "[yellow]This session migrated traces, which is stateless - there is no checkpoint to resume.[/yellow]\n"
+            "Re-run `langsmith-migrator traces` with the same options; finished windows produce an empty diff."
+        )
         return
 
     orchestrator = MigrationOrchestrator(config, state_manager)

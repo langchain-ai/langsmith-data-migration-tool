@@ -62,6 +62,7 @@ def test_registered_command_names_match_public_cli_surface():
         "resume",
         "rules",
         "test",
+        "traces",
         "users",
     ]
 

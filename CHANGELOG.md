@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Long-lived trace migration (`traces`)**: New command that migrates traces
+  whose `trace_tier` is `longlived` between deployments. Run `id`, `trace_id`,
+  `parent_run_id`, `dotted_order` and all timestamps are preserved verbatim
+  (there is no time-shifting option); tracing projects are mapped rather than
+  assumed equal. Attachments and offloaded `inputs`/`outputs` are fetched
+  through the tool's own configured HTTP session — with the blob host validated
+  and redirects refused — and re-inlined, so a failed fetch is reported rather
+  than migrating a run with a placeholder. Writes go through
+  `multipart_ingest` in trace-boundary batches sized to the destination's
+  advertised limits, with binary-split isolation on failure.
+
+  The command is **stateless**: for each `(project, time window)` slice it
+  ingests `source_ids - dest_ids` and re-queries to confirm the difference is
+  empty, so the diff is the work-list, the skip-list and the completeness proof
+  at once. A run the destination already holds is never re-sent: a fully
+  ingested run is immutable (its `end_time` is persisted), so it cannot be
+  repaired in place — repair means re-migrating that window into a fresh
+  destination project. There is no checkpoint and no resume — re-run instead,
+  and `resume` says so. A pre-flight canary verifies the destination still
+  accepts historical timestamps before anything is written, and destination
+  projects are created with an explicit long-lived trace tier,
+  scoped one project at a time. Run `model-pricing` before `traces`: token and
+  cost rollups are recomputed by the destination, not replayed. Deliberately
+  not wired into `migrate-all`.
+
 - **Custom model pricing migration (`model-pricing`)**: New command to migrate
   workspace-custom model price entries between instances/workspaces via
   `/model-price-map`. Only workspace-custom entries are copied; the global
