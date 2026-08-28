@@ -15,9 +15,10 @@ and finished windows produce an empty diff. ``resume`` does not apply.
 
 Two backend facts drive most of the shape here:
 
-* Run identity on the destination is ``(tenant_id, session_id, start_time,
-  id)``, so preserving IDs and timestamps is what makes replay an upsert - and
-  why migrating into the *same* tenant is refused outright.
+* A run id is write-once per tenant: re-sending one is refused with ``409 Run
+  create payload already received``, not upserted. Idempotency comes from the ID
+  diff never re-sending a run the destination already holds - which is also why
+  migrating into the *same* tenant is refused outright.
 * There is no per-run trace-tier field on the ingest contract. The destination
   *session's* tier is the only lever, and it must be correct at ingest time
   because the row TTL and the blob key prefix are both baked in at insert.
@@ -28,7 +29,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from tempfile import SpooledTemporaryFile
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
@@ -52,8 +53,10 @@ from ..trace_domain import (
     iter_windows,
     payload_digest,
     plan_slice,
+    resolve_range_start,
     resolve_window_bounds,
     to_ingest_payload,
+    verified_bounds,
 )
 from .base import BaseMigrator
 
@@ -67,15 +70,6 @@ _MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 
 _VERIFY_ATTEMPTS = 4
 _VERIFY_BACKOFF = 3.0
-
-_DEGRADED_ACTIONS = {
-    "attachment_fetch_failed": "Once the source blob store is reachable, re-migrate this window into a fresh destination project.",
-    "attachment_host_rejected": "The source returned a blob URL off its own host; investigate, then re-migrate into a fresh destination project.",
-    "attachments_skipped": "Re-migrate this window into a fresh destination project without --skip-attachments.",
-    "payload_oversized_for_destination": "Raise MAX_FIELD_SIZE_BYTES on the destination, set a matching --max-field-bytes, and re-migrate into a fresh destination project.",
-    "run_example_link_dropped": "The run pointed at a source dataset example; re-point it after migrating datasets if needed.",
-    "longlived_pending_operator_upgrade": "Feed the emitted upgrade list to POST /internal/runs/upgrade-trace-tier; long-lived retention is not yet in effect.",
-}
 
 _CANARY_SESSION = "langsmith-migrator-canary"
 
@@ -94,7 +88,6 @@ def _raise_if_tier_denied(error: Exception) -> None:
         )
 
 
-_CANARY_NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
 
 
 class TracePreflightError(RuntimeError):
@@ -111,7 +104,8 @@ class TraceMigrator(BaseMigrator):
         state,
         config,
         *,
-        max_age_days: float = 180.0,
+        max_age_days: Optional[float] = 180.0,
+        range_start: Optional[datetime] = None,
         window_days: float = 1.0,
         max_field_bytes: int = 25 * 1024 * 1024,
         verify: bool = True,
@@ -124,6 +118,13 @@ class TraceMigrator(BaseMigrator):
     ):
         super().__init__(source_client, dest_client, state, config)
         self.max_age_days = max_age_days
+        self.range_start = range_start
+        # Resolved exactly once. Recomputing "now - max_age_days" per call gave
+        # a slightly different instant each time, which is the same drift an
+        # absolute --max-age-stamp exists to avoid.
+        self._resolved_start = resolve_range_start(
+            datetime.now(timezone.utc), max_age_days, range_start
+        )
         self.window_days = window_days
         self.max_field_bytes = max_field_bytes
         self.verify = verify
@@ -134,14 +135,15 @@ class TraceMigrator(BaseMigrator):
         self.emit_upgrade_list = emit_upgrade_list
         self.project_id_map = dict(project_id_map or {})
 
-        # Anything that reduces fidelity names its repair. A run that landed
-        # incomplete is invisible to the ordinary ID diff - its ID is present -
-        # and cannot be fixed by re-sending, because a fully ingested run is
-        # immutable. The only repair is a different destination session.
+        # What was reduced, stated as fact. A run that landed incomplete is
+        # invisible to the ordinary ID diff, since its ID is present.
         self.fidelity_reduced: Set[str] = set()
         if skip_attachments:
-            self.fidelity_reduced.add("without --skip-attachments")
+            self.fidelity_reduced.add("attachments were skipped (--skip-attachments)")
         self.upgrade_rows: List[Tuple[str, str, str]] = []
+        # Human-readable reasons for blocked runs, so the CLI can explain a
+        # blocked count instead of only recording it into state.
+        self.blocked_reasons: List[str] = []
 
         # Blobs are proxied by whichever deployment stores them, so the
         # allow-list is per side: the destination's read-back URLs live on the
@@ -153,6 +155,23 @@ class TraceMigrator(BaseMigrator):
         if not config.destination.verify_ssl:
             self._dest_session_http.verify = False
         self._ingest_errors: List[Exception] = []
+        # The SDK reports nothing on a 2xx, and a backend that accepts the
+        # request then drops the runs is indistinguishable from success. We own
+        # this session, so record what the multipart POST actually answered.
+        self._ingest_responses: List[Tuple[int, str]] = []
+        _session_request = self._dest_session_http.request
+
+        def _record_ingest(method, url, **kwargs):
+            response = _session_request(method, url, **kwargs)
+            if "/runs/multipart" in str(url):
+                try:
+                    body = (response.text or "").strip()[:600]
+                except Exception:
+                    body = "<unreadable>"
+                self._ingest_responses.append((response.status_code, body))
+            return response
+
+        self._dest_session_http.request = _record_ingest
         # The SDK logs multipart failures and returns normally, so an exception
         # never reaches us. The callback is the only way to notice.
         self.dest_ls_client = Client(
@@ -162,6 +181,10 @@ class TraceMigrator(BaseMigrator):
             omit_traced_runtime_info=True,
             tracing_error_callback=self._ingest_errors.append,
         )
+
+    def resolved_range_start(self) -> datetime:
+        """Absolute lower bound of this run's walk, fixed for the whole run."""
+        return self._resolved_start
 
     # ------------------------------------------------------------------
     # Plumbing
@@ -379,9 +402,11 @@ class TraceMigrator(BaseMigrator):
     def ingest(self, payloads: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
         """Send one batch, isolating a bad run by binary split.
 
-        Returns ``[(run_id, error)]`` for runs that could not be ingested. A
-        single-run conflict is replay success: the SDK breaks out of its retry
-        loop without reporting it, so it never reaches us as an error.
+        Returns ``[(run_id, error)]`` for runs that could not be ingested.
+
+        The SDK reports neither a 409 (it breaks out of its retry loop
+        silently) nor any other non-2xx it has already logged, so failures are
+        read off the recorded response rather than from an exception.
         """
         if not payloads or self.config.migration.dry_run:
             return []
@@ -395,11 +420,25 @@ class TraceMigrator(BaseMigrator):
         )
         self._sync_dest_headers()
         del self._ingest_errors[:]
+        del self._ingest_responses[:]
         try:
             self.dest_ls_client.multipart_ingest(create=payloads)
             error = self._ingest_errors[0] if self._ingest_errors else None
         except Exception as exc:  # pragma: no cover - defensive
             error = exc
+        self._report_ingest_responses()
+        conflict = next((body for status, body in self._ingest_responses if status == 409), None)
+        if conflict is not None:
+            # A 409 rejects every payload in the request ("duplicate run create
+            # requests are not supported"), so it is not a one-bad-apple case:
+            # splitting would just repeat the same rejection per run. It also
+            # is NOT replay success - the runs exist somewhere on the tenant,
+            # but not in the project we asked for.
+            return [(str(p["id"]), f"HTTP 409: {conflict}") for p in payloads]
+        if error is None:
+            swallowed = next(((st, bd) for st, bd in self._ingest_responses if st >= 300), None)
+            if swallowed:
+                error = RuntimeError(f"HTTP {swallowed[0]}: {swallowed[1]}")
         if error is None:
             return []
         if len(payloads) == 1:
@@ -409,6 +448,26 @@ class TraceMigrator(BaseMigrator):
             f"[yellow]  ==> batch of {len(payloads)} rejected; splitting to isolate the bad run[/yellow]"
         )
         return self.ingest(payloads[:mid]) + self.ingest(payloads[mid:])
+
+    def _report_ingest_responses(self) -> None:
+        """Show what the multipart endpoint answered.
+
+        A non-2xx is printed unconditionally - it is the direct explanation for
+        runs that never arrive, and the SDK only logs it. A 2xx with a body is
+        printed too, because per-run rejections are reported that way.
+        """
+        for status, body in self._ingest_responses:
+            interesting = body and body not in ("{}", "null", '""')
+            if status >= 300:
+                self.console.print(f"[red]      ingest POST -> HTTP {status}: {body or '<empty body>'}[/red]")
+            elif interesting:
+                self.console.print(f"[yellow]      ingest POST -> HTTP {status}: {body}[/yellow]")
+            else:
+                self.log(f"      ingest POST -> HTTP {status} (empty body)", "info")
+
+    def last_ingest_summary(self) -> str:
+        """Last multipart status codes, for blocked-run evidence."""
+        return ", ".join(f"HTTP {st}{': ' + bd if bd else ''}" for st, bd in self._ingest_responses) or "no response recorded"
 
     # ------------------------------------------------------------------
     # Sessions
@@ -469,12 +528,20 @@ class TraceMigrator(BaseMigrator):
             return None, "ambiguous"
         return (matches[0], "name") if matches else (None, "missing")
 
-    def _dest_sessions_by_name(self) -> Dict[str, List[Dict[str, Any]]]:
-        index: Dict[str, List[Dict[str, Any]]] = {}
-        for s in self.dest.get_paginated("/sessions", params={"reference_free": "true"}, page_size=100):
-            if isinstance(s, dict) and not s.get("reference_dataset_id"):
-                index.setdefault(s.get("name"), []).append(s)
-        return index
+    def _dest_sessions_named(self, name: str) -> List[Dict[str, Any]]:
+        """Destination tracing projects with exactly this name.
+
+        Uses the endpoint's ``name`` filter rather than enumerating every
+        project: the previous full walk cost one request per 100 projects on
+        the destination, repeated for the canary and again for each project
+        being migrated, which dominated the request count on a busy tenant.
+        Returning every match keeps the ambiguity check intact.
+        """
+        found = self.dest.get("/sessions", params={"name": name, "reference_free": "true"}) or []
+        return [
+            s for s in found
+            if isinstance(s, dict) and s.get("name") == name and not s.get("reference_dataset_id")
+        ]
 
     def resolve_dest_session(self, source_session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Operator mapping -> destination name match -> create.
@@ -497,8 +564,7 @@ class TraceMigrator(BaseMigrator):
             if existing:
                 return existing
 
-        by_name = self._dest_sessions_by_name()
-        matches = by_name.get(target_name) or []
+        matches = self._dest_sessions_named(target_name)
         if len(matches) > 1:
             self.log(f"Ambiguous destination session name '{target_name}'; supply --project-mapping", "warning")
             return None
@@ -579,22 +645,26 @@ class TraceMigrator(BaseMigrator):
         Historical ingest is refused outright by a deployment that enforces the
         ±24h window, and the whole multipart request fails - so this is checked
         once, before anything is migrated, rather than discovered mid-transfer.
-        The run ID is deterministic and the session is scratch, so repeated
-        stateless invocations upsert one canary instead of accumulating them.
+        The ID is fresh on every invocation. It used to be derived from the
+        scratch project and an hour-rounded stamp, so repeated runs would
+        "upsert one canary" - but the destination does not upsert a re-sent
+        run, it answers ``409 Run create payload already received``. The write
+        was therefore rejected and the read-back found the *previous* run,
+        so the check passed while proving nothing about this invocation. A
+        unique ID means the read-back can only succeed if our own write landed.
+
+        The cost is one tiny run per invocation in the scratch project, which
+        cannot be cleaned up because run deletion is not exposed. That is worth
+        paying for a gate that actually gates.
         """
         if self.config.migration.dry_run:
             return
         session = self._scratch_session()
-        # Quantised to the hour, and the ID derived from it: ``start_time`` is
-        # part of the destination's dedup key, so a canary re-sent under the
-        # same ID with a drifted timestamp lands as a *second* row and the
-        # read-back then compares against the wrong one. Same hour, same pair,
-        # real upsert. Run deletion is not exposed by the API, so the scratch
-        # project keeps at most one canary per hour the tool is used.
-        stamp = (datetime.now(timezone.utc) - timedelta(days=self.max_age_days)).replace(
-            minute=0, second=0, microsecond=0
-        )
-        run_id = str(uuid.uuid5(_CANARY_NS, f"canary:{session['id']}:{stamp.isoformat()}"))
+        # The exact range start, not an hour-rounded one: with a unique ID
+        # there is no dedup pair to keep stable, so the canary can test the
+        # precise oldest instant this run will send.
+        stamp = self.resolved_range_start()
+        run_id = str(uuid.uuid4())
         payload = {
             "id": run_id,
             "trace_id": run_id,
@@ -624,23 +694,18 @@ class TraceMigrator(BaseMigrator):
         self._block_historical("canary run absent after ingest")
 
     def _block_historical(self, detail: str) -> None:
-        next_action = (
-            "Raise the destination's ingest time window "
-            "(V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS) and re-run `langsmith-migrator traces`."
-        )
         issue = self.record_issue(
             "blocked",
             "historical_ingest_rejected",
-            f"Destination refuses historical run timestamps ({self.max_age_days:g}d): {detail}",
-            next_action=next_action,
-            evidence={"max_age_days": self.max_age_days, "detail": detail},
+            f"Destination refuses historical run timestamps "
+            f"(from {self.resolved_range_start().isoformat()}): {detail}",
+            evidence={"range_start": self.resolved_range_start().isoformat(), "detail": detail},
         )
-        if issue:
-            self.queue_remediation(issue_id=issue.id, next_action=next_action, command="langsmith-migrator traces")
+        del issue
         raise TracePreflightError(f"historical_ingest_rejected: {detail}")
 
     def _scratch_session(self) -> Dict[str, Any]:
-        existing = next(iter(self._dest_sessions_by_name().get(_CANARY_SESSION, [])), None)
+        existing = next(iter(self._dest_sessions_named(_CANARY_SESSION)), None)
         return existing or self.dest.post(
             "/sessions", {"name": _CANARY_SESSION, "description": "langsmith-migrator pre-flight canary"}
         )
@@ -685,7 +750,6 @@ class TraceMigrator(BaseMigrator):
                 "longlived_pending_operator_upgrade",
                 f"{len(source_ids)} run(s) in {window.label()} are not yet long-lived: "
                 "the destination project was left at its existing tier",
-                next_action=_DEGRADED_ACTIONS["longlived_pending_operator_upgrade"],
                 evidence={"window": window.label(), "count": len(source_ids), "dest_session_id": dst_id},
             )
 
@@ -697,7 +761,7 @@ class TraceMigrator(BaseMigrator):
             still_missing = self._confirm(dst_id, window, plan.to_ingest - blocked)
             if still_missing:
                 blocked |= still_missing
-                self._block_runs(window, still_missing)
+                self._block_runs(window, still_missing, dst_id)
             if digests:
                 self._check_content(dst_id, window, digests, degraded)
 
@@ -707,6 +771,14 @@ class TraceMigrator(BaseMigrator):
         # stay a partition of the source total.
         degraded_ids = set().union(*degraded.values())
         degraded_only = degraded_ids - blocked
+        # Only a wholly clean slice yields a watermark: a slice that degraded
+        # or blocked anything cannot claim "everything up to here is complete".
+        # A watermark is a claim that everything up to it is confirmed on the
+        # destination, so it may only be made when a confirming query actually
+        # ran: --no-verify skips it, and a dry run wrote nothing to confirm.
+        complete = (plan.to_ingest | plan.already_present) - blocked - degraded_ids
+        clean = not (blocked or degraded_ids) and self.verify and not self.config.migration.dry_run
+        earliest, latest = verified_bounds(population, complete) if clean else (None, None)
         return Reconciliation(
             session_id=src_id,
             dest_session_id=dst_id,
@@ -717,6 +789,9 @@ class TraceMigrator(BaseMigrator):
             degraded=len(degraded_only),
             blocked=len(blocked),
             extra_on_dest=len(plan.extra_on_dest),
+            earliest=earliest,
+            latest=latest,
+            verified_runs=len(complete) if clean else 0,
         )
 
     def _ingest_plan(
@@ -745,7 +820,7 @@ class TraceMigrator(BaseMigrator):
                 # The backend stubs an oversized field rather than rejecting
                 # it, so this run must not be reported as fully migrated.
                 degraded.setdefault("payload_oversized_for_destination", set()).add(run_id)
-                self.fidelity_reduced.add("after raising --max-field-bytes")
+                self.fidelity_reduced.add("payloads exceeded --max-field-bytes")
                 continue
 
             codes = set(issues)
@@ -754,19 +829,27 @@ class TraceMigrator(BaseMigrator):
             for code in codes:
                 degraded.setdefault(code, set()).add(run_id)
                 if code in ("attachment_fetch_failed", "attachment_host_rejected"):
-                    self.fidelity_reduced.add("once the source blob store is reachable")
+                    self.fidelity_reduced.add("some source blobs could not be fetched")
 
             if len(digests) < self.verify_content_sample:
                 digests[run_id] = self._digest_of(run, overrides)
             prepared.append(payload)
 
         max_runs, max_bytes = self.batch_limits()
+        rejected: Dict[str, Set[str]] = {}
         for batch in batch_traces(
             group_into_traces(prepared), max_runs=max_runs, max_bytes=max_bytes, size_of=self._size_of
         ):
             for run_id, error in self.ingest(batch):
                 blocked.add(run_id)
-                self.log(f"Run {run_id} rejected: {str(error)[:200]}", "error")
+                rejected.setdefault(str(error), set()).add(run_id)
+        # Grouped by cause: twenty runs refused for one reason is one fact, not
+        # twenty truncated lines.
+        for error, ids in rejected.items():
+            self._record_blocked(
+                window, ids, "run_ingest_rejected",
+                f"{len(ids)} run(s) refused by the destination on ingest: {error}",
+            )
         return digests
 
     @staticmethod
@@ -811,7 +894,6 @@ class TraceMigrator(BaseMigrator):
                 "degraded",
                 "run_fidelity_mismatch",
                 f"{len(mismatched)} sampled run(s) differ from the source ({window.label()})",
-                next_action="Re-migrate this window into a fresh destination project.",
                 # Field names and counts only - never values.
                 evidence={"window": window.label(), "runs": dict(list(mismatched.items())[:20])},
             )
@@ -829,21 +911,54 @@ class TraceMigrator(BaseMigrator):
                 "degraded",
                 code,
                 f"{len(run_ids)} run(s) migrated with reduced fidelity ({code}) in {window.label()}",
-                next_action=_DEGRADED_ACTIONS.get(code),
                 evidence={"window": window.label(), "count": len(run_ids), "run_ids": sorted(run_ids)[:20]},
             )
 
-    def _block_runs(self, window: Window, run_ids: Set[str]) -> None:
-        next_action = "Re-run `langsmith-migrator traces` for this window; the diff will re-send them."
-        issue = self.record_issue(
+    def _record_blocked(self, window: Window, run_ids: Set[str], code: str, summary: str) -> None:
+        """One record per (window, cause), whichever path blocked the runs.
+
+        Both the ingest rejection and the confirm miss land here, so a blocked
+        count always has a matching reason in the output and in state - rather
+        than a reason only for one of the two ways runs get blocked.
+        """
+        self.blocked_reasons.append(f"{window.label()}: {summary}")
+        self.record_issue(
             "blocked",
-            "run_not_ingested",
-            f"{len(run_ids)} run(s) still missing from the destination after ingest ({window.label()})",
-            next_action=next_action,
-            evidence={"window": window.label(), "run_ids": sorted(run_ids)[:20], "count": len(run_ids)},
+            code,
+            f"{summary} ({window.label()})",
+            evidence={"window": window.label(), "count": len(run_ids), "run_ids": sorted(run_ids)[:20]},
         )
-        if issue:
-            self.queue_remediation(issue_id=issue.id, next_action=next_action, command="langsmith-migrator traces")
+
+    def _diagnose_missing(self, dest_session_id: str, run_ids: Set[str]) -> Tuple[str, str]:
+        """Explain why runs are absent, by asking where they actually are.
+
+        The common cause is not a lost write: the destination keeps one copy of
+        a run id per tenant, so a run that already landed in another project
+        cannot be ingested into a second one - the write is accepted and then
+        dropped. Saying "still missing" for that is true but useless.
+        """
+        for run_id in sorted(run_ids)[:3]:
+            try:
+                run = self.dest.get(f"/runs/{run_id}")
+            except Exception:
+                continue
+            other = str((run or {}).get("session_id") or "")
+            if other and other != dest_session_id:
+                return (
+                    "run_exists_in_other_project",
+                    f"{len(run_ids)} run(s) already exist on this destination under a different "
+                    f"project ({other}); the destination keeps one copy per run id per tenant, so "
+                    f"they were not written into {dest_session_id}",
+                )
+        return (
+            "run_not_ingested",
+            f"{len(run_ids)} run(s) still missing from the destination after ingest "
+            f"(last ingest response: {self.last_ingest_summary()})",
+        )
+
+    def _block_runs(self, window: Window, run_ids: Set[str], dest_session_id: str) -> None:
+        code, summary = self._diagnose_missing(dest_session_id, run_ids)
+        self._record_blocked(window, run_ids, code, summary)
 
     # ------------------------------------------------------------------
     # Per-session driver
@@ -866,7 +981,8 @@ class TraceMigrator(BaseMigrator):
         recon = None
         try:
             slices = []
-            for window in iter_windows(now or datetime.now(timezone.utc), self.max_age_days, self.window_days):
+            end = now or datetime.now(timezone.utc)
+            for window in iter_windows(self.resolved_range_start(), end, self.window_days):
                 sliced = self.migrate_slice(source_session, dest_session, window)
                 slices.append(sliced)
                 if sliced.source_total:
@@ -875,7 +991,8 @@ class TraceMigrator(BaseMigrator):
                     self.log(
                         f"  {sliced.window}: source {sliced.source_total} = ingested {sliced.ingested}"
                         f" + already present {sliced.already_present}"
-                        f" + degraded {sliced.degraded} + blocked {sliced.blocked}",
+                        f" + degraded {sliced.degraded} + blocked {sliced.blocked}"
+                        + (f" | verified {sliced.earliest} .. {sliced.latest}" if sliced.earliest else ""),
                         "info",
                     )
             recon = Reconciliation.of(str(source_session["id"]), str(dest_session["id"]), slices)
@@ -913,10 +1030,6 @@ class TraceMigrator(BaseMigrator):
             "degraded",
             "dest_tier_left_raised",
             f"Destination project {dest_session['id']} was raised to {LONGLIVED} and left raised "
-            f"because {reason}",
-            next_action=(
-                f"Re-run `langsmith-migrator traces` to finish it, or set the tier back to "
-                f"'{prior_tier}' by hand once you no longer need it raised."
-            ),
+            f"because {reason}; its previous tier was '{prior_tier}'",
             evidence={"dest_session_id": str(dest_session["id"]), "prior_tier": prior_tier, "reason": reason},
         )

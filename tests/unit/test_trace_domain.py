@@ -51,7 +51,7 @@ def _run(**kw):
 # Windows
 # --------------------------------------------------------------------------
 def test_windows_are_half_open_and_oldest_first():
-    windows = list(iter_windows(NOW, max_age_days=3, window_days=1))
+    windows = list(iter_windows(NOW - timedelta(days=3), NOW, window_days=1))
     assert [w.start for w in windows] == sorted(w.start for w in windows)
     assert windows[0].start == NOW - timedelta(days=3)
     assert windows[-1].end == NOW
@@ -61,21 +61,57 @@ def test_windows_are_half_open_and_oldest_first():
 
 
 def test_final_window_is_clipped_to_now():
-    windows = list(iter_windows(NOW, max_age_days=2.5, window_days=1))
+    windows = list(iter_windows(NOW - timedelta(days=2.5), NOW, window_days=1))
     assert windows[-1].end == NOW
     assert sum((w.end - w.start).total_seconds() for w in windows) == pytest.approx(2.5 * 86400)
 
 
 def test_window_size_does_not_change_which_instants_are_covered():
-    coarse = list(iter_windows(NOW, 4, 4))
-    fine = list(iter_windows(NOW, 4, 0.5))
+    coarse = list(iter_windows(NOW - timedelta(days=4), NOW, 4))
+    fine = list(iter_windows(NOW - timedelta(days=4), NOW, 0.5))
     assert (coarse[0].start, coarse[-1].end) == (fine[0].start, fine[-1].end)
 
 
-@pytest.mark.parametrize("bad", [(0, 1), (1, 0), (-1, 1)])
-def test_nonpositive_range_or_window_is_rejected(bad):
+@pytest.mark.parametrize(
+    "start, end, window",
+    [
+        (NOW, NOW, 1),                      # empty range
+        (NOW - timedelta(days=1), NOW, 0),  # zero window
+        (NOW, NOW - timedelta(days=1), 1),  # inverted range
+    ],
+)
+def test_an_empty_or_inverted_range_is_rejected(start, end, window):
     with pytest.raises(ValueError):
-        list(iter_windows(NOW, *bad))
+        list(iter_windows(start, end, window))
+
+
+@pytest.mark.parametrize("max_age_days", [0, -1, None])
+def test_resolve_range_start_rejects_a_nonpositive_age(max_age_days):
+    from langsmith_migrator.core.trace_domain import resolve_range_start
+
+    with pytest.raises(ValueError):
+        resolve_range_start(NOW, max_age_days, None)
+
+
+def test_an_absolute_stamp_wins_over_a_relative_age():
+    """The whole point: an absolute bound cannot drift as the clock moves."""
+    from langsmith_migrator.core.trace_domain import resolve_range_start
+
+    stamp = datetime(2026, 8, 20, 6, 0, tzinfo=timezone.utc)
+    assert resolve_range_start(NOW, 180.0, stamp) == stamp
+    # evaluated an hour later, the same stamp still means the same instant
+    assert resolve_range_start(NOW + timedelta(hours=1), 180.0, stamp) == stamp
+    # whereas the relative age does not
+    a = resolve_range_start(NOW, 1.0, None)
+    b = resolve_range_start(NOW + timedelta(hours=1), 1.0, None)
+    assert a != b
+
+
+def test_a_naive_stamp_is_read_as_utc():
+    from langsmith_migrator.core.trace_domain import resolve_range_start
+
+    naive = datetime(2026, 8, 20, 6, 0)
+    assert resolve_range_start(NOW, None, naive) == datetime(2026, 8, 20, 6, 0, tzinfo=timezone.utc)
 
 
 def test_bounds_carry_no_run_level_upper_bound_and_a_skew_buffer():
@@ -283,3 +319,68 @@ def test_session_reconciliation_sums_its_slices_and_reports_both_ids():
 def test_a_session_with_blocked_runs_is_not_complete():
     blocked = Reconciliation.of("S", "D", [Reconciliation("S", "D", "w", 2, 1, 0, 0, 1)])
     assert not blocked.complete
+
+
+# --------------------------------------------------------------------------
+# Verified watermark
+# --------------------------------------------------------------------------
+def test_bounds_span_only_the_runs_confirmed_complete():
+    from langsmith_migrator.core.trace_domain import verified_bounds
+
+    runs = [
+        _run(id="a", start_time="2026-08-20T10:00:00"),
+        _run(id="b", start_time="2026-08-21T10:00:00"),
+        _run(id="c", start_time="2026-08-22T10:00:00"),
+    ]
+    earliest, latest = verified_bounds(runs, {"a", "b"})
+    assert earliest.startswith("2026-08-20T10:00:00")
+    assert latest.startswith("2026-08-21T10:00:00")
+
+
+def test_bounds_are_none_when_nothing_is_complete():
+    from langsmith_migrator.core.trace_domain import verified_bounds
+
+    assert verified_bounds([_run(id="a")], set()) == (None, None)
+
+
+def test_bounds_order_by_instant_not_by_string():
+    from langsmith_migrator.core.trace_domain import verified_bounds
+
+    # Same instant, two encodings: naive-UTC sorts after the offset form as a
+    # string, so a string min/max would pick the wrong end.
+    runs = [
+        _run(id="a", start_time="2026-08-20T23:00:00+00:00"),
+        _run(id="b", start_time="2026-08-21T01:00:00"),
+    ]
+    earliest, _ = verified_bounds(runs, {"a", "b"})
+    assert earliest.startswith("2026-08-20T23:00:00")
+
+
+def test_an_unparsable_timestamp_is_skipped_not_fatal():
+    from langsmith_migrator.core.trace_domain import verified_bounds
+
+    runs = [_run(id="a", start_time="not-a-date"), _run(id="b", start_time="2026-08-21T10:00:00")]
+    earliest, latest = verified_bounds(runs, {"a", "b"})
+    assert earliest == latest and earliest.startswith("2026-08-21")
+
+
+def test_session_bounds_are_the_outer_envelope_of_its_slices():
+    slices = [
+        Reconciliation("S", "D", "w1", 1, 1, 0, 0, 0, earliest="2026-08-20T00:00:00", latest="2026-08-20T12:00:00"),
+        Reconciliation("S", "D", "w2", 1, 1, 0, 0, 0, earliest="2026-08-21T00:00:00", latest="2026-08-21T12:00:00"),
+        Reconciliation("S", "D", "w3", 1, 0, 0, 0, 1),  # dirty slice contributes nothing
+    ]
+    total = Reconciliation.of("S", "D", slices)
+    assert total.earliest == "2026-08-20T00:00:00"
+    assert total.latest == "2026-08-21T12:00:00"
+
+
+def test_verified_run_count_only_counts_clean_slices():
+    slices = [
+        Reconciliation("S", "D", "w1", 4, 4, 0, 0, 0, earliest="2026-08-20T00:00:00+00:00",
+                       latest="2026-08-20T12:00:00+00:00", verified_runs=4),
+        Reconciliation("S", "D", "w2", 3, 2, 0, 0, 1),  # dirty: contributes nothing
+    ]
+    total = Reconciliation.of("S", "D", slices)
+    assert total.verified_runs == 4
+    assert (total.earliest, total.latest) == ("2026-08-20T00:00:00+00:00", "2026-08-20T12:00:00+00:00")

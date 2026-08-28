@@ -96,19 +96,34 @@ class Window:
         return f"{self.start.date()}..{self.end.date()}"
 
 
-def iter_windows(now: datetime, max_age_days: float, window_days: float) -> Iterator[Window]:
-    """Yield half-open windows covering ``[now - max_age_days, now)``, oldest first.
+def iter_windows(start: datetime, end: datetime, window_days: float) -> Iterator[Window]:
+    """Yield half-open windows covering ``[start, end)``, oldest first.
 
-    Windows abut exactly, so every instant in the range belongs to exactly one.
+    Bounds are absolute on purpose. Deriving them from ``now`` inside here
+    meant the same relative age denoted a different instant every time it was
+    evaluated, so a watermark expressed in days silently drifted while a long
+    migration was still running.
     """
-    if max_age_days <= 0 or window_days <= 0:
-        raise ValueError("max_age_days and window_days must be positive")
-    start = now - timedelta(days=max_age_days)
+    if window_days <= 0:
+        raise ValueError("window_days must be positive")
+    if start >= end:
+        raise ValueError("range start must precede its end")
     step = timedelta(days=window_days)
-    while start < now:
-        end = min(start + step, now)
-        yield Window(start, end)
-        start = end
+    while start < end:
+        boundary = min(start + step, end)
+        yield Window(start, boundary)
+        start = boundary
+
+
+def resolve_range_start(
+    now: datetime, max_age_days: Optional[float], stamp: Optional[datetime]
+) -> datetime:
+    """The absolute lower bound of the walk, from whichever bound was given."""
+    if stamp is not None:
+        return stamp.astimezone(timezone.utc) if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+    if not max_age_days or max_age_days <= 0:
+        raise ValueError("max_age_days must be positive")
+    return now - timedelta(days=max_age_days)
 
 
 def resolve_window_bounds(window: Window) -> Tuple[str, str]:
@@ -211,6 +226,32 @@ def digest_mismatches(left: Dict[str, str], right: Dict[str, str]) -> Tuple[str,
     return tuple(sorted(k for k in set(left) | set(right) if left.get(k) != right.get(k)))
 
 
+def verified_bounds(
+    runs: Iterable[Dict[str, Any]], complete_ids: Set[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    """Earliest and latest ``start_time`` among runs confirmed complete.
+
+    Timestamps are parsed rather than string-compared: the API is consistent
+    today, but a mix of offset-bearing and naive ISO strings would order
+    wrongly, and this value is meant to be trusted as a watermark. Naive
+    values are read as UTC, which is what the endpoint returns - without that,
+    a mixed set raises rather than ordering, and comparing them is the whole
+    point of this function.
+    """
+    stamps = []
+    for run in runs:
+        if str(run.get("id")) not in complete_ids or not run.get("start_time"):
+            continue
+        try:
+            stamp = datetime.fromisoformat(str(run["start_time"]).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        stamps.append(stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc))
+    if not stamps:
+        return None, None
+    return min(stamps).isoformat(), max(stamps).isoformat()
+
+
 def group_into_traces(runs: Iterable[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     """Group runs by ``trace_id``, parents before children within each trace.
 
@@ -289,6 +330,14 @@ class Reconciliation:
     degraded: int
     blocked: int
     extra_on_dest: int = 0
+    # Bounds of the runs confirmed complete on the destination. A slice that
+    # degraded or blocked anything contributes nothing, so the pair always
+    # describes runs that are wholly there.
+    earliest: Optional[str] = None
+    latest: Optional[str] = None
+    # How many runs the span above covers, so a resume overlap can be sized in
+    # runs (one ingest batch) rather than guessed in time.
+    verified_runs: int = 0
 
     def __post_init__(self) -> None:
         total = self.ingested + self.already_present + self.degraded + self.blocked
@@ -314,6 +363,9 @@ class Reconciliation:
             degraded=s("degraded"),
             blocked=s("blocked"),
             extra_on_dest=s("extra_on_dest"),
+            earliest=min([x.earliest for x in slices if x.earliest], default=None),
+            latest=max([x.latest for x in slices if x.latest], default=None),
+            verified_runs=s("verified_runs"),
         )
 
     @property

@@ -132,8 +132,13 @@ def test_normalize_deployment_url_treats_api_suffixes_as_the_same_deployment():
     )
 
 
-def test_display_resolution_summary_groups_duplicate_user_failures(monkeypatch, tmp_path):
-    """Resolution summaries should collapse repeated user-role blockers into a grouped next step."""
+def test_display_resolution_summary_reports_counts_without_advice(monkeypatch, tmp_path):
+    """The summary states outcomes; it does not prescribe fixes.
+
+    It used to synthesise a next step per blocked item, falling back to generic
+    text when a migrator had nothing specific to say - which produced confident
+    advice that was sometimes simply wrong.
+    """
 
     state = build_state("migration_grouped_summary")
     state.remediation_bundle_path = str((tmp_path / "remediation" / state.session_id).resolve())
@@ -170,12 +175,10 @@ def test_display_resolution_summary_groups_duplicate_user_failures(monkeypatch, 
     cli_main._display_resolution_summary(StubOrchestrator(state))
 
     normalized_output = " ".join(console.text.split())
-    assert "Actionable Next Steps" in normalized_output
-    assert (
-        "Workspace memberships failed to add (2 items: alice@example.com, "
-        "bob@example.com): Review the workspace membership create error in the "
-        "remediation bundle, then re-run `langsmith-migrator users`."
-    ) in normalized_output
+    assert "Blocked: 2" in normalized_output
+    assert "Remediation bundle:" in normalized_output
+    for advice in ("Actionable Next Steps", "Re-run", "Review the", "retry once"):
+        assert advice not in normalized_output, advice
 
 
 def test_resolve_workspaces_with_explicit_pair_sets_context(monkeypatch):

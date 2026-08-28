@@ -70,7 +70,13 @@ What `traces` guarantees:
 window, not from a checkpoint. If a run is interrupted, just re-run the same command —
 finished windows produce an empty difference. `--max-age-days` sets the range to walk
 (default 180, the retention ceiling) and `--window` the size of one slice of it
-(default 1 day); widen `--window` when migrating many projects. `langsmith-migrator
+(default 1 day); widen `--window` when migrating many projects. `--max-age-days` is
+the easy way to *start* a migration; to **resume** one, prefer `--max-age-stamp` with
+an absolute instant, because a relative age denotes a different point in time every
+time it is evaluated — over a multi-hour run the same float silently slides forward.
+Each project reports a `verified complete from … to …` watermark and a ready-to-paste
+`--max-age-stamp` that redoes about one ingest batch, so no boundary run is skipped.
+Passing both bounds is an error rather than a silent preference. `langsmith-migrator
 resume` does not apply and will say so.
 
 **Ordering dependency: run `model-pricing` before `traces`.** Token and cost rollups are
@@ -525,6 +531,8 @@ The prompt default is `No` (rules are created disabled).
 --project TEXT                  Tracing project (session) name or ID; repeatable
 --all                           Migrate all tracing projects without prompting
 --max-age-days FLOAT            How far back to walk, the range (default: 180, the retention ceiling)
+--max-age-stamp TEXT            Absolute lower bound instead of --max-age-days, e.g. 2026-08-27T18:00:00Z
+                                (mutually exclusive with --max-age-days; prefer it for long runs and resuming)
 --window FLOAT                  Size in days of one slice of the range (default: 1)
 --max-field-bytes INTEGER       Destination MAX_FIELD_SIZE_BYTES; not advertised, so it must be supplied (default: 25 MB)
 --no-verify                     Skip the confirming re-query after ingest (the pre-diff still runs)

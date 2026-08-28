@@ -1776,7 +1776,12 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
 
 
 def _display_resolution_summary(orchestrator) -> None:
-    """Print a consistent migration resolution summary."""
+    """Print a consistent migration resolution summary.
+
+    Counts and artifact locations only: the tool reports what happened and
+    never synthesises generic guidance to fill the gap when a migrator has
+    nothing specific to say.
+    """
     if not orchestrator.state:
         return
 
@@ -1800,22 +1805,6 @@ def _display_resolution_summary(orchestrator) -> None:
         console.print(f"  Remediation bundle: {bundle_display}")
     console.print("  Resume command: langsmith-migrator resume")
 
-    actionable_groups = orchestrator.state.get_actionable_groups()
-    if actionable_groups:
-        console.print("\n[bold]Actionable Next Steps[/bold]")
-        for group in actionable_groups[:5]:
-            item_count = len(group["items"])
-            if item_count == 1:
-                console.print(f"  • {group['subjects'][0]}: {group['next_action']}")
-            else:
-                affected = orchestrator.state.format_actionable_subjects(
-                    group["subjects"],
-                    max_items=3,
-                )
-                console.print(
-                    f"  • {group['label']} ({item_count} items: {affected}): {group['next_action']}"
-                )
-
 
 def _needs_operator_action(state) -> bool:
     """Return True when the session requires manual remediation or follow-up."""
@@ -1836,9 +1825,7 @@ def _exit_for_remediation_if_needed(ctx, config: Config, orchestrator) -> None:
         and orchestrator.state
         and _needs_operator_action(orchestrator.state)
     ):
-        console.print(
-            "\n[yellow]Manual or external follow-up is required. Review the remediation bundle and run `langsmith-migrator resume` after resolving the blockers.[/yellow]"
-        )
+        console.print("\n[yellow]Some items did not migrate; see the issues above.[/yellow]")
         ctx.exit(2)
 
 
@@ -6266,6 +6253,14 @@ def contexts(
     help="How far back to walk (the range). 180 days is the long-lived retention ceiling.",
 )
 @click.option(
+    "--max-age-stamp",
+    help=(
+        "Absolute lower bound instead of --max-age-days, e.g. 2026-08-27 or "
+        "2026-08-27T18:00:00Z. Prefer this for long runs and for resuming: a "
+        "relative age denotes a different instant every time it is evaluated."
+    ),
+)
+@click.option(
     "--window",
     "window_days",
     type=float,
@@ -6303,6 +6298,7 @@ def traces(
     projects,
     select_all,
     max_age_days,
+    max_age_stamp,
     window_days,
     max_field_bytes,
     no_verify,
@@ -6330,6 +6326,22 @@ def traces(
     display_banner()
     if not ensure_config(config):
         return
+
+    range_start = None
+    if max_age_stamp:
+        # Refuse rather than pick one: the two bounds disagree the moment the
+        # clock moves, and silently preferring either would be a trap.
+        if ctx.get_parameter_source("max_age_days").name != "DEFAULT":
+            console.print("[red]Error: --max-age-days and --max-age-stamp are mutually exclusive[/red]")
+            ctx.exit(1)
+            return
+        try:
+            range_start = _parse_age_stamp(max_age_stamp)
+        except ValueError as exc:
+            console.print(f"[red]Error: {exc}[/red]")
+            ctx.exit(1)
+            return
+        max_age_days = None
 
     project_id_map = _load_project_mapping_arg(project_mapping)
     if project_id_map is _PROJECT_MAPPING_ERROR:
@@ -6392,6 +6404,7 @@ def traces(
             orchestrator.state,
             config,
             max_age_days=max_age_days,
+            range_start=range_start,
             window_days=window_days,
             max_field_bytes=max_field_bytes,
             verify=not no_verify,
@@ -6404,7 +6417,7 @@ def traces(
             or _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
             or (build_project_id_mapping_tui(orchestrator.source_client, orchestrator.dest_client) if map_projects else None),
         )
-        _print_trace_preflight(migrator, config, max_age_days, window_days, max_field_bytes, no_verify, into_session_suffix)
+        _print_trace_preflight(migrator, config, window_days, max_field_bytes, no_verify, into_session_suffix)
 
         try:
             migrator.canary()
@@ -6419,7 +6432,6 @@ def traces(
                     "blocked",
                     "trace_preflight_failed",
                     f"Pre-flight failed before any run was migrated: {str(exc)[:200]}",
-                    next_action="Resolve the destination error above and re-run `langsmith-migrator traces`.",
                     evidence={"error": str(exc)[:500]},
                 )
             _display_resolution_summary(orchestrator)
@@ -6468,9 +6480,15 @@ def traces(
                 console.print("  [yellow]skipped: supply an explicit --project-mapping for this project[/yellow]")
                 failed_projects.append((label, "unresolved destination project"))
                 continue
+            for reason in migrator.blocked_reasons:
+                console.print(f"  [red]blocked:[/red] {reason}")
+            del migrator.blocked_reasons[:]
             session_reports.append((source_session.get("name"), report))
             _record_trace_session_outcome(orchestrator, config, migrator, source_session, report)
-            _print_trace_reconciliation(report)
+            _print_trace_reconciliation(
+                report, migrator.batch_limits()[0],
+                verified=not no_verify and not config.migration.dry_run,
+            )
         upgrade_rows.extend(migrator.upgrade_rows)
         fidelity_notes |= migrator.fidelity_reduced
 
@@ -6522,7 +6540,18 @@ def _select_trace_sessions(config: Config, migrator, projects, select_all: bool)
     )
 
 
-def _print_trace_preflight(migrator, config, max_age_days, window_days, max_field_bytes, no_verify, into_session_suffix):
+def _human_duration(days: float) -> str:
+    """``0.01`` -> ``14m24s``. str(timedelta) would say ``0:14:24``."""
+    total = int(round(days * 86400))
+    if total <= 0:
+        return "0s"
+    d, rem = divmod(total, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    return "".join(f"{v}{u}" for v, u in ((d, "d"), (h, "h"), (m, "m"), (sec, "s")) if v)
+
+
+def _print_trace_preflight(migrator, config, window_days, max_field_bytes, no_verify, into_session_suffix):
     """Report the destination's configuration before writing anything."""
     max_runs, max_bytes = migrator.batch_limits()
     table = Table(title="Destination pre-flight", show_header=True)
@@ -6532,7 +6561,12 @@ def _print_trace_preflight(migrator, config, max_age_days, window_days, max_fiel
     table.add_row("Batch runs per request", str(max_runs), "GET /info (BATCH_INGEST_SIZE_LIMIT)")
     table.add_row("Batch bytes per request", f"{max_bytes:,}", "GET /info (BATCH_INGEST_SIZE_LIMIT_BYTES)")
     table.add_row("Max field bytes", f"{max_field_bytes:,}", "--max-field-bytes (not advertised by the destination)")
-    table.add_row("Range / window", f"{max_age_days:g}d / {window_days:g}d", "--max-age-days / --window")
+    table.add_row(
+        "Range / window",
+        f"{migrator.resolved_range_start().isoformat()} -> now\n"
+        f"window {window_days:g}d = {_human_duration(window_days)}",
+        ("--max-age-stamp" if migrator.range_start else "--max-age-days") + " / --window",
+    )
     table.add_row("Trace tier", "longlived" if not migrator.emit_upgrade_list else "left as-is (--emit-upgrade-list)", "destination session")
     console.print(table)
     if config.migration.dry_run:
@@ -6560,11 +6594,7 @@ def _record_trace_session_outcome(orchestrator, config, migrator, source_session
         "dest_session_id": report.dest_session_id,
     }
     if report.blocked:
-        migrator.mark_blocked(
-            item_id, "run_not_ingested",
-            next_action="Re-run `langsmith-migrator traces` for this project.",
-            evidence=evidence,
-        )
+        migrator.mark_blocked(item_id, "run_not_ingested", next_action="", evidence=evidence)
     elif report.degraded:
         migrator.mark_degraded(item_id, "migrated_with_reduced_fidelity", evidence=evidence)
     else:
@@ -6591,18 +6621,72 @@ def _record_trace_session_failure(orchestrator, config, migrator, source_session
     migrator.mark_blocked(
         _trace_item_id(orchestrator, config, source_session),
         code,
-        next_action="Re-run `langsmith-migrator traces` for this project once the cause is resolved.",
+        next_action="",  # the tool reports what happened, not what to do about it
         evidence={"error": str(exc)[:500]},
     )
 
 
-def _print_trace_reconciliation(report) -> None:
+def _print_trace_reconciliation(report, batch_runs: int, verified: bool = True) -> None:
     console.print(
         f"  source {report.source_total} = ingested {report.ingested}"
         f" + already present {report.already_present}"
         f" + degraded {report.degraded} + blocked {report.blocked}"
         + (f"  [dim](destination also holds {report.extra_on_dest} run(s) the source did not)[/dim]" if report.extra_on_dest else "")
     )
+    _print_trace_watermark(report, batch_runs, verified)
+
+
+def _parse_age_stamp(value: str):
+    """Parse --max-age-stamp as an ISO date or datetime, naive read as UTC."""
+    import datetime as _dt
+
+    try:
+        stamp = _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"--max-age-stamp is not an ISO date/datetime: {value!r}") from None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=_dt.timezone.utc)
+    if stamp >= _dt.datetime.now(_dt.timezone.utc):
+        raise ValueError(f"--max-age-stamp must be in the past, got {stamp.isoformat()}")
+    return stamp
+
+
+def _print_trace_watermark(report, batch_runs: int, verified: bool = True) -> None:
+    """Report the confirmed-complete span, and how to resume from it.
+
+    The resume point is the *latest* verified run, pulled back by the time one
+    ingest batch occupied: enough overlap that a boundary run cannot be
+    skipped, without re-walking the whole verified span. The overlap is sized
+    from the observed run density rather than guessed, and falls back to the
+    earliest timestamp when the whole span is smaller than one batch.
+    """
+    if not report.earliest:
+        # Only explain a *fidelity* reason here. With --dry-run or --no-verify
+        # there is simply nothing verified, and the run already said so at the
+        # top - claiming "degraded or blocked runs" would send the operator
+        # looking for problems that do not exist.
+        if report.source_total and verified:
+            console.print(
+                "  [yellow]no verified watermark: this project had degraded or blocked runs, "
+                "so no span can be claimed complete[/yellow]"
+            )
+        return
+    import datetime as _dt
+
+    earliest = _dt.datetime.fromisoformat(report.earliest)
+    latest = _dt.datetime.fromisoformat(report.latest)
+    fraction = 1.0
+    if report.verified_runs > batch_runs:
+        fraction = batch_runs / report.verified_runs
+    resume = latest - (latest - earliest) * fraction
+    console.print(
+        f"  verified complete from [bold]{report.earliest}[/bold] to {report.latest} "
+        f"({report.verified_runs} run(s))"
+    )
+    overlap = "the whole span" if fraction == 1.0 else f"~{batch_runs} run(s), one ingest batch"
+    # An absolute stamp, not a relative age: a float age would denote a
+    # different instant by the time a long run finishes.
+    console.print(f"  [dim]to continue from here: --max-age-stamp {resume.isoformat()} (redoing {overlap})[/dim]")
 
 
 def _print_trace_summary(session_reports, fidelity_notes, no_verify, failed_projects=()) -> None:
@@ -6612,23 +6696,16 @@ def _print_trace_summary(session_reports, fidelity_notes, no_verify, failed_proj
         console.print("\n[yellow]No traces migrated[/yellow]")
         return
     table = Table(title="Trace migration", show_header=True)
-    for column in ("Project", "Source", "Ingested", "Present", "Degraded", "Blocked"):
+    for column in ("Project", "Source", "Ingested", "Present", "Degraded", "Blocked", "Verified from"):
         table.add_column(column)
     for name, r in session_reports:
-        table.add_row(name or "?", str(r.source_total), str(r.ingested), str(r.already_present), str(r.degraded), str(r.blocked))
+        table.add_row(name or "?", str(r.source_total), str(r.ingested), str(r.already_present),
+                      str(r.degraded), str(r.blocked), r.earliest or "-")
     console.print(table)
     if no_verify:
         console.print("[yellow]Completeness was not verified (--no-verify).[/yellow]")
     if fidelity_notes:
-        # A run already on the destination is immutable, so there is no
-        # in-place repair: the only fix is to write into a different session.
-        console.print(
-            "[yellow]Fidelity was reduced for some runs. A fully ingested run cannot be modified, "
-            "so repair means re-migrating the affected window into a fresh destination project "
-            "(a new --into-session-suffix), "
-            + ", ".join(sorted(fidelity_notes))
-            + ".[/yellow]"
-        )
+        console.print("[yellow]Fidelity was reduced: " + "; ".join(sorted(fidelity_notes)) + ".[/yellow]")
 
 
 def _write_upgrade_list(path: str, rows) -> None:
@@ -6717,35 +6794,26 @@ def resume(ctx, retry_exhausted):
         )
         if retry_exhausted:
             console.print("[dim]Including items that used up their retry budget[/dim]")
-        actionable_groups = state.get_actionable_groups()
+        manual_items = [
+            item
+            for item in state.items.values()
+            if item.terminal_state
+            in (
+                ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value,
+                ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY.value,
+            )
+        ]
 
         console.print(f"\nResumable items: {len(resume_items)}")
-        console.print(
-            f"Checkpoint/manual items: {sum(len(group['items']) for group in actionable_groups)}"
-        )
+        console.print(f"Checkpoint/manual items: {len(manual_items)}")
 
-        if actionable_groups:
-            console.print("\n[bold]Items requiring manual attention:[/bold]")
-            for group in actionable_groups[:10]:
-                item_count = len(group["items"])
-                if item_count == 1:
-                    console.print(f"  • {group['subjects'][0]}: {group['next_action']}")
-                else:
-                    affected = state.format_actionable_subjects(
-                        group["subjects"],
-                        max_items=3,
-                    )
-                    console.print(
-                        f"  • {group['label']} ({item_count} items: {affected}): "
-                        f"{group['next_action']}"
-                    )
+        if manual_items:
+            console.print("\n[bold]Items that did not migrate:[/bold]")
+            for item in manual_items[:10]:
+                console.print(f"  • {item.name or item.id}: {item.outcome_code or item.terminal_state}")
 
         if not resume_items:
             console.print("\n[yellow]No items to resume automatically.[/yellow]")
-            if actionable_groups:
-                console.print(
-                    "[dim]Review the checkpoint items above and resolve them manually.[/dim]"
-                )
             return
 
         # Show what will be resumed

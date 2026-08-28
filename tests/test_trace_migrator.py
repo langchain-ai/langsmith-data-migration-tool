@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from langsmith_migrator.core.api_client import EnhancedAPIClient
-from langsmith_migrator.core.migrators.trace import TraceMigrator, TracePreflightError
+from langsmith_migrator.core.migrators.trace import _CANARY_SESSION, TraceMigrator, TracePreflightError
 from langsmith_migrator.core.trace_domain import Reconciliation, Window
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
@@ -150,10 +150,32 @@ def test_a_run_that_never_appears_is_blocked(sample_config, migration_state):
     m = _migrator(sample_config, migration_state)
     _wire_slice(m, [_run("a")], [], confirmed=[])
     m.ingest = Mock(return_value=[])
+    m.dest.get.return_value = None  # nowhere else either
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
     assert (report.blocked, report.ingested) == (1, 0)
     assert any(i.code == "run_not_ingested" for i in migration_state.issue_log)
+    assert any("still missing" in r for r in m.blocked_reasons)
+
+
+def test_a_run_held_by_another_project_says_so(sample_config, migration_state):
+    """The destination keeps one copy of a run id per tenant.
+
+    Reporting "still missing" here is true and useless: the write was accepted
+    and dropped, and re-running will never fix it.
+    """
+    m = _migrator(sample_config, migration_state)
+    _wire_slice(m, [_run("a")], [], confirmed=[])
+    m.ingest = Mock(return_value=[])
+    m.dest.get.return_value = {"id": "a", "session_id": "some-other-project"}
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
+    assert report.blocked == 1
+    issue = next(i for i in migration_state.issue_log if i.code == "run_exists_in_other_project")
+    assert "some-other-project" in issue.summary
+    assert any("different project" in r for r in m.blocked_reasons)
+    # facts only, no instructions
+    assert not issue.next_action
 
 
 def test_ingest_queue_lag_is_tolerated(sample_config):
@@ -280,7 +302,7 @@ def test_skip_attachments_degrades_rather_than_pretending(sample_config):
     assert issues == ["attachments_skipped"]
     assert "attachments" not in overrides
     # the repair is named, and it is never "pass --skip-attachments again"
-    assert m.fidelity_reduced == {"without --skip-attachments"}
+    assert m.fidelity_reduced == {"attachments were skipped (--skip-attachments)"}
 
 
 def test_offloaded_inputs_are_re_inlined_only_when_absent(sample_config):
@@ -327,7 +349,7 @@ def test_a_payload_over_the_field_limit_is_degraded_before_sending(sample_config
 # --------------------------------------------------------------------------
 def test_the_source_session_id_is_attempted_on_create(sample_config):
     m = _migrator(sample_config)
-    m.dest.get_paginated.return_value = []
+    m.dest.get.return_value = []
     m.dest.post.return_value = {"id": "src-1", "trace_tier": "longlived"}
     resolved = m.resolve_dest_session({"id": "src-1", "name": "proj"})
     assert m.dest.post.call_args[0][1]["id"] == "src-1"
@@ -337,7 +359,7 @@ def test_the_source_session_id_is_attempted_on_create(sample_config):
 
 def test_a_rejected_source_id_is_retried_without_one(sample_config):
     m = _migrator(sample_config)
-    m.dest.get_paginated.return_value = []
+    m.dest.get.return_value = []
     m.dest.post.side_effect = [RuntimeError("id taken"), {"id": "fresh", "trace_tier": "longlived"}]
     resolved = m.resolve_dest_session({"id": "src-1", "name": "proj"})
     assert resolved["id"] == "fresh"
@@ -346,7 +368,7 @@ def test_a_rejected_source_id_is_retried_without_one(sample_config):
 
 def test_an_existing_destination_session_is_matched_by_name(sample_config):
     m = _migrator(sample_config)
-    m.dest.get_paginated.return_value = [{"id": "other-id", "name": "proj", "trace_tier": "longlived"}]
+    m.dest.get.return_value = [{"id": "other-id", "name": "proj", "trace_tier": "longlived"}]
     resolved = m.resolve_dest_session({"id": "src-1", "name": "proj"})
     assert resolved["id"] == "other-id"  # identity is a coincidence, not a requirement
     m.dest.post.assert_not_called()
@@ -360,15 +382,13 @@ def test_an_operator_mapping_wins_over_name_matching(sample_config):
 
 def test_an_ambiguous_destination_name_is_skipped(sample_config):
     m = _migrator(sample_config)
-    m.dest.get_paginated.return_value = [
-        {"id": "a", "name": "proj"}, {"id": "b", "name": "proj"},
-    ]
+    m.dest.get.return_value = [{"id": "a", "name": "proj"}, {"id": "b", "name": "proj"}]
     assert m.resolve_dest_session({"id": "src-1", "name": "proj"}) is None
 
 
 def test_into_session_suffix_targets_a_separate_session(sample_config):
     m = _migrator(sample_config, into_session_suffix="-migrated")
-    m.dest.get_paginated.return_value = [{"id": "live", "name": "proj", "trace_tier": "shortlived"}]
+    m.dest.get.return_value = [{"id": "live", "name": "proj", "trace_tier": "shortlived"}]
     m.dest.post.return_value = {"id": "copy", "trace_tier": "longlived"}
     resolved = m.resolve_dest_session({"id": "src-1", "name": "proj"})
     assert m.dest.post.call_args[0][1]["name"] == "proj-migrated"
@@ -407,11 +427,19 @@ def test_the_tier_is_not_restored_while_a_session_is_incomplete(sample_config):
 # --------------------------------------------------------------------------
 # Pre-flight canary
 # --------------------------------------------------------------------------
+def _dest_get(run_payload):
+    """Route dest.get: /sessions is the scratch lookup, /runs/<id> the read-back."""
+    def get(path, params=None):
+        if path == "/sessions":
+            return [{"id": "scratch", "name": _CANARY_SESSION}]
+        return run_payload() if callable(run_payload) else run_payload
+    return get
+
+
 def test_the_canary_blocks_when_the_timestamp_is_rewritten(sample_config, migration_state):
     m = _migrator(sample_config, migration_state, max_age_days=180)
-    m.dest.get_paginated.return_value = [{"id": "scratch", "name": "langsmith-migrator-canary"}]
     m.ingest = Mock(return_value=[])
-    m.dest.get.return_value = {"start_time": datetime.now(timezone.utc).isoformat()}
+    m.dest.get.side_effect = _dest_get({"start_time": datetime.now(timezone.utc).isoformat()})
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         with pytest.raises(TracePreflightError, match="historical_ingest_rejected"):
             m.canary()
@@ -420,28 +448,41 @@ def test_the_canary_blocks_when_the_timestamp_is_rewritten(sample_config, migrat
 
 def test_the_canary_blocks_when_the_run_never_appears(sample_config, migration_state):
     m = _migrator(sample_config, migration_state, max_age_days=180)
-    m.dest.get_paginated.return_value = [{"id": "scratch", "name": "langsmith-migrator-canary"}]
     m.ingest = Mock(return_value=[])
-    m.dest.get.return_value = None
+    m.dest.get.side_effect = _dest_get(None)
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         with pytest.raises(TracePreflightError):
             m.canary()
 
 
-def test_repeated_preflights_reuse_one_canary_identity(sample_config):
+def test_each_preflight_writes_its_own_canary(sample_config):
+    """The read-back must prove *this* invocation's write landed.
+
+    A deterministic ID made repeated pre-flights 409 ("duplicate run create
+    requests are not supported"), after which the read-back found the previous
+    invocation's canary and the gate passed having verified nothing.
+    """
     m = _migrator(sample_config, max_age_days=180)
-    m.dest.get_paginated.return_value = [{"id": "scratch", "name": "langsmith-migrator-canary"}]
     sent = []
     m.ingest = lambda batch: sent.extend(batch) or []
-    m.dest.get.side_effect = lambda path: {"start_time": sent[-1]["start_time"]}
+    m.dest.get.side_effect = _dest_get(lambda: {"start_time": sent[-1]["start_time"]})
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         m.canary()
         m.canary()
-    # same id AND same start_time: start_time is part of the dedup key, so a
-    # drifted stamp would add a row instead of replacing one
-    assert sent[0]["id"] == sent[1]["id"]
-    assert sent[0]["start_time"] == sent[1]["start_time"]
+    assert sent[0]["id"] != sent[1]["id"], "a reused ID is rejected, not upserted"
     assert sent[0]["session_id"] == "scratch"  # never a migration target
+    # the exact resolved range start, not an hour-rounded value, and stable
+    # across calls because it is resolved once per run
+    assert sent[0]["start_time"] == sent[1]["start_time"] == m.resolved_range_start().isoformat()
+
+
+def test_a_conflicted_canary_blocks_instead_of_passing(sample_config, migration_state):
+    m = _migrator(sample_config, migration_state, max_age_days=180)
+    m.ingest = Mock(return_value=[("id", "HTTP 409: duplicate run create")])
+    m.dest.get.side_effect = _dest_get({"start_time": "whatever"})
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        with pytest.raises(TracePreflightError, match="historical_ingest_rejected"):
+            m.canary()
 
 
 def test_dry_run_skips_the_canary_entirely(sample_config):
@@ -511,7 +552,7 @@ def test_a_query_failure_is_never_swallowed(sample_config):
 def test_a_forbidden_session_create_is_a_tier_permission_blocker(sample_config):
     # PROJECTS_INCREASE_TRACE_TIER is checked on create too, not only on update.
     m = _migrator(sample_config)
-    m.dest.get_paginated.return_value = []
+    m.dest.get.return_value = []
     m.dest.post.side_effect = RuntimeError("403 Forbidden")
     with pytest.raises(TracePreflightError, match="trace_tier_permission_denied"):
         m.resolve_dest_session({"id": "src-1", "name": "proj"})
@@ -767,3 +808,125 @@ def test_a_tier_we_never_raised_is_never_touched(sample_config, migration_state)
         m.migrate_session({"id": "src", "name": "p", "trace_tier": "shortlived"}, now=NOW)
     m.restore_tier.assert_not_called()
     assert not any(i.code == "dest_tier_left_raised" for i in migration_state.issue_log)
+
+
+# --------------------------------------------------------------------------
+# The watermark is a completeness claim, so it needs real verification
+# --------------------------------------------------------------------------
+def _one_run_slice(m):
+    page = {"runs": [_run("a")], "cursors": {}}
+    m.source.post.side_effect = [page, page]
+    m.dest.post.side_effect = [{"runs": [], "cursors": {}}] * 6
+    m.ingest = Mock(return_value=[])
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        return m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
+
+
+def test_a_dry_run_claims_no_watermark(sample_config):
+    # Nothing was written, so there is nothing to be complete.
+    sample_config.migration.dry_run = True
+    report = _one_run_slice(_migrator(sample_config))
+    assert (report.earliest, report.latest, report.verified_runs) == (None, None, 0)
+
+
+def test_no_verify_claims_no_watermark(sample_config):
+    # Runs were ingested but never confirmed readable; the watermark would be
+    # an unearned completeness claim an operator might skip work on.
+    report = _one_run_slice(_migrator(sample_config, verify=False))
+    assert (report.earliest, report.latest, report.verified_runs) == (None, None, 0)
+
+
+def test_a_verified_run_does_claim_a_watermark(sample_config):
+    m = _migrator(sample_config)
+    page = {"runs": [_run("a")], "cursors": {}}
+    m.source.post.side_effect = [page, page]
+    m.dest.post.side_effect = [
+        {"runs": [], "cursors": {}},          # pre-diff: missing
+        {"runs": [_run("a")], "cursors": {}},  # confirm: present
+        {"runs": [_run("a")], "cursors": {}},  # content sample
+    ]
+    m.ingest = Mock(return_value=[])
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
+    assert report.earliest is not None and report.verified_runs == 1
+
+
+# --------------------------------------------------------------------------
+# A conflict is a rejection, not a replay
+# --------------------------------------------------------------------------
+def test_a_409_fails_every_run_in_the_request(sample_config):
+    """409 rejects the whole request, so it is neither success nor one bad run."""
+    m = _migrator(sample_config)
+    m.dest_ls_client.multipart_ingest.return_value = None
+    m._ingest_responses.append((409, '{"error":"Run create payload already received."}'))
+    original = m._ingest_responses[:]
+    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.extend(original)
+    del m._ingest_responses[:]
+
+    failures = m.ingest([{"id": "a", "trace_id": "t"}, {"id": "b", "trace_id": "t"}])
+    assert {rid for rid, _ in failures} == {"a", "b"}
+    assert all("409" in err for _, err in failures)
+    # no binary split: the rejection applies to every payload equally
+    assert m.dest_ls_client.multipart_ingest.call_count == 1
+
+
+def test_a_swallowed_non_2xx_is_still_a_failure(sample_config):
+    m = _migrator(sample_config)
+    original = [(503, "Service unavailable")]
+    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.extend(original)
+    failures = m.ingest([{"id": "solo", "trace_id": "t"}])
+    assert failures and "503" in failures[0][1]
+
+
+def test_a_clean_202_is_success(sample_config):
+    m = _migrator(sample_config)
+    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.append((202, ""))
+    assert m.ingest([{"id": "a", "trace_id": "t"}]) == []
+
+
+# --------------------------------------------------------------------------
+# A blocked count always has a matching reason, from either path
+# --------------------------------------------------------------------------
+def test_an_ingest_rejection_is_reported_once_per_cause(sample_config, migration_state):
+    """Twenty runs refused for one reason is one fact, not twenty log lines.
+
+    The confirm-miss path recorded a reason but the ingest-rejection path did
+    not, and because a fully-blocked slice leaves nothing for the confirm to
+    check, a blocked count could appear with no reason anywhere.
+    """
+    m = _migrator(sample_config, migration_state)
+    runs = [_run(c, trace="t1", order=f"A.{c}") for c in "abcde"]
+    _wire_slice(m, runs, [])
+    m.ingest = lambda batch: [(str(p["id"]), 'HTTP 409: {"error":"already received"}') for p in batch]
+
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
+
+    assert report.blocked == 5
+    reasons = [r for r in m.blocked_reasons if "refused by the destination" in r]
+    assert len(reasons) == 1, f"expected one grouped reason, got {m.blocked_reasons}"
+    assert "5 run(s)" in reasons[0] and "409" in reasons[0]
+    issue = next(i for i in migration_state.issue_log if i.code == "run_ingest_rejected")
+    assert issue.evidence["count"] == 5
+
+
+def test_distinct_causes_are_reported_separately(sample_config, migration_state):
+    m = _migrator(sample_config, migration_state)
+    runs = [_run(c, trace="t1", order=f"A.{c}") for c in "ab"]
+    _wire_slice(m, runs, [])
+    m.ingest = lambda batch: [(str(p["id"]), f"HTTP {409 if p['id'] == 'a' else 503}") for p in batch]
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
+    assert len({r for r in m.blocked_reasons if "refused" in r}) == 2
+
+
+def test_the_migrator_records_no_remediation_advice(migration_state, sample_config):
+    """Every issue states what happened; none prescribes what to do."""
+    m = _migrator(sample_config, migration_state)
+    _wire_slice(m, [_run("a")], [])
+    m.ingest = lambda batch: [("a", "HTTP 409")]
+    m.dest.get.return_value = None
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
+    assert migration_state.issue_log
+    assert not any(i.next_action for i in migration_state.issue_log)
