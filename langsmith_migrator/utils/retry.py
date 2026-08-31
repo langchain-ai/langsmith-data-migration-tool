@@ -149,6 +149,10 @@ def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 
                     requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout,
                     requests.exceptions.ReadTimeout,
+                    # A truncated response body. Not a ConnectionError subclass,
+                    # so it needs naming: it is the usual way a full connection
+                    # pool surfaces once several readers are in flight.
+                    requests.exceptions.ChunkedEncodingError,
                     socket.timeout,
                 ) as e:
                     # Retry network errors

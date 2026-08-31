@@ -27,17 +27,29 @@ Two backend facts drive most of the shape here:
 from __future__ import annotations
 
 import json
+import re
+import threading
 import time
 import uuid
+from dataclasses import dataclass
+from dataclasses import field as _field
 from datetime import datetime, timezone
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from tempfile import SpooledTemporaryFile
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 import requests
 from langsmith import Client
 
 from ..api_client import APIError, NotFoundError
+from ..trace_frames import (
+    DEFAULT_COMPRESS_LEVEL,
+    CompiledFrame,
+    compile_frame,
+    unavailable_reason,
+)
 from ..trace_domain import (
     ATTACHMENT_PREFIX,
     LONGLIVED,
@@ -60,9 +72,20 @@ from ..trace_domain import (
 )
 from .base import BaseMigrator
 
-# Measured on a real deployment: 2000 IDs per /runs/query is fine, 5000 returns
-# 503. Half the safe value, so a slow shard has headroom.
+# The binding constraint is the *response* size, not the ID count: 500 IDs of a
+# heavy project's full payloads is ~65 MB and a gateway rejects it with a 502 in
+# under ten seconds, while 500 IDs of a light one is fine. So this is a starting
+# point that halves itself on rejection, down to _ID_CHUNK_MIN.
 _ID_CHUNK = 500
+_ID_CHUNK_MIN = 25
+
+# Both real deployments cap /runs/query at 1000. A deployment that caps lower
+# says so in the 400, so the limit self-corrects rather than being probed.
+# Measured: an ``id``-filtered query ignores the limit entirely (2000 IDs at
+# limit=10 returned all 2000 in one page). Not relied on - ID chunks are held
+# at or under the limit so a request never depends on that leniency.
+_PAGE_LIMIT = 1000
+_PAGE_CAP_RE = re.compile(r"maximum allowed value of (\d+)")
 
 # Not advertised by /info (only the batch limits are), so it matches the
 # backend's own MAX_ATTACHMENT_SIZE_BYTES default and is a guard, not a truth.
@@ -72,6 +95,48 @@ _VERIFY_ATTEMPTS = 4
 _VERIFY_BACKOFF = 3.0
 
 _CANARY_SESSION = "langsmith-migrator-canary"
+
+
+def _size_connection_pools(*clients_and_size) -> None:
+    """Give each client a connection pool that fits the reader count.
+
+    urllib3 defaults to 10, and a full pool silently drops connections rather
+    than queueing, which shows up as ChunkedEncodingError under load.
+
+    The sessions themselves stay shared across the prepare workers. urllib3's
+    pools are thread-safe; what is not is mutating session state, and the only
+    mutable piece in play is the cookie jar - measured empty, as neither
+    deployment sends Set-Cookie on the endpoints this migrator uses. Headers
+    are mutated only on the destination write session, which is main-thread
+    only.
+    """
+    *clients, workers = clients_and_size
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=max(10, workers * 2), pool_maxsize=max(10, workers * 2)
+    )
+    for client in clients:
+        session = getattr(client, "session", None)
+        if session is not None and hasattr(session, "mount"):
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+
+
+def _response_too_large(error: Exception) -> bool:
+    """Whether a failure looks like "that response was too big to serve".
+
+    The gateway in front of LangSmith answers 502 (or 413) on an oversized
+    response body rather than saying so, and it does it fast - there is nothing
+    to distinguish it from a genuine outage except that retrying at the same
+    size keeps failing, which the retry layer has already established.
+    """
+    status = getattr(error, "status_code", None)
+    return status in (413, 502, 503)
+
+
+def _page_limit_cap(error: Exception) -> Optional[int]:
+    """The page cap a deployment advertises when it rejects our limit."""
+    match = _PAGE_CAP_RE.search(str(error))
+    return int(match.group(1)) if match else None
 
 
 def _raise_if_tier_denied(error: Exception) -> None:
@@ -88,6 +153,31 @@ def _raise_if_tier_denied(error: Exception) -> None:
         )
 
 
+
+
+@dataclass
+class SlicePrepared:
+    """One slice's work, built off the main thread and committed on it.
+
+    Findings accumulate here rather than on the migrator so a worker never
+    writes shared state; ``commit_slice`` merges them in window order.
+    """
+
+    window: Window
+    src_id: str
+    dst_id: str
+    plan: SlicePlan
+    population: List[Dict[str, Any]]
+    # (payloads, pre-compiled frame). The payloads are kept so a rejected batch
+    # can still be split to isolate one bad run; that is what bounds peak
+    # memory to prefetch x window, and why --window is the knob for it.
+    batches: List[Tuple[List[Dict[str, Any]], Optional[CompiledFrame]]] = _field(default_factory=list)
+    digests: Dict[str, Dict[str, str]] = _field(default_factory=dict)
+    degraded: Dict[str, Set[str]] = _field(default_factory=dict)
+    fidelity_notes: Set[str] = _field(default_factory=set)
+    upgrade_rows: List[Tuple[str, str, str]] = _field(default_factory=list)
+    # (issue_class, code, summary, evidence), replayed through record_issue.
+    issues: List[Tuple[str, str, str, Dict[str, Any]]] = _field(default_factory=list)
 
 
 class TracePreflightError(RuntimeError):
@@ -115,6 +205,8 @@ class TraceMigrator(BaseMigrator):
         into_session_suffix: Optional[str] = None,
         emit_upgrade_list: Optional[str] = None,
         project_id_map: Optional[Dict[str, str]] = None,
+        compress_level: Optional[int] = DEFAULT_COMPRESS_LEVEL,
+        prefetch_windows: int = 4,
     ):
         super().__init__(source_client, dest_client, state, config)
         self.max_age_days = max_age_days
@@ -144,6 +236,26 @@ class TraceMigrator(BaseMigrator):
         # Human-readable reasons for blocked runs, so the CLI can explain a
         # blocked count instead of only recording it into state.
         self.blocked_reasons: List[str] = []
+
+        # Per side: the two deployments need not cap /runs/query alike.
+        self._page_limit = {"source": _PAGE_LIMIT, "dest": _PAGE_LIMIT}
+        # Shrinks itself when a project's payloads make the response too big.
+        self._id_chunk = _ID_CHUNK
+
+        # None = send uncompressed through the SDK's public path. Resolved
+        # once, after the client exists, so a missing SDK internal or a
+        # destination without the feature degrades instead of failing per batch.
+        self.compress_level = compress_level
+        self.compress_unavailable: Optional[str] = None
+
+        # How many windows may be retrieved concurrently. Ingest stays serial
+        # whatever this is; only the reading ahead is parallel. Peak memory is
+        # roughly this many windows of payloads, so --window trades it back.
+        self.prefetch_windows = max(1, prefetch_windows)
+        self._main_thread = threading.get_ident()
+        # Sized to the readers: the default pool of 10 would churn connections
+        # once several windows are in flight.
+        _size_connection_pools(source_client, dest_client, self.prefetch_windows)
 
         # Blobs are proxied by whichever deployment stores them, so the
         # allow-list is per side: the destination's read-back URLs live on the
@@ -181,6 +293,10 @@ class TraceMigrator(BaseMigrator):
             omit_traced_runtime_info=True,
             tracing_error_callback=self._ingest_errors.append,
         )
+        if self.compress_level is not None:
+            self.compress_unavailable = unavailable_reason(self.dest_ls_client)
+            if self.compress_unavailable:
+                self.compress_level = None
 
     def resolved_range_start(self) -> datetime:
         """Absolute lower bound of this run's walk, fixed for the whole run."""
@@ -241,14 +357,24 @@ class TraceMigrator(BaseMigrator):
             "trace_filter": trace_filter,
             "start_time": run_start,
             "select": list(select),
-            "limit": 100,
         }
         if ids is not None:
             body["id"] = [str(i) for i in ids]
-        side = "source" if client is self.source else "dest  "
+        side = "source" if client is self.source else "dest"
+        body["limit"] = self._page_limit[side]
         page_num, seen = 0, 0
         while True:
-            response = client.post("/runs/query", body) or {}
+            try:
+                response = client.post("/runs/query", body) or {}
+            except APIError as exc:
+                cap = _page_limit_cap(exc)
+                if cap is None or cap >= body["limit"]:
+                    raise
+                # This deployment pages smaller than we asked. Adopt its
+                # number for the rest of the run and re-send.
+                self._page_limit[side] = cap
+                body = {**body, "limit": cap}
+                continue
             runs = response.get("runs") or []
             page_num += 1
             seen += len(runs)
@@ -257,7 +383,7 @@ class TraceMigrator(BaseMigrator):
                 # Kept under 80 columns: a wrapped progress line is worse
                 # than a terse one.
                 self.console.print(
-                    f"[dim]  query {side} p{page_num:<4}"
+                    f"[dim]  query {side:<6} p{page_num:<4}"
                     f"runs {n:>4} | traces {traces:>4} | {self._human(size):>9} | "
                     f"total {seen:>6}[/dim]"
                 )
@@ -290,12 +416,37 @@ class TraceMigrator(BaseMigrator):
     def fetch_runs(
         self, client, session_id: str, window: Window, run_ids: Sequence[str]
     ) -> Iterator[Dict[str, Any]]:
-        """Full payloads for a set of IDs, chunked so no request is oversized."""
+        """Full payloads for a set of IDs, chunked so no response is oversized.
+
+        A chunk is materialised before being yielded so an oversized response
+        can be retried at half the size without double-yielding what the failed
+        attempt had already produced.
+        """
+        side = "source" if client is self.source else "dest"
         ids = list(run_ids)
-        for start in range(0, len(ids), _ID_CHUNK):
-            yield from self._query_runs(
-                client, session_id, window, select=RUN_QUERY_SELECT, ids=ids[start : start + _ID_CHUNK]
-            )
+        start = 0
+        while start < len(ids):
+            chunk = min(self._id_chunk, self._page_limit[side])
+            try:
+                page = list(
+                    self._query_runs(
+                        client, session_id, window, select=RUN_QUERY_SELECT, ids=ids[start : start + chunk]
+                    )
+                )
+            except APIError as exc:
+                if not _response_too_large(exc) or chunk <= _ID_CHUNK_MIN:
+                    raise
+                # Retries at this size are already exhausted, so the size is
+                # the problem. Halve it and keep it for the rest of the run.
+                self._id_chunk = max(_ID_CHUNK_MIN, chunk // 2)
+                self.log(
+                    f"  {chunk} IDs per request was refused ({exc.status_code}); "
+                    f"continuing at {self._id_chunk}",
+                    "warning",
+                )
+                continue
+            yield from page
+            start += chunk
 
     # ------------------------------------------------------------------
     # Blobs
@@ -399,8 +550,13 @@ class TraceMigrator(BaseMigrator):
             and len(json.dumps(payload[field], default=str)) > self.max_field_bytes
         ]
 
-    def ingest(self, payloads: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    def ingest(
+        self, payloads: List[Dict[str, Any]], frame: Optional[CompiledFrame] = None
+    ) -> List[Tuple[str, str]]:
         """Send one batch, isolating a bad run by binary split.
+
+        ``frame`` is a body compiled earlier, off this thread. A split has to
+        compile its halves here, since the parent's frame covers the whole batch.
 
         Returns ``[(run_id, error)]`` for runs that could not be ingested.
 
@@ -410,6 +566,9 @@ class TraceMigrator(BaseMigrator):
         """
         if not payloads or self.config.migration.dry_run:
             return []
+        # Ordered, serial, single-threaded is the whole basis of "a failure
+        # leaves no gap". Fail loudly rather than quietly losing that.
+        assert threading.get_ident() == self._main_thread, "ingest must run on the main thread"
         n, traces, size = self._shape(payloads)
         # Deliberately louder than the query lines around it: this is the only
         # step that writes, and it is otherwise invisible - multipart_ingest
@@ -422,18 +581,24 @@ class TraceMigrator(BaseMigrator):
         del self._ingest_errors[:]
         del self._ingest_responses[:]
         try:
-            self.dest_ls_client.multipart_ingest(create=payloads)
+            self._send(payloads, frame)
             error = self._ingest_errors[0] if self._ingest_errors else None
         except Exception as exc:  # pragma: no cover - defensive
             error = exc
         self._report_ingest_responses()
         conflict = next((body for status, body in self._ingest_responses if status == 409), None)
         if conflict is not None:
-            # A 409 rejects every payload in the request ("duplicate run create
-            # requests are not supported"), so it is not a one-bad-apple case:
-            # splitting would just repeat the same rejection per run. It also
-            # is NOT replay success - the runs exist somewhere on the tenant,
-            # but not in the project we asked for.
+            # A 409 rejects the whole request, so splitting would only repeat
+            # it per run. What it does NOT say is where those runs are: the
+            # duplicate may be a copy in another project (a real rejection) or
+            # this very request's own earlier attempt, which landed. Only the
+            # destination can tell the two apart, so when verification is going
+            # to ask anyway, defer to it rather than guessing "blocked".
+            if self.verify:
+                self.console.print(
+                    "[yellow]  ==> 409 on ingest; leaving the verdict to verification[/yellow]"
+                )
+                return []
             return [(str(p["id"]), f"HTTP 409: {conflict}") for p in payloads]
         if error is None:
             swallowed = next(((st, bd) for st, bd in self._ingest_responses if st >= 300), None)
@@ -448,6 +613,29 @@ class TraceMigrator(BaseMigrator):
             f"[yellow]  ==> batch of {len(payloads)} rejected; splitting to isolate the bad run[/yellow]"
         )
         return self.ingest(payloads[:mid]) + self.ingest(payloads[mid:])
+
+    def _send(self, payloads: List[Dict[str, Any]], frame: Optional[CompiledFrame] = None) -> None:
+        """Post one batch, compressing unless that is unavailable or refused.
+
+        ``frame`` is a body already compiled elsewhere; without one it is
+        compiled here. A split re-compiles, which is why this takes both.
+        """
+        if self.compress_level is None:
+            self.dest_ls_client.multipart_ingest(create=payloads)
+            return
+        if frame is None or set(frame.run_ids) != {str(p["id"]) for p in payloads}:
+            frame = compile_frame(self.dest_ls_client, payloads, self.compress_level)
+        self.console.print(
+            f"[dim]      zstd L{self.compress_level}: {self._human(frame.sizes[0])}"
+            f" -> {self._human(frame.sizes[1])}"
+            f" ({frame.sizes[0] / max(frame.sizes[1], 1):.1f}x)[/dim]"
+        )
+        # attempts=1 deliberately. Ingest is not idempotent - a run id is
+        # write-once per tenant - so a blind retry of a request whose outcome is
+        # unknown (a slow, large batch that the server did accept) earns a 409
+        # and makes a landed run look rejected. Verification establishes the
+        # truth instead; a genuinely lost batch shows up as missing there.
+        self.dest_ls_client._send_compressed_multipart_req(frame.stream, frame.sizes, attempts=1)
 
     def _report_ingest_responses(self) -> None:
         """Show what the multipart endpoint answered.
@@ -713,14 +901,22 @@ class TraceMigrator(BaseMigrator):
     # ------------------------------------------------------------------
     # The unit of work
     # ------------------------------------------------------------------
-    def migrate_slice(
+    def prepare_slice(
         self, source_session: Dict[str, Any], dest_session: Dict[str, Any], window: Window
-    ) -> Reconciliation:
-        """Diff, ingest the difference, confirm it is empty, sample content."""
+    ) -> SlicePrepared:
+        """Everything up to the write: diff, fetch, adapt, compile.
+
+        Runs off the main thread, so it touches no shared state - findings
+        accumulate into the returned value and are merged by ``commit_slice``.
+        The exceptions are ``self._page_limit`` and ``self._id_chunk``: both are
+        only ever lowered, toward a bound the server dictated, so concurrent
+        writes converge on the same value and a lost update just means one more
+        rejection before it sticks.
+        """
         src_id, dst_id = str(source_session["id"]), str(dest_session["id"])
         population = self.slice_runs(self.source, src_id, window)
         if not population:
-            return Reconciliation(src_id, dst_id, window.label(), 0, 0, 0, 0, 0)
+            return SlicePrepared(window, src_id, dst_id, plan_slice(set(), set()), [])
         source_ids = {str(r["id"]) for r in population}
 
         # With --emit-upgrade-list the destination sessions stay at their
@@ -731,13 +927,13 @@ class TraceMigrator(BaseMigrator):
             if self.config.migration.dry_run
             else self.long_lived_run_ids(self.dest, dst_id, window, tier_filter=not self.emit_upgrade_list)
         )
-        plan = plan_slice(source_ids, dest_ids)
+        prepared = SlicePrepared(window, src_id, dst_id, plan_slice(source_ids, dest_ids), population)
 
         if self.emit_upgrade_list:
             # Derived from the window's source population, not the diff: built
             # from the diff, a re-run whose differences are all empty would
             # emit an empty list.
-            self.upgrade_rows.extend(
+            prepared.upgrade_rows.extend(
                 (dst_id, str(r["trace_id"]), str(r["start_time"]))
                 for r in population
                 if str(r.get("trace_id")) == str(r.get("id"))
@@ -745,31 +941,107 @@ class TraceMigrator(BaseMigrator):
             # Reported against the whole population for the same reason, and
             # kept out of the reconciliation buckets so the parts still
             # partition the source total exactly once.
-            self.record_issue(
-                "degraded",
-                "longlived_pending_operator_upgrade",
-                f"{len(source_ids)} run(s) in {window.label()} are not yet long-lived: "
-                "the destination project was left at its existing tier",
-                evidence={"window": window.label(), "count": len(source_ids), "dest_session_id": dst_id},
+            prepared.issues.append(
+                (
+                    "degraded",
+                    "longlived_pending_operator_upgrade",
+                    f"{len(source_ids)} run(s) in {window.label()} are not yet long-lived: "
+                    "the destination project was left at its existing tier",
+                    {"window": window.label(), "count": len(source_ids), "dest_session_id": dst_id},
+                )
             )
 
-        degraded: Dict[str, Set[str]] = {}
+        self._build_batches(prepared)
+        return prepared
+
+    def _build_batches(self, prepared: SlicePrepared) -> None:
+        """Fetch and adapt the diff into ready-to-send batches."""
+        if not prepared.plan.to_ingest:
+            return
+        payloads: List[Dict[str, Any]] = []
+        for run in self.fetch_runs(
+            self.source, prepared.src_id, prepared.window, sorted(prepared.plan.to_ingest)
+        ):
+            run_id = str(run["id"])
+            overrides, issues = self.materialise(run)
+            payload_obj, dropped = to_ingest_payload(run, prepared.dst_id, overrides)
+            payload = payload_obj.as_dict()
+
+            oversized = self._oversized_fields(payload)
+            if oversized:
+                # The backend stubs an oversized field rather than rejecting
+                # it, so this run must not be reported as fully migrated.
+                prepared.degraded.setdefault("payload_oversized_for_destination", set()).add(run_id)
+                prepared.fidelity_notes.add("payloads exceeded --max-field-bytes")
+                continue
+
+            codes = set(issues)
+            if dropped:
+                codes.add("run_example_link_dropped")
+            for code in codes:
+                prepared.degraded.setdefault(code, set()).add(run_id)
+                if code in ("attachment_fetch_failed", "attachment_host_rejected"):
+                    prepared.fidelity_notes.add("some source blobs could not be fetched")
+
+            # Before compiling: _run_transform mutates the payload in place.
+            if len(prepared.digests) < self.verify_content_sample:
+                prepared.digests[run_id] = self._digest_of(run, overrides)
+            payloads.append(payload)
+
+        max_runs, max_bytes = self.batch_limits()
+        for batch in batch_traces(
+            group_into_traces(payloads), max_runs=max_runs, max_bytes=max_bytes, size_of=self._size_of
+        ):
+            frame = (
+                None
+                if self.compress_level is None or self.config.migration.dry_run
+                else compile_frame(self.dest_ls_client, batch, self.compress_level)
+            )
+            prepared.batches.append((batch, frame))
+
+    def commit_slice(self, prepared: SlicePrepared) -> Reconciliation:
+        """Write one prepared slice, confirm it, and account for it.
+
+        Main thread only, and called in window order, so a failure leaves every
+        earlier window complete rather than a gap.
+        """
+        src_id, dst_id, window, plan = prepared.src_id, prepared.dst_id, prepared.window, prepared.plan
+        if not prepared.population:
+            return Reconciliation(src_id, dst_id, window.label(), 0, 0, 0, 0, 0)
+
+        self.upgrade_rows.extend(prepared.upgrade_rows)
+        self.fidelity_reduced |= prepared.fidelity_notes
+        for issue_class, code, summary, evidence in prepared.issues:
+            self.record_issue(issue_class, code, summary, evidence=evidence)
+
+        degraded = prepared.degraded
         blocked: Set[str] = set()
-        digests = self._ingest_plan(src_id, dst_id, window, plan, degraded, blocked)
+        rejected: Dict[str, Set[str]] = {}
+        for batch, frame in prepared.batches:
+            for run_id, error in self.ingest(batch, frame=frame):
+                blocked.add(run_id)
+                rejected.setdefault(str(error), set()).add(run_id)
+        # Grouped by cause: twenty runs refused for one reason is one fact, not
+        # twenty truncated lines.
+        for error, ids in rejected.items():
+            self._record_blocked(
+                window, ids, "run_ingest_rejected",
+                f"{len(ids)} run(s) refused by the destination on ingest: {error}",
+            )
 
         if self.verify and plan.to_ingest and not self.config.migration.dry_run:
             still_missing = self._confirm(dst_id, window, plan.to_ingest - blocked)
             if still_missing:
                 blocked |= still_missing
                 self._block_runs(window, still_missing, dst_id)
-            if digests:
-                self._check_content(dst_id, window, digests, degraded)
+            if prepared.digests:
+                self._check_content(dst_id, window, prepared.digests, degraded)
 
         self._report_degraded(window, degraded)
 
         # A run can be both degraded and blocked; blocked wins, so the parts
         # stay a partition of the source total.
-        degraded_ids = set().union(*degraded.values())
+        degraded_ids = set().union(*degraded.values()) if degraded else set()
         degraded_only = degraded_ids - blocked
         # Only a wholly clean slice yields a watermark: a slice that degraded
         # or blocked anything cannot claim "everything up to here is complete".
@@ -778,12 +1050,12 @@ class TraceMigrator(BaseMigrator):
         # ran: --no-verify skips it, and a dry run wrote nothing to confirm.
         complete = (plan.to_ingest | plan.already_present) - blocked - degraded_ids
         clean = not (blocked or degraded_ids) and self.verify and not self.config.migration.dry_run
-        earliest, latest = verified_bounds(population, complete) if clean else (None, None)
+        earliest, latest = verified_bounds(prepared.population, complete) if clean else (None, None)
         return Reconciliation(
             session_id=src_id,
             dest_session_id=dst_id,
             window=window.label(),
-            source_total=len(source_ids),
+            source_total=len(prepared.population),
             ingested=len(plan.to_ingest) - len(degraded_only) - len(blocked),
             already_present=len(plan.already_present),
             degraded=len(degraded_only),
@@ -794,63 +1066,11 @@ class TraceMigrator(BaseMigrator):
             verified_runs=len(complete) if clean else 0,
         )
 
-    def _ingest_plan(
-        self,
-        src_id: str,
-        dst_id: str,
-        window: Window,
-        plan: SlicePlan,
-        degraded: Dict[str, Set[str]],
-        blocked: Set[str],
-    ) -> Dict[str, Dict[str, str]]:
-        """Fetch, adapt and send the diff. Returns digests for the sampled runs."""
-        digests: Dict[str, Dict[str, str]] = {}
-        if not plan.to_ingest:
-            return digests
-
-        prepared: List[Dict[str, Any]] = []
-        for run in self.fetch_runs(self.source, src_id, window, sorted(plan.to_ingest)):
-            run_id = str(run["id"])
-            overrides, issues = self.materialise(run)
-            payload_obj, dropped = to_ingest_payload(run, dst_id, overrides)
-            payload = payload_obj.as_dict()
-
-            oversized = self._oversized_fields(payload)
-            if oversized:
-                # The backend stubs an oversized field rather than rejecting
-                # it, so this run must not be reported as fully migrated.
-                degraded.setdefault("payload_oversized_for_destination", set()).add(run_id)
-                self.fidelity_reduced.add("payloads exceeded --max-field-bytes")
-                continue
-
-            codes = set(issues)
-            if dropped:
-                codes.add("run_example_link_dropped")
-            for code in codes:
-                degraded.setdefault(code, set()).add(run_id)
-                if code in ("attachment_fetch_failed", "attachment_host_rejected"):
-                    self.fidelity_reduced.add("some source blobs could not be fetched")
-
-            if len(digests) < self.verify_content_sample:
-                digests[run_id] = self._digest_of(run, overrides)
-            prepared.append(payload)
-
-        max_runs, max_bytes = self.batch_limits()
-        rejected: Dict[str, Set[str]] = {}
-        for batch in batch_traces(
-            group_into_traces(prepared), max_runs=max_runs, max_bytes=max_bytes, size_of=self._size_of
-        ):
-            for run_id, error in self.ingest(batch):
-                blocked.add(run_id)
-                rejected.setdefault(str(error), set()).add(run_id)
-        # Grouped by cause: twenty runs refused for one reason is one fact, not
-        # twenty truncated lines.
-        for error, ids in rejected.items():
-            self._record_blocked(
-                window, ids, "run_ingest_rejected",
-                f"{len(ids)} run(s) refused by the destination on ingest: {error}",
-            )
-        return digests
+    def migrate_slice(
+        self, source_session: Dict[str, Any], dest_session: Dict[str, Any], window: Window
+    ) -> Reconciliation:
+        """Prepare and commit one slice, without look-ahead."""
+        return self.commit_slice(self.prepare_slice(source_session, dest_session, window))
 
     @staticmethod
     def _digest_of(run: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, str]:
@@ -982,8 +1202,8 @@ class TraceMigrator(BaseMigrator):
         try:
             slices = []
             end = now or datetime.now(timezone.utc)
-            for window in iter_windows(self.resolved_range_start(), end, self.window_days):
-                sliced = self.migrate_slice(source_session, dest_session, window)
+            windows = iter_windows(self.resolved_range_start(), end, self.window_days)
+            for sliced in self._walk_windows(source_session, dest_session, windows):
                 slices.append(sliced)
                 if sliced.source_total:
                     # Per-slice detail is verbose-only: the range can be 180
@@ -999,6 +1219,48 @@ class TraceMigrator(BaseMigrator):
             return recon
         finally:
             self._settle_tier(dest_session, prior_tier, source_session.get("trace_tier"), recon)
+
+    def _walk_windows(
+        self, source_session: Dict[str, Any], dest_session: Dict[str, Any], windows
+    ) -> Iterator[Reconciliation]:
+        """Prepare up to ``prefetch_windows`` slices at once; commit in order.
+
+        Retrieval is the slow half and parallelises cleanly. Ingest does not:
+        committing out of order would let a later window land while an earlier
+        one is missing, so a failure would leave a hole rather than a clean
+        prefix. Windows are therefore committed strictly oldest-first, and the
+        first failure stops the walk with every earlier window complete - which
+        is what makes the watermark a claim worth printing.
+
+        A failure still waits for the preparations already in flight, since a
+        thread mid-request cannot be interrupted; nothing further is committed.
+        """
+        if self.prefetch_windows <= 1:
+            for window in windows:
+                yield self.migrate_slice(source_session, dest_session, window)
+            return
+
+        pending: Deque[Future] = deque()
+        with ThreadPoolExecutor(
+            max_workers=self.prefetch_windows, thread_name_prefix="trace-prepare"
+        ) as pool:
+            def submit_next() -> None:
+                # Main thread only: ``windows`` is a generator, and advancing
+                # one from several threads is not safe.
+                window = next(windows, None)
+                if window is not None:
+                    pending.append(pool.submit(self.prepare_slice, source_session, dest_session, window))
+
+            for _ in range(self.prefetch_windows):
+                submit_next()
+            while pending:
+                prepared = pending.popleft().result()  # in-order: raises here on failure
+                # Refilled before committing, not after: the commit is the slow
+                # serial POST, and that is exactly when readers should be busy.
+                # Peak residency is therefore prefetch_windows in flight plus
+                # the one being written.
+                submit_next()
+                yield self.commit_slice(prepared)
 
     def _settle_tier(
         self,

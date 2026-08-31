@@ -312,7 +312,7 @@ langsmith-migrator clean
 - `fleet`: migrate Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets) with `--skip-*` flags for each resource type, and `--agent <name-or-id>` / `--agents-owned-only` to scope which agents (and their schedules/triggers/usage limits) are migrated
 - `issues`: migrate Engine issues-agent configs and detected issues as metadata (`--session` to scope to one tracing project)
 - `contexts`: migrate Context Hub agents and skills, replaying full commit history and tags by default (`--latest-only`, `--no-tags`, `--agents-only`, `--skills-only`, `--include-external`, `--same-instance`)
-- `traces`: migrate long-lived traces (`trace_tier == "longlived"`) with run IDs and timestamps preserved; stateless, so re-run rather than resume (`--max-age-days`, `--window`, `--skip-attachments`, `--emit-upgrade-list`). Not part of `migrate-all`
+- `traces`: migrate long-lived traces (`trace_tier == "longlived"`) with run IDs and timestamps preserved; stateless, so re-run rather than resume (`--max-age-days`, `--window`, `--prefetch-windows`, `--compress-level`, `--skip-attachments`, `--emit-upgrade-list`). Not part of `migrate-all`
 - `users`: migrate users/roles between instances, or run single-instance CSV access sync
 - `export-users`: export active org and workspace members to a members CSV for import via `users --members-csv`
 - `resume`: retry resumable items from a prior session and show grouped manual blockers
@@ -538,6 +538,9 @@ The prompt default is `No` (rules are created disabled).
 --no-verify                     Skip the confirming re-query after ingest (the pre-diff still runs)
 --verify-content-sample INTEGER Runs per window to content-check (default: 100)
 --skip-attachments              Migrate runs without their attachments (recorded as degraded)
+--compress-level INTEGER        zstd level for the ingest body, 1-22 (default: 3)
+--no-compress-upload            Send the ingest body uncompressed
+--prefetch-windows INTEGER      Windows to retrieve concurrently, 1-32 (default: 4); ingest stays serial
 --map-projects                  Launch interactive TUI to map source projects to destination projects
 --project-mapping TEXT          JSON string or file path with project ID mapping (headless, no TUI)
 --restore-session-tier/--no-restore-session-tier
@@ -548,6 +551,33 @@ The prompt default is `No` (rules are created disabled).
 ```
 
 There are deliberately **no timestamp options**: run timestamps are copied verbatim.
+
+#### Throughput
+
+Three settings govern speed, and only one of them trades anything away:
+
+- `--prefetch-windows` (default 4) retrieves several windows at once. **Ingest
+  stays serial and strictly oldest-first whatever this is set to**, so a failure
+  leaves every earlier window complete rather than a hole in the middle. Peak
+  memory is this many windows of payloads plus the one being written — shrink
+  `--window` if that is too much.
+- `--compress-level` (default 3) sets the zstd level for the ingest body.
+  Measured per assembled request on real payloads: level 1 (what the SDK uses
+  on its own) 5.9x, level 3 with long-distance matching 68.5x at 1755 MB/s,
+  level 19 79.7x at 58 MB/s. Level 3 is effectively free; raise it only when
+  genuinely bandwidth-bound, since the frame is built by the retrieval workers
+  and higher levels start costing real CPU.
+- Page size is not an option: `/runs/query` is asked for 1000 runs per page and
+  lowers itself if a deployment advertises a smaller cap. Payload fetches are
+  likewise self-tuning — they start at 500 run IDs per request and halve on a
+  413/502/503, because for a project with large payloads that many IDs makes a
+  response the gateway refuses to serve. A line like `500 IDs per request was
+  refused (502); continuing at 250` is that adjustment, not an error.
+
+`--no-compress-upload` falls back to the SDK's own uncompressed multipart path.
+Compression is also skipped automatically if the destination does not advertise
+`zstd_compression_enabled` or the SDK internals it needs have moved; the
+pre-flight table says which.
 
 ### Users Options
 

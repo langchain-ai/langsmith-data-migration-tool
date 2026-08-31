@@ -39,6 +39,7 @@ from ..core.migrators import (
     FleetWebhookMigrator,
 )
 from ..core.migrators.trace import TracePreflightError
+from ..core.trace_frames import DEFAULT_COMPRESS_LEVEL
 from ..core.migrators.user_role import (
     is_workspace_role_union_id,
     select_effective_workspace_role_id,
@@ -6281,6 +6282,28 @@ def contexts(
 @click.option("--no-verify", is_flag=True, help="Skip the confirming re-query after ingest (the pre-diff still runs)")
 @click.option("--verify-content-sample", type=int, default=100, show_default=True, help="Runs per window to content-check")
 @click.option("--skip-attachments", is_flag=True, help="Migrate runs without their attachments (recorded as degraded)")
+@click.option(
+    "--compress-level",
+    type=click.IntRange(1, 22),
+    default=DEFAULT_COMPRESS_LEVEL,
+    show_default=True,
+    help=(
+        "zstd level for the ingest body. 3 is nearly free; >=15 trades roughly "
+        "30x the CPU for ~16% fewer bytes, worth it only when bandwidth-bound."
+    ),
+)
+@click.option("--no-compress-upload", is_flag=True, help="Send the ingest body uncompressed")
+@click.option(
+    "--prefetch-windows",
+    type=click.IntRange(1, 32),
+    default=4,
+    show_default=True,
+    help=(
+        "How many windows to retrieve concurrently. Ingest stays serial and in "
+        "window order regardless. Peak memory is this many windows of payloads "
+        "plus the one being written, so shrink --window if it is too much."
+    ),
+)
 @click.option("--map-projects", is_flag=True, help="Interactively map source projects to destination projects")
 @click.option("--project-mapping", help='Headless project mapping: JSON object or file, {"src-id": "dest-id"}')
 @click.option(
@@ -6304,6 +6327,9 @@ def traces(
     no_verify,
     verify_content_sample,
     skip_attachments,
+    compress_level,
+    no_compress_upload,
+    prefetch_windows,
     map_projects,
     project_mapping,
     restore_session_tier,
@@ -6413,6 +6439,8 @@ def traces(
             restore_session_tier=restore_session_tier,
             into_session_suffix=into_session_suffix,
             emit_upgrade_list=emit_upgrade_list,
+            compress_level=None if no_compress_upload else compress_level,
+            prefetch_windows=prefetch_windows,
             project_id_map=project_id_map
             or _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
             or (build_project_id_mapping_tui(orchestrator.source_client, orchestrator.dest_client) if map_projects else None),
@@ -6568,6 +6596,22 @@ def _print_trace_preflight(migrator, config, window_days, max_field_bytes, no_ve
         ("--max-age-stamp" if migrator.range_start else "--max-age-days") + " / --window",
     )
     table.add_row("Trace tier", "longlived" if not migrator.emit_upgrade_list else "left as-is (--emit-upgrade-list)", "destination session")
+    table.add_row(
+        "Ingest compression",
+        f"zstd level {migrator.compress_level}" if migrator.compress_level else "off",
+        migrator.compress_unavailable or "--compress-level / --no-compress-upload",
+    )
+    table.add_row("Page size", f"{migrator._page_limit['source']:,} runs", "/runs/query (lowered if capped)")
+    table.add_row(
+        "Window prefetch",
+        (
+            f"{migrator.prefetch_windows} concurrent\n"
+            f"up to {migrator.prefetch_windows + 1} windows resident"
+            if migrator.prefetch_windows > 1
+            else "serial"
+        ),
+        "--prefetch-windows (ingest stays serial and in order)",
+    )
     console.print(table)
     if config.migration.dry_run:
         console.print("[yellow]Dry run: no session creation, no canary, no ingest[/yellow]")

@@ -5,14 +5,23 @@ diff/ingest/confirm round trip, blob handling and failure isolation. Everything
 expressible as a function of its arguments is in ``tests/unit/test_trace_domain.py``.
 """
 
+import io
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 import pytest
 
-from langsmith_migrator.core.api_client import EnhancedAPIClient
-from langsmith_migrator.core.migrators.trace import _CANARY_SESSION, TraceMigrator, TracePreflightError
+from langsmith_migrator.core.api_client import APIError, EnhancedAPIClient
+from langsmith_migrator.core.migrators.trace import (
+    _CANARY_SESSION,
+    _ID_CHUNK,
+    _ID_CHUNK_MIN,
+    _PAGE_LIMIT,
+    TraceMigrator,
+    TracePreflightError,
+)
 from langsmith_migrator.core.trace_domain import Reconciliation, Window
+from langsmith_migrator.core.trace_frames import DEFAULT_COMPRESS_LEVEL, CompiledFrame
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
 WINDOW = Window(NOW - timedelta(days=1), NOW)
@@ -87,13 +96,99 @@ def test_short_lived_runs_are_filtered_client_side(sample_config):
     assert m.long_lived_run_ids(m.source, "src", WINDOW) == {"keep"}
 
 
+def test_pages_are_requested_at_the_page_limit(sample_config):
+    m = _migrator(sample_config)
+    m.source.post.side_effect = _pages([])
+    m.long_lived_run_ids(m.source, "src", WINDOW)
+    assert m.source.post.call_args[0][1]["limit"] == _PAGE_LIMIT
+
+
+def test_a_deployment_that_pages_smaller_is_obeyed_and_remembered(sample_config):
+    m = _migrator(sample_config)
+    reject = APIError("API request failed: 400 - Limit exceeds maximum allowed value of 250", status_code=400)
+    m.source.post.side_effect = [reject] + _pages([_run("a")])
+    assert m.long_lived_run_ids(m.source, "src", WINDOW) == {"a"}
+    assert m.source.post.call_args[0][1]["limit"] == 250
+    # Adopted for the rest of the run, so the rejection is paid once.
+    assert m._page_limit["source"] == 250
+    assert m._page_limit["dest"] == _PAGE_LIMIT
+
+
+def test_a_400_that_is_not_about_the_limit_still_raises(sample_config):
+    m = _migrator(sample_config)
+    m.source.post.side_effect = APIError("API request failed: 400 - bad filter", status_code=400)
+    with pytest.raises(APIError):
+        m.long_lived_run_ids(m.source, "src", WINDOW)
+
+
+def test_id_chunks_never_exceed_the_page_limit(sample_config):
+    """An id-filtered query must stay self-consistent, whatever the backend tolerates."""
+    m = _migrator(sample_config)
+    m._page_limit["source"] = 2
+    m.source.post.side_effect = _pages([_run("a"), _run("b")]) + _pages([_run("c")])
+    fetched = [r["id"] for r in m.fetch_runs(m.source, "src", WINDOW, ["a", "b", "c"])]
+    assert sorted(fetched) == ["a", "b", "c"]
+    for call in m.source.post.call_args_list:
+        assert len(call[0][1]["id"]) <= 2
+
+
 def test_payload_fetch_is_chunked_without_changing_the_result(sample_config):
     m = _migrator(sample_config)
-    with patch("langsmith_migrator.core.migrators.trace._ID_CHUNK", 2):
-        m.source.post.side_effect = _pages([_run("a"), _run("b")]) + _pages([_run("c")])
-        fetched = [r["id"] for r in m.fetch_runs(m.source, "src", WINDOW, ["a", "b", "c"])]
+    m._id_chunk = 2
+    m.source.post.side_effect = _pages([_run("a"), _run("b")]) + _pages([_run("c")])
+    fetched = [r["id"] for r in m.fetch_runs(m.source, "src", WINDOW, ["a", "b", "c"])]
     assert sorted(fetched) == ["a", "b", "c"]
-    assert [len(call[0][1]["id"]) for call in m.source.post.call_args_list] == [2, 1]
+
+
+def test_an_oversized_response_halves_the_chunk_and_retries(sample_config):
+    """A heavy project's payloads make 500 IDs a ~65 MB response the gateway
+    refuses with a 502; the size is the problem, so shrink rather than fail."""
+    m = _migrator(sample_config)
+    m._id_chunk = 100
+    ids = [str(i) for i in range(100)]
+    too_big = APIError("API request failed: 502 - <html>...", status_code=502)
+    m.source.post.side_effect = [too_big] + _pages([_run(i) for i in ids[:50]]) + _pages(
+        [_run(i) for i in ids[50:]]
+    )
+    fetched = [r["id"] for r in m.fetch_runs(m.source, "src", WINDOW, ids)]
+    assert fetched == ids
+    assert m._id_chunk == 50  # remembered for the rest of the run
+    for call in m.source.post.call_args_list[1:]:
+        assert len(call[0][1]["id"]) <= 50
+
+
+def test_a_chunk_already_at_the_floor_gives_up(sample_config):
+    m = _migrator(sample_config)
+    m._id_chunk = _ID_CHUNK_MIN
+    m.source.post.side_effect = APIError("API request failed: 502 - <html>", status_code=502)
+    with pytest.raises(APIError):
+        list(m.fetch_runs(m.source, "src", WINDOW, ["a"]))
+
+
+def test_a_non_size_error_is_not_treated_as_too_large(sample_config):
+    m = _migrator(sample_config)
+    m.source.post.side_effect = APIError("API request failed: 400 - bad select", status_code=400)
+    with pytest.raises(APIError):
+        list(m.fetch_runs(m.source, "src", WINDOW, ["a"]))
+    assert m._id_chunk == _ID_CHUNK
+
+
+def test_a_failed_chunk_does_not_double_yield_what_it_had_produced(sample_config):
+    """The retry re-requests the whole chunk, so nothing may have escaped yet."""
+    m = _migrator(sample_config)
+    m._id_chunk = 100
+    ids = [str(i) for i in range(100)]
+    # first attempt yields a page, then dies on the second page of the chunk
+    m.source.post.side_effect = [
+        {"runs": [_run(ids[0])], "cursors": {"next": "c0"}},
+        APIError("API request failed: 502 - <html>", status_code=502),
+        *_pages([_run(i) for i in ids[:50]]),
+        *_pages([_run(i) for i in ids[50:]]),
+    ]
+    fetched = [r["id"] for r in m.fetch_runs(m.source, "src", WINDOW, ids)]
+    assert fetched == ids, "the abandoned page leaked into the result"
+    # the whole chunk is re-requested at half size, not resumed mid-chunk
+    assert [len(c[0][1]["id"]) for c in m.source.post.call_args_list] == [100, 100, 50, 50]
 
 
 # --------------------------------------------------------------------------
@@ -104,7 +199,11 @@ def _wire_slice(m, source_runs, dest_ids, *, confirmed=None):
 
     The payload fetch honours the request's ``id`` filter, as the real endpoint
     does, so a test can tell "fetched" from "ingested".
+
+    Compression is off here: these tests are about the diff/verify round trip,
+    and frame compilation needs a real SDK client. It has its own tests.
     """
+    m.compress_level = None
     def source_query(_endpoint, body):
         wanted = set(body.get("id") or [])
         runs = [r for r in source_runs if not wanted or r["id"] in wanted]
@@ -122,7 +221,7 @@ def test_only_the_difference_is_ingested(sample_config):
     m = _migrator(sample_config, verify=False)
     _wire_slice(m, [_run("a"), _run("b"), _run("c")], ["b"])
     sent = []
-    m.ingest = lambda batch: sent.extend(batch) or []
+    m.ingest = lambda batch, frame=None: sent.extend(batch) or []
 
     report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
     assert {p["id"] for p in sent} == {"a", "c"}
@@ -180,6 +279,7 @@ def test_a_run_held_by_another_project_says_so(sample_config, migration_state):
 
 def test_ingest_queue_lag_is_tolerated(sample_config):
     m = _migrator(sample_config)
+    m.compress_level = None  # ingest is mocked; see _wire_slice
     source_page = {"runs": [_run("a")], "cursors": {}}
     m.source.post.side_effect = [source_page, source_page]
     m.dest.post.side_effect = [
@@ -198,13 +298,14 @@ def test_no_verify_still_computes_the_pre_diff(sample_config):
     m = _migrator(sample_config, verify=False)
     _wire_slice(m, [_run("a"), _run("b")], ["a"])
     sent = []
-    m.ingest = lambda batch: sent.extend(batch) or []
+    m.ingest = lambda batch, frame=None: sent.extend(batch) or []
     m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
     assert [p["id"] for p in sent] == ["b"]  # the diff is the work-list either way
 
 
 def test_sets_from_two_sessions_are_never_merged(sample_config):
     m = _migrator(sample_config, verify=False)
+    m.compress_level = None  # ingest is mocked; see _wire_slice
     m.source.post.side_effect = [
         {"runs": [_run("a")], "cursors": {}}, {"runs": [_run("a")], "cursors": {}},
         {"runs": [_run("b")], "cursors": {}}, {"runs": [_run("b")], "cursors": {}},
@@ -221,7 +322,7 @@ def test_sets_from_two_sessions_are_never_merged(sample_config):
 # Failure isolation
 # --------------------------------------------------------------------------
 def test_a_bad_run_is_isolated_by_binary_split(sample_config):
-    m = _migrator(sample_config)
+    m = _migrator(sample_config, compress_level=None)
     bad = "b"
 
     def ingest(create):
@@ -236,7 +337,7 @@ def test_a_bad_run_is_isolated_by_binary_split(sample_config):
 def test_a_single_run_conflict_never_reaches_us_as_an_error(sample_config):
     # The SDK breaks out of its retry loop on 409 without invoking the error
     # callback, so a replay reads as success.
-    m = _migrator(sample_config)
+    m = _migrator(sample_config, compress_level=None)
     m.dest_ls_client.multipart_ingest.return_value = None
     assert m.ingest([{"id": "a"}]) == []
 
@@ -246,6 +347,83 @@ def test_dry_run_sends_nothing(sample_config):
     m = _migrator(sample_config)
     assert m.ingest([{"id": "a"}]) == []
     m.dest_ls_client.multipart_ingest.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# Ingest compression
+# --------------------------------------------------------------------------
+def _frame(run_ids, raw=1000, comp=100):
+    return CompiledFrame(run_ids=tuple(run_ids), stream=io.BytesIO(b"z"), sizes=(raw, comp))
+
+
+def test_the_body_is_compressed_by_default(sample_config, capsys):
+    m = _migrator(sample_config)
+    assert m.compress_level == DEFAULT_COMPRESS_LEVEL
+    with patch("langsmith_migrator.core.migrators.trace.compile_frame") as compile_:
+        compile_.side_effect = lambda client, payloads, level: _frame([str(p["id"]) for p in payloads])
+        m._ingest_responses.append((202, ""))
+        assert m.ingest([{"id": "a", "trace_id": "t", "dotted_order": "o"}]) == []
+    m.dest_ls_client._send_compressed_multipart_req.assert_called_once()
+    m.dest_ls_client.multipart_ingest.assert_not_called()
+    # the ratio is worth seeing: it is the whole point of the option
+    assert "10.0x" in capsys.readouterr().out
+
+
+def test_no_compress_upload_uses_the_sdk_path(sample_config):
+    m = _migrator(sample_config, compress_level=None)
+    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.append((202, ""))
+    assert m.ingest([{"id": "a", "trace_id": "t"}]) == []
+    m.dest_ls_client._send_compressed_multipart_req.assert_not_called()
+
+
+def test_a_missing_sdk_internal_degrades_to_uncompressed(sample_config):
+    with patch("langsmith_migrator.core.migrators.trace.unavailable_reason", return_value="moved"):
+        m = _migrator(sample_config)
+    assert m.compress_level is None
+    assert m.compress_unavailable == "moved"
+
+
+def test_a_split_recompiles_rather_than_reusing_the_batch_frame(sample_config):
+    """The pre-built frame covers the whole batch, so each half needs its own."""
+    m = _migrator(sample_config)
+    payloads = [{"id": c, "trace_id": "t", "dotted_order": f"o{c}"} for c in "abcd"]
+    compiled = []
+
+    def fake_compile(client, batch, level):
+        compiled.append(tuple(str(p["id"]) for p in batch))
+        return _frame([str(p["id"]) for p in batch])
+
+    def send(stream, sizes, attempts=1):
+        # only the batch still containing "b" fails
+        if "b" in compiled[-1]:
+            m._ingest_errors.append(RuntimeError("nope"))
+
+    with patch("langsmith_migrator.core.migrators.trace.compile_frame", side_effect=fake_compile):
+        m.dest_ls_client._send_compressed_multipart_req.side_effect = send
+        failures = m.ingest(payloads)
+    assert failures == [("b", "nope")]
+    # a frame per attempted batch, never the parent's frame re-sent
+    assert compiled[0] == ("a", "b", "c", "d")
+    assert ("b",) in compiled
+
+
+def test_a_frame_that_does_not_match_the_batch_is_rebuilt(sample_config):
+    m = _migrator(sample_config)
+    stale = _frame(["x"])
+    with patch("langsmith_migrator.core.migrators.trace.compile_frame") as compile_:
+        compile_.side_effect = lambda client, payloads, level: _frame([str(p["id"]) for p in payloads])
+        m._ingest_responses.append((202, ""))
+        m._send([{"id": "a", "trace_id": "t", "dotted_order": "o"}], frame=stale)
+    compile_.assert_called_once()
+
+
+def test_a_matching_prebuilt_frame_is_sent_as_is(sample_config):
+    m = _migrator(sample_config)
+    ready = _frame(["a"])
+    with patch("langsmith_migrator.core.migrators.trace.compile_frame") as compile_:
+        m._send([{"id": "a", "trace_id": "t", "dotted_order": "o"}], frame=ready)
+    compile_.assert_not_called()
+    assert m.dest_ls_client._send_compressed_multipart_req.call_args[0][0] is ready.stream
 
 
 # --------------------------------------------------------------------------
@@ -414,7 +592,7 @@ def test_a_tier_permission_failure_blocks_the_session(sample_config):
 
 
 def test_the_tier_is_not_restored_while_a_session_is_incomplete(sample_config):
-    m = _migrator(sample_config, verify=False)
+    m = _migrator(sample_config, verify=False, prefetch_windows=1)
     m.resolve_dest_session = Mock(return_value={"id": DEST, "trace_tier": "longlived"})
     m.restore_tier = Mock()
     m.migrate_slice = Mock(side_effect=lambda s, d, w: __import__(
@@ -464,7 +642,7 @@ def test_each_preflight_writes_its_own_canary(sample_config):
     """
     m = _migrator(sample_config, max_age_days=180)
     sent = []
-    m.ingest = lambda batch: sent.extend(batch) or []
+    m.ingest = lambda batch, frame=None: sent.extend(batch) or []
     m.dest.get.side_effect = _dest_get(lambda: {"start_time": sent[-1]["start_time"]})
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         m.canary()
@@ -681,7 +859,7 @@ def test_each_query_page_reports_runs_traces_and_size(sample_config, capsys):
 
 
 def test_the_multipart_write_is_reported_prominently(sample_config, capsys):
-    m = _migrator(sample_config)
+    m = _migrator(sample_config, compress_level=None)
     m.dest_ls_client.multipart_ingest.return_value = None
     m.ingest([{"id": "a", "trace_id": "t1"}, {"id": "b", "trace_id": "t1"}, {"id": "c", "trace_id": "t2"}])
     out = capsys.readouterr().out
@@ -763,7 +941,7 @@ def _raisable(m, source_tier="shortlived"):
 
 
 def test_a_raised_tier_is_restored_after_a_clean_migration(sample_config):
-    m = _migrator(sample_config)
+    m = _migrator(sample_config, prefetch_windows=1)
     src, dest = _raisable(m)
     m.migrate_slice = Mock(side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 0, 0, 0, 0, 0))
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
@@ -774,7 +952,7 @@ def test_a_raised_tier_is_restored_after_a_clean_migration(sample_config):
 def test_a_raised_tier_is_settled_even_when_the_migration_raises(sample_config, migration_state):
     # Walking away here would leave the project long-lived indefinitely,
     # changing retention for traffic unrelated to this migration.
-    m = _migrator(sample_config, migration_state)
+    m = _migrator(sample_config, migration_state, prefetch_windows=1)
     src, dest = _raisable(m)
     m.migrate_slice = Mock(side_effect=RuntimeError("source query blew up"))
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
@@ -789,7 +967,7 @@ def test_a_raised_tier_is_settled_even_when_the_migration_raises(sample_config, 
 
 
 def test_an_incomplete_migration_leaves_the_tier_raised_and_says_so(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state)
+    m = _migrator(sample_config, migration_state, prefetch_windows=1)
     src, dest = _raisable(m)
     m.migrate_slice = Mock(side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1))
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
@@ -800,7 +978,7 @@ def test_an_incomplete_migration_leaves_the_tier_raised_and_says_so(sample_confi
 
 
 def test_a_tier_we_never_raised_is_never_touched(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state)
+    m = _migrator(sample_config, migration_state, prefetch_windows=1)
     m.resolve_dest_session = Mock(return_value={"id": DEST, "trace_tier": "longlived"})
     m.restore_tier = Mock()
     m.migrate_slice = Mock(side_effect=RuntimeError("boom"))
@@ -814,6 +992,7 @@ def test_a_tier_we_never_raised_is_never_touched(sample_config, migration_state)
 # The watermark is a completeness claim, so it needs real verification
 # --------------------------------------------------------------------------
 def _one_run_slice(m):
+    m.compress_level = None  # ingest is mocked; see _wire_slice
     page = {"runs": [_run("a")], "cursors": {}}
     m.source.post.side_effect = [page, page]
     m.dest.post.side_effect = [{"runs": [], "cursors": {}}] * 6
@@ -838,6 +1017,7 @@ def test_no_verify_claims_no_watermark(sample_config):
 
 def test_a_verified_run_does_claim_a_watermark(sample_config):
     m = _migrator(sample_config)
+    m.compress_level = None  # ingest is mocked; see _wire_slice
     page = {"runs": [_run("a")], "cursors": {}}
     m.source.post.side_effect = [page, page]
     m.dest.post.side_effect = [
@@ -856,7 +1036,7 @@ def test_a_verified_run_does_claim_a_watermark(sample_config):
 # --------------------------------------------------------------------------
 def test_a_409_fails_every_run_in_the_request(sample_config):
     """409 rejects the whole request, so it is neither success nor one bad run."""
-    m = _migrator(sample_config)
+    m = _migrator(sample_config, compress_level=None, verify=False)
     m.dest_ls_client.multipart_ingest.return_value = None
     m._ingest_responses.append((409, '{"error":"Run create payload already received."}'))
     original = m._ingest_responses[:]
@@ -870,8 +1050,30 @@ def test_a_409_fails_every_run_in_the_request(sample_config):
     assert m.dest_ls_client.multipart_ingest.call_count == 1
 
 
-def test_a_swallowed_non_2xx_is_still_a_failure(sample_config):
+def test_a_409_defers_to_verification_when_it_will_run(sample_config, capsys):
+    """A 409 cannot distinguish "already in another project" from "our own
+    earlier attempt landed"; only the destination can, so do not pre-judge."""
+    m = _migrator(sample_config, compress_level=None)
+    original = [(409, '{"error":"Run create payload already received."}')]
+    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.extend(original)
+    assert m.ingest([{"id": "a", "trace_id": "t"}, {"id": "b", "trace_id": "t"}]) == []
+    assert "leaving the verdict to verification" in capsys.readouterr().out
+    # not split into halves either: the rejection applies to the whole request
+    assert m.dest_ls_client.multipart_ingest.call_count == 1
+
+
+def test_the_compressed_send_never_blind_retries(sample_config):
+    """Ingest is not idempotent, so an unknown outcome must not be re-sent."""
     m = _migrator(sample_config)
+    with patch("langsmith_migrator.core.migrators.trace.compile_frame") as compile_:
+        compile_.side_effect = lambda client, payloads, level: _frame([str(p["id"]) for p in payloads])
+        m._ingest_responses.append((202, ""))
+        m.ingest([{"id": "a", "trace_id": "t", "dotted_order": "o"}])
+    assert m.dest_ls_client._send_compressed_multipart_req.call_args.kwargs["attempts"] == 1
+
+
+def test_a_swallowed_non_2xx_is_still_a_failure(sample_config):
+    m = _migrator(sample_config, compress_level=None)
     original = [(503, "Service unavailable")]
     m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.extend(original)
     failures = m.ingest([{"id": "solo", "trace_id": "t"}])
@@ -879,7 +1081,7 @@ def test_a_swallowed_non_2xx_is_still_a_failure(sample_config):
 
 
 def test_a_clean_202_is_success(sample_config):
-    m = _migrator(sample_config)
+    m = _migrator(sample_config, compress_level=None)
     m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.append((202, ""))
     assert m.ingest([{"id": "a", "trace_id": "t"}]) == []
 
@@ -897,7 +1099,7 @@ def test_an_ingest_rejection_is_reported_once_per_cause(sample_config, migration
     m = _migrator(sample_config, migration_state)
     runs = [_run(c, trace="t1", order=f"A.{c}") for c in "abcde"]
     _wire_slice(m, runs, [])
-    m.ingest = lambda batch: [(str(p["id"]), 'HTTP 409: {"error":"already received"}') for p in batch]
+    m.ingest = lambda batch, frame=None: [(str(p["id"]), 'HTTP 409: {"error":"already received"}') for p in batch]
 
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
@@ -914,7 +1116,7 @@ def test_distinct_causes_are_reported_separately(sample_config, migration_state)
     m = _migrator(sample_config, migration_state)
     runs = [_run(c, trace="t1", order=f"A.{c}") for c in "ab"]
     _wire_slice(m, runs, [])
-    m.ingest = lambda batch: [(str(p["id"]), f"HTTP {409 if p['id'] == 'a' else 503}") for p in batch]
+    m.ingest = lambda batch, frame=None: [(str(p["id"]), f"HTTP {409 if p['id'] == 'a' else 503}") for p in batch]
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
     assert len({r for r in m.blocked_reasons if "refused" in r}) == 2
@@ -924,7 +1126,7 @@ def test_the_migrator_records_no_remediation_advice(migration_state, sample_conf
     """Every issue states what happened; none prescribes what to do."""
     m = _migrator(sample_config, migration_state)
     _wire_slice(m, [_run("a")], [])
-    m.ingest = lambda batch: [("a", "HTTP 409")]
+    m.ingest = lambda batch, frame=None: [("a", "HTTP 409")]
     m.dest.get.return_value = None
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
