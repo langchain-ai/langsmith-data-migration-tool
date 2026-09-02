@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 import pytest
+import requests
 
 from langsmith_migrator.core.api_client import APIError, EnhancedAPIClient
 from langsmith_migrator.core.migrators.trace import (
@@ -36,6 +37,8 @@ def _client() -> Mock:
 
 
 def _migrator(sample_config, state=None, **kwargs):
+    kwargs.setdefault("range_start", NOW - timedelta(days=180))
+    kwargs.setdefault("range_end", NOW)
     with patch("langsmith_migrator.core.migrators.trace.Client"):
         migrator = TraceMigrator(_client(), _client(), state, sample_config, **kwargs)
     migrator.dest_ls_client = Mock()
@@ -369,6 +372,22 @@ def test_the_body_is_compressed_by_default(sample_config, capsys):
     assert "10.0x" in capsys.readouterr().out
 
 
+def test_the_reported_batch_size_is_the_real_one_after_compiling(sample_config, capsys):
+    """The size on the MULTIPART line is the operator's view of what is being
+    written; compilation must not shrink the payloads it is measured from."""
+    m = _migrator(sample_config)
+    payloads = [
+        {"id": "a", "trace_id": "t", "dotted_order": "o", "name": "n", "run_type": "chain",
+         "start_time": "2026-08-26T12:00:00+00:00", "inputs": {"q": "x" * 20_000}}
+    ]
+    m._ingest_responses.append((202, ""))
+    m.ingest(payloads, frame=None)
+    out = capsys.readouterr().out
+    # 20 KB of inputs must still be visible in the reported size, not stripped
+    assert "20." in out or "19." in out, out
+    assert payloads[0]["inputs"]["q"], "inputs were stripped from the caller's payload"
+
+
 def test_no_compress_upload_uses_the_sdk_path(sample_config):
     m = _migrator(sample_config, compress_level=None)
     m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.append((202, ""))
@@ -598,7 +617,7 @@ def test_the_tier_is_not_restored_while_a_session_is_incomplete(sample_config):
     m.migrate_slice = Mock(side_effect=lambda s, d, w: __import__(
         "langsmith_migrator.core.trace_domain", fromlist=["Reconciliation"]
     ).Reconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1))
-    m.migrate_session({"id": "src", "name": "p", "trace_tier": "shortlived"}, now=NOW)
+    m.migrate_session({"id": "src", "name": "p", "trace_tier": "shortlived"})
     m.restore_tier.assert_not_called()
 
 
@@ -615,7 +634,7 @@ def _dest_get(run_payload):
 
 
 def test_the_canary_blocks_when_the_timestamp_is_rewritten(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state, max_age_days=180)
+    m = _migrator(sample_config, migration_state)
     m.ingest = Mock(return_value=[])
     m.dest.get.side_effect = _dest_get({"start_time": datetime.now(timezone.utc).isoformat()})
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
@@ -625,7 +644,7 @@ def test_the_canary_blocks_when_the_timestamp_is_rewritten(sample_config, migrat
 
 
 def test_the_canary_blocks_when_the_run_never_appears(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state, max_age_days=180)
+    m = _migrator(sample_config, migration_state)
     m.ingest = Mock(return_value=[])
     m.dest.get.side_effect = _dest_get(None)
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
@@ -640,7 +659,7 @@ def test_each_preflight_writes_its_own_canary(sample_config):
     requests are not supported"), after which the read-back found the previous
     invocation's canary and the gate passed having verified nothing.
     """
-    m = _migrator(sample_config, max_age_days=180)
+    m = _migrator(sample_config)
     sent = []
     m.ingest = lambda batch, frame=None: sent.extend(batch) or []
     m.dest.get.side_effect = _dest_get(lambda: {"start_time": sent[-1]["start_time"]})
@@ -655,7 +674,7 @@ def test_each_preflight_writes_its_own_canary(sample_config):
 
 
 def test_a_conflicted_canary_blocks_instead_of_passing(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state, max_age_days=180)
+    m = _migrator(sample_config, migration_state)
     m.ingest = Mock(return_value=[("id", "HTTP 409: duplicate run create")])
     m.dest.get.side_effect = _dest_get({"start_time": "whatever"})
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
@@ -849,12 +868,33 @@ def test_each_query_page_reports_runs_traces_and_size(sample_config, capsys):
         [_run("a", trace="t1"), _run("b", trace="t1"), _run("c", trace="t2")], [_run("d", trace="t3")]
     )
     list(m._query_runs(m.source, "src", WINDOW, select=["id"]))
-    lines = [ln for ln in capsys.readouterr().out.splitlines() if "query source" in ln]
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "scan " in ln]
     assert len(lines) == 2
     assert "runs" in lines[0] and "traces" in lines[0]
     assert "3" in lines[0] and "2" in lines[0]  # 3 runs across 2 traces
-    assert "total" in lines[1]
+    assert "p1" in lines[0] and "p2" in lines[1] and "total" in lines[1]
     # a wrapped progress line is worse than a terse one
+    assert all(len(ln) <= 80 for ln in lines), lines
+
+
+def test_payload_fetches_are_labelled_by_phase_not_by_page(sample_config, capsys):
+    """Each chunk is its own request, so a per-call page counter restarted at
+    ``p1`` for every one of them and read as a call going backwards."""
+    sample_config.migration.verbose = True
+    m = _migrator(sample_config)
+    m._id_chunk = 2
+    m.source.post.side_effect = lambda _e, body: {
+        "runs": [_run(i) for i in body["id"]], "cursors": {},
+    }
+
+    fetched = list(m.fetch_runs(m.source, "src", WINDOW, ["a", "b", "c", "d", "e"]))
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if "fetch " in ln]
+    assert len(fetched) == 5
+    assert len(lines) == 3
+    # no page number (it would restart at p1 per chunk) and no running total
+    # (it could only restate `runs`), so the chunk size is stated exactly once
+    assert not any("scan" in ln or "p1" in ln or "total" in ln for ln in lines), lines
+    assert [ln.split("runs")[1].split("|")[0].strip() for ln in lines] == ["2", "2", "1"]
     assert all(len(ln) <= 80 for ln in lines), lines
 
 
@@ -945,7 +985,7 @@ def test_a_raised_tier_is_restored_after_a_clean_migration(sample_config):
     src, dest = _raisable(m)
     m.migrate_slice = Mock(side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 0, 0, 0, 0, 0))
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        m.migrate_session(src, now=NOW)
+        m.migrate_session(src)
     m.restore_tier.assert_called_once_with(dest, "shortlived")
 
 
@@ -957,7 +997,7 @@ def test_a_raised_tier_is_settled_even_when_the_migration_raises(sample_config, 
     m.migrate_slice = Mock(side_effect=RuntimeError("source query blew up"))
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         with pytest.raises(RuntimeError, match="blew up"):
-            m.migrate_session(src, now=NOW)
+            m.migrate_session(src)
     # deliberately left raised so a re-run still ingests long-lived...
     m.restore_tier.assert_not_called()
     # ...but never silently
@@ -971,7 +1011,7 @@ def test_an_incomplete_migration_leaves_the_tier_raised_and_says_so(sample_confi
     src, dest = _raisable(m)
     m.migrate_slice = Mock(side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1))
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        m.migrate_session(src, now=NOW)
+        m.migrate_session(src)
     m.restore_tier.assert_not_called()
     assert any(i.code == "dest_tier_left_raised" and "blocked runs" in i.summary
                for i in migration_state.issue_log)
@@ -983,7 +1023,7 @@ def test_a_tier_we_never_raised_is_never_touched(sample_config, migration_state)
     m.restore_tier = Mock()
     m.migrate_slice = Mock(side_effect=RuntimeError("boom"))
     with pytest.raises(RuntimeError):
-        m.migrate_session({"id": "src", "name": "p", "trace_tier": "shortlived"}, now=NOW)
+        m.migrate_session({"id": "src", "name": "p", "trace_tier": "shortlived"})
     m.restore_tier.assert_not_called()
     assert not any(i.code == "dest_tier_left_raised" for i in migration_state.issue_log)
 
@@ -1132,3 +1172,42 @@ def test_the_migrator_records_no_remediation_advice(migration_state, sample_conf
         m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
     assert migration_state.issue_log
     assert not any(i.next_action for i in migration_state.issue_log)
+
+
+def test_a_read_timeout_halves_the_id_chunk_like_a_502_does(sample_config):
+    """The server took the request and never finished the body: same problem as
+    a 502 on an oversized response, and requests reports it under two classes.
+    """
+    from langsmith_migrator.core.migrators.trace import _response_too_large
+
+    assert _response_too_large(requests.exceptions.ReadTimeout("read timed out"))
+    assert _response_too_large(
+        requests.exceptions.ConnectionError("HTTPSConnectionPool(...): Read timed out. (read timeout=30)")
+    )
+    assert not _response_too_large(requests.exceptions.ConnectionError("dns failure"))
+
+    m = _migrator(sample_config)
+    calls = {"n": 0}
+
+    def post(_endpoint, body):
+        calls["n"] += 1
+        if len(body.get("id") or []) > 250:
+            raise requests.exceptions.ConnectionError("HTTPSConnectionPool: Read timed out.")
+        return {"runs": [{"id": i} for i in body["id"]], "cursors": {}}
+
+    m.source.post.side_effect = post
+    fetched = list(m.fetch_runs(m.source, "src", WINDOW, [str(i) for i in range(500)]))
+    assert len(fetched) == 500 and m._id_chunk == 250
+
+
+def test_a_destination_project_is_created_without_fields_the_source_lacks(sample_config):
+    """An archive knows a project's name and ID and nothing else, and the
+    endpoint answers 422 to "start_time": null."""
+    m = _migrator(sample_config)
+    m._dest_sessions_named = Mock(return_value=[])
+    sent = []
+    m.dest.post = Mock(side_effect=lambda _e, body: sent.append(body) or {"id": "new"})
+
+    m.resolve_dest_session({"id": "src-id", "name": "from-archive"})
+    assert "start_time" not in sent[0] and "description" not in sent[0]
+    assert sent[0]["trace_tier"] == "longlived" and sent[0]["name"] == "from-archive"

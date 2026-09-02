@@ -8,6 +8,7 @@ import requests
 from langsmith_migrator.utils.retry import (
     APIError,
     AuthenticationError,
+    RATE_LIMIT_RETRIES,
     ConflictError,
     RateLimitError,
     UpstreamRejectionError,
@@ -38,7 +39,8 @@ def _counting_raiser(exc: Exception):
     [
         UpstreamRejectionError("proxy said no", status_code=403),
         UpstreamRejectionError("proxy said no", status_code=401),
-        RateLimitError("slow down"),
+        pytest.param(RateLimitError("slow down"), id="rate-limit", marks=pytest.mark.skip(
+            reason="covered by test_rate_limits_get_their_own_larger_budget")),
         APIError("server blew up", status_code=503),
         requests.exceptions.ConnectionError("dns failed"),
         requests.exceptions.ReadTimeout("too slow"),
@@ -113,3 +115,15 @@ def test_backoff_is_capped(monkeypatch):
         call()
 
     assert all(delay <= 60.0 for delay in slept)
+
+
+def test_rate_limits_get_their_own_larger_budget():
+    """A 429 names its own wait, so it is not rationed against a server error's
+    three attempts - a burst under concurrent readers used to give up after ~6s.
+    """
+    call, calls = _counting_raiser(RateLimitError("slow down", retry_after=0))
+
+    with pytest.raises(RateLimitError):
+        call()
+
+    assert calls["count"] == RATE_LIMIT_RETRIES + 1

@@ -68,16 +68,14 @@ What `traces` guarantees:
 
 **Statelessness: there is no resume.** Work is derived from a destination diff per time
 window, not from a checkpoint. If a run is interrupted, just re-run the same command —
-finished windows produce an empty difference. `--max-age-days` sets the range to walk
-(default 180, the retention ceiling) and `--window` the size of one slice of it
-(default 1 day); widen `--window` when migrating many projects. `--max-age-days` is
-the easy way to *start* a migration; to **resume** one, prefer `--max-age-stamp` with
-an absolute instant, because a relative age denotes a different point in time every
-time it is evaluated — over a multi-hour run the same float silently slides forward.
-Each project reports a `verified complete from … to …` watermark and a ready-to-paste
-`--max-age-stamp` that redoes about one ingest batch, so no boundary run is skipped.
-Passing both bounds is an error rather than a silent preference. `langsmith-migrator
-resume` does not apply and will say so.
+finished windows produce an empty difference. `--since` and `--until` bound the range
+to walk and are both **required and absolute**; `--window` sets the size of one slice
+of it in **hours** (default 24) — widen it when migrating many projects. The bounds are stamps
+rather than relative ages because a relative age denotes a different point in time
+every time it is evaluated, so over a multi-hour run the same float silently slides
+forward. Each project reports a `verified complete from … to …` watermark and a
+ready-to-paste `--since` that redoes about one ingest batch, so no boundary run is
+skipped. `langsmith-migrator resume` does not apply and will say so.
 
 **Ordering dependency: run `model-pricing` before `traces`.** Token and cost rollups are
 not replayed — the destination recomputes them from each run's `usage_metadata` against
@@ -288,8 +286,10 @@ langsmith-migrator fleet --agents-owned-only    # Only agents you own or are dir
 # Long-lived traces (run model-pricing first)
 langsmith-migrator traces                       # Interactive project selection
 langsmith-migrator traces --all                 # All tracing projects
-langsmith-migrator traces --project "my-project" --max-age-days 90 --window 7
+langsmith-migrator traces --project "my-project" --since 2026-06-01 --until 2026-09-01 --window 168
 langsmith-migrator traces --emit-upgrade-list upgrade.csv  # Leave tiers alone, hand the list to an operator
+langsmith-migrator traces --to-archive /data/archive/run1 --project p --since 2026-06-01 --until 2026-09-01
+langsmith-migrator traces --from-archive /data/archive/run1 --all --since 2026-08-31 --until 2026-09-01
 
 # Utilities
 langsmith-migrator export-users --source -o users.csv  # Export active members to a members CSV
@@ -312,7 +312,7 @@ langsmith-migrator clean
 - `fleet`: migrate Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets) with `--skip-*` flags for each resource type, and `--agent <name-or-id>` / `--agents-owned-only` to scope which agents (and their schedules/triggers/usage limits) are migrated
 - `issues`: migrate Engine issues-agent configs and detected issues as metadata (`--session` to scope to one tracing project)
 - `contexts`: migrate Context Hub agents and skills, replaying full commit history and tags by default (`--latest-only`, `--no-tags`, `--agents-only`, `--skills-only`, `--include-external`, `--same-instance`)
-- `traces`: migrate long-lived traces (`trace_tier == "longlived"`) with run IDs and timestamps preserved; stateless, so re-run rather than resume (`--max-age-days`, `--window`, `--prefetch-windows`, `--compress-level`, `--skip-attachments`, `--emit-upgrade-list`). Not part of `migrate-all`
+- `traces`: migrate long-lived traces (`trace_tier == "longlived"`) with run IDs and timestamps preserved; stateless, so re-run rather than resume (`--since`/`--until` required and absolute, `--window`, `--prefetch-windows`, `--compress-level`, `--skip-attachments`, `--emit-upgrade-list`). Can archive to disk and replay (`--to-archive`, `--from-archive`). Not part of `migrate-all`
 - `users`: migrate users/roles between instances, or run single-instance CSV access sync
 - `export-users`: export active org and workspace members to a members CSV for import via `users --members-csv`
 - `resume`: retry resumable items from a prior session and show grouped manual blockers
@@ -530,10 +530,9 @@ The prompt default is `No` (rules are created disabled).
 ```bash
 --project TEXT                  Tracing project (session) name or ID; repeatable
 --all                           Migrate all tracing projects without prompting
---max-age-days FLOAT            How far back to walk, the range (default: 180, the retention ceiling)
---max-age-stamp TEXT            Absolute lower bound instead of --max-age-days, e.g. 2026-08-27T18:00:00Z
-                                (mutually exclusive with --max-age-days; prefer it for long runs and resuming)
---window FLOAT                  Size in days of one slice of the range (default: 1)
+--since TEXT                    Oldest trace to take, absolute: 2026-08-27 or 2026-08-27T18:00:00Z (required)
+--until TEXT                    Youngest trace to take, same form (required)
+--window FLOAT                  Size in HOURS of one slice of the range; fractions fine (default: 24)
 --max-field-bytes INTEGER       Destination MAX_FIELD_SIZE_BYTES; not advertised, so it must be supplied (default: 25 MB)
 --no-verify                     Skip the confirming re-query after ingest (the pre-diff still runs)
 --verify-content-sample INTEGER Runs per window to content-check (default: 100)
@@ -541,6 +540,9 @@ The prompt default is `No` (rules are created disabled).
 --compress-level INTEGER        zstd level for the ingest body, 1-22 (default: 3)
 --no-compress-upload            Send the ingest body uncompressed
 --prefetch-windows INTEGER      Windows to retrieve concurrently, 1-32 (default: 4); ingest stays serial
+--to-archive DIR                Write windows to disk as .tar.zst instead of ingesting into a destination
+--from-archive DIR              Replay window files from a directory instead of reading the source deployment
+--allow-incomplete              Replay a truncated (.partial) window file
 --map-projects                  Launch interactive TUI to map source projects to destination projects
 --project-mapping TEXT          JSON string or file path with project ID mapping (headless, no TUI)
 --restore-session-tier/--no-restore-session-tier
@@ -550,7 +552,58 @@ The prompt default is `No` (rules are created disabled).
 --emit-upgrade-list FILE        Leave project tiers alone and write (dest_session_id, trace_id, start_time) per trace
 ```
 
-There are deliberately **no timestamp options**: run timestamps are copied verbatim.
+Both range bounds are **required and absolute** — a relative age means a
+different moment every time it is read, which breaks clean resumption.
+`--max-age-stamp` still works as another name for `--since`.
+
+The timestamps observed are the trace's (root run's) `start_time` - all
+children of the trace are selected regardless of their individual `start_time`-s.
+
+#### Archive to disk, replay later
+
+`--to-archive DIR` writes each project/window to one compressed `.tar.zst`
+instead of ingesting it; `--from-archive DIR` loads those files into a
+destination. This enables: staged or air-gapped transfer, re-ingest without
+re-reading the source, and capture-once-load-many.
+
+```bash
+# capture one project's history in 6-hour windows, into a dated directory
+langsmith-migrator traces --to-archive /data/archive/$(date -u +%Y%m%dT%H%M%SZ) \
+  --project gtm-agent --source-workspace WS_ID \
+  --since 2026-06-01 --until 2026-09-01 --window 6
+
+# load one day of it back, into projects suffixed with a stamp
+langsmith-migrator traces --from-archive /data/archive/20260901T120000Z \
+  --all --since 2026-08-31 --until 2026-09-01 \
+  --into-session-suffix "-replay-$(date -u +%H%M%S)"
+```
+
+```
+<archive>/<workspace-name>-<workspace-id>/<project-name>-<session-id>/
+    20260901T000000Z__20260901T060000Z.tar.zst     # one window, bounds in the name
+```
+
+- **`--window` (in hours) is the only control over file size.** It also bounds
+  how much one worker holds in memory. The bigger the window/byte size, the better
+  the compression ratio. OTOH big window increases the gap between and the size of
+  "checkpoints", making resumption after a failure slower.
+- **`ls` tells you what finished.** A window is written as `.partial` and renamed
+  only once complete, in time order — so an interrupted export leaves an
+  unbroken run of files, never a gap in the middle.
+- **To resume, re-run the identical command**; finished windows are skipped. To
+  re-capture one window, delete its file. DO NOT change the time window on re-run!
+- Compression measures 22x on small payloads and up to 190x on projects with
+  large repeated content.
+
+Two things to know before pointing this at real data:
+
+- **Pass `--source-workspace` for any unattended export.** No destination key or
+  `--dest-workspace` is needed, but on a key that sees several workspaces,
+  omitting it opens the interactive workspace mapper — which hangs when stdin is
+  not a terminal. Add `--non-interactive` to make that case fail fast instead.
+- **An archive is unencrypted trace data** — inputs, outputs and attachments in
+  plain text. Give every export its own directory; two exports writing into one
+  directory are going to clash.
 
 #### Throughput
 
@@ -563,8 +616,10 @@ Three settings govern speed, and only one of them trades anything away:
   `--window` if that is too much.
 - `--compress-level` (default 3) sets the zstd level for the ingest body.
   Measured per assembled request on real payloads: level 1 (what the SDK uses
-  on its own) 5.9x, level 3 with long-distance matching 68.5x at 1755 MB/s,
-  level 19 79.7x at 58 MB/s. Level 3 is effectively free; raise it only when
+  on its own) 5.9x, level 3 alone 30.6x, level 3 with long-distance matching
+  68.5x at ~1755 MB/s, level 19 79.7x at 58 MB/s. The long-match gain ranges
+  from 0.98x to 3.71x depending on how much a project repeats content across
+  runs. Level 3 is effectively free; raise it only when
   genuinely bandwidth-bound, since the frame is built by the retrieval workers
   and higher levels start costing real CPU.
 - Page size is not an option: `/runs/query` is asked for 1000 runs per page and

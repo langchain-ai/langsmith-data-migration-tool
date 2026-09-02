@@ -51,7 +51,7 @@ def _run(**kw):
 # Windows
 # --------------------------------------------------------------------------
 def test_windows_are_half_open_and_oldest_first():
-    windows = list(iter_windows(NOW - timedelta(days=3), NOW, window_days=1))
+    windows = list(iter_windows(NOW - timedelta(days=3), NOW, window_hours=24))
     assert [w.start for w in windows] == sorted(w.start for w in windows)
     assert windows[0].start == NOW - timedelta(days=3)
     assert windows[-1].end == NOW
@@ -61,7 +61,7 @@ def test_windows_are_half_open_and_oldest_first():
 
 
 def test_final_window_is_clipped_to_now():
-    windows = list(iter_windows(NOW - timedelta(days=2.5), NOW, window_days=1))
+    windows = list(iter_windows(NOW - timedelta(days=2.5), NOW, window_hours=24))
     assert windows[-1].end == NOW
     assert sum((w.end - w.start).total_seconds() for w in windows) == pytest.approx(2.5 * 86400)
 
@@ -85,33 +85,14 @@ def test_an_empty_or_inverted_range_is_rejected(start, end, window):
         list(iter_windows(start, end, window))
 
 
-@pytest.mark.parametrize("max_age_days", [0, -1, None])
-def test_resolve_range_start_rejects_a_nonpositive_age(max_age_days):
-    from langsmith_migrator.core.trace_domain import resolve_range_start
+def test_a_naive_bound_is_read_as_utc():
+    """Both ends of the walk are absolute stamps; relative ages were removed
+    because each evaluation of "now - N days" denoted a different instant."""
+    from langsmith_migrator.core.trace_domain import as_utc
 
-    with pytest.raises(ValueError):
-        resolve_range_start(NOW, max_age_days, None)
-
-
-def test_an_absolute_stamp_wins_over_a_relative_age():
-    """The whole point: an absolute bound cannot drift as the clock moves."""
-    from langsmith_migrator.core.trace_domain import resolve_range_start
-
-    stamp = datetime(2026, 8, 20, 6, 0, tzinfo=timezone.utc)
-    assert resolve_range_start(NOW, 180.0, stamp) == stamp
-    # evaluated an hour later, the same stamp still means the same instant
-    assert resolve_range_start(NOW + timedelta(hours=1), 180.0, stamp) == stamp
-    # whereas the relative age does not
-    a = resolve_range_start(NOW, 1.0, None)
-    b = resolve_range_start(NOW + timedelta(hours=1), 1.0, None)
-    assert a != b
-
-
-def test_a_naive_stamp_is_read_as_utc():
-    from langsmith_migrator.core.trace_domain import resolve_range_start
-
-    naive = datetime(2026, 8, 20, 6, 0)
-    assert resolve_range_start(NOW, None, naive) == datetime(2026, 8, 20, 6, 0, tzinfo=timezone.utc)
+    assert as_utc(datetime(2026, 8, 20, 6, 0)) == datetime(2026, 8, 20, 6, 0, tzinfo=timezone.utc)
+    aware = datetime(2026, 8, 20, 6, 0, tzinfo=timezone.utc)
+    assert as_utc(aware) is aware or as_utc(aware) == aware
 
 
 def test_bounds_carry_no_run_level_upper_bound_and_a_skew_buffer():
@@ -384,3 +365,28 @@ def test_verified_run_count_only_counts_clean_slices():
     total = Reconciliation.of("S", "D", slices)
     assert total.verified_runs == 4
     assert (total.earliest, total.latest) == ("2026-08-20T00:00:00+00:00", "2026-08-20T12:00:00+00:00")
+
+
+def test_a_window_label_carries_the_time_not_only_the_date():
+    """--window is in hours, so a date-only label made every window of one day
+    print identically - which is what an operator reads to tell them apart."""
+    start = datetime(2026, 9, 1, 22, 0, tzinfo=timezone.utc)
+    assert Window(start, start + timedelta(hours=1)).label() == "2026-09-01T22:00..23:00Z"
+    # the end's date appears only when it differs
+    assert Window(start, start + timedelta(hours=12)).label() == "2026-09-01T22:00..2026-09-02T10:00Z"
+    # fractional hours land on the minute
+    assert Window(start, start + timedelta(hours=1.7)).label() == "2026-09-01T22:00..23:42Z"
+
+
+def test_sub_minute_windows_still_label_distinctly():
+    """Seconds appear only when a bound has them, so the narrow case stays
+    unambiguous without widening every other line."""
+    start = datetime(2026, 9, 1, 22, 0, tzinfo=timezone.utc)
+    labels = [w.label() for w in iter_windows(start, start + timedelta(seconds=36), 0.005)]
+    assert labels == ["2026-09-01T22:00:00..22:00:18Z", "2026-09-01T22:00:18..22:00:36Z"]
+    assert len(set(labels)) == 2
+
+
+def test_a_naive_window_bound_is_labelled_as_utc():
+    naive = datetime(2026, 9, 1, 22, 0)
+    assert Window(naive, naive + timedelta(hours=1)).label() == "2026-09-01T22:00..23:00Z"

@@ -28,12 +28,12 @@ from __future__ import annotations
 
 import json
 import re
+import signal
 import threading
 import time
 import uuid
-from dataclasses import dataclass
-from dataclasses import field as _field
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from tempfile import SpooledTemporaryFile
@@ -50,22 +50,23 @@ from ..trace_frames import (
     compile_frame,
     unavailable_reason,
 )
+from ..trace_ports import RunSink, RunSource, SlicePrepared
 from ..trace_domain import (
     ATTACHMENT_PREFIX,
     LONGLIVED,
     RUN_QUERY_SELECT,
     S3_URL_PAYLOAD_FIELDS,
     Reconciliation,
-    SlicePlan,
     Window,
     batch_traces,
     digest_mismatches,
     group_into_traces,
     is_long_lived,
     iter_windows,
+    payload_bytes,
     payload_digest,
     plan_slice,
-    resolve_range_start,
+    as_utc,
     resolve_window_bounds,
     to_ingest_payload,
     verified_bounds,
@@ -86,6 +87,13 @@ _ID_CHUNK_MIN = 25
 # at or under the limit so a request never depends on that leniency.
 _PAGE_LIMIT = 1000
 _PAGE_CAP_RE = re.compile(r"maximum allowed value of (\d+)")
+_READ_TIMEOUT_RE = re.compile("read timed out", re.IGNORECASE)
+
+# Payload fetches ask for hundreds of heavy runs at once - one chunk of a heavy
+# project measured 355 MB - which the client's 30 s default cannot serve. Long
+# enough for a legitimately large response, short enough that the chunk halving
+# still reacts within a few minutes rather than a quarter of an hour.
+_QUERY_TIMEOUT = 120
 
 # Not advertised by /info (only the batch limits are), so it matches the
 # backend's own MAX_ATTACHMENT_SIZE_BYTES default and is a guard, not a truth.
@@ -128,9 +136,18 @@ def _response_too_large(error: Exception) -> bool:
     response body rather than saying so, and it does it fast - there is nothing
     to distinguish it from a genuine outage except that retrying at the same
     size keeps failing, which the retry layer has already established.
+
+    A read timeout is the same problem stated differently: the server took the
+    request and never finished the body. ``requests`` reports it as ``Timeout``
+    or, when the stall strikes while the body is being consumed, as a
+    ``ConnectionError`` wrapping urllib3's own read timeout - so the class alone
+    is not a reliable discriminator and the message has to be read too.
     """
-    status = getattr(error, "status_code", None)
-    return status in (413, 502, 503)
+    if getattr(error, "status_code", None) in (413, 502, 503):
+        return True
+    return isinstance(error, requests.exceptions.Timeout) or bool(
+        _READ_TIMEOUT_RE.search(str(error))
+    )
 
 
 def _page_limit_cap(error: Exception) -> Optional[int]:
@@ -155,31 +172,6 @@ def _raise_if_tier_denied(error: Exception) -> None:
 
 
 
-@dataclass
-class SlicePrepared:
-    """One slice's work, built off the main thread and committed on it.
-
-    Findings accumulate here rather than on the migrator so a worker never
-    writes shared state; ``commit_slice`` merges them in window order.
-    """
-
-    window: Window
-    src_id: str
-    dst_id: str
-    plan: SlicePlan
-    population: List[Dict[str, Any]]
-    # (payloads, pre-compiled frame). The payloads are kept so a rejected batch
-    # can still be split to isolate one bad run; that is what bounds peak
-    # memory to prefetch x window, and why --window is the knob for it.
-    batches: List[Tuple[List[Dict[str, Any]], Optional[CompiledFrame]]] = _field(default_factory=list)
-    digests: Dict[str, Dict[str, str]] = _field(default_factory=dict)
-    degraded: Dict[str, Set[str]] = _field(default_factory=dict)
-    fidelity_notes: Set[str] = _field(default_factory=set)
-    upgrade_rows: List[Tuple[str, str, str]] = _field(default_factory=list)
-    # (issue_class, code, summary, evidence), replayed through record_issue.
-    issues: List[Tuple[str, str, str, Dict[str, Any]]] = _field(default_factory=list)
-
-
 class TracePreflightError(RuntimeError):
     """A destination precondition failed; nothing may be migrated."""
 
@@ -194,9 +186,9 @@ class TraceMigrator(BaseMigrator):
         state,
         config,
         *,
-        max_age_days: Optional[float] = 180.0,
-        range_start: Optional[datetime] = None,
-        window_days: float = 1.0,
+        range_start: datetime,
+        range_end: datetime,
+        window_hours: float = 24.0,
         max_field_bytes: int = 25 * 1024 * 1024,
         verify: bool = True,
         verify_content_sample: int = 100,
@@ -207,17 +199,22 @@ class TraceMigrator(BaseMigrator):
         project_id_map: Optional[Dict[str, str]] = None,
         compress_level: Optional[int] = DEFAULT_COMPRESS_LEVEL,
         prefetch_windows: int = 4,
+        run_sink: Optional[RunSink] = None,
+        run_source: Optional[RunSource] = None,
     ):
         super().__init__(source_client, dest_client, state, config)
-        self.max_age_days = max_age_days
-        self.range_start = range_start
-        # Resolved exactly once. Recomputing "now - max_age_days" per call gave
-        # a slightly different instant each time, which is the same drift an
-        # absolute --max-age-stamp exists to avoid.
-        self._resolved_start = resolve_range_start(
-            datetime.now(timezone.utc), max_age_days, range_start
-        )
-        self.window_days = window_days
+        # This class *is* the LangSmith source and sink; an archive supplies the
+        # file ones. Both halves are swappable independently, which is what lets
+        # an export need no destination and a replay need no source deployment.
+        self.run_sink: RunSink = run_sink or self
+        self.run_source: RunSource = run_source or self
+        # Both bounds absolute, so nothing here reads a clock: two runs of the
+        # same command walk exactly the same windows.
+        self._resolved_start = as_utc(range_start)
+        self._resolved_end = as_utc(range_end)
+        if self._resolved_start >= self._resolved_end:
+            raise ValueError("the range start must precede its end")
+        self.window_hours = window_hours
         self.max_field_bytes = max_field_bytes
         self.verify = verify
         self.verify_content_sample = verify_content_sample
@@ -241,6 +238,16 @@ class TraceMigrator(BaseMigrator):
         self._page_limit = {"source": _PAGE_LIMIT, "dest": _PAGE_LIMIT}
         # Shrinks itself when a project's payloads make the response too big.
         self._id_chunk = _ID_CHUNK
+        # Set before any worker starts. The default 30 s is a payload fetch's
+        # normal case here, not its worst.
+        for client in (source_client, dest_client):
+            if getattr(client, "timeout", 0) and client.timeout < _QUERY_TIMEOUT:
+                client.timeout = _QUERY_TIMEOUT
+        # Set by graceful_stop's first signal; stops scheduling, drains the rest.
+        self.stop_requested = False
+        self.skipped_windows = 0
+        # dest_session_id -> (its tier before we touched it, the source's tier).
+        self._prior_tier: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
 
         # None = send uncompressed through the SDK's public path. Resolved
         # once, after the client exists, so a missing SDK internal or a
@@ -262,6 +269,13 @@ class TraceMigrator(BaseMigrator):
         # destination host, not the source's.
         self._source_blob_host = urlparse(self._host(config.source.base_url)).netloc
         self._dest_blob_host = urlparse(self._host(config.destination.base_url)).netloc
+
+        if self.run_sink is not self:
+            self.dest_ls_client = None
+            self._ingest_errors: List[Exception] = []
+            self._ingest_responses: List[Tuple[int, str]] = []
+            self.compress_level = None
+            return
 
         self._dest_session_http = requests.Session()
         if not config.destination.verify_ssl:
@@ -302,6 +316,64 @@ class TraceMigrator(BaseMigrator):
         """Absolute lower bound of this run's walk, fixed for the whole run."""
         return self._resolved_start
 
+    def walk_end(self) -> datetime:
+        """Absolute upper bound of this run's walk."""
+        return self._resolved_end
+
+    # ------------------------------------------------------------------
+    # RunSource / RunSink for the LangSmith side
+    # ------------------------------------------------------------------
+    def sessions(self) -> List[Dict[str, Any]]:
+        return self.list_source_sessions()
+
+    def windows(self, session: Dict[str, Any]) -> Iterator[Window]:
+        return iter_windows(self.resolved_range_start(), self.walk_end(), self.window_hours)
+
+    def open_target(self, session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Resolve the destination project and make sure its tier is right.
+
+        The prior tier is remembered here rather than by the caller, so
+        ``close_target`` can put it back without the driver knowing a tier
+        exists at all.
+        """
+        target = self.resolve_dest_session(session)
+        if not target:
+            return None
+        self._prior_tier[str(target["id"])] = (target.get("trace_tier"), session.get("trace_tier"))
+        self.ensure_long_lived(target)
+        return target
+
+    def has_window(self, target: Dict[str, Any], window: Window) -> bool:
+        """Always false: a project has no window-level record, and can always
+        gain runs - from a concurrent dual-write, or another operator."""
+        return False
+
+    def existing_ids(self, target: Dict[str, Any], window: Window) -> Set[str]:
+        # With --emit-upgrade-list the destination sessions stay at their
+        # existing tier, so filtering on tier there would read every migrated
+        # run as missing.
+        if self.config.migration.dry_run:
+            return set()
+        return self.long_lived_run_ids(
+            self.dest, str(target["id"]), window, tier_filter=not self.emit_upgrade_list
+        )
+
+    def stage(self, target: Dict[str, Any], window: Window, prepared: SlicePrepared) -> None:
+        """Nothing to stage: the frames were compiled during ``prepare``."""
+        return None
+
+    def commit(
+        self, target: Dict[str, Any], window: Window, prepared: SlicePrepared, staged: Any
+    ) -> List[Tuple[str, str]]:
+        failures: List[Tuple[str, str]] = []
+        for batch, frame in prepared.batches:
+            failures.extend(self.ingest(batch, frame=frame))
+        return failures
+
+    def close_target(self, target: Dict[str, Any], recon: Optional[Reconciliation] = None) -> None:
+        prior, source_tier = self._prior_tier.pop(str(target["id"]), (None, None))
+        self._settle_tier(target, prior, source_tier, recon)
+
     # ------------------------------------------------------------------
     # Plumbing
     # ------------------------------------------------------------------
@@ -317,12 +389,7 @@ class TraceMigrator(BaseMigrator):
     def _shape(runs: Sequence[Dict[str, Any]]) -> Tuple[int, int, int]:
         """``(runs, distinct traces, serialized bytes)`` for a page or a batch."""
         traces = {str(r.get("trace_id")) for r in runs}
-        size = sum(
-            len(json.dumps({k: v for k, v in r.items() if k != "attachments"}, default=str))
-            + sum(len(data) for _, data in (r.get("attachments") or {}).values())
-            for r in runs
-        )
-        return len(runs), len(traces), size
+        return len(runs), len(traces), sum(payload_bytes(r) for r in runs)
 
     @staticmethod
     def _host(base_url: str) -> str:
@@ -380,12 +447,18 @@ class TraceMigrator(BaseMigrator):
             seen += len(runs)
             if self.config.migration.verbose and runs:
                 n, traces, size = self._shape(runs)
-                # Kept under 80 columns: a wrapped progress line is worse
-                # than a terse one.
+                # Named per phase, because only the identity scan paginates: a
+                # fetch is one request per ID chunk, so a page number would
+                # restart at p1 on every one of them and a running total could
+                # only ever restate ``runs``. The scan's column is kept blank
+                # there so the two line shapes still align. Under 80 columns: a
+                # wrapped progress line is worse than a terse one.
+                scan = ids is None
                 self.console.print(
-                    f"[dim]  query {side:<6} p{page_num:<4}"
-                    f"runs {n:>4} | traces {traces:>4} | {self._human(size):>9} | "
-                    f"total {seen:>6}[/dim]"
+                    f"[dim]  {'scan' if scan else 'fetch':<5} {side:<6} "
+                    f"{f'p{page_num}' if scan else '':<4}"
+                    f"runs {n:>4} | traces {traces:>4} | {self._human(size):>9}"
+                    f"{f' | total {seen:>6}' if scan else ''}[/dim]"
                 )
             yield from runs
             cursor = (response.get("cursors") or {}).get("next")
@@ -433,16 +506,19 @@ class TraceMigrator(BaseMigrator):
                         client, session_id, window, select=RUN_QUERY_SELECT, ids=ids[start : start + chunk]
                     )
                 )
-            except APIError as exc:
+            except (APIError, requests.exceptions.RequestException) as exc:
                 if not _response_too_large(exc) or chunk <= _ID_CHUNK_MIN:
                     raise
                 # Retries at this size are already exhausted, so the size is
                 # the problem. Halve it and keep it for the rest of the run.
                 self._id_chunk = max(_ID_CHUNK_MIN, chunk // 2)
-                self.log(
-                    f"  {chunk} IDs per request was refused ({exc.status_code}); "
-                    f"continuing at {self._id_chunk}",
-                    "warning",
+                # Printed unconditionally: it changes request sizes for the rest
+                # of the run and is the explanation for a slow one. Each halving
+                # is a distinct size, so this cannot repeat itself.
+                self.console.print(
+                    f"[yellow]  {chunk} IDs per request was refused "
+                    f"({getattr(exc, 'status_code', None) or type(exc).__name__}); "
+                    f"continuing at {self._id_chunk}[/yellow]"
                 )
                 continue
             yield from page
@@ -532,10 +608,6 @@ class TraceMigrator(BaseMigrator):
     # ------------------------------------------------------------------
     # Write path
     # ------------------------------------------------------------------
-    @classmethod
-    def _size_of(cls, payload: Dict[str, Any]) -> int:
-        return cls._shape([payload])[2]
-
     def _oversized_fields(self, payload: Dict[str, Any]) -> List[str]:
         """Fields the destination would silently replace with a placeholder.
 
@@ -762,17 +834,25 @@ class TraceMigrator(BaseMigrator):
         if self.config.migration.dry_run:
             return {"id": f"dry-run-{source_id}", "name": target_name, "trace_tier": LONGLIVED}
 
-        # Explicit tier, never omitted: a nil tier resolves to the destination
-        # tenant's default, and the tier cannot be repaired after ingest.
+        # Unset fields are omitted rather than sent as null: an archive knows a
+        # project's name and ID and nothing else, and the endpoint answers 422 to
+        # "start_time": null. The tier is always sent - a nil tier resolves to
+        # the destination tenant's default, which cannot be repaired after ingest.
         payload = {
-            "name": target_name,
-            "description": source_session.get("description"),
-            "metadata": source_session.get("metadata"),
-            "extra": source_session.get("extra"),
-            "start_time": source_session.get("start_time"),
-            "end_time": source_session.get("end_time"),
-            "trace_tier": source_session.get("trace_tier") if self.emit_upgrade_list else LONGLIVED,
+            key: value
+            for key, value in (
+                ("name", target_name),
+                ("description", source_session.get("description")),
+                ("metadata", source_session.get("metadata")),
+                ("extra", source_session.get("extra")),
+                ("start_time", source_session.get("start_time")),
+                ("end_time", source_session.get("end_time")),
+            )
+            if value is not None
         }
+        payload["trace_tier"] = (
+            source_session.get("trace_tier") if self.emit_upgrade_list else LONGLIVED
+        )
         # Reusing the source ID is convenient, not load-bearing: a rejection
         # just means the session gets mapped instead.
         with_id = payload if self.into_session_suffix else {**payload, "id": source_id}
@@ -913,21 +993,32 @@ class TraceMigrator(BaseMigrator):
         writes converge on the same value and a lost update just means one more
         rejection before it sticks.
         """
-        src_id, dst_id = str(source_session["id"]), str(dest_session["id"])
+        return self.run_source.prepare(
+            source_session,
+            dest_session,
+            window,
+            lambda: self.run_sink.existing_ids(dest_session, window),
+        )
+
+    def prepare(
+        self,
+        source_session: Dict[str, Any],
+        target: Dict[str, Any],
+        window: Window,
+        existing_ids,
+    ) -> SlicePrepared:
+        """``RunSource.prepare`` for the LangSmith side.
+
+        The diff is taken *before* anything is fetched, so a re-run of a
+        finished window costs the identity scan and nothing else. For an export
+        the oracle answers empty, which is what an archive is for.
+        """
+        src_id, dst_id = str(source_session["id"]), str(target["id"])
         population = self.slice_runs(self.source, src_id, window)
         if not population:
             return SlicePrepared(window, src_id, dst_id, plan_slice(set(), set()), [])
         source_ids = {str(r["id"]) for r in population}
-
-        # With --emit-upgrade-list the destination sessions stay at their
-        # existing tier, so filtering on tier there would read every migrated
-        # run as missing.
-        dest_ids = (
-            set()
-            if self.config.migration.dry_run
-            else self.long_lived_run_ids(self.dest, dst_id, window, tier_filter=not self.emit_upgrade_list)
-        )
-        prepared = SlicePrepared(window, src_id, dst_id, plan_slice(source_ids, dest_ids), population)
+        prepared = SlicePrepared(window, src_id, dst_id, plan_slice(source_ids, existing_ids()), population)
 
         if self.emit_upgrade_list:
             # Derived from the window's source population, not the diff: built
@@ -959,10 +1050,12 @@ class TraceMigrator(BaseMigrator):
         if not prepared.plan.to_ingest:
             return
         payloads: List[Dict[str, Any]] = []
+        fetched: Set[str] = set()
         for run in self.fetch_runs(
             self.source, prepared.src_id, prepared.window, sorted(prepared.plan.to_ingest)
         ):
             run_id = str(run["id"])
+            fetched.add(run_id)
             overrides, issues = self.materialise(run)
             payload_obj, dropped = to_ingest_payload(run, prepared.dst_id, overrides)
             payload = payload_obj.as_dict()
@@ -988,16 +1081,31 @@ class TraceMigrator(BaseMigrator):
                 prepared.digests[run_id] = self._digest_of(run, overrides)
             payloads.append(payload)
 
-        max_runs, max_bytes = self.batch_limits()
+        # The identity scan listed these; the payload fetch did not return them.
+        # On the migrate path the confirming re-query would eventually notice; an
+        # export has no destination to confirm against, so a run silently absent
+        # from the archive would still be reported as captured.
+        absent = prepared.plan.to_ingest - fetched
+        if absent:
+            prepared.degraded.setdefault("run_not_returned_by_source", set()).update(absent)
+            prepared.fidelity_notes.add("the source did not return every run it listed")
+
+        max_runs, max_bytes = self.run_sink.batch_limits()
         for batch in batch_traces(
-            group_into_traces(payloads), max_runs=max_runs, max_bytes=max_bytes, size_of=self._size_of
+            group_into_traces(payloads), max_runs=max_runs, max_bytes=max_bytes, size_of=payload_bytes
         ):
-            frame = (
-                None
-                if self.compress_level is None or self.config.migration.dry_run
-                else compile_frame(self.dest_ls_client, batch, self.compress_level)
-            )
-            prepared.batches.append((batch, frame))
+            prepared.batches.append((batch, self.compile_batch(batch)))
+
+    def compile_batch(self, batch: List[Dict[str, Any]]) -> Optional[CompiledFrame]:
+        """The compressed ingest body for one batch, or None when unused.
+
+        Called from a prefetch worker on both paths - the API source builds its
+        own batches, the archive source re-batches a replayed window - which is
+        the whole point of compiling here rather than on the serial send.
+        """
+        if self.compress_level is None or self.config.migration.dry_run:
+            return None
+        return compile_frame(self.dest_ls_client, batch, self.compress_level)
 
     def commit_slice(self, prepared: SlicePrepared) -> Reconciliation:
         """Write one prepared slice, confirm it, and account for it.
@@ -1007,6 +1115,11 @@ class TraceMigrator(BaseMigrator):
         """
         src_id, dst_id, window, plan = prepared.src_id, prepared.dst_id, prepared.window, prepared.plan
         if not prepared.population:
+            # Still committed: for an archive an empty window is a *file*, and
+            # "we looked here and found nothing" is a different fact from "we
+            # never looked". Only a file can carry the difference, and without
+            # it the sorted-files-are-contiguous coverage proof is false.
+            self.run_sink.commit(prepared.target or {"id": dst_id}, window, prepared, prepared.staged)
             return Reconciliation(src_id, dst_id, window.label(), 0, 0, 0, 0, 0)
 
         self.upgrade_rows.extend(prepared.upgrade_rows)
@@ -1017,10 +1130,11 @@ class TraceMigrator(BaseMigrator):
         degraded = prepared.degraded
         blocked: Set[str] = set()
         rejected: Dict[str, Set[str]] = {}
-        for batch, frame in prepared.batches:
-            for run_id, error in self.ingest(batch, frame=frame):
-                blocked.add(run_id)
-                rejected.setdefault(str(error), set()).add(run_id)
+        for run_id, error in self.run_sink.commit(
+            prepared.target or {"id": dst_id}, window, prepared, prepared.staged
+        ):
+            blocked.add(run_id)
+            rejected.setdefault(str(error), set()).add(run_id)
         # Grouped by cause: twenty runs refused for one reason is one fact, not
         # twenty truncated lines.
         for error, ids in rejected.items():
@@ -1068,9 +1182,10 @@ class TraceMigrator(BaseMigrator):
 
     def migrate_slice(
         self, source_session: Dict[str, Any], dest_session: Dict[str, Any], window: Window
-    ) -> Reconciliation:
-        """Prepare and commit one slice, without look-ahead."""
-        return self.commit_slice(self.prepare_slice(source_session, dest_session, window))
+    ) -> Optional[Reconciliation]:
+        """Prepare and commit one slice, without look-ahead. None when skipped."""
+        prepared = self._prepare_and_stage(source_session, dest_session, window)
+        return None if prepared is None else self.commit_slice(prepared)
 
     @staticmethod
     def _digest_of(run: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, str]:
@@ -1183,42 +1298,43 @@ class TraceMigrator(BaseMigrator):
     # ------------------------------------------------------------------
     # Per-session driver
     # ------------------------------------------------------------------
-    def migrate_session(self, source_session: Dict[str, Any], now: Optional[datetime] = None) -> Optional[Reconciliation]:
+    def migrate_session(self, source_session: Dict[str, Any]) -> Optional[Reconciliation]:
         """Raise tier -> migrate windows oldest-first -> verify -> restore.
 
-        The tier is settled in a ``finally``: once an existing project has been
-        raised, walking away without deciding what to do about it would leave a
-        project long-lived indefinitely on any mid-run failure, silently
-        changing retention for traffic that has nothing to do with this
-        migration.
+        ``close_target`` is called in a ``finally``: once an existing project
+        has been raised, walking away without deciding what to do about it
+        would leave a project long-lived indefinitely on any mid-run failure,
+        silently changing retention for traffic unrelated to this migration.
         """
-        dest_session = self.resolve_dest_session(source_session)
-        if not dest_session:
+        target = self.run_sink.open_target(source_session)
+        if not target:
             return None
-        prior_tier = dest_session.get("trace_tier")
-        self.ensure_long_lived(dest_session)
 
         recon = None
+        project = source_session.get("name") or str(source_session["id"])
         try:
             slices = []
-            end = now or datetime.now(timezone.utc)
-            windows = iter_windows(self.resolved_range_start(), end, self.window_days)
-            for sliced in self._walk_windows(source_session, dest_session, windows):
+            windows = self.run_source.windows(source_session)
+            for sliced in self._walk_windows(source_session, target, windows):
                 slices.append(sliced)
                 if sliced.source_total:
                     # Per-slice detail is verbose-only: the range can be 180
                     # windows wide, and the per-session total is always printed.
+                    # Named per line, not just under the project header: in
+                    # verbose mode the query and ingest lines of a single window
+                    # push that header off the screen.
                     self.log(
-                        f"  {sliced.window}: source {sliced.source_total} = ingested {sliced.ingested}"
+                        f"  {project} {sliced.window}:"
+                        f" source {sliced.source_total} = ingested {sliced.ingested}"
                         f" + already present {sliced.already_present}"
                         f" + degraded {sliced.degraded} + blocked {sliced.blocked}"
                         + (f" | verified {sliced.earliest} .. {sliced.latest}" if sliced.earliest else ""),
                         "info",
                     )
-            recon = Reconciliation.of(str(source_session["id"]), str(dest_session["id"]), slices)
+            recon = Reconciliation.of(str(source_session["id"]), str(target["id"]), slices)
             return recon
         finally:
-            self._settle_tier(dest_session, prior_tier, source_session.get("trace_tier"), recon)
+            self.run_sink.close_target(target, recon)
 
     def _walk_windows(
         self, source_session: Dict[str, Any], dest_session: Dict[str, Any], windows
@@ -1237,7 +1353,11 @@ class TraceMigrator(BaseMigrator):
         """
         if self.prefetch_windows <= 1:
             for window in windows:
-                yield self.migrate_slice(source_session, dest_session, window)
+                if self.stop_requested:
+                    return
+                recon = self.migrate_slice(source_session, dest_session, window)
+                if recon is not None:
+                    yield recon
             return
 
         pending: Deque[Future] = deque()
@@ -1247,9 +1367,11 @@ class TraceMigrator(BaseMigrator):
             def submit_next() -> None:
                 # Main thread only: ``windows`` is a generator, and advancing
                 # one from several threads is not safe.
-                window = next(windows, None)
+                window = None if self.stop_requested else next(windows, None)
                 if window is not None:
-                    pending.append(pool.submit(self.prepare_slice, source_session, dest_session, window))
+                    pending.append(
+                        pool.submit(self._prepare_and_stage, source_session, dest_session, window)
+                    )
 
             for _ in range(self.prefetch_windows):
                 submit_next()
@@ -1260,7 +1382,56 @@ class TraceMigrator(BaseMigrator):
                 # Peak residency is therefore prefetch_windows in flight plus
                 # the one being written.
                 submit_next()
-                yield self.commit_slice(prepared)
+                if prepared is not None:
+                    yield self.commit_slice(prepared)
+
+    def _prepare_and_stage(
+        self, source_session: Dict[str, Any], target: Dict[str, Any], window: Window
+    ) -> Optional[SlicePrepared]:
+        """One window's worker-side work: skip, read, stage. Never the publish.
+
+        Staging here rather than in ``commit_slice`` is what keeps the archive's
+        tar+zstd encode off the serial path - a heavy window is ~18 s of
+        compression, which across thousands of windows would add hours.
+        """
+        if self.run_sink.has_window(target, window):
+            self.skipped_windows += 1
+            return None
+        prepared = self.prepare_slice(source_session, target, window)
+        prepared.target = target
+        prepared.staged = self.run_sink.stage(target, window, prepared)
+        return prepared
+
+    @contextmanager
+    def graceful_stop(self):
+        """Make the first Ctrl-C lose nothing, and the second abandon at once.
+
+        The first signal stops scheduling new windows; the walk then drains what
+        is already in flight and commits it in order, so the loss is zero rather
+        than one window. The handler is restored as it fires, so a second Ctrl-C
+        raises ``KeyboardInterrupt`` the way it normally would.
+        """
+        previous: Dict[int, Any] = {}
+
+        def handle(signum, frame):  # pragma: no cover - signal delivery
+            for sig, old in previous.items():
+                signal.signal(sig, old)
+            self.stop_requested = True
+            self.console.print(
+                "\n[yellow]Stop requested: finishing the windows already in flight. "
+                "Ctrl-C again to abandon them.[/yellow]"
+            )
+
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                previous[sig] = signal.signal(sig, handle)
+        except ValueError:  # not the main thread; nothing to install
+            previous.clear()
+        try:
+            yield
+        finally:
+            for sig, old in previous.items():
+                signal.signal(sig, old)
 
     def _settle_tier(
         self,

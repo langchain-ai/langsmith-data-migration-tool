@@ -27,6 +27,8 @@ def _client():
 
 
 def _migrator(sample_config, **kwargs):
+    kwargs.setdefault("range_start", NOW - timedelta(days=6))
+    kwargs.setdefault("range_end", NOW)
     with patch("langsmith_migrator.core.migrators.trace.Client"):
         m = TraceMigrator(_client(), _client(), None, sample_config, **kwargs)
     m.dest_ls_client = Mock()
@@ -44,16 +46,15 @@ def _labels(n_windows):
     """Window labels in the order they must be committed."""
     from langsmith_migrator.core.trace_domain import iter_windows
 
-    return [w.label() for w in iter_windows(NOW - timedelta(days=n_windows), NOW, 1.0)]
+    return [w.label() for w in iter_windows(NOW - timedelta(days=n_windows), NOW, 24.0)]
 
 
 def _drive(m, n_windows=6):
     """Walk n windows of one day each, recording commit order."""
-    end = NOW
-    m.range_start = end - timedelta(days=n_windows)
-    m._resolved_start = m.range_start
-    m.window_days = 1.0
-    return m.migrate_session({"id": "src", "name": "p", "trace_tier": "longlived"}, now=end)
+    m._resolved_start = NOW - timedelta(days=n_windows)
+    m._resolved_end = NOW
+    m.window_hours = 24.0
+    return m.migrate_session({"id": "src", "name": "p", "trace_tier": "longlived"})
 
 
 # --------------------------------------------------------------------------

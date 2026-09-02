@@ -72,8 +72,14 @@ def compile_frame(
     filesystem-attachment check (attachments are already in-memory bytes), and
     the create/update merge (this path only creates).
 
-    NB: ``_run_transform`` mutates each payload in place - ``id`` becomes a
-    ``UUID`` - so digests must be taken before compiling.
+    The caller's payloads are left intact. Both SDK steps mutate what they are
+    given - ``_run_transform`` rewrites ``id`` to a ``UUID``, and
+    ``serialize_run_dict`` **pops** ``inputs``, ``outputs``, ``events``,
+    ``extra``, ``error``, ``serialized`` and ``attachments`` out of the dict -
+    so each payload is shallow-copied first. Without that, a caller holding the
+    payloads for a retry would re-send stripped skeletons, and any size measured
+    afterwards would be of the skeleton. The copy is a key table, not the
+    values, so it costs nothing against the payload bytes.
     """
     run_ids = tuple(str(p["id"]) for p in payloads)
     # multipart_ingest validates this before serializing; this path skips it, so
@@ -85,7 +91,7 @@ def compile_frame(
         # must not touch. Nothing sets it here; fail loudly if that changes.
         raise RuntimeError("frame compilation requires tracing_sample_rate to be unset")
 
-    transformed = [client._run_transform(p) for p in payloads]
+    transformed = [client._run_transform(dict(p)) for p in payloads]
     client._insert_runtime_env(transformed)  # no-op under omit_traced_runtime_info
     ops = combine_serialized_queue_operations(
         [serialize_run_dict("post", run) for run in transformed]

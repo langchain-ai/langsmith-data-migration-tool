@@ -82,7 +82,11 @@ RUN_QUERY_SELECT: Tuple[str, ...] = tuple(
 
 
 def _iso(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat()
+    return _as_utc(value).isoformat()
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -93,37 +97,55 @@ class Window:
     end: datetime
 
     def label(self) -> str:
-        return f"{self.start.date()}..{self.end.date()}"
+        """Human-readable bounds in UTC, e.g. ``2026-09-01T10:00..11:42Z``.
+
+        Carries the time, not just the date: ``--window`` is in hours, so
+        sub-day windows are the norm and a date-only label made every window of
+        one day print identically. The end's date is omitted when it matches the
+        start's - the common case, and it keeps the label inside a column.
+        Seconds appear only when a bound actually has them, so a window narrower
+        than a minute still labels distinctly without widening every other line.
+        """
+        start, end = _as_utc(self.start), _as_utc(self.end)
+        fmt = "%Y-%m-%dT%H:%M:%S" if (start.second or end.second) else "%Y-%m-%dT%H:%M"
+        tail = end.strftime(fmt.split("T")[1] if start.date() == end.date() else fmt)
+        return f"{start.strftime(fmt)}..{tail}Z"
 
 
-def iter_windows(start: datetime, end: datetime, window_days: float) -> Iterator[Window]:
+def iter_windows(start: datetime, end: datetime, window_hours: float) -> Iterator[Window]:
     """Yield half-open windows covering ``[start, end)``, oldest first.
+
+    Hours rather than days because the useful range is sub-day: a heavy project
+    needs roughly 1.7 h to keep one prepare slice in memory, which as a fraction
+    of a day (0.07) is a number nobody can read.
 
     Bounds are absolute on purpose. Deriving them from ``now`` inside here
     meant the same relative age denoted a different instant every time it was
     evaluated, so a watermark expressed in days silently drifted while a long
     migration was still running.
     """
-    if window_days <= 0:
-        raise ValueError("window_days must be positive")
+    if window_hours <= 0:
+        raise ValueError("window_hours must be positive")
     if start >= end:
         raise ValueError("range start must precede its end")
-    step = timedelta(days=window_days)
+    step = timedelta(hours=window_hours)
     while start < end:
         boundary = min(start + step, end)
         yield Window(start, boundary)
         start = boundary
 
 
-def resolve_range_start(
-    now: datetime, max_age_days: Optional[float], stamp: Optional[datetime]
-) -> datetime:
-    """The absolute lower bound of the walk, from whichever bound was given."""
-    if stamp is not None:
-        return stamp.astimezone(timezone.utc) if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
-    if not max_age_days or max_age_days <= 0:
-        raise ValueError("max_age_days must be positive")
-    return now - timedelta(days=max_age_days)
+def as_utc(stamp: datetime) -> datetime:
+    """Normalise a bound to aware UTC, reading a naive value as UTC.
+
+    Both ends of the walk are absolute stamps, so there is no clock reading in
+    window derivation at all: the same command covers the same span whenever it
+    runs. Relative ages (``--max-age-days`` / ``--min-age-days``) were removed
+    for exactly that reason - each evaluation of "now - N days" denoted a
+    different instant, which slid the whole window grid and gave an archive's
+    files a new name on every run.
+    """
+    return stamp.astimezone(timezone.utc) if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
 def resolve_window_bounds(window: Window) -> Tuple[str, str]:
@@ -264,6 +286,17 @@ def group_into_traces(runs: Iterable[Dict[str, Any]]) -> List[List[Dict[str, Any
     for group in traces.values():
         group.sort(key=lambda r: r.get("dotted_order") or "")
     return [traces[key] for key in sorted(traces, key=lambda t: traces[t][0].get("dotted_order") or "")]
+
+
+def payload_bytes(run: Dict[str, Any]) -> int:
+    """Serialized size of one run, attachments counted as their raw bytes.
+
+    The batching limits and the archive's byte accounting are both expressed in
+    these units, so they have to agree on what a run costs.
+    """
+    return len(json.dumps({k: v for k, v in run.items() if k != "attachments"}, default=str)) + sum(
+        len(data) for _, data in (run.get("attachments") or {}).values()
+    )
 
 
 def batch_traces(

@@ -23,7 +23,7 @@ def _watermark(verified_runs, span_hours, batch_runs):
 
 def _resume_instant(text):
     """The hint now carries an absolute stamp, which cannot drift."""
-    return dt.datetime.fromisoformat(text.split("--max-age-stamp ")[1].split()[0])
+    return dt.datetime.fromisoformat(text.split("--since ")[1].split()[0])
 
 
 def test_the_overlap_is_one_batch_not_the_whole_span():
@@ -55,7 +55,7 @@ def test_a_project_with_blocked_runs_claims_no_watermark():
         cli_main._print_trace_watermark(Reconciliation("S", "D", "", 2, 1, 0, 0, 1), 100)
     text = "\n".join(printed)
     assert "no verified watermark" in text
-    assert "--max-age-stamp" not in text
+    assert "--since" not in text
 
 
 def test_a_dry_run_explains_nothing_rather_than_blaming_fidelity():
@@ -81,11 +81,11 @@ def test_a_verified_run_with_blocked_runs_does_explain_itself():
 
 def test_window_durations_read_as_wall_clock():
     """The pre-flight prints the window in units an operator thinks in."""
-    h = cli_main._human_duration
-    assert h(0.01) == "14m24s"
-    assert h(0.1) == "2h24m"
-    assert h(1.0) == "1d"
-    assert h(2.5) == "2d12h"
-    assert h((2 * 3600 + 5 * 60 + 4) / 86400) == "2h5m4s"   # the example asked for
-    assert h(1 / 86400) == "1s"
+    h = cli_main._human_duration   # takes hours, since --window does
+    assert h(0.24) == "14m24s"
+    assert h(2.4) == "2h24m"
+    assert h(24.0) == "1d"
+    assert h(60.0) == "2d12h"
+    assert h(2 + 5 / 60 + 4 / 3600) == "2h5m4s"
+    assert h(1 / 3600) == "1s"
     assert h(0) == "0s"

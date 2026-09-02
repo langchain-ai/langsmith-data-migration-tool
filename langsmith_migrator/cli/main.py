@@ -3,6 +3,7 @@
 import csv
 import functools
 import logging
+import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,7 @@ from ..core.migrators import (
     FleetWebhookMigrator,
 )
 from ..core.migrators.trace import TracePreflightError
+from ..core.trace_archive import ArchiveSink, ArchiveSource, projected_file_count
 from ..core.trace_frames import DEFAULT_COMPRESS_LEVEL
 from ..core.migrators.user_role import (
     is_workspace_role_union_id,
@@ -57,6 +59,7 @@ from ..utils.chart_mode import (
     workspace_pair_allows_same_instance as _chart_workspace_pair_allows_same_instance,
 )
 from ..utils.config import Config
+from ..utils.retry import RateLimitError
 from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
 from ..utils.workspace import (
     discover_workspaces,
@@ -6247,27 +6250,34 @@ def contexts(
 @click.option("--project", "projects", multiple=True, help="Tracing project (session) name or ID; repeatable")
 @click.option("--all", "select_all", is_flag=True, help="Migrate all tracing projects without prompting")
 @click.option(
-    "--max-age-days",
-    type=float,
-    default=180.0,
-    show_default=True,
-    help="How far back to walk (the range). 180 days is the long-lived retention ceiling.",
-)
-@click.option(
+    "--since",
     "--max-age-stamp",
+    "since",
+    required=True,
     help=(
-        "Absolute lower bound instead of --max-age-days, e.g. 2026-08-27 or "
-        "2026-08-27T18:00:00Z. Prefer this for long runs and for resuming: a "
-        "relative age denotes a different instant every time it is evaluated."
+        "Oldest trace to take, as an absolute stamp: 2026-08-27 or "
+        "2026-08-27T18:00:00Z. Bounds a trace root's start_time. Absolute on "
+        "purpose - a relative age denotes a different instant every time it is "
+        "evaluated, which slides the whole window grid. (Former name: "
+        "--max-age-stamp.)"
     ),
 )
 @click.option(
+    "--until",
+    required=True,
+    help="Youngest trace to take, as an absolute stamp. Same form as --since.",
+)
+@click.option(
     "--window",
-    "window_days",
+    "window_hours",
     type=float,
-    default=1.0,
+    default=24.0,
     show_default=True,
-    help="Size in days of one slice of the range. Widen it for a many-project run.",
+    help=(
+        "Size in hours of one slice of the range. Fractions are fine (1.5). It "
+        "bounds how much a prepare worker holds in memory and, for an archive, "
+        "is the only control over file size - a heavy project wants ~1.7."
+    ),
 )
 @click.option(
     "--max-field-bytes",
@@ -6304,6 +6314,24 @@ def contexts(
         "plus the one being written, so shrink --window if it is too much."
     ),
 )
+@click.option(
+    "--to-archive",
+    type=click.Path(file_okay=False),
+    help=(
+        "Write windows to this directory as one .tar.zst per (project, window) "
+        "instead of ingesting into a destination. Give every run its own directory."
+    ),
+)
+@click.option(
+    "--from-archive",
+    type=click.Path(exists=True, file_okay=False),
+    help="Replay window files from this directory instead of reading the source deployment",
+)
+@click.option(
+    "--allow-incomplete",
+    is_flag=True,
+    help="Replay a truncated (.partial) window file; without this such a file is refused",
+)
 @click.option("--map-projects", is_flag=True, help="Interactively map source projects to destination projects")
 @click.option("--project-mapping", help='Headless project mapping: JSON object or file, {"src-id": "dest-id"}')
 @click.option(
@@ -6320,9 +6348,9 @@ def traces(
     ctx,
     projects,
     select_all,
-    max_age_days,
-    max_age_stamp,
-    window_days,
+    since,
+    until,
+    window_hours,
     max_field_bytes,
     no_verify,
     verify_content_sample,
@@ -6330,6 +6358,9 @@ def traces(
     compress_level,
     no_compress_upload,
     prefetch_windows,
+    to_archive,
+    from_archive,
+    allow_incomplete,
     map_projects,
     project_mapping,
     restore_session_tier,
@@ -6350,24 +6381,36 @@ def traces(
     state_manager = ctx.obj["state_manager"]
 
     display_banner()
+    if to_archive and from_archive:
+        console.print("[red]Error: --to-archive and --from-archive are mutually exclusive[/red]")
+        ctx.exit(1)
+        return
+    if to_archive and (into_session_suffix or emit_upgrade_list):
+        console.print("[red]Error: --to-archive writes no destination, so project-tier options do not apply[/red]")
+        ctx.exit(1)
+        return
+    if to_archive:
+        # An export writes to disk and never touches a destination, so it must
+        # not require destination credentials or a destination workspace. Both
+        # are satisfied with the source's, so the shared validation, connection
+        # test and workspace pairing still work unchanged.
+        if not config.destination.api_key:
+            config.destination.api_key = config.source.api_key
+            config.destination.base_url = config.source.base_url
+        dest_workspace = dest_workspace or source_workspace
     if not ensure_config(config):
         return
 
-    range_start = None
-    if max_age_stamp:
-        # Refuse rather than pick one: the two bounds disagree the moment the
-        # clock moves, and silently preferring either would be a trap.
-        if ctx.get_parameter_source("max_age_days").name != "DEFAULT":
-            console.print("[red]Error: --max-age-days and --max-age-stamp are mutually exclusive[/red]")
-            ctx.exit(1)
-            return
-        try:
-            range_start = _parse_age_stamp(max_age_stamp)
-        except ValueError as exc:
-            console.print(f"[red]Error: {exc}[/red]")
-            ctx.exit(1)
-            return
-        max_age_days = None
+    try:
+        range_start, range_end = _parse_stamp(since, "--since"), _parse_stamp(until, "--until")
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        ctx.exit(1)
+        return
+    if range_start >= range_end:
+        console.print("[red]Error: --since must be earlier than --until[/red]")
+        ctx.exit(1)
+        return
 
     project_id_map = _load_project_mapping_arg(project_mapping)
     if project_id_map is _PROJECT_MAPPING_ERROR:
@@ -6404,7 +6447,11 @@ def traces(
     # re-ingesting preserved IDs into the same tenant duplicates rather than
     # replaces - whatever the session mapping says. Cross-workspace on one
     # deployment is fine.
-    if _is_same_deployment(config) and any(src == dst for src, dst in ws_pairs):
+    # Only applies when the *source deployment* is being read: an export writes
+    # no destination, and a replay reads a directory.
+    if not (to_archive or from_archive) and _is_same_deployment(config) and any(
+        src == dst for src, dst in ws_pairs
+    ):
         console.print(
             "[red]Refusing to migrate traces into the same deployment and workspace they were read from.[/red]\n"
             "[red]Runs keep their original IDs, so the destination would duplicate or overwrite the source.[/red]"
@@ -6418,37 +6465,82 @@ def traces(
     session_reports = []
     fidelity_notes = set()
     failed_projects = []
+    interrupted = False
+    archives_written = archives_skipped = 0
 
     for src_ws, dst_ws in ws_pairs:
+        if interrupted:
+            console.print("[yellow]Stopped; remaining workspace pairs were not started[/yellow]")
+            break
         if src_ws and dst_ws:
             orchestrator.set_workspace_context(src_ws, dst_ws)
             console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
 
+        archive_sink = (
+            ArchiveSink(
+                to_archive,
+                compress_level=compress_level,
+                dry_run=config.migration.dry_run,
+                workspace=_source_workspace_ref(orchestrator, src_ws),
+            )
+            if to_archive
+            else None
+        )
+        archive_source = (
+            ArchiveSource(
+                from_archive,
+                allow_incomplete=allow_incomplete,
+                range_start=range_start,
+                range_end=None,
+            )
+            if from_archive
+            else None
+        )
         migrator = TraceMigrator(
             orchestrator.source_client,
             orchestrator.dest_client,
             orchestrator.state,
             config,
-            max_age_days=max_age_days,
             range_start=range_start,
-            window_days=window_days,
+            range_end=range_end,
+            window_hours=window_hours,
             max_field_bytes=max_field_bytes,
-            verify=not no_verify,
-            verify_content_sample=verify_content_sample,
+            # An export has no destination to confirm against or compare with;
+            # verification belongs to replay, where one can answer.
+            verify=not (no_verify or to_archive),
+            verify_content_sample=0 if to_archive else verify_content_sample,
             skip_attachments=skip_attachments,
             restore_session_tier=restore_session_tier,
             into_session_suffix=into_session_suffix,
             emit_upgrade_list=emit_upgrade_list,
             compress_level=None if no_compress_upload else compress_level,
             prefetch_windows=prefetch_windows,
+            run_sink=archive_sink,
+            run_source=archive_source,
             project_id_map=project_id_map
             or _workspace_scoped_project_id_map(orchestrator, ws_result, src_ws)
             or (build_project_id_mapping_tui(orchestrator.source_client, orchestrator.dest_client) if map_projects else None),
         )
-        _print_trace_preflight(migrator, config, window_days, max_field_bytes, no_verify, into_session_suffix)
+        if archive_source is not None:
+            # Deferred: a replayed window is re-batched and compiled against the
+            # live destination, which is the migrator this source was handed to.
+            archive_source.bind(migrator)
+            # --since / --until select *which* archived windows are replayed.
+            # That is the lever for a destination that only accepts a recent
+            # ingest window.
+            archive_source.range_start = migrator.resolved_range_start()
+            archive_source.range_end = migrator.walk_end()
+        _print_trace_preflight(
+            migrator, config, window_hours, max_field_bytes, no_verify, into_session_suffix,
+            to_archive=to_archive, from_archive=from_archive,
+            projects=len(projects) or None,
+        )
 
         try:
-            migrator.canary()
+            # An export writes no runs anywhere, so there is no ingest window to
+            # prove and no scratch project to create.
+            if not to_archive:
+                migrator.canary()
         except Exception as exc:
             # Any pre-flight failure, not just a refused timestamp: a 403 on the
             # scratch project used to escape as a raw traceback with no recorded
@@ -6487,36 +6579,36 @@ def traces(
             console.print("[yellow]No tracing projects selected[/yellow]")
             continue
 
-        for source_session in selected:
-            label = _trace_session_label(source_session)
-            console.print(f"\n[bold]{label}[/bold] ({source_session['id']})")
-            try:
-                report = migrator.migrate_session(source_session)
-            except Exception as exc:
-                # Not just printed: a project that failed must leave a blocked
-                # outcome behind and fail the exit code, or a run that migrated
-                # nothing looks indistinguishable from a clean one.
-                blocked = isinstance(exc, TracePreflightError)
-                console.print(f"  [red]{'blocked' if blocked else 'failed'}: {exc}[/red]")
-                failed_projects.append((label, str(exc)))
-                _record_trace_session_failure(
-                    orchestrator, config, migrator, source_session,
-                    "trace_session_blocked" if blocked else "trace_session_failed", exc,
+        if archive_sink is not None:
+            # Resolved once for the whole run, and recorded in every manifest, so
+            # "meant to cover 180 days, stopped at day 47" is distinguishable
+            # from "meant to cover 47 days". A resumed run legitimately writes a
+            # later range_end, and the latest one is the authoritative target.
+            archive_sink.intent = {
+                "range_start": migrator.resolved_range_start().isoformat(),
+                "range_end": migrator.walk_end().isoformat(),
+                "window_hours": window_hours,
+                "projects": sorted(_trace_session_label(s) for s in selected),
+            }
+
+        try:
+            with migrator.graceful_stop():
+                _run_trace_projects(
+                    ctx, orchestrator, config, migrator, selected,
+                    session_reports, failed_projects,
+                    verified=not (no_verify or to_archive) and not config.migration.dry_run,
                 )
-                continue
-            if report is None:
-                console.print("  [yellow]skipped: supply an explicit --project-mapping for this project[/yellow]")
-                failed_projects.append((label, "unresolved destination project"))
-                continue
-            for reason in migrator.blocked_reasons:
-                console.print(f"  [red]blocked:[/red] {reason}")
-            del migrator.blocked_reasons[:]
-            session_reports.append((source_session.get("name"), report))
-            _record_trace_session_outcome(orchestrator, config, migrator, source_session, report)
-            _print_trace_reconciliation(
-                report, migrator.batch_limits()[0],
-                verified=not no_verify and not config.migration.dry_run,
-            )
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Abandoned.[/yellow]")
+            interrupted = True
+        finally:
+            interrupted = interrupted or migrator.stop_requested
+            if archive_sink is not None:
+                for removed in archive_sink.discard_staged():
+                    console.print(f"[yellow]Discarded incomplete window {removed.name}[/yellow]")
+                archives_written += len(archive_sink.written)
+                archives_skipped += migrator.skipped_windows
+
         upgrade_rows.extend(migrator.upgrade_rows)
         fidelity_notes |= migrator.fidelity_reduced
 
@@ -6527,11 +6619,128 @@ def traces(
         _write_upgrade_list(emit_upgrade_list, upgrade_rows)
 
     _print_trace_summary(session_reports, fidelity_notes, no_verify, failed_projects)
+    if to_archive:
+        console.print(
+            f"Archive: {archives_written} window file(s) written, "
+            f"{archives_skipped} already captured and skipped, under {to_archive}"
+        )
+    if to_archive and (interrupted or failed_projects):
+        _print_archive_resume(
+            to_archive, projects,
+            window_hours=window_hours, since=since, until=until,
+            compress_level=compress_level,
+            prefetch_windows=prefetch_windows,
+            source_workspace=source_workspace, captured=archives_written,
+        )
     _display_resolution_summary(orchestrator)
     _exit_for_remediation_if_needed(ctx, config, orchestrator)
     orchestrator.cleanup()
+    if interrupted:
+        ctx.exit(130)
     if failed_projects:
         ctx.exit(1)
+
+
+def _source_workspace_ref(orchestrator, workspace_id):
+    """``{"id", "name"}`` for the source workspace an archive is filed under.
+
+    The name is what the operator reads, so a failure to resolve it must not
+    stop an export: it degrades to the ID, and then to nothing at all on a
+    deployment with no workspace endpoint.
+    """
+    try:
+        workspaces = _list_workspaces(orchestrator.source_client)
+    except Exception:
+        workspaces = []
+    if workspace_id:
+        match = next((w for w in workspaces if str(w.get("id")) == str(workspace_id)), None)
+        return {"id": str(workspace_id), "name": get_workspace_name(match) if match else None}
+    # No explicit --source-workspace: unambiguous only when there is one.
+    if len(workspaces) == 1:
+        return {"id": str(workspaces[0].get("id")), "name": get_workspace_name(workspaces[0])}
+    return None
+
+
+def _run_trace_projects(
+    ctx, orchestrator, config, migrator, selected, session_reports, failed_projects, *, verified: bool
+) -> None:
+    """Migrate each selected project, recording every outcome.
+
+    Extracted from ``traces`` so the graceful-stop context and the archive's
+    ``.partial`` cleanup can wrap the whole loop without reindenting it.
+    """
+    for source_session in selected:
+        label = _trace_session_label(source_session)
+        console.print(f"\n[bold]{label}[/bold] ({source_session['id']})")
+        try:
+            report = migrator.migrate_session(source_session)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            # Not just printed: a project that failed must leave a blocked
+            # outcome behind and fail the exit code, or a run that migrated
+            # nothing looks indistinguishable from a clean one.
+            blocked = isinstance(exc, TracePreflightError)
+            console.print(f"  [red]{'blocked' if blocked else 'failed'}: {exc}[/red]")
+            if isinstance(exc, RateLimitError):
+                console.print(
+                    "  [yellow]the source kept rate-limiting us; lower --prefetch-windows "
+                    "and re-run - captured windows are skipped[/yellow]"
+                )
+            failed_projects.append((label, str(exc)))
+            _record_trace_session_failure(
+                orchestrator, config, migrator, source_session,
+                "trace_session_blocked" if blocked else "trace_session_failed", exc,
+            )
+            continue
+        if report is None:
+            console.print("  [yellow]skipped: supply an explicit --project-mapping for this project[/yellow]")
+            failed_projects.append((label, "unresolved destination project"))
+            continue
+        for reason in migrator.blocked_reasons:
+            console.print(f"  [red]blocked:[/red] {reason}")
+        del migrator.blocked_reasons[:]
+        session_reports.append((source_session.get("name"), report))
+        _record_trace_session_outcome(orchestrator, config, migrator, source_session, report)
+        _print_trace_reconciliation(report, migrator.batch_limits()[0], verified=verified)
+
+
+# Only parameters that differ from these end up in a printed resume command, so
+# the line stays short enough to copy.
+_TRACE_DEFAULTS = {
+    "--window": 24.0, "--compress-level": DEFAULT_COMPRESS_LEVEL, "--prefetch-windows": 4,
+}
+
+
+def _print_archive_resume(archive, projects, *, captured: int, **params) -> None:
+    """Say exactly how to continue an interrupted export.
+
+    Rebuilt from an allow-list of parameters, never echoed from ``sys.argv``:
+    ``--api-key`` exists as a flag on this CLI, so the raw invocation can carry
+    a live credential into a terminal, a CI log, or a scrollback that outlives
+    the session. Credentials come from the environment on the resumed run, as
+    they did on the first.
+
+    The command is the *same* command - a window whose file is already on disk
+    is skipped - so there is no stamp to substitute and nothing to clean up.
+    """
+    parts = ["langsmith-migrator traces", f"--to-archive {shlex.quote(str(archive))}"]
+    parts += [f"--project {shlex.quote(str(name))}" for name in projects]
+    for flag, key in (
+        ("--window", "window_hours"), ("--since", "since"), ("--until", "until"),
+        ("--compress-level", "compress_level"), ("--prefetch-windows", "prefetch_windows"),
+        ("--source-workspace", "source_workspace"),
+    ):
+        value = params.get(key)
+        if value in (None, "", _TRACE_DEFAULTS.get(flag)):
+            continue
+        parts.append(f"{flag} {shlex.quote(str(value))}")
+    if captured:
+        console.print(f"\n[yellow]Interrupted after {captured} window file(s).[/yellow]")
+    else:
+        console.print("\n[yellow]Interrupted: 0 windows captured.[/yellow]")
+    console.print("To continue, re-run the same command - captured windows are skipped:")
+    console.print("  [bold]" + " \\\n    ".join(parts) + "[/bold]")
 
 
 def _select_trace_sessions(config: Config, migrator, projects, select_all: bool) -> list:
@@ -6541,6 +6750,24 @@ def _select_trace_sessions(config: Config, migrator, projects, select_all: bool)
     project on a busy deployment takes minutes, and naming one is the common
     case for a trace migration.
     """
+    if migrator.run_source is not migrator:
+        # An archive's project list is a directory listing, so name/ID selection
+        # is a filter over it rather than a lookup against a deployment.
+        available = migrator.run_source.sessions()
+        if not projects:
+            return _select_or_all(
+                config, available, select_all=select_all,
+                title="Select Archived Projects to Replay",
+                columns=[
+                    {"key": "name", "title": "Project", "width": 44},
+                    {"key": "id", "title": "ID", "width": 38},
+                ],
+            )
+        wanted = {str(v) for v in projects}
+        chosen = [s for s in available if str(s["id"]) in wanted or str(s.get("name")) in wanted]
+        for missing in wanted - {str(s["id"]) for s in chosen} - {str(s.get("name")) for s in chosen}:
+            console.print(f"[yellow]No archived project matched '{missing}'[/yellow]")
+        return chosen
     if projects:
         chosen = []
         for value in projects:
@@ -6568,9 +6795,9 @@ def _select_trace_sessions(config: Config, migrator, projects, select_all: bool)
     )
 
 
-def _human_duration(days: float) -> str:
-    """``0.01`` -> ``14m24s``. str(timedelta) would say ``0:14:24``."""
-    total = int(round(days * 86400))
+def _human_duration(hours: float) -> str:
+    """``0.24`` -> ``14m24s``. str(timedelta) would say ``0:14:24``."""
+    total = int(round(hours * 3600))
     if total <= 0:
         return "0s"
     d, rem = divmod(total, 86400)
@@ -6579,7 +6806,10 @@ def _human_duration(days: float) -> str:
     return "".join(f"{v}{u}" for v, u in ((d, "d"), (h, "h"), (m, "m"), (sec, "s")) if v)
 
 
-def _print_trace_preflight(migrator, config, window_days, max_field_bytes, no_verify, into_session_suffix):
+def _print_trace_preflight(
+    migrator, config, window_hours, max_field_bytes, no_verify, into_session_suffix,
+    *, to_archive=None, from_archive=None, projects=None,
+):
     """Report the destination's configuration before writing anything."""
     max_runs, max_bytes = migrator.batch_limits()
     table = Table(title="Destination pre-flight", show_header=True)
@@ -6591,9 +6821,9 @@ def _print_trace_preflight(migrator, config, window_days, max_field_bytes, no_ve
     table.add_row("Max field bytes", f"{max_field_bytes:,}", "--max-field-bytes (not advertised by the destination)")
     table.add_row(
         "Range / window",
-        f"{migrator.resolved_range_start().isoformat()} -> now\n"
-        f"window {window_days:g}d = {_human_duration(window_days)}",
-        ("--max-age-stamp" if migrator.range_start else "--max-age-days") + " / --window",
+        f"{migrator.resolved_range_start().isoformat()} ->\n{migrator.walk_end().isoformat()}\n"
+        f"window {window_hours:g}h = {_human_duration(window_hours)}",
+        "--since / --until / --window",
     )
     table.add_row("Trace tier", "longlived" if not migrator.emit_upgrade_list else "left as-is (--emit-upgrade-list)", "destination session")
     table.add_row(
@@ -6612,7 +6842,26 @@ def _print_trace_preflight(migrator, config, window_days, max_field_bytes, no_ve
         ),
         "--prefetch-windows (ingest stays serial and in order)",
     )
+    if to_archive:
+        table.add_row("Archive", str(to_archive), "--to-archive (no destination is written)")
+        table.add_row("Archive compression", f"zstd level {migrator.run_sink.compress_level}", "--compress-level")
+    if from_archive:
+        table.add_row("Replaying from", str(from_archive), "--from-archive (the source deployment is not read)")
     console.print(table)
+    if to_archive:
+        range_hours = (migrator.walk_end() - migrator.resolved_range_start()).total_seconds() / 3600
+        files = projected_file_count(range_hours, window_hours, projects or 1)
+        console.print(f"[dim]Projected window files: ~{files:,} ({_human_duration(window_hours)} each)[/dim]")
+        if files > 100_000:
+            suggested = range_hours * (projects or 1) / 100_000
+            console.print(
+                f"[yellow]That is a lot of files for one filesystem. --window {suggested:.3g} "
+                f"would keep it under 100,000. Continuing anyway.[/yellow]"
+            )
+        console.print(
+            "[yellow]An archive is plaintext trace data - inputs, outputs and attachments - with "
+            "no encryption at rest. Files are 0o600 and directories 0o700; nothing more.[/yellow]"
+        )
     if config.migration.dry_run:
         console.print("[yellow]Dry run: no session creation, no canary, no ingest[/yellow]")
     if no_verify:
@@ -6680,18 +6929,23 @@ def _print_trace_reconciliation(report, batch_runs: int, verified: bool = True) 
     _print_trace_watermark(report, batch_runs, verified)
 
 
-def _parse_age_stamp(value: str):
-    """Parse --max-age-stamp as an ISO date or datetime, naive read as UTC."""
+def _parse_stamp(value: str, flag: str):
+    """Parse a range bound as an ISO date or datetime; naive is read as UTC.
+
+    Only the lower bound is required to be in the past: an upper bound beyond
+    now simply selects everything written so far, and refusing it would make
+    "up to the present" unexpressible.
+    """
     import datetime as _dt
 
     try:
         stamp = _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except ValueError:
-        raise ValueError(f"--max-age-stamp is not an ISO date/datetime: {value!r}") from None
+        raise ValueError(f"{flag} is not an ISO date/datetime: {value!r}") from None
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=_dt.timezone.utc)
-    if stamp >= _dt.datetime.now(_dt.timezone.utc):
-        raise ValueError(f"--max-age-stamp must be in the past, got {stamp.isoformat()}")
+    if flag == "--since" and stamp >= _dt.datetime.now(_dt.timezone.utc):
+        raise ValueError(f"{flag} must be in the past, got {stamp.isoformat()}")
     return stamp
 
 
@@ -6728,9 +6982,7 @@ def _print_trace_watermark(report, batch_runs: int, verified: bool = True) -> No
         f"({report.verified_runs} run(s))"
     )
     overlap = "the whole span" if fraction == 1.0 else f"~{batch_runs} run(s), one ingest batch"
-    # An absolute stamp, not a relative age: a float age would denote a
-    # different instant by the time a long run finishes.
-    console.print(f"  [dim]to continue from here: --max-age-stamp {resume.isoformat()} (redoing {overlap})[/dim]")
+    console.print(f"  [dim]to continue from here: --since {resume.isoformat()} (redoing {overlap})[/dim]")
 
 
 def _print_trace_summary(session_reports, fidelity_notes, no_verify, failed_projects=()) -> None:

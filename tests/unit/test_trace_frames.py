@@ -98,6 +98,30 @@ def test_a_higher_level_compresses_harder(client):
     assert low.sizes[0] == high.sizes[0]  # same body, different framing
 
 
+def test_the_callers_payloads_survive_compilation(client):
+    """serialize_run_dict pops inputs/outputs/extra/... out of the dict it is
+    given. If that reached the caller's copy, a retry would re-send skeletons
+    and any size measured afterwards would be of the skeleton."""
+    import copy
+
+    pay = _payload(attachments={"blob": ("application/octet-stream", b"\x00" * 512)})
+    pay["extra"] = {"m": 1}
+    pay["events"] = [{"e": 1}]
+    pay["serialized"] = {"s": 1}
+    before = copy.deepcopy(pay)
+    compile_frame(client, [pay], DEFAULT_COMPRESS_LEVEL)
+    assert pay == before, f"stripped: {[k for k in before if k not in pay]}"
+
+
+def test_recompiling_the_same_payload_gives_the_same_frame(client):
+    """The binary split recompiles its halves; it must not get a lesser body."""
+    pay = _payload(blob=400)
+    first = compile_frame(client, [pay], DEFAULT_COMPRESS_LEVEL)
+    second = compile_frame(client, [pay], DEFAULT_COMPRESS_LEVEL)
+    assert first.sizes == second.sizes
+    assert _body(first) == _body(second)
+
+
 def test_a_run_without_dotted_order_is_refused(client):
     bad = _payload()
     del bad["dotted_order"]
