@@ -1,10 +1,4 @@
-"""Pure core for long-lived trace migration.
-
-No HTTP client, no implicit clock: every function here takes what it needs and
-returns a value, so the requirements it encodes (windowing, the read/write
-contract split, digests, reconciliation arithmetic) are unit-testable without
-mocking a backend. The imperative shell lives in ``core/migrators/trace.py``.
-"""
+"""Pure core for long-lived trace migration."""
 
 from __future__ import annotations
 
@@ -14,40 +8,37 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-LONGLIVED = "longlived"
-
-# Root and child runs of one trace can be stamped microseconds apart in either
-# direction (the backend buffers for the same skew). The run-level lower bound
-# is relaxed by this much so a child stamped just before its own root is still
-# returned. It never widens which *traces* are selected - that is decided by
-# the trace-level predicate on the root.
-SKEW_BUFFER = timedelta(seconds=60)
-
-# Read-only fields the query API returns that we need to materialise a payload
-# but must never forward: blob references, the tier, and the source-only
-# example pointer.
-READ_ONLY_SELECT = (
-    "inputs_s3_urls", "outputs_s3_urls", "s3_urls", "trace_tier", "reference_example_id",
+LOST_CONTENT_CODES = frozenset(
+    {
+        "attachment_fetch_failed",
+        "attachment_host_rejected",
+        "payload_fetch_failed",
+        "payload_host_rejected",
+        "payload_field_unavailable",
+    }
 )
 
-# Fields of the write contract that the query API cannot project. Attachments
-# come back as ``s3_urls["attachment.<name>"]`` entries instead.
+LONGLIVED = "longlived"
+
+SKEW_BUFFER = timedelta(seconds=60)
+
+READ_ONLY_SELECT = (
+    "inputs_s3_urls",
+    "outputs_s3_urls",
+    "s3_urls",
+    "trace_tier",
+    "reference_example_id",
+)
+
 WRITE_ONLY_FIELDS = frozenset({"attachments"})
 
-# Offloadable payload fields carried in the generic ``s3_urls`` map.
 S3_URL_PAYLOAD_FIELDS = ("extra", "events", "error", "serialized", "inputs", "outputs")
 ATTACHMENT_PREFIX = "attachment."
 
 
 @dataclass(frozen=True)
 class RunIngestPayload:
-    """The ingest write contract (``smith-go/runs/runs.go`` ``type Run struct``).
-
-    Constructing one *is* the allow-list: ``manifest_id``, ``*_s3_urls``,
-    ``reference_example_id`` and the token/cost rollups are structurally
-    unsendable because there is no field to put them in. An SDK or backend bump
-    means re-checking this list against that Go struct.
-    """
+    """The ingest write contract (``smith-go/runs/runs.go`` ``type Run struct``)."""
 
     id: str
     trace_id: str
@@ -70,11 +61,11 @@ class RunIngestPayload:
 
     def as_dict(self) -> Dict[str, Any]:
         """Drop unset optionals so the destination keeps its own defaults."""
-        return {f.name: getattr(self, f.name) for f in fields(self) if getattr(self, f.name) is not None}
+        return {
+            f.name: getattr(self, f.name) for f in fields(self) if getattr(self, f.name) is not None
+        }
 
 
-# Derived, not hand-maintained: adding a field to the write contract selects it
-# with no second edit. Order is stable for test comparison.
 RUN_QUERY_SELECT: Tuple[str, ...] = tuple(
     [f.name for f in fields(RunIngestPayload) if f.name not in WRITE_ONLY_FIELDS]
     + list(READ_ONLY_SELECT)
@@ -97,15 +88,7 @@ class Window:
     end: datetime
 
     def label(self) -> str:
-        """Human-readable bounds in UTC, e.g. ``2026-09-01T10:00..11:42Z``.
-
-        Carries the time, not just the date: ``--window`` is in hours, so
-        sub-day windows are the norm and a date-only label made every window of
-        one day print identically. The end's date is omitted when it matches the
-        start's - the common case, and it keeps the label inside a column.
-        Seconds appear only when a bound actually has them, so a window narrower
-        than a minute still labels distinctly without widening every other line.
-        """
+        """Human-readable bounds in UTC, e.g. ``2026-09-01T10:00..11:42Z``."""
         start, end = _as_utc(self.start), _as_utc(self.end)
         fmt = "%Y-%m-%dT%H:%M:%S" if (start.second or end.second) else "%Y-%m-%dT%H:%M"
         tail = end.strftime(fmt.split("T")[1] if start.date() == end.date() else fmt)
@@ -113,17 +96,7 @@ class Window:
 
 
 def iter_windows(start: datetime, end: datetime, window_hours: float) -> Iterator[Window]:
-    """Yield half-open windows covering ``[start, end)``, oldest first.
-
-    Hours rather than days because the useful range is sub-day: a heavy project
-    needs roughly 1.7 h to keep one prepare slice in memory, which as a fraction
-    of a day (0.07) is a number nobody can read.
-
-    Bounds are absolute on purpose. Deriving them from ``now`` inside here
-    meant the same relative age denoted a different instant every time it was
-    evaluated, so a watermark expressed in days silently drifted while a long
-    migration was still running.
-    """
+    """Yield half-open windows covering ``[start, end)``, oldest first."""
     if window_hours <= 0:
         raise ValueError("window_hours must be positive")
     if start >= end:
@@ -136,28 +109,12 @@ def iter_windows(start: datetime, end: datetime, window_hours: float) -> Iterato
 
 
 def as_utc(stamp: datetime) -> datetime:
-    """Normalise a bound to aware UTC, reading a naive value as UTC.
-
-    Both ends of the walk are absolute stamps, so there is no clock reading in
-    window derivation at all: the same command covers the same span whenever it
-    runs. Relative ages (``--max-age-days`` / ``--min-age-days``) were removed
-    for exactly that reason - each evaluation of "now - N days" denoted a
-    different instant, which slid the whole window grid and gave an archive's
-    files a new name on every run.
-    """
+    """Normalise a bound to aware UTC, reading a naive value as UTC."""
     return stamp.astimezone(timezone.utc) if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
 def resolve_window_bounds(window: Window) -> Tuple[str, str]:
-    """Return ``(trace_filter, run_level_start_time)`` for one window.
-
-    The window is expressed **only** as a predicate on the trace root, so a
-    trace is selected whole and belongs to exactly one window. There is
-    deliberately no run-level upper bound: children start after their root, so
-    one would truncate late children out of in-window traces. The run-level
-    lower bound is always sent explicitly (the endpoint otherwise defaults to
-    ~1 day ago) and carries the skew buffer.
-    """
+    """Return ``(trace_filter, run_level_start_time)`` for one window."""
     trace_filter = (
         f'and(gte(start_time,"{_iso(window.start)}"),lt(start_time,"{_iso(window.end)}"))'
     )
@@ -165,12 +122,7 @@ def resolve_window_bounds(window: Window) -> Tuple[str, str]:
 
 
 def is_long_lived(run: Dict[str, Any]) -> bool:
-    """Tier predicate applied client-side.
-
-    ``trace_tier`` is not accepted inside ``trace_filter`` on the V1 endpoint
-    ("Attribute trace_tier not accepted"), but it *is* returned on every run,
-    so the filter moves here.
-    """
+    """Tier predicate applied client-side."""
     return run.get("trace_tier") == LONGLIVED
 
 
@@ -179,13 +131,7 @@ def to_ingest_payload(
     dest_session_id: str,
     materialised: Optional[Dict[str, Any]] = None,
 ) -> Tuple[RunIngestPayload, Tuple[str, ...]]:
-    """Adapt one queried run to the write contract.
-
-    ``materialised`` supplies re-inlined values for fields the source offloaded
-    to blob storage (and the fetched ``attachments``); it overrides the run's
-    own value for those keys. Returns the payload plus the names of source
-    fields that could not be carried, for ``degraded`` reporting.
-    """
+    """Adapt one queried run to the write contract."""
     merged = dict(source_run)
     merged.update(materialised or {})
 
@@ -220,13 +166,10 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def payload_digest(run: Dict[str, Any], attachments: Optional[Dict[str, int]] = None) -> Dict[str, str]:
-    """Per-field digests over a materialised run, for the fidelity comparison.
-
-    Field *names* and digests are safe to report; values are not. ``serialized``
-    is only compared for llm/prompt runs, because the SDK drops it for every
-    other run type on the way in.
-    """
+def payload_digest(
+    run: Dict[str, Any], attachments: Optional[Dict[str, int]] = None
+) -> Dict[str, str]:
+    """Per-field digests over a materialised run, for the fidelity comparison."""
     parts = {
         "inputs": run.get("inputs"),
         "outputs": run.get("outputs"),
@@ -251,15 +194,7 @@ def digest_mismatches(left: Dict[str, str], right: Dict[str, str]) -> Tuple[str,
 def verified_bounds(
     runs: Iterable[Dict[str, Any]], complete_ids: Set[str]
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Earliest and latest ``start_time`` among runs confirmed complete.
-
-    Timestamps are parsed rather than string-compared: the API is consistent
-    today, but a mix of offset-bearing and naive ISO strings would order
-    wrongly, and this value is meant to be trusted as a watermark. Naive
-    values are read as UTC, which is what the endpoint returns - without that,
-    a mixed set raises rather than ordering, and comparing them is the whole
-    point of this function.
-    """
+    """Earliest and latest ``start_time`` among runs confirmed complete."""
     stamps = []
     for run in runs:
         if str(run.get("id")) not in complete_ids or not run.get("start_time"):
@@ -275,25 +210,19 @@ def verified_bounds(
 
 
 def group_into_traces(runs: Iterable[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-    """Group runs by ``trace_id``, parents before children within each trace.
-
-    Sorting on ``dotted_order`` puts a parent before its children because a
-    child's dotted order is its parent's plus a suffix.
-    """
+    """Group runs by ``trace_id``, parents before children within each trace."""
     traces: Dict[str, List[Dict[str, Any]]] = {}
     for run in runs:
         traces.setdefault(str(run.get("trace_id")), []).append(run)
     for group in traces.values():
         group.sort(key=lambda r: r.get("dotted_order") or "")
-    return [traces[key] for key in sorted(traces, key=lambda t: traces[t][0].get("dotted_order") or "")]
+    return [
+        traces[key] for key in sorted(traces, key=lambda t: traces[t][0].get("dotted_order") or "")
+    ]
 
 
 def payload_bytes(run: Dict[str, Any]) -> int:
-    """Serialized size of one run, attachments counted as their raw bytes.
-
-    The batching limits and the archive's byte accounting are both expressed in
-    these units, so they have to agree on what a run costs.
-    """
+    """Serialized size of one run, attachments counted as their raw bytes."""
     return len(json.dumps({k: v for k, v in run.items() if k != "attachments"}, default=str)) + sum(
         len(data) for _, data in (run.get("attachments") or {}).values()
     )
@@ -306,10 +235,7 @@ def batch_traces(
     max_bytes: int,
     size_of,
 ) -> Iterator[List[Dict[str, Any]]]:
-    """Flush at trace boundaries, so a trace never splits across requests.
-
-    A single trace larger than a limit still ships alone rather than being cut.
-    """
+    """Flush at trace boundaries, so a trace never splits across requests."""
     batch: List[Dict[str, Any]] = []
     batch_bytes = 0
     for trace in traces:
@@ -333,13 +259,7 @@ class SlicePlan:
 
 
 def plan_slice(source_ids: Set[str], dest_ids: Set[str]) -> SlicePlan:
-    """The diff is the work-list, the skip-list and the completeness proof.
-
-    There is deliberately no "re-send anyway" mode: a run is immutable once
-    fully ingested (its ``end_time`` is persisted), so re-sending one already
-    on the destination cannot repair it. Repair means writing into a *different*
-    destination session, because run identity includes ``session_id``.
-    """
+    """The diff is the work-list, the skip-list and the completeness proof."""
     return SlicePlan(
         to_ingest=source_ids - dest_ids,
         already_present=source_ids & dest_ids,
@@ -349,10 +269,7 @@ def plan_slice(source_ids: Set[str], dest_ids: Set[str]) -> SlicePlan:
 
 @dataclass(frozen=True)
 class Reconciliation:
-    """Counts for one window, or a session's total. The parts must account for
-    the source total, so the "counts add up" rule holds on every real run
-    rather than only in a test.
-    """
+    """Counts for one window, or a session's total. The parts must account for"""
 
     session_id: str
     dest_session_id: str
@@ -363,13 +280,8 @@ class Reconciliation:
     degraded: int
     blocked: int
     extra_on_dest: int = 0
-    # Bounds of the runs confirmed complete on the destination. A slice that
-    # degraded or blocked anything contributes nothing, so the pair always
-    # describes runs that are wholly there.
     earliest: Optional[str] = None
     latest: Optional[str] = None
-    # How many runs the span above covers, so a resume overlap can be sized in
-    # runs (one ingest batch) rather than guessed in time.
     verified_runs: int = 0
 
     def __post_init__(self) -> None:
@@ -382,7 +294,9 @@ class Reconciliation:
             )
 
     @classmethod
-    def of(cls, session_id: str, dest_session_id: str, slices: Sequence["Reconciliation"]) -> "Reconciliation":
+    def of(
+        cls, session_id: str, dest_session_id: str, slices: Sequence["Reconciliation"]
+    ) -> "Reconciliation":
         def s(attr: str) -> int:
             return sum(getattr(x, attr) for x in slices)
 

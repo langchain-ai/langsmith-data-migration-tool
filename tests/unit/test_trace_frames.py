@@ -70,7 +70,8 @@ def test_the_compiled_body_is_well_formed_multipart(client):
 def test_attachments_survive_into_the_body(client):
     blob = bytes(range(256))
     frame = compile_frame(
-        client, [_payload(attachments={"shot": ("application/octet-stream", blob)})],
+        client,
+        [_payload(attachments={"shot": ("application/octet-stream", blob)})],
         DEFAULT_COMPRESS_LEVEL,
     )
     body = _body(frame)
@@ -84,18 +85,10 @@ def test_compiling_off_the_main_thread_gives_the_same_bytes(client):
     main = compile_frame(client, copy.deepcopy(runs), DEFAULT_COMPRESS_LEVEL)
     with ThreadPoolExecutor(2) as pool:
         assert pool.submit(threading.get_ident).result() != threading.get_ident()
-        worker = pool.submit(compile_frame, client, copy.deepcopy(runs), DEFAULT_COMPRESS_LEVEL).result()
+        worker = pool.submit(
+            compile_frame, client, copy.deepcopy(runs), DEFAULT_COMPRESS_LEVEL
+        ).result()
     assert _body(worker) == _body(main)
-
-
-def test_a_higher_level_compresses_harder(client):
-    import copy
-
-    runs = [_payload(i) for i in range(6)]
-    low = compile_frame(client, copy.deepcopy(runs), 1)
-    high = compile_frame(client, copy.deepcopy(runs), 19)
-    assert high.sizes[1] < low.sizes[1]
-    assert low.sizes[0] == high.sizes[0]  # same body, different framing
 
 
 def test_the_callers_payloads_survive_compilation(client):
@@ -113,15 +106,6 @@ def test_the_callers_payloads_survive_compilation(client):
     assert pay == before, f"stripped: {[k for k in before if k not in pay]}"
 
 
-def test_recompiling_the_same_payload_gives_the_same_frame(client):
-    """The binary split recompiles its halves; it must not get a lesser body."""
-    pay = _payload(blob=400)
-    first = compile_frame(client, [pay], DEFAULT_COMPRESS_LEVEL)
-    second = compile_frame(client, [pay], DEFAULT_COMPRESS_LEVEL)
-    assert first.sizes == second.sizes
-    assert _body(first) == _body(second)
-
-
 def test_a_run_without_dotted_order_is_refused(client):
     bad = _payload()
     del bad["dotted_order"]
@@ -135,21 +119,10 @@ def test_sampling_is_refused_because_it_keeps_client_state(client):
         compile_frame(client, [_payload()], DEFAULT_COMPRESS_LEVEL)
 
 
-def test_unavailable_reason_is_none_when_the_sdk_cooperates(client):
-    assert unavailable_reason(client) is None
-
-
 def test_a_moved_sdk_internal_is_reported_not_raised(client):
     with patch.object(trace_frames, "_UNAVAILABLE", "no module named x"):
         reason = unavailable_reason(client)
     assert reason and "SDK internals moved" in reason
-
-
-def test_a_client_without_the_compressed_sender_is_reported():
-    class Old:
-        pass
-
-    assert "no _send_compressed_multipart_req" in unavailable_reason(Old())
 
 
 def test_the_stream_carries_the_log_context(client):

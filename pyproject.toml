@@ -55,6 +55,12 @@ test = [
     "respx==0.23.1",
     "ruff==0.16.1",
 ]
+# S3-backed trace archives (--to-archive/--from-archive s3://...). Optional so
+# that anyone who never addresses a bucket carries no AWS dependency; pinned to
+# a botocore range compatible with langchain-aws, so [s3] and [models] coexist.
+s3 = [
+    "boto3==1.43.87",
+]
 # Additional model providers for pulling prompts with include_model=True
 models = [
     "langchain-google-genai==4.3.2",

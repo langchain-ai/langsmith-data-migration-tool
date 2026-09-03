@@ -1,15 +1,4 @@
-"""Compile a multipart ingest body, optionally zstd-compressed.
-
-The SDK's ``multipart_ingest`` builds and sends in one call, so its CPU lands
-wherever the send happens. Splitting the two lets the body be built off the
-serial ingest path (see ``TraceMigrator.prepare_slice``) and lets us choose a
-compression level: the SDK hardcodes zstd level 1, which measures at 5.9x on
-real trace payloads against 68.5x at level 3 with long-distance matching.
-
-Everything here is reachable only through SDK private API. The imports are
-guarded and reported as one reason string so an SDK bump degrades to the
-uncompressed public path instead of crashing.
-"""
+"""Compile a multipart ingest body, optionally zstd-compressed."""
 
 from __future__ import annotations
 
@@ -17,9 +6,6 @@ import io
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# Level 3 + long-distance matching, measured per assembled frame on real dev
-# payloads: 30.6x -> 68.5x at the same 1755 MB/s. window_log 24 (16 MB) covers
-# the ~20 MB batch cap; 32 MB and 128 MB windows add 1% for 8x the memory.
 DEFAULT_COMPRESS_LEVEL = 3
 _WINDOW_LOG = 24
 
@@ -62,33 +48,12 @@ def _params(level: int):
     )
 
 
-def compile_frame(
-    client: Any, payloads: Sequence[Dict[str, Any]], level: int
-) -> CompiledFrame:
-    """Build one compressed ingest body. Safe to call from a worker thread.
-
-    Mirrors ``Client.multipart_ingest`` minus the parts that cannot apply here:
-    the 404 fallback to ``/runs/batch`` (this migrator requires multipart), the
-    filesystem-attachment check (attachments are already in-memory bytes), and
-    the create/update merge (this path only creates).
-
-    The caller's payloads are left intact. Both SDK steps mutate what they are
-    given - ``_run_transform`` rewrites ``id`` to a ``UUID``, and
-    ``serialize_run_dict`` **pops** ``inputs``, ``outputs``, ``events``,
-    ``extra``, ``error``, ``serialized`` and ``attachments`` out of the dict -
-    so each payload is shallow-copied first. Without that, a caller holding the
-    payloads for a retry would re-send stripped skeletons, and any size measured
-    afterwards would be of the skeleton. The copy is a key table, not the
-    values, so it costs nothing against the payload bytes.
-    """
+def compile_frame(client: Any, payloads: Sequence[Dict[str, Any]], level: int) -> CompiledFrame:
+    """Build one compressed ingest body. Safe to call from a worker thread."""
     run_ids = tuple(str(p["id"]) for p in payloads)
-    # multipart_ingest validates this before serializing; this path skips it, so
-    # the check has to live here rather than in an assert that -O would strip.
     if not all(p.get("trace_id") and p.get("dotted_order") for p in payloads):
         raise ValueError("multipart ingest requires trace_id and dotted_order on every run")
     if client.tracing_sample_rate is not None:
-        # Sampling keeps per-trace state on the client, which a worker thread
-        # must not touch. Nothing sets it here; fail loudly if that changes.
         raise RuntimeError("frame compilation requires tracing_sample_rate to be unset")
 
     transformed = [client._run_transform(dict(p)) for p in payloads]
@@ -106,6 +71,5 @@ def compile_frame(
     raw = _rqtb.MultipartEncoder(acc.parts, boundary=_BOUNDARY).to_string()
     comp = _zstd.ZstdCompressor(compression_params=_params(level)).compress(raw)
     stream = io.BytesIO(comp)
-    # The SDK's sender joins this into the request's log context.
     stream.context = getattr(acc, "context", [])
     return CompiledFrame(run_ids=run_ids, stream=stream, sizes=(len(raw), len(comp)))

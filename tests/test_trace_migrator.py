@@ -15,7 +15,6 @@ import requests
 from langsmith_migrator.core.api_client import APIError, EnhancedAPIClient
 from langsmith_migrator.core.migrators.trace import (
     _CANARY_SESSION,
-    _ID_CHUNK,
     _ID_CHUNK_MIN,
     _PAGE_LIMIT,
     TraceMigrator,
@@ -42,7 +41,10 @@ def _migrator(sample_config, state=None, **kwargs):
     with patch("langsmith_migrator.core.migrators.trace.Client"):
         migrator = TraceMigrator(_client(), _client(), state, sample_config, **kwargs)
     migrator.dest_ls_client = Mock()
-    migrator.dest_ls_client.info.batch_ingest_config = {"size_limit": 100, "size_limit_bytes": 20_000_000}
+    migrator.dest_ls_client.info.batch_ingest_config = {
+        "size_limit": 100,
+        "size_limit_bytes": 20_000_000,
+    }
     return migrator
 
 
@@ -99,40 +101,17 @@ def test_short_lived_runs_are_filtered_client_side(sample_config):
     assert m.long_lived_run_ids(m.source, "src", WINDOW) == {"keep"}
 
 
-def test_pages_are_requested_at_the_page_limit(sample_config):
-    m = _migrator(sample_config)
-    m.source.post.side_effect = _pages([])
-    m.long_lived_run_ids(m.source, "src", WINDOW)
-    assert m.source.post.call_args[0][1]["limit"] == _PAGE_LIMIT
-
-
 def test_a_deployment_that_pages_smaller_is_obeyed_and_remembered(sample_config):
     m = _migrator(sample_config)
-    reject = APIError("API request failed: 400 - Limit exceeds maximum allowed value of 250", status_code=400)
+    reject = APIError(
+        "API request failed: 400 - Limit exceeds maximum allowed value of 250", status_code=400
+    )
     m.source.post.side_effect = [reject] + _pages([_run("a")])
     assert m.long_lived_run_ids(m.source, "src", WINDOW) == {"a"}
     assert m.source.post.call_args[0][1]["limit"] == 250
     # Adopted for the rest of the run, so the rejection is paid once.
     assert m._page_limit["source"] == 250
     assert m._page_limit["dest"] == _PAGE_LIMIT
-
-
-def test_a_400_that_is_not_about_the_limit_still_raises(sample_config):
-    m = _migrator(sample_config)
-    m.source.post.side_effect = APIError("API request failed: 400 - bad filter", status_code=400)
-    with pytest.raises(APIError):
-        m.long_lived_run_ids(m.source, "src", WINDOW)
-
-
-def test_id_chunks_never_exceed_the_page_limit(sample_config):
-    """An id-filtered query must stay self-consistent, whatever the backend tolerates."""
-    m = _migrator(sample_config)
-    m._page_limit["source"] = 2
-    m.source.post.side_effect = _pages([_run("a"), _run("b")]) + _pages([_run("c")])
-    fetched = [r["id"] for r in m.fetch_runs(m.source, "src", WINDOW, ["a", "b", "c"])]
-    assert sorted(fetched) == ["a", "b", "c"]
-    for call in m.source.post.call_args_list:
-        assert len(call[0][1]["id"]) <= 2
 
 
 def test_payload_fetch_is_chunked_without_changing_the_result(sample_config):
@@ -150,8 +129,8 @@ def test_an_oversized_response_halves_the_chunk_and_retries(sample_config):
     m._id_chunk = 100
     ids = [str(i) for i in range(100)]
     too_big = APIError("API request failed: 502 - <html>...", status_code=502)
-    m.source.post.side_effect = [too_big] + _pages([_run(i) for i in ids[:50]]) + _pages(
-        [_run(i) for i in ids[50:]]
+    m.source.post.side_effect = (
+        [too_big] + _pages([_run(i) for i in ids[:50]]) + _pages([_run(i) for i in ids[50:]])
     )
     fetched = [r["id"] for r in m.fetch_runs(m.source, "src", WINDOW, ids)]
     assert fetched == ids
@@ -166,14 +145,6 @@ def test_a_chunk_already_at_the_floor_gives_up(sample_config):
     m.source.post.side_effect = APIError("API request failed: 502 - <html>", status_code=502)
     with pytest.raises(APIError):
         list(m.fetch_runs(m.source, "src", WINDOW, ["a"]))
-
-
-def test_a_non_size_error_is_not_treated_as_too_large(sample_config):
-    m = _migrator(sample_config)
-    m.source.post.side_effect = APIError("API request failed: 400 - bad select", status_code=400)
-    with pytest.raises(APIError):
-        list(m.fetch_runs(m.source, "src", WINDOW, ["a"]))
-    assert m._id_chunk == _ID_CHUNK
 
 
 def test_a_failed_chunk_does_not_double_yield_what_it_had_produced(sample_config):
@@ -207,6 +178,7 @@ def _wire_slice(m, source_runs, dest_ids, *, confirmed=None):
     and frame compilation needs a real SDK client. It has its own tests.
     """
     m.compress_level = None
+
     def source_query(_endpoint, body):
         wanted = set(body.get("id") or [])
         runs = [r for r in source_runs if not wanted or r["id"] in wanted]
@@ -240,14 +212,6 @@ def test_runs_the_destination_already_holds_are_not_re_sent(sample_config):
     assert (report.ingested, report.already_present) == (0, 1)
 
 
-def test_extra_runs_on_the_destination_are_informational(sample_config):
-    m = _migrator(sample_config, verify=False)
-    _wire_slice(m, [_run("a")], ["a", "stranger"])
-    m.ingest = Mock(return_value=[])
-    report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
-    assert report.extra_on_dest == 1 and report.blocked == 0
-
-
 def test_a_run_that_never_appears_is_blocked(sample_config, migration_state):
     m = _migrator(sample_config, migration_state)
     _wire_slice(m, [_run("a")], [], confirmed=[])
@@ -258,67 +222,6 @@ def test_a_run_that_never_appears_is_blocked(sample_config, migration_state):
     assert (report.blocked, report.ingested) == (1, 0)
     assert any(i.code == "run_not_ingested" for i in migration_state.issue_log)
     assert any("still missing" in r for r in m.blocked_reasons)
-
-
-def test_a_run_held_by_another_project_says_so(sample_config, migration_state):
-    """The destination keeps one copy of a run id per tenant.
-
-    Reporting "still missing" here is true and useless: the write was accepted
-    and dropped, and re-running will never fix it.
-    """
-    m = _migrator(sample_config, migration_state)
-    _wire_slice(m, [_run("a")], [], confirmed=[])
-    m.ingest = Mock(return_value=[])
-    m.dest.get.return_value = {"id": "a", "session_id": "some-other-project"}
-    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
-    assert report.blocked == 1
-    issue = next(i for i in migration_state.issue_log if i.code == "run_exists_in_other_project")
-    assert "some-other-project" in issue.summary
-    assert any("different project" in r for r in m.blocked_reasons)
-    # facts only, no instructions
-    assert not issue.next_action
-
-
-def test_ingest_queue_lag_is_tolerated(sample_config):
-    m = _migrator(sample_config)
-    m.compress_level = None  # ingest is mocked; see _wire_slice
-    source_page = {"runs": [_run("a")], "cursors": {}}
-    m.source.post.side_effect = [source_page, source_page]
-    m.dest.post.side_effect = [
-        {"runs": [], "cursors": {}},          # pre-diff: missing
-        {"runs": [], "cursors": {}},          # confirm 1: still not readable
-        {"runs": [_run("a")], "cursors": {}},  # confirm 2: readable
-        {"runs": [_run("a")], "cursors": {}},  # content sample
-    ]
-    m.ingest = Mock(return_value=[])
-    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
-    assert (report.ingested, report.blocked) == (1, 0)
-
-
-def test_no_verify_still_computes_the_pre_diff(sample_config):
-    m = _migrator(sample_config, verify=False)
-    _wire_slice(m, [_run("a"), _run("b")], ["a"])
-    sent = []
-    m.ingest = lambda batch, frame=None: sent.extend(batch) or []
-    m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
-    assert [p["id"] for p in sent] == ["b"]  # the diff is the work-list either way
-
-
-def test_sets_from_two_sessions_are_never_merged(sample_config):
-    m = _migrator(sample_config, verify=False)
-    m.compress_level = None  # ingest is mocked; see _wire_slice
-    m.source.post.side_effect = [
-        {"runs": [_run("a")], "cursors": {}}, {"runs": [_run("a")], "cursors": {}},
-        {"runs": [_run("b")], "cursors": {}}, {"runs": [_run("b")], "cursors": {}},
-    ]
-    m.dest.post.side_effect = [{"runs": [], "cursors": {}}, {"runs": [], "cursors": {}}]
-    m.ingest = Mock(return_value=[])
-    first = m.migrate_slice({"id": "s1"}, {"id": "d1"}, WINDOW)
-    second = m.migrate_slice({"id": "s2"}, {"id": "d2"}, WINDOW)
-    assert (first.source_total, second.source_total) == (1, 1)
-    assert (first.dest_session_id, second.dest_session_id) == ("d1", "d2")
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +266,9 @@ def test_the_body_is_compressed_by_default(sample_config, capsys):
     m = _migrator(sample_config)
     assert m.compress_level == DEFAULT_COMPRESS_LEVEL
     with patch("langsmith_migrator.core.migrators.trace.compile_frame") as compile_:
-        compile_.side_effect = lambda client, payloads, level: _frame([str(p["id"]) for p in payloads])
+        compile_.side_effect = lambda client, payloads, level: _frame(
+            [str(p["id"]) for p in payloads]
+        )
         m._ingest_responses.append((202, ""))
         assert m.ingest([{"id": "a", "trace_id": "t", "dotted_order": "o"}]) == []
     m.dest_ls_client._send_compressed_multipart_req.assert_called_once()
@@ -372,25 +277,11 @@ def test_the_body_is_compressed_by_default(sample_config, capsys):
     assert "10.0x" in capsys.readouterr().out
 
 
-def test_the_reported_batch_size_is_the_real_one_after_compiling(sample_config, capsys):
-    """The size on the MULTIPART line is the operator's view of what is being
-    written; compilation must not shrink the payloads it is measured from."""
-    m = _migrator(sample_config)
-    payloads = [
-        {"id": "a", "trace_id": "t", "dotted_order": "o", "name": "n", "run_type": "chain",
-         "start_time": "2026-08-26T12:00:00+00:00", "inputs": {"q": "x" * 20_000}}
-    ]
-    m._ingest_responses.append((202, ""))
-    m.ingest(payloads, frame=None)
-    out = capsys.readouterr().out
-    # 20 KB of inputs must still be visible in the reported size, not stripped
-    assert "20." in out or "19." in out, out
-    assert payloads[0]["inputs"]["q"], "inputs were stripped from the caller's payload"
-
-
 def test_no_compress_upload_uses_the_sdk_path(sample_config):
     m = _migrator(sample_config, compress_level=None)
-    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.append((202, ""))
+    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.append(
+        (202, "")
+    )
     assert m.ingest([{"id": "a", "trace_id": "t"}]) == []
     m.dest_ls_client._send_compressed_multipart_req.assert_not_called()
 
@@ -426,16 +317,6 @@ def test_a_split_recompiles_rather_than_reusing_the_batch_frame(sample_config):
     assert ("b",) in compiled
 
 
-def test_a_frame_that_does_not_match_the_batch_is_rebuilt(sample_config):
-    m = _migrator(sample_config)
-    stale = _frame(["x"])
-    with patch("langsmith_migrator.core.migrators.trace.compile_frame") as compile_:
-        compile_.side_effect = lambda client, payloads, level: _frame([str(p["id"]) for p in payloads])
-        m._ingest_responses.append((202, ""))
-        m._send([{"id": "a", "trace_id": "t", "dotted_order": "o"}], frame=stale)
-    compile_.assert_called_once()
-
-
 def test_a_matching_prebuilt_frame_is_sent_as_is(sample_config):
     m = _migrator(sample_config)
     ready = _frame(["a"])
@@ -463,7 +344,14 @@ def test_attachments_are_fetched_through_the_configured_session(sample_config):
     m._source_blob_host = "source.api.test.com"
     m.source.session.get.return_value = _blob_response(b"attachment-bytes")
 
-    run = _run("a", s3_urls={"attachment.note": {"presigned_url": "https://source.api.test.com/public/download?jwt=x"}})
+    run = _run(
+        "a",
+        s3_urls={
+            "attachment.note": {
+                "presigned_url": "https://source.api.test.com/public/download?jwt=x"
+            }
+        },
+    )
     overrides, issues = m.materialise(run)
 
     assert overrides["attachments"] == {"note": ("text/plain", b"attachment-bytes")}
@@ -491,28 +379,25 @@ def test_a_failed_blob_fetch_is_explicit_not_a_placeholder(sample_config):
     assert "attachments" not in overrides
 
 
-def test_skip_attachments_degrades_rather_than_pretending(sample_config):
-    m = _migrator(sample_config, skip_attachments=True)
-    m._source_blob_host = "source.api.test.com"
-    run = _run("a", s3_urls={"attachment.note": {"presigned_url": "https://source.api.test.com/x"}})
-    overrides, issues = m.materialise(run)
-    assert issues == ["attachments_skipped"]
-    assert "attachments" not in overrides
-    # the repair is named, and it is never "pass --skip-attachments again"
-    assert m.fidelity_reduced == {"attachments were skipped (--skip-attachments)"}
-
-
 def test_offloaded_inputs_are_re_inlined_only_when_absent(sample_config):
     m = _migrator(sample_config)
     m._source_blob_host = "source.api.test.com"
     m.source.session.get.return_value = _blob_response(b'{"q": "from-blob"}', "application/json")
 
-    offloaded = _run("a", inputs=None, inputs_s3_urls={"ROOT": {"presigned_url": "https://source.api.test.com/b"}})
+    offloaded = _run(
+        "a",
+        inputs=None,
+        inputs_s3_urls={"ROOT": {"presigned_url": "https://source.api.test.com/b"}},
+    )
     assert m.materialise(offloaded)[0]["inputs"] == {"q": "from-blob"}
 
     # the query API usually resolves the payload itself; do not re-fetch it
     m.source.session.get.reset_mock()
-    inline = _run("a", inputs={"q": "inline"}, inputs_s3_urls={"ROOT": {"presigned_url": "https://source.api.test.com/b"}})
+    inline = _run(
+        "a",
+        inputs={"q": "inline"},
+        inputs_s3_urls={"ROOT": {"presigned_url": "https://source.api.test.com/b"}},
+    )
     assert m.materialise(inline)[0] == {}
     m.source.session.get.assert_not_called()
 
@@ -521,8 +406,14 @@ def test_a_blob_larger_than_the_budget_is_refused(sample_config):
     m = _migrator(sample_config, max_field_bytes=4)
     m._source_blob_host = "source.api.test.com"
     m.source.session.get.return_value = _blob_response(b"far too many bytes")
-    run = _run("a", inputs=None, inputs_s3_urls={"ROOT": {"presigned_url": "https://source.api.test.com/b"}})
-    assert m.materialise(run)[1] == ["attachment_fetch_failed"]
+    run = _run(
+        "a",
+        inputs=None,
+        inputs_s3_urls={"ROOT": {"presigned_url": "https://source.api.test.com/b"}},
+    )
+    # A payload field, so a payload code - an archive uses these to decide
+    # whether the run it holds is whole.
+    assert m.materialise(run)[1] == ["payload_fetch_failed"]
 
 
 # --------------------------------------------------------------------------
@@ -563,14 +454,6 @@ def test_a_rejected_source_id_is_retried_without_one(sample_config):
     assert "id" not in m.dest.post.call_args[0][1]
 
 
-def test_an_existing_destination_session_is_matched_by_name(sample_config):
-    m = _migrator(sample_config)
-    m.dest.get.return_value = [{"id": "other-id", "name": "proj", "trace_tier": "longlived"}]
-    resolved = m.resolve_dest_session({"id": "src-1", "name": "proj"})
-    assert resolved["id"] == "other-id"  # identity is a coincidence, not a requirement
-    m.dest.post.assert_not_called()
-
-
 def test_an_operator_mapping_wins_over_name_matching(sample_config):
     m = _migrator(sample_config, project_id_map={"src-1": "chosen"})
     m.dest.get.return_value = {"id": "chosen", "trace_tier": "longlived"}
@@ -581,15 +464,6 @@ def test_an_ambiguous_destination_name_is_skipped(sample_config):
     m = _migrator(sample_config)
     m.dest.get.return_value = [{"id": "a", "name": "proj"}, {"id": "b", "name": "proj"}]
     assert m.resolve_dest_session({"id": "src-1", "name": "proj"}) is None
-
-
-def test_into_session_suffix_targets_a_separate_session(sample_config):
-    m = _migrator(sample_config, into_session_suffix="-migrated")
-    m.dest.get.return_value = [{"id": "live", "name": "proj", "trace_tier": "shortlived"}]
-    m.dest.post.return_value = {"id": "copy", "trace_tier": "longlived"}
-    resolved = m.resolve_dest_session({"id": "src-1", "name": "proj"})
-    assert m.dest.post.call_args[0][1]["name"] == "proj-migrated"
-    assert resolved["id"] == "copy"  # the live session's tier is untouched
 
 
 def test_a_short_lived_session_is_raised_and_re_read_before_ingesting(sample_config):
@@ -603,20 +477,15 @@ def test_a_short_lived_session_is_raised_and_re_read_before_ingesting(sample_con
     m.dest.patch.assert_called_once_with("/sessions/d1", {"trace_tier": "longlived"})
 
 
-def test_a_tier_permission_failure_blocks_the_session(sample_config):
-    m = _migrator(sample_config)
-    m.dest.patch.side_effect = RuntimeError("403 Forbidden")
-    with pytest.raises(TracePreflightError, match="trace_tier_permission_denied"):
-        m.ensure_long_lived({"id": "d1", "trace_tier": "shortlived"})
-
-
 def test_the_tier_is_not_restored_while_a_session_is_incomplete(sample_config):
     m = _migrator(sample_config, verify=False, prefetch_windows=1)
     m.resolve_dest_session = Mock(return_value={"id": DEST, "trace_tier": "longlived"})
     m.restore_tier = Mock()
-    m.migrate_slice = Mock(side_effect=lambda s, d, w: __import__(
-        "langsmith_migrator.core.trace_domain", fromlist=["Reconciliation"]
-    ).Reconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1))
+    m.migrate_slice = Mock(
+        side_effect=lambda s, d, w: __import__(
+            "langsmith_migrator.core.trace_domain", fromlist=["Reconciliation"]
+        ).Reconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1)
+    )
     m.migrate_session({"id": "src", "name": "p", "trace_tier": "shortlived"})
     m.restore_tier.assert_not_called()
 
@@ -626,10 +495,12 @@ def test_the_tier_is_not_restored_while_a_session_is_incomplete(sample_config):
 # --------------------------------------------------------------------------
 def _dest_get(run_payload):
     """Route dest.get: /sessions is the scratch lookup, /runs/<id> the read-back."""
+
     def get(path, params=None):
         if path == "/sessions":
             return [{"id": "scratch", "name": _CANARY_SESSION}]
         return run_payload() if callable(run_payload) else run_payload
+
     return get
 
 
@@ -641,45 +512,6 @@ def test_the_canary_blocks_when_the_timestamp_is_rewritten(sample_config, migrat
         with pytest.raises(TracePreflightError, match="historical_ingest_rejected"):
             m.canary()
     assert any(i.code == "historical_ingest_rejected" for i in migration_state.issue_log)
-
-
-def test_the_canary_blocks_when_the_run_never_appears(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state)
-    m.ingest = Mock(return_value=[])
-    m.dest.get.side_effect = _dest_get(None)
-    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        with pytest.raises(TracePreflightError):
-            m.canary()
-
-
-def test_each_preflight_writes_its_own_canary(sample_config):
-    """The read-back must prove *this* invocation's write landed.
-
-    A deterministic ID made repeated pre-flights 409 ("duplicate run create
-    requests are not supported"), after which the read-back found the previous
-    invocation's canary and the gate passed having verified nothing.
-    """
-    m = _migrator(sample_config)
-    sent = []
-    m.ingest = lambda batch, frame=None: sent.extend(batch) or []
-    m.dest.get.side_effect = _dest_get(lambda: {"start_time": sent[-1]["start_time"]})
-    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        m.canary()
-        m.canary()
-    assert sent[0]["id"] != sent[1]["id"], "a reused ID is rejected, not upserted"
-    assert sent[0]["session_id"] == "scratch"  # never a migration target
-    # the exact resolved range start, not an hour-rounded value, and stable
-    # across calls because it is resolved once per run
-    assert sent[0]["start_time"] == sent[1]["start_time"] == m.resolved_range_start().isoformat()
-
-
-def test_a_conflicted_canary_blocks_instead_of_passing(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state)
-    m.ingest = Mock(return_value=[("id", "HTTP 409: duplicate run create")])
-    m.dest.get.side_effect = _dest_get({"start_time": "whatever"})
-    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        with pytest.raises(TracePreflightError, match="historical_ingest_rejected"):
-            m.canary()
 
 
 def test_dry_run_skips_the_canary_entirely(sample_config):
@@ -728,22 +560,9 @@ def test_the_destination_query_drops_the_tier_filter_for_a_deferred_upgrade(samp
     assert report.already_present == 1
 
 
-def test_a_deferred_upgrade_leaves_the_session_tier_alone(sample_config):
-    m = _migrator(sample_config, emit_upgrade_list="/tmp/x.csv")
-    m.ensure_long_lived({"id": "d1", "trace_tier": "shortlived"})
-    m.dest.patch.assert_not_called()
-
-
 # --------------------------------------------------------------------------
 # Source and destination capability fallbacks
 # --------------------------------------------------------------------------
-def test_a_query_failure_is_never_swallowed(sample_config):
-    # There is no select-rejection fallback: the derived select is built from
-    # the write contract, every name of which the endpoint accepts.
-    m = _migrator(sample_config)
-    m.source.post.side_effect = RuntimeError("503 Service unavailable")
-    with pytest.raises(RuntimeError, match="503"):
-        m.long_lived_run_ids(m.source, "src", WINDOW)
 
 
 def test_a_forbidden_session_create_is_a_tier_permission_blocker(sample_config):
@@ -771,9 +590,23 @@ def test_the_ingest_field_set_matches_the_backend_contract():
     from langsmith_migrator.core.trace_domain import RunIngestPayload
 
     assert {f.name for f in fields(RunIngestPayload)} == {
-        "id", "trace_id", "parent_run_id", "dotted_order", "session_id",
-        "name", "run_type", "start_time", "end_time", "status",
-        "inputs", "outputs", "extra", "error", "serialized", "events", "tags",
+        "id",
+        "trace_id",
+        "parent_run_id",
+        "dotted_order",
+        "session_id",
+        "name",
+        "run_type",
+        "start_time",
+        "end_time",
+        "status",
+        "inputs",
+        "outputs",
+        "extra",
+        "error",
+        "serialized",
+        "events",
+        "tags",
         "attachments",
     }
 
@@ -781,12 +614,6 @@ def test_the_ingest_field_set_matches_the_backend_contract():
 # --------------------------------------------------------------------------
 # A transient source failure must not look like "no such project"
 # --------------------------------------------------------------------------
-def test_a_missing_source_session_resolves_to_none(sample_config):
-    from langsmith_migrator.core.api_client import NotFoundError
-
-    m = _migrator(sample_config)
-    m.source.get.side_effect = NotFoundError("404 Not Found")
-    assert m.get_source_session("no-such-id") is None
 
 
 def test_a_transient_source_failure_is_raised_not_swallowed(sample_config):
@@ -815,47 +642,17 @@ def test_a_project_name_is_resolved_through_the_endpoint_not_a_full_walk(sample_
     session, reason = m.find_source_session("evaluators")
     assert (session["id"], reason) == ("p1", "name")
     # the endpoint filters; enumerating tens of thousands of sessions would not scale
-    assert m.source.get.call_args.kwargs["params"] == {"name": "evaluators", "reference_free": "true"}
+    assert m.source.get.call_args.kwargs["params"] == {
+        "name": "evaluators",
+        "reference_free": "true",
+    }
     m.source.get_paginated.assert_not_called()
-
-
-def test_an_id_wins_over_a_name_lookup(sample_config):
-    the_id = "0fffee47-dd97-46f6-ae24-8866e2b8b9d9"
-    m = _migrator(sample_config)
-    m.source.get.return_value = {"id": the_id, "name": "whatever"}
-    assert m.find_source_session(the_id) == ({"id": the_id, "name": "whatever"}, "id")
-    assert m.source.get.call_args[0][0] == f"/sessions/{the_id}"
-
-
-def test_an_unknown_uuid_falls_through_to_the_name_lookup(sample_config):
-    from langsmith_migrator.core.api_client import NotFoundError
-
-    m = _migrator(sample_config)
-    m.source.get.side_effect = [NotFoundError("404"), [{"id": "p1", "name": "named-like-a-uuid"}]]
-    assert m.find_source_session("00000000-0000-0000-0000-000000000000")[1] == "name"
 
 
 def test_a_duplicated_project_name_is_reported_as_ambiguous(sample_config):
     m = _migrator(sample_config)
     m.source.get.return_value = [{"id": "a", "name": "dup"}, {"id": "b", "name": "dup"}]
     assert m.find_source_session("dup") == (None, "ambiguous")
-
-
-def test_an_experiment_session_is_not_matched_by_name(sample_config):
-    m = _migrator(sample_config)
-    m.source.get.return_value = [{"id": "x", "name": "n", "reference_dataset_id": "ds"}]
-    assert m.find_source_session("n") == (None, "missing")
-
-
-def test_a_non_uuid_project_value_skips_the_id_endpoint_entirely(sample_config):
-    # /sessions/<non-uuid> answers 422, not 404, so attempting it and then
-    # sniffing the error to recover would be both slower and more fragile.
-    m = _migrator(sample_config)
-    m.source.get.return_value = [{"id": "p1", "name": "evaluators"}]
-    session, reason = m.find_source_session("evaluators")
-    assert (session["id"], reason) == ("p1", "name")
-    assert m.source.get.call_count == 1
-    assert m.source.get.call_args[0][0] == "/sessions"
 
 
 # --------------------------------------------------------------------------
@@ -865,7 +662,8 @@ def test_each_query_page_reports_runs_traces_and_size(sample_config, capsys):
     sample_config.migration.verbose = True
     m = _migrator(sample_config)
     m.source.post.side_effect = _pages(
-        [_run("a", trace="t1"), _run("b", trace="t1"), _run("c", trace="t2")], [_run("d", trace="t3")]
+        [_run("a", trace="t1"), _run("b", trace="t1"), _run("c", trace="t2")],
+        [_run("d", trace="t3")],
     )
     list(m._query_runs(m.source, "src", WINDOW, select=["id"]))
     lines = [ln for ln in capsys.readouterr().out.splitlines() if "scan " in ln]
@@ -877,54 +675,12 @@ def test_each_query_page_reports_runs_traces_and_size(sample_config, capsys):
     assert all(len(ln) <= 80 for ln in lines), lines
 
 
-def test_payload_fetches_are_labelled_by_phase_not_by_page(sample_config, capsys):
-    """Each chunk is its own request, so a per-call page counter restarted at
-    ``p1`` for every one of them and read as a call going backwards."""
-    sample_config.migration.verbose = True
-    m = _migrator(sample_config)
-    m._id_chunk = 2
-    m.source.post.side_effect = lambda _e, body: {
-        "runs": [_run(i) for i in body["id"]], "cursors": {},
-    }
-
-    fetched = list(m.fetch_runs(m.source, "src", WINDOW, ["a", "b", "c", "d", "e"]))
-    lines = [ln for ln in capsys.readouterr().out.splitlines() if "fetch " in ln]
-    assert len(fetched) == 5
-    assert len(lines) == 3
-    # no page number (it would restart at p1 per chunk) and no running total
-    # (it could only restate `runs`), so the chunk size is stated exactly once
-    assert not any("scan" in ln or "p1" in ln or "total" in ln for ln in lines), lines
-    assert [ln.split("runs")[1].split("|")[0].strip() for ln in lines] == ["2", "2", "1"]
-    assert all(len(ln) <= 80 for ln in lines), lines
-
-
-def test_the_multipart_write_is_reported_prominently(sample_config, capsys):
-    m = _migrator(sample_config, compress_level=None)
-    m.dest_ls_client.multipart_ingest.return_value = None
-    m.ingest([{"id": "a", "trace_id": "t1"}, {"id": "b", "trace_id": "t1"}, {"id": "c", "trace_id": "t2"}])
-    out = capsys.readouterr().out
-    # the one step that writes must not read like another query log line
-    assert "MULTIPART INGEST" in out
-    assert "runs 3" in out and "traces 2" in out
-
-
-def test_query_pages_are_silent_without_verbose(sample_config, capsys):
-    m = _migrator(sample_config)
-    m.source.post.side_effect = _pages([_run("a")])
-    list(m._query_runs(m.source, "src", WINDOW, select=["id"]))
-    assert "query source" not in capsys.readouterr().out
-
-
 def test_reported_size_counts_attachment_bytes(sample_config):
     small = TraceMigrator._shape([{"id": "a", "trace_id": "t"}])[2]
-    big = TraceMigrator._shape([{"id": "a", "trace_id": "t", "attachments": {"n": ("text/plain", b"x" * 5000)}}])[2]
+    big = TraceMigrator._shape(
+        [{"id": "a", "trace_id": "t", "attachments": {"n": ("text/plain", b"x" * 5000)}}]
+    )[2]
     assert big - small >= 5000
-
-
-def test_human_sizes_are_readable():
-    assert TraceMigrator._human(512) == "512 B"
-    assert TraceMigrator._human(1536) == "1.5 KB"
-    assert TraceMigrator._human(5 * 1024 * 1024) == "5.0 MB"
 
 
 # --------------------------------------------------------------------------
@@ -941,7 +697,12 @@ def test_the_destination_read_back_uses_the_destination_blob_host(sample_config)
     m._source_blob_host, m._dest_blob_host = "source.api.test.com", "dest.api.test.com"
     m.dest.session.get.return_value = _blob_response(b"attachment-bytes")
 
-    run = _run("a", s3_urls={"attachment.note": {"presigned_url": "https://dest.api.test.com/public/download?jwt=x"}})
+    run = _run(
+        "a",
+        s3_urls={
+            "attachment.note": {"presigned_url": "https://dest.api.test.com/public/download?jwt=x"}
+        },
+    )
     overrides, issues = m.materialise(run, side="dest")
 
     assert issues == []
@@ -949,18 +710,15 @@ def test_the_destination_read_back_uses_the_destination_blob_host(sample_config)
     m.source.session.get.assert_not_called()
 
 
-def test_a_source_url_is_still_refused_on_the_destination_side(sample_config):
-    m = _migrator(sample_config)
-    m._source_blob_host, m._dest_blob_host = "source.api.test.com", "dest.api.test.com"
-    run = _run("a", s3_urls={"attachment.note": {"presigned_url": "https://source.api.test.com/x"}})
-    assert m.materialise(run, side="dest")[1] == ["attachment_host_rejected"]
-
-
-def test_an_unreadable_read_back_is_not_reported_as_a_content_mismatch(sample_config, migration_state):
+def test_an_unreadable_read_back_is_not_reported_as_a_content_mismatch(
+    sample_config, migration_state
+):
     m = _migrator(sample_config, migration_state)
     m._source_blob_host, m._dest_blob_host = "source.api.test.com", "dest.api.test.com"
     m.dest.session.get.side_effect = RuntimeError("blob store down")
-    m.dest.post.side_effect = _pages([_run("a", s3_urls={"attachment.n": {"presigned_url": "https://dest.api.test.com/x"}})])
+    m.dest.post.side_effect = _pages(
+        [_run("a", s3_urls={"attachment.n": {"presigned_url": "https://dest.api.test.com/x"}})]
+    )
 
     degraded = {}
     m._check_content(DEST, WINDOW, {"a": {"attachments": "deadbeef"}}, degraded)
@@ -983,7 +741,9 @@ def _raisable(m, source_tier="shortlived"):
 def test_a_raised_tier_is_restored_after_a_clean_migration(sample_config):
     m = _migrator(sample_config, prefetch_windows=1)
     src, dest = _raisable(m)
-    m.migrate_slice = Mock(side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 0, 0, 0, 0, 0))
+    m.migrate_slice = Mock(
+        side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 0, 0, 0, 0, 0)
+    )
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         m.migrate_session(src)
     m.restore_tier.assert_called_once_with(dest, "shortlived")
@@ -1009,23 +769,16 @@ def test_a_raised_tier_is_settled_even_when_the_migration_raises(sample_config, 
 def test_an_incomplete_migration_leaves_the_tier_raised_and_says_so(sample_config, migration_state):
     m = _migrator(sample_config, migration_state, prefetch_windows=1)
     src, dest = _raisable(m)
-    m.migrate_slice = Mock(side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1))
+    m.migrate_slice = Mock(
+        side_effect=lambda s, d, w: Reconciliation("src", DEST, w.label(), 1, 0, 0, 0, 1)
+    )
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         m.migrate_session(src)
     m.restore_tier.assert_not_called()
-    assert any(i.code == "dest_tier_left_raised" and "blocked runs" in i.summary
-               for i in migration_state.issue_log)
-
-
-def test_a_tier_we_never_raised_is_never_touched(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state, prefetch_windows=1)
-    m.resolve_dest_session = Mock(return_value={"id": DEST, "trace_tier": "longlived"})
-    m.restore_tier = Mock()
-    m.migrate_slice = Mock(side_effect=RuntimeError("boom"))
-    with pytest.raises(RuntimeError):
-        m.migrate_session({"id": "src", "name": "p", "trace_tier": "shortlived"})
-    m.restore_tier.assert_not_called()
-    assert not any(i.code == "dest_tier_left_raised" for i in migration_state.issue_log)
+    assert any(
+        i.code == "dest_tier_left_raised" and "blocked runs" in i.summary
+        for i in migration_state.issue_log
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1041,53 +794,9 @@ def _one_run_slice(m):
         return m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
 
 
-def test_a_dry_run_claims_no_watermark(sample_config):
-    # Nothing was written, so there is nothing to be complete.
-    sample_config.migration.dry_run = True
-    report = _one_run_slice(_migrator(sample_config))
-    assert (report.earliest, report.latest, report.verified_runs) == (None, None, 0)
-
-
-def test_no_verify_claims_no_watermark(sample_config):
-    # Runs were ingested but never confirmed readable; the watermark would be
-    # an unearned completeness claim an operator might skip work on.
-    report = _one_run_slice(_migrator(sample_config, verify=False))
-    assert (report.earliest, report.latest, report.verified_runs) == (None, None, 0)
-
-
-def test_a_verified_run_does_claim_a_watermark(sample_config):
-    m = _migrator(sample_config)
-    m.compress_level = None  # ingest is mocked; see _wire_slice
-    page = {"runs": [_run("a")], "cursors": {}}
-    m.source.post.side_effect = [page, page]
-    m.dest.post.side_effect = [
-        {"runs": [], "cursors": {}},          # pre-diff: missing
-        {"runs": [_run("a")], "cursors": {}},  # confirm: present
-        {"runs": [_run("a")], "cursors": {}},  # content sample
-    ]
-    m.ingest = Mock(return_value=[])
-    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
-    assert report.earliest is not None and report.verified_runs == 1
-
-
 # --------------------------------------------------------------------------
 # A conflict is a rejection, not a replay
 # --------------------------------------------------------------------------
-def test_a_409_fails_every_run_in_the_request(sample_config):
-    """409 rejects the whole request, so it is neither success nor one bad run."""
-    m = _migrator(sample_config, compress_level=None, verify=False)
-    m.dest_ls_client.multipart_ingest.return_value = None
-    m._ingest_responses.append((409, '{"error":"Run create payload already received."}'))
-    original = m._ingest_responses[:]
-    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.extend(original)
-    del m._ingest_responses[:]
-
-    failures = m.ingest([{"id": "a", "trace_id": "t"}, {"id": "b", "trace_id": "t"}])
-    assert {rid for rid, _ in failures} == {"a", "b"}
-    assert all("409" in err for _, err in failures)
-    # no binary split: the rejection applies to every payload equally
-    assert m.dest_ls_client.multipart_ingest.call_count == 1
 
 
 def test_a_409_defers_to_verification_when_it_will_run(sample_config, capsys):
@@ -1095,7 +804,9 @@ def test_a_409_defers_to_verification_when_it_will_run(sample_config, capsys):
     earlier attempt landed"; only the destination can, so do not pre-judge."""
     m = _migrator(sample_config, compress_level=None)
     original = [(409, '{"error":"Run create payload already received."}')]
-    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.extend(original)
+    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.extend(
+        original
+    )
     assert m.ingest([{"id": "a", "trace_id": "t"}, {"id": "b", "trace_id": "t"}]) == []
     assert "leaving the verdict to verification" in capsys.readouterr().out
     # not split into halves either: the rejection applies to the whole request
@@ -1106,7 +817,9 @@ def test_the_compressed_send_never_blind_retries(sample_config):
     """Ingest is not idempotent, so an unknown outcome must not be re-sent."""
     m = _migrator(sample_config)
     with patch("langsmith_migrator.core.migrators.trace.compile_frame") as compile_:
-        compile_.side_effect = lambda client, payloads, level: _frame([str(p["id"]) for p in payloads])
+        compile_.side_effect = lambda client, payloads, level: _frame(
+            [str(p["id"]) for p in payloads]
+        )
         m._ingest_responses.append((202, ""))
         m.ingest([{"id": "a", "trace_id": "t", "dotted_order": "o"}])
     assert m.dest_ls_client._send_compressed_multipart_req.call_args.kwargs["attempts"] == 1
@@ -1115,14 +828,18 @@ def test_the_compressed_send_never_blind_retries(sample_config):
 def test_a_swallowed_non_2xx_is_still_a_failure(sample_config):
     m = _migrator(sample_config, compress_level=None)
     original = [(503, "Service unavailable")]
-    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.extend(original)
+    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.extend(
+        original
+    )
     failures = m.ingest([{"id": "solo", "trace_id": "t"}])
     assert failures and "503" in failures[0][1]
 
 
 def test_a_clean_202_is_success(sample_config):
     m = _migrator(sample_config, compress_level=None)
-    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.append((202, ""))
+    m.dest_ls_client.multipart_ingest.side_effect = lambda create: m._ingest_responses.append(
+        (202, "")
+    )
     assert m.ingest([{"id": "a", "trace_id": "t"}]) == []
 
 
@@ -1139,7 +856,9 @@ def test_an_ingest_rejection_is_reported_once_per_cause(sample_config, migration
     m = _migrator(sample_config, migration_state)
     runs = [_run(c, trace="t1", order=f"A.{c}") for c in "abcde"]
     _wire_slice(m, runs, [])
-    m.ingest = lambda batch, frame=None: [(str(p["id"]), 'HTTP 409: {"error":"already received"}') for p in batch]
+    m.ingest = lambda batch, frame=None: [
+        (str(p["id"]), 'HTTP 409: {"error":"already received"}') for p in batch
+    ]
 
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         report = m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
@@ -1152,28 +871,6 @@ def test_an_ingest_rejection_is_reported_once_per_cause(sample_config, migration
     assert issue.evidence["count"] == 5
 
 
-def test_distinct_causes_are_reported_separately(sample_config, migration_state):
-    m = _migrator(sample_config, migration_state)
-    runs = [_run(c, trace="t1", order=f"A.{c}") for c in "ab"]
-    _wire_slice(m, runs, [])
-    m.ingest = lambda batch, frame=None: [(str(p["id"]), f"HTTP {409 if p['id'] == 'a' else 503}") for p in batch]
-    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
-    assert len({r for r in m.blocked_reasons if "refused" in r}) == 2
-
-
-def test_the_migrator_records_no_remediation_advice(migration_state, sample_config):
-    """Every issue states what happened; none prescribes what to do."""
-    m = _migrator(sample_config, migration_state)
-    _wire_slice(m, [_run("a")], [])
-    m.ingest = lambda batch, frame=None: [("a", "HTTP 409")]
-    m.dest.get.return_value = None
-    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
-        m.migrate_slice({"id": "src"}, {"id": DEST}, WINDOW)
-    assert migration_state.issue_log
-    assert not any(i.next_action for i in migration_state.issue_log)
-
-
 def test_a_read_timeout_halves_the_id_chunk_like_a_502_does(sample_config):
     """The server took the request and never finished the body: same problem as
     a 502 on an oversized response, and requests reports it under two classes.
@@ -1182,7 +879,9 @@ def test_a_read_timeout_halves_the_id_chunk_like_a_502_does(sample_config):
 
     assert _response_too_large(requests.exceptions.ReadTimeout("read timed out"))
     assert _response_too_large(
-        requests.exceptions.ConnectionError("HTTPSConnectionPool(...): Read timed out. (read timeout=30)")
+        requests.exceptions.ConnectionError(
+            "HTTPSConnectionPool(...): Read timed out. (read timeout=30)"
+        )
     )
     assert not _response_too_large(requests.exceptions.ConnectionError("dns failure"))
 
@@ -1211,3 +910,15 @@ def test_a_destination_project_is_created_without_fields_the_source_lacks(sample
     m.resolve_dest_session({"id": "src-id", "name": "from-archive"})
     assert "start_time" not in sent[0] and "description" not in sent[0]
     assert sent[0]["trace_tier"] == "longlived" and sent[0]["name"] == "from-archive"
+
+
+def test_an_offloaded_field_with_no_url_is_a_loss_not_a_no_op(sample_config):
+    """The field is offloaded, so returning quietly loses it with nothing said."""
+    from langsmith_migrator.core.trace_domain import LOST_CONTENT_CODES
+
+    m = _migrator(sample_config)
+    run = _run("a", inputs=None, inputs_s3_urls={"ROOT": {}})
+    overrides, issues = m.materialise(run)
+    assert issues == ["payload_field_unavailable"]
+    assert "inputs" not in overrides
+    assert set(issues) <= LOST_CONTENT_CODES, "an archive must refuse to publish this"

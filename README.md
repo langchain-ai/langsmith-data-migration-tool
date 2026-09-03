@@ -34,7 +34,7 @@ langsmith-migrator datasets
 - **Custom Model Pricing**: Migrate workspace-custom model price entries (`model-pricing`). Global built-in prices are skipped since they already exist in every workspace. Idempotent: an equivalent entry on the destination is updated in place, or skipped with `--skip-existing`
 - **Engine Issues**: Migrate per-project LangSmith Engine issues-agent configs and detected issues as metadata (`issues`). Run links and trace deep-links are not migrated (see Limitations)
 - **Fleet**: Migrate agents, shared skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, and workspace secrets (`fleet`)
-- **Long-lived traces**: Migrate traces whose tier is `longlived` between deployments (`traces`), preserving run IDs, `dotted_order` and timestamps verbatim, carrying attachments and re-inlining offloaded payloads. Stateless — work is a destination diff per time window, so re-run instead of resuming. Not part of `migrate-all`
+- **Long-lived traces**: Migrate traces whose tier is `longlived` between deployments (`traces`), preserving run IDs, `dotted_order` and timestamps verbatim, carrying attachments and re-inlining offloaded payloads. No resumable checkpoint — work is a destination diff per time window, so re-run instead of resuming. Not part of `migrate-all`
 - **Context Hub**: Migrate Context Hub agents and skills (the versioned agent/skill repos in the LangSmith Context Hub), including files and repo metadata (description, readme, tags, is_public) (`contexts`). Replays the **full commit history** by default so the destination reproduces the source's commit chain; use `--latest-only` to copy just the latest commit. Also copies **commit tags**, including the `production` / `staging` environment tags behind the Context Hub promote feature, pointing each at the same commit on the destination (`--no-tags` to skip). Lists the same contexts the Context Hub UI shows (external-source repos are hidden by default; use `--include-external` to migrate them too). Scope with `--agents-only` / `--skills-only`; linked-repo commit pins are stripped and reported cross-instance, or preserved with `--same-instance`
 - **Workspace Scoping**: Run resource migrations per workspace pair with explicit IDs or interactive workspace mapping
 - **Remediation & Resume**: Persist migration state, write remediation bundles, print grouped actionable next steps, and retry pending/failed work with `resume`
@@ -59,15 +59,25 @@ What `traces` guarantees:
   attempts the source's UUID because a match is convenient, but a rejection is normal
   progress — nothing depends on the two being equal. Resolution order is
   `--project-mapping` / `--map-projects` → destination name match → create.
-- **Completeness is verified per project.** For each `(project, time window)` slice the
+- **Run IDs are checked per project.** For each `(project, time window)` slice the
   tool compares the source's long-lived run IDs against the destination's and reports
-  `source = ingested + already present + degraded + blocked`.
+  `source = ingested + already present + degraded + blocked`. This checks that the
+  right runs arrived, by ID.
+- **Content is spot-checked, not fully checked.** Up to
+  `--verify-content-sample` runs per window are read back and compared field by
+  field. If a sampled run cannot be read back from the destination, the tool
+  prints a warning and skips that sample; the window can still be reported clean
+  and still advance the watermark. So the watermark means "the right run IDs are
+  there", not "every field was compared".
 - **Attachments and offloaded payloads are carried.** Blobs are fetched through the
   tool's own configured HTTP session (SSL settings, CA bundles, proxies) and re-inlined;
   a failed fetch is reported, never silently replaced with a placeholder.
 
-**Statelessness: there is no resume.** Work is derived from a destination diff per time
-window, not from a checkpoint. If a run is interrupted, just re-run the same command —
+**Direct migration has no resumable checkpoint.** Work is derived from a
+destination diff per time window, not from a saved position. The command does
+still write state: each project's outcome and any remediation data are recorded
+under `.langsmith-migrator/`. Exporting to an archive *does* have checkpoints —
+the window files themselves. If a run is interrupted, just re-run the same command —
 finished windows produce an empty difference. `--since` and `--until` bound the range
 to walk and are both **required and absolute**; `--window` sets the size of one slice
 of it in **hours** (default 24) — widen it when migrating many projects. The bounds are stamps
@@ -93,6 +103,11 @@ TTL and the blob key prefix are both baked in at insert. Destination projects ar
 therefore created with an explicit long-lived tier, and an existing short-lived project is
 raised (and re-read until the raise is observable) before anything is written into it.
 Exposure is scoped to one project at a time: raise → migrate → verify → restore.
+The tier is only put back when that project finishes cleanly. If the run is
+interrupted, or the project has blocked runs, it is **left raised on purpose** so
+a re-run can still ingest long-lived data — and the tool records that it did,
+because otherwise nobody would know a project's retention was changed and not
+changed back. Put it back by re-running until the project is clean, or by hand.
 `--restore-session-tier` defaults on when the source project was not itself long-lived.
 
 **Fidelity repair means a new project, not a re-send.** A run is immutable once fully
@@ -104,9 +119,14 @@ The tool reports rather than requires: the pre-flight prints the destination's a
 limits, runs a historical-ingest canary, and names the setting behind any value that will
 hurt. Fixing the destination and re-running costs nothing.
 
+The canary writes to the destination before your traces are migrated. It creates
+or reuses a project called `langsmith-migrator-canary` and leaves one run in it,
+stamped at the far end of your range. Nothing deletes it, so it stays until the
+destination's retention removes it. `--dry-run` skips the canary.
+
 | Setting | Default | Why it matters |
 | --- | --- | --- |
-| `V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS` | `["*"]` | Historical timestamps are rejected outright when the ±24h ingest window is enforced, and the *whole* multipart request fails. Keep `*` or add the org. The pre-flight canary — one run stamped at the far end of the requested range, read back by ID — enforces this before anything is migrated, and stops with `historical_ingest_rejected` if it fails. |
+| `V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS` | `["*"]` | Historical timestamps are rejected outright when the ±24h ingest window is enforced, and the *whole* multipart request fails. Keep `*` or add the org. The pre-flight canary — one run stamped at the far end of the requested range, read back by ID — enforces this before your traces are migrated, and stops with `historical_ingest_rejected` if it fails. The run it writes is left behind. |
 | `MAX_FIELD_SIZE_BYTES` | 25 MB | An oversized `inputs`/`outputs` is **silently replaced with a placeholder**, not rejected, and the limit is not advertised. Tell the tool via `--max-field-bytes`; a larger re-inlined payload is then reported as `payload_oversized_for_destination` instead of quietly stubbed. |
 | `MAX_ATTACHMENT_SIZE_BYTES` | 200 MB | Attachments above this are refused. |
 | `TRACE_TIER_TTL_DURATION_SEC_MAP`, `S3_TRACE_TIER_PREFIX_MAP` | `""` | Both need a `longlived` entry or tier handling errors. |
@@ -312,7 +332,7 @@ langsmith-migrator clean
 - `fleet`: migrate Fleet resources (agents, skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, secrets) with `--skip-*` flags for each resource type, and `--agent <name-or-id>` / `--agents-owned-only` to scope which agents (and their schedules/triggers/usage limits) are migrated
 - `issues`: migrate Engine issues-agent configs and detected issues as metadata (`--session` to scope to one tracing project)
 - `contexts`: migrate Context Hub agents and skills, replaying full commit history and tags by default (`--latest-only`, `--no-tags`, `--agents-only`, `--skills-only`, `--include-external`, `--same-instance`)
-- `traces`: migrate long-lived traces (`trace_tier == "longlived"`) with run IDs and timestamps preserved; stateless, so re-run rather than resume (`--since`/`--until` required and absolute, `--window`, `--prefetch-windows`, `--compress-level`, `--skip-attachments`, `--emit-upgrade-list`). Can archive to disk and replay (`--to-archive`, `--from-archive`). Not part of `migrate-all`
+- `traces`: migrate long-lived traces (`trace_tier == "longlived"`) with run IDs and timestamps preserved; no resumable checkpoint, so re-run rather than resume (`--since`/`--until` required and absolute, `--window`, `--prefetch-windows`, `--compress-level`, `--skip-attachments`, `--emit-upgrade-list`). Can archive to disk and replay (`--to-archive`, `--from-archive`). Not part of `migrate-all`
 - `users`: migrate users/roles between instances, or run single-instance CSV access sync
 - `export-users`: export active org and workspace members to a members CSV for import via `users --members-csv`
 - `resume`: retry resumable items from a prior session and show grouped manual blockers
@@ -540,9 +560,19 @@ The prompt default is `No` (rules are created disabled).
 --compress-level INTEGER        zstd level for the ingest body, 1-22 (default: 3)
 --no-compress-upload            Send the ingest body uncompressed
 --prefetch-windows INTEGER      Windows to retrieve concurrently, 1-32 (default: 4); ingest stays serial
---to-archive DIR                Write windows to disk as .tar.zst instead of ingesting into a destination
---from-archive DIR              Replay window files from a directory instead of reading the source deployment
---allow-incomplete              Replay a truncated (.partial) window file
+--to-archive LOCATION           Write windows as .tar.zst instead of ingesting: a directory, or s3://bucket/prefix
+--from-archive LOCATION         Replay window files from a directory or s3://bucket/prefix
+--allow-incomplete              Replay a truncated (.partial) window file (local archives only)
+--s3-part-bytes INTEGER         Multipart part size (default 8 MiB, S3 floor 5 MiB)
+--s3-upload-concurrency INTEGER Parts in flight per window (default 4)
+--s3-download-concurrency INTEGER
+                                Ranges in flight per window on replay (default 4)
+--s3-download-chunk-bytes INTEGER
+                                Range size on replay (default 2 MiB)
+--s3-endpoint-url TEXT          S3-compatible endpoint (MinIO/Ceph)
+--s3-sse TEXT                   Server-side encryption: AES256 or aws:kms
+--s3-kms-key-id TEXT            KMS key, with --s3-sse aws:kms
+--s3-storage-class TEXT         e.g. STANDARD_IA
 --map-projects                  Launch interactive TUI to map source projects to destination projects
 --project-mapping TEXT          JSON string or file path with project ID mapping (headless, no TUI)
 --restore-session-tier/--no-restore-session-tier
@@ -554,8 +584,6 @@ The prompt default is `No` (rules are created disabled).
 
 Both range bounds are **required and absolute** — a relative age means a
 different moment every time it is read, which breaks clean resumption.
-`--max-age-stamp` still works as another name for `--since`.
-
 The timestamps observed are the trace's (root run's) `start_time` - all
 children of the trace are selected regardless of their individual `start_time`-s.
 
@@ -583,17 +611,64 @@ langsmith-migrator traces --from-archive /data/archive/20260901T120000Z \
     20260901T000000Z__20260901T060000Z.tar.zst     # one window, bounds in the name
 ```
 
-- **`--window` (in hours) is the only control over file size.** It also bounds
-  how much one worker holds in memory. The bigger the window/byte size, the better
-  the compression ratio. OTOH big window increases the gap between and the size of
-  "checkpoints", making resumption after a failure slower.
+#### Archive in S3
+
+Both flags also take `s3://bucket/prefix`, with the same layout, so an archive
+can be copied between a disk and a bucket with `aws s3 sync` and read from
+either. Needs the `s3` extra:
+
+```bash
+uv tool install 'langsmith-data-migration-tool[s3]'
+
+langsmith-migrator traces --to-archive s3://my-bucket/traces/run1 \
+  --project gtm-agent --since 2026-06-01 --until 2026-09-01 --window 6
+```
+
+Credentials come from the usual AWS chain. Prefer a profile or an instance role
+over static `AWS_*` variables for long exports: static keys cannot be refreshed,
+so an export outliving a session token stops partway (safely — re-run to
+continue).
+
+A window is uploaded as a multipart upload and becomes visible only when it
+completes, so there is no `.partial` stage and no `--allow-incomplete`. An
+interrupted export leaves an unfinished upload rather than a readable object;
+the tool aborts its own on exit, and a bucket lifecycle rule is the backstop for
+anything a `kill -9` leaves behind:
+
+```json
+{"Rules": [{"ID": "abort-stale-uploads", "Status": "Enabled", "Filter": {},
+            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}}]}
+```
+
+Transfer tuning is available as flags and as `MIGRATION_S3_*` environment
+variables (`PART_BYTES`, `UPLOAD_CONCURRENCY`, `DOWNLOAD_CONCURRENCY`,
+`DOWNLOAD_CHUNK_BYTES`, `MAX_POOL_CONNECTIONS`, `CONNECT_TIMEOUT`,
+`READ_TIMEOUT`, `MAX_ATTEMPTS`, `RETRY_MODE`, `ENDPOINT_URL`,
+`ADDRESSING_STYLE`, `SSE`, `SSE_KMS_KEY_ID`, `STORAGE_CLASS`). The defaults suit a modest link. The effective values are printed in the
+pre-flight table.
+
+An archive is **plaintext trace data**. Use `--s3-sse` (and a restrictive bucket
+policy) if that matters; note a versioned bucket keeps every re-captured window.
+
+`--dry-run` reads the source and compresses exactly as a real run does, and
+reports the size it would have written, but issues no upload. It is the quick
+way to check reach, credentials, resume state and compression ratio.
+
+- **`--window` (in hours) sets how much goes in one file, before compression.**
+  It is also what bounds how much one worker holds in memory. The size on disk
+  depends on the payloads themselves and on `--compress-level` as well, so the
+  same window can produce very different file sizes for different projects. A
+  bigger window usually compresses better, but makes each checkpoint larger, so
+  re-running after a failure repeats more work.
 - **`ls` tells you what finished.** A window is written as `.partial` and renamed
   only once complete, in time order — so an interrupted export leaves an
   unbroken run of files, never a gap in the middle.
 - **To resume, re-run the identical command**; finished windows are skipped. To
   re-capture one window, delete its file. DO NOT change the time window on re-run!
-- Compression measures 22x on small payloads and up to 190x on projects with
-  large repeated content.
+- **Compression ratios vary a lot by project** — mostly with how much content
+  repeats between runs. Use `--dry-run`, which compresses for real and reports
+  the size and ratio it would have written, to measure your own data before
+  committing to a long export.
 
 Two things to know before pointing this at real data:
 
@@ -614,14 +689,12 @@ Three settings govern speed, and only one of them trades anything away:
   leaves every earlier window complete rather than a hole in the middle. Peak
   memory is this many windows of payloads plus the one being written — shrink
   `--window` if that is too much.
-- `--compress-level` (default 3) sets the zstd level for the ingest body.
-  Measured per assembled request on real payloads: level 1 (what the SDK uses
-  on its own) 5.9x, level 3 alone 30.6x, level 3 with long-distance matching
-  68.5x at ~1755 MB/s, level 19 79.7x at 58 MB/s. The long-match gain ranges
-  from 0.98x to 3.71x depending on how much a project repeats content across
-  runs. Level 3 is effectively free; raise it only when
-  genuinely bandwidth-bound, since the frame is built by the retrieval workers
-  and higher levels start costing real CPU.
+- `--compress-level` (default 3) sets the zstd level for the ingest body, with
+  long-distance matching on. Higher levels shrink the body more and cost more
+  CPU; how much of each depends on how much your projects repeat content between
+  runs. The default is cheap enough to leave alone — raise it only when you are
+  clearly limited by bandwidth rather than CPU, and measure with `--dry-run`
+  first, because the body is built by the same threads that fetch the data.
 - Page size is not an option: `/runs/query` is asked for 1000 runs per page and
   lowers itself if a deployment advertises a smaller cap. Payload fetches are
   likewise self-tuning — they start at 500 run IDs per request and halve on a
@@ -630,9 +703,10 @@ Three settings govern speed, and only one of them trades anything away:
   refused (502); continuing at 250` is that adjustment, not an error.
 
 `--no-compress-upload` falls back to the SDK's own uncompressed multipart path.
-Compression is also skipped automatically if the destination does not advertise
-`zstd_compression_enabled` or the SDK internals it needs have moved; the
-pre-flight table says which.
+Compression is also skipped automatically if the SDK internals it needs have
+moved; the pre-flight table says which. The destination is not asked whether it
+supports compression — if it rejects a compressed body, use
+`--no-compress-upload`.
 
 ### Users Options
 
