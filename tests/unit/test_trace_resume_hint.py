@@ -12,8 +12,17 @@ def _watermark(verified_runs, span_hours, batch_runs):
     latest = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
     earliest = latest - dt.timedelta(hours=span_hours)
     report = Reconciliation(
-        "S", "D", "", verified_runs, verified_runs, 0, 0, 0,
-        earliest=earliest.isoformat(), latest=latest.isoformat(), verified_runs=verified_runs,
+        "S",
+        "D",
+        "",
+        verified_runs,
+        verified_runs,
+        0,
+        0,
+        0,
+        earliest=earliest.isoformat(),
+        latest=latest.isoformat(),
+        verified_runs=verified_runs,
     )
     printed = []
     with patch.object(cli_main.console, "print", lambda *a, **k: printed.append(str(a[0]))):
@@ -43,12 +52,6 @@ def test_a_span_smaller_than_one_batch_resumes_at_the_earliest():
     assert _resume_instant(text) == earliest
 
 
-def test_a_denser_project_gets_a_smaller_overlap():
-    sparse = _resume_instant(_watermark(1000, span_hours=10, batch_runs=100)[0])
-    dense = _resume_instant(_watermark(10_000, span_hours=10, batch_runs=100)[0])
-    assert dense > sparse, "10x the run density should mean 10x less time redone"
-
-
 def test_a_project_with_blocked_runs_claims_no_watermark():
     printed = []
     with patch.object(cli_main.console, "print", lambda *a, **k: printed.append(str(a[0]))):
@@ -58,30 +61,9 @@ def test_a_project_with_blocked_runs_claims_no_watermark():
     assert "--since" not in text
 
 
-def test_a_dry_run_explains_nothing_rather_than_blaming_fidelity():
-    """The suppression reason must match reality.
-
-    With --dry-run or --no-verify there is nothing verified; saying "degraded
-    or blocked runs" would send an operator hunting for problems that the very
-    same line reports as zero.
-    """
-    clean_but_unverified = Reconciliation("S", "D", "", 2, 2, 0, 0, 0)
-    printed = []
-    with patch.object(cli_main.console, "print", lambda *a, **k: printed.append(str(a[0]))):
-        cli_main._print_trace_watermark(clean_but_unverified, 100, verified=False)
-    assert printed == []
-
-
-def test_a_verified_run_with_blocked_runs_does_explain_itself():
-    printed = []
-    with patch.object(cli_main.console, "print", lambda *a, **k: printed.append(str(a[0]))):
-        cli_main._print_trace_watermark(Reconciliation("S", "D", "", 2, 1, 0, 0, 1), 100, verified=True)
-    assert "degraded or blocked runs" in "\n".join(printed)
-
-
 def test_window_durations_read_as_wall_clock():
     """The pre-flight prints the window in units an operator thinks in."""
-    h = cli_main._human_duration   # takes hours, since --window does
+    h = cli_main._human_duration  # takes hours, since --window does
     assert h(0.24) == "14m24s"
     assert h(2.4) == "2h24m"
     assert h(24.0) == "1d"

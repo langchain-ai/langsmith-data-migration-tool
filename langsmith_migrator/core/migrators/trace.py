@@ -1,28 +1,4 @@
-"""Long-lived trace migration.
-
-Copies runs whose trace tier is ``longlived`` between two LangSmith
-deployments, preserving ``id`` / ``trace_id`` / ``parent_run_id`` /
-``dotted_order`` and every timestamp verbatim. Contrast with
-``ExperimentMigrator``, which remaps run IDs, time-shifts into the ingest
-window, and checkpoints a cursor: none of that happens here.
-
-The unit of work is a ``(session, time window)`` slice. For each one we ask the
-source for its long-lived run IDs, ask the mapped destination session for the
-same, ingest the difference, and re-query to confirm the difference is now
-empty. That diff is simultaneously the work-list, the skip-list and the
-completeness proof, which is why nothing is checkpointed: interrupt and re-run,
-and finished windows produce an empty diff. ``resume`` does not apply.
-
-Two backend facts drive most of the shape here:
-
-* A run id is write-once per tenant: re-sending one is refused with ``409 Run
-  create payload already received``, not upserted. Idempotency comes from the ID
-  diff never re-sending a run the destination already holds - which is also why
-  migrating into the *same* tenant is refused outright.
-* There is no per-run trace-tier field on the ingest contract. The destination
-  *session's* tier is the only lever, and it must be correct at ingest time
-  because the row TTL and the blob key prefix are both baked in at insert.
-"""
+"""Long-lived trace migration."""
 
 from __future__ import annotations
 
@@ -52,6 +28,7 @@ from ..trace_frames import (
 )
 from ..trace_ports import RunSink, RunSource, SlicePrepared
 from ..trace_domain import (
+    LOST_CONTENT_CODES,
     ATTACHMENT_PREFIX,
     LONGLIVED,
     RUN_QUERY_SELECT,
@@ -73,30 +50,17 @@ from ..trace_domain import (
 )
 from .base import BaseMigrator
 
-# The binding constraint is the *response* size, not the ID count: 500 IDs of a
-# heavy project's full payloads is ~65 MB and a gateway rejects it with a 502 in
-# under ten seconds, while 500 IDs of a light one is fine. So this is a starting
-# point that halves itself on rejection, down to _ID_CHUNK_MIN.
 _ID_CHUNK = 500
 _ID_CHUNK_MIN = 25
 
-# Both real deployments cap /runs/query at 1000. A deployment that caps lower
-# says so in the 400, so the limit self-corrects rather than being probed.
-# Measured: an ``id``-filtered query ignores the limit entirely (2000 IDs at
-# limit=10 returned all 2000 in one page). Not relied on - ID chunks are held
-# at or under the limit so a request never depends on that leniency.
 _PAGE_LIMIT = 1000
 _PAGE_CAP_RE = re.compile(r"maximum allowed value of (\d+)")
 _READ_TIMEOUT_RE = re.compile("read timed out", re.IGNORECASE)
 
-# Payload fetches ask for hundreds of heavy runs at once - one chunk of a heavy
-# project measured 355 MB - which the client's 30 s default cannot serve. Long
-# enough for a legitimately large response, short enough that the chunk halving
-# still reacts within a few minutes rather than a quarter of an hour.
 _QUERY_TIMEOUT = 120
 
-# Not advertised by /info (only the batch limits are), so it matches the
-# backend's own MAX_ATTACHMENT_SIZE_BYTES default and is a guard, not a truth.
+_DRY_RUN_PREFIX = "dry-run-"
+
 _MAX_ATTACHMENT_BYTES = 200 * 1024 * 1024
 
 _VERIFY_ATTEMPTS = 4
@@ -106,18 +70,7 @@ _CANARY_SESSION = "langsmith-migrator-canary"
 
 
 def _size_connection_pools(*clients_and_size) -> None:
-    """Give each client a connection pool that fits the reader count.
-
-    urllib3 defaults to 10, and a full pool silently drops connections rather
-    than queueing, which shows up as ChunkedEncodingError under load.
-
-    The sessions themselves stay shared across the prepare workers. urllib3's
-    pools are thread-safe; what is not is mutating session state, and the only
-    mutable piece in play is the cookie jar - measured empty, as neither
-    deployment sends Set-Cookie on the endpoints this migrator uses. Headers
-    are mutated only on the destination write session, which is main-thread
-    only.
-    """
+    """Give each client a connection pool that fits the reader count."""
     *clients, workers = clients_and_size
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=max(10, workers * 2), pool_maxsize=max(10, workers * 2)
@@ -130,19 +83,7 @@ def _size_connection_pools(*clients_and_size) -> None:
 
 
 def _response_too_large(error: Exception) -> bool:
-    """Whether a failure looks like "that response was too big to serve".
-
-    The gateway in front of LangSmith answers 502 (or 413) on an oversized
-    response body rather than saying so, and it does it fast - there is nothing
-    to distinguish it from a genuine outage except that retrying at the same
-    size keeps failing, which the retry layer has already established.
-
-    A read timeout is the same problem stated differently: the server took the
-    request and never finished the body. ``requests`` reports it as ``Timeout``
-    or, when the stall strikes while the body is being consumed, as a
-    ``ConnectionError`` wrapping urllib3's own read timeout - so the class alone
-    is not a reliable discriminator and the message has to be read too.
-    """
+    """Whether a failure looks like "that response was too big to serve"."""
     if getattr(error, "status_code", None) in (413, 502, 503):
         return True
     return isinstance(error, requests.exceptions.Timeout) or bool(
@@ -157,19 +98,13 @@ def _page_limit_cap(error: Exception) -> Optional[int]:
 
 
 def _raise_if_tier_denied(error: Exception) -> None:
-    """Turn a 403 on a tier-carrying write into an explicit pre-flight blocker.
-
-    ``PROJECTS_INCREASE_TRACE_TIER`` is checked on *create* too, not only on
-    update, when the destination tenant's default tier is short-lived.
-    """
+    """Turn a 403 on a tier-carrying write into an explicit pre-flight blocker."""
     text = str(error)
     if "403" in text or "Forbidden" in text:
         raise TracePreflightError(
             "trace_tier_permission_denied: the destination key needs PROJECTS_INCREASE_TRACE_TIER "
             f"(and PROJECTS_DECREASE_TRACE_TIER to restore). {text[:200]}"
         )
-
-
 
 
 class TracePreflightError(RuntimeError):
@@ -203,13 +138,8 @@ class TraceMigrator(BaseMigrator):
         run_source: Optional[RunSource] = None,
     ):
         super().__init__(source_client, dest_client, state, config)
-        # This class *is* the LangSmith source and sink; an archive supplies the
-        # file ones. Both halves are swappable independently, which is what lets
-        # an export need no destination and a replay need no source deployment.
         self.run_sink: RunSink = run_sink or self
         self.run_source: RunSource = run_source or self
-        # Both bounds absolute, so nothing here reads a clock: two runs of the
-        # same command walk exactly the same windows.
         self._resolved_start = as_utc(range_start)
         self._resolved_end = as_utc(range_end)
         if self._resolved_start >= self._resolved_end:
@@ -224,49 +154,30 @@ class TraceMigrator(BaseMigrator):
         self.emit_upgrade_list = emit_upgrade_list
         self.project_id_map = dict(project_id_map or {})
 
-        # What was reduced, stated as fact. A run that landed incomplete is
-        # invisible to the ordinary ID diff, since its ID is present.
         self.fidelity_reduced: Set[str] = set()
         if skip_attachments:
             self.fidelity_reduced.add("attachments were skipped (--skip-attachments)")
         self.upgrade_rows: List[Tuple[str, str, str]] = []
-        # Human-readable reasons for blocked runs, so the CLI can explain a
-        # blocked count instead of only recording it into state.
         self.blocked_reasons: List[str] = []
 
-        # Per side: the two deployments need not cap /runs/query alike.
         self._page_limit = {"source": _PAGE_LIMIT, "dest": _PAGE_LIMIT}
-        # Shrinks itself when a project's payloads make the response too big.
         self._id_chunk = _ID_CHUNK
-        # Set before any worker starts. The default 30 s is a payload fetch's
-        # normal case here, not its worst.
         for client in (source_client, dest_client):
             if getattr(client, "timeout", 0) and client.timeout < _QUERY_TIMEOUT:
                 client.timeout = _QUERY_TIMEOUT
-        # Set by graceful_stop's first signal; stops scheduling, drains the rest.
         self.stop_requested = False
         self.skipped_windows = 0
-        # dest_session_id -> (its tier before we touched it, the source's tier).
+        self.windows_scanned = 0
+        self.windows_empty = 0
         self._prior_tier: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
 
-        # None = send uncompressed through the SDK's public path. Resolved
-        # once, after the client exists, so a missing SDK internal or a
-        # destination without the feature degrades instead of failing per batch.
         self.compress_level = compress_level
         self.compress_unavailable: Optional[str] = None
 
-        # How many windows may be retrieved concurrently. Ingest stays serial
-        # whatever this is; only the reading ahead is parallel. Peak memory is
-        # roughly this many windows of payloads, so --window trades it back.
         self.prefetch_windows = max(1, prefetch_windows)
         self._main_thread = threading.get_ident()
-        # Sized to the readers: the default pool of 10 would churn connections
-        # once several windows are in flight.
         _size_connection_pools(source_client, dest_client, self.prefetch_windows)
 
-        # Blobs are proxied by whichever deployment stores them, so the
-        # allow-list is per side: the destination's read-back URLs live on the
-        # destination host, not the source's.
         self._source_blob_host = urlparse(self._host(config.source.base_url)).netloc
         self._dest_blob_host = urlparse(self._host(config.destination.base_url)).netloc
 
@@ -281,9 +192,6 @@ class TraceMigrator(BaseMigrator):
         if not config.destination.verify_ssl:
             self._dest_session_http.verify = False
         self._ingest_errors: List[Exception] = []
-        # The SDK reports nothing on a 2xx, and a backend that accepts the
-        # request then drops the runs is indistinguishable from success. We own
-        # this session, so record what the multipart POST actually answered.
         self._ingest_responses: List[Tuple[int, str]] = []
         _session_request = self._dest_session_http.request
 
@@ -298,8 +206,6 @@ class TraceMigrator(BaseMigrator):
             return response
 
         self._dest_session_http.request = _record_ingest
-        # The SDK logs multipart failures and returns normally, so an exception
-        # never reaches us. The callback is the only way to notice.
         self.dest_ls_client = Client(
             api_key=config.destination.api_key,
             api_url=self._host(config.destination.base_url),
@@ -320,9 +226,6 @@ class TraceMigrator(BaseMigrator):
         """Absolute upper bound of this run's walk."""
         return self._resolved_end
 
-    # ------------------------------------------------------------------
-    # RunSource / RunSink for the LangSmith side
-    # ------------------------------------------------------------------
     def sessions(self) -> List[Dict[str, Any]]:
         return self.list_source_sessions()
 
@@ -330,12 +233,7 @@ class TraceMigrator(BaseMigrator):
         return iter_windows(self.resolved_range_start(), self.walk_end(), self.window_hours)
 
     def open_target(self, session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Resolve the destination project and make sure its tier is right.
-
-        The prior tier is remembered here rather than by the caller, so
-        ``close_target`` can put it back without the driver knowing a tier
-        exists at all.
-        """
+        """Resolve the destination project and make sure its tier is right."""
         target = self.resolve_dest_session(session)
         if not target:
             return None
@@ -344,15 +242,11 @@ class TraceMigrator(BaseMigrator):
         return target
 
     def has_window(self, target: Dict[str, Any], window: Window) -> bool:
-        """Always false: a project has no window-level record, and can always
-        gain runs - from a concurrent dual-write, or another operator."""
+        """Always false: a project has no window-level record, and can always"""
         return False
 
     def existing_ids(self, target: Dict[str, Any], window: Window) -> Set[str]:
-        # With --emit-upgrade-list the destination sessions stay at their
-        # existing tier, so filtering on tier there would read every migrated
-        # run as missing.
-        if self.config.migration.dry_run:
+        if str(target.get("id", "")).startswith(_DRY_RUN_PREFIX):
             return set()
         return self.long_lived_run_ids(
             self.dest, str(target["id"]), window, tier_filter=not self.emit_upgrade_list
@@ -374,9 +268,6 @@ class TraceMigrator(BaseMigrator):
         prior, source_tier = self._prior_tier.pop(str(target["id"]), (None, None))
         self._settle_tier(target, prior, source_tier, recon)
 
-    # ------------------------------------------------------------------
-    # Plumbing
-    # ------------------------------------------------------------------
     @staticmethod
     def _human(size: float) -> str:
         for unit in ("B", "KB", "MB", "GB"):
@@ -411,9 +302,6 @@ class TraceMigrator(BaseMigrator):
             cfg = {}
         return int(cfg.get("size_limit") or 100), int(cfg.get("size_limit_bytes") or 20_971_520)
 
-    # ------------------------------------------------------------------
-    # Read path
-    # ------------------------------------------------------------------
     def _query_runs(
         self, client, session_id: str, window: Window, *, select: Sequence[str], ids=None
     ) -> Iterator[Dict[str, Any]]:
@@ -437,22 +325,14 @@ class TraceMigrator(BaseMigrator):
                 cap = _page_limit_cap(exc)
                 if cap is None or cap >= body["limit"]:
                     raise
-                # This deployment pages smaller than we asked. Adopt its
-                # number for the rest of the run and re-send.
                 self._page_limit[side] = cap
                 body = {**body, "limit": cap}
                 continue
             runs = response.get("runs") or []
             page_num += 1
             seen += len(runs)
-            if self.config.migration.verbose and runs:
+            if self.config.migration.verbose:
                 n, traces, size = self._shape(runs)
-                # Named per phase, because only the identity scan paginates: a
-                # fetch is one request per ID chunk, so a page number would
-                # restart at p1 on every one of them and a running total could
-                # only ever restate ``runs``. The scan's column is kept blank
-                # there so the two line shapes still align. Under 80 columns: a
-                # wrapped progress line is worse than a terse one.
                 scan = ids is None
                 self.console.print(
                     f"[dim]  {'scan' if scan else 'fetch':<5} {side:<6} "
@@ -466,35 +346,30 @@ class TraceMigrator(BaseMigrator):
                 return
             body = {**body, "cursor": cursor}
 
-    # Enough to identify a run and place its trace, so one pass over a slice
-    # serves both the diff and the deferred-upgrade list.
     _ID_SELECT = ("id", "trace_tier", "trace_id", "start_time")
 
-    def slice_runs(self, client, session_id: str, window: Window, *, tier_filter: bool = True) -> List[Dict[str, Any]]:
-        """The long-lived runs of one slice, projected to identity fields only.
-
-        ``trace_tier`` is filtered client-side: the V1 endpoint rejects it
-        inside ``trace_filter`` ("Attribute trace_tier not accepted") but
-        returns it on every run.
-        """
+    def slice_runs(
+        self, client, session_id: str, window: Window, *, tier_filter: bool = True
+    ) -> List[Dict[str, Any]]:
+        """The long-lived runs of one slice, projected to identity fields only."""
         return [
             run
             for run in self._query_runs(client, session_id, window, select=self._ID_SELECT)
             if run.get("id") and (not tier_filter or is_long_lived(run))
         ]
 
-    def long_lived_run_ids(self, client, session_id: str, window: Window, *, tier_filter: bool = True) -> Set[str]:
-        return {str(r["id"]) for r in self.slice_runs(client, session_id, window, tier_filter=tier_filter)}
+    def long_lived_run_ids(
+        self, client, session_id: str, window: Window, *, tier_filter: bool = True
+    ) -> Set[str]:
+        return {
+            str(r["id"])
+            for r in self.slice_runs(client, session_id, window, tier_filter=tier_filter)
+        }
 
     def fetch_runs(
         self, client, session_id: str, window: Window, run_ids: Sequence[str]
     ) -> Iterator[Dict[str, Any]]:
-        """Full payloads for a set of IDs, chunked so no response is oversized.
-
-        A chunk is materialised before being yielded so an oversized response
-        can be retried at half the size without double-yielding what the failed
-        attempt had already produced.
-        """
+        """Full payloads for a set of IDs, chunked so no response is oversized."""
         side = "source" if client is self.source else "dest"
         ids = list(run_ids)
         start = 0
@@ -503,18 +378,17 @@ class TraceMigrator(BaseMigrator):
             try:
                 page = list(
                     self._query_runs(
-                        client, session_id, window, select=RUN_QUERY_SELECT, ids=ids[start : start + chunk]
+                        client,
+                        session_id,
+                        window,
+                        select=RUN_QUERY_SELECT,
+                        ids=ids[start : start + chunk],
                     )
                 )
             except (APIError, requests.exceptions.RequestException) as exc:
                 if not _response_too_large(exc) or chunk <= _ID_CHUNK_MIN:
                     raise
-                # Retries at this size are already exhausted, so the size is
-                # the problem. Halve it and keep it for the rest of the run.
                 self._id_chunk = max(_ID_CHUNK_MIN, chunk // 2)
-                # Printed unconditionally: it changes request sizes for the rest
-                # of the run and is the explanation for a slow one. Each halving
-                # is a distinct size, so this cannot repeat itself.
                 self.console.print(
                     f"[yellow]  {chunk} IDs per request was refused "
                     f"({getattr(exc, 'status_code', None) or type(exc).__name__}); "
@@ -524,24 +398,18 @@ class TraceMigrator(BaseMigrator):
             yield from page
             start += chunk
 
-    # ------------------------------------------------------------------
-    # Blobs
-    # ------------------------------------------------------------------
     def _fetch_blob(self, url: str, limit: int, host: str, sess) -> Tuple[str, bytes]:
-        """Download one presigned blob through the tool's configured session.
-
-        Never the SDK's own conversion, which uses a bare ``requests.get`` that
-        ignores SSL config, CA bundles and proxies, and substitutes a
-        placeholder on failure. Redirects are not followed: the deployment
-        proxies blob downloads on its own host, so a redirect would be the
-        source steering us somewhere else.
-        """
+        """Download one presigned blob through the tool's configured session."""
         parsed = urlparse(url)
         if parsed.scheme != "https" or parsed.netloc != host:
             raise PermissionError("attachment_host_rejected")
         with sess.get(url, stream=True, timeout=120, allow_redirects=False) as resp:
             resp.raise_for_status()
-            content_type = (resp.headers.get("Content-Type") or "application/octet-stream").split(";")[0].strip()
+            content_type = (
+                (resp.headers.get("Content-Type") or "application/octet-stream")
+                .split(";")[0]
+                .strip()
+            )
             with SpooledTemporaryFile(max_size=8 * 1024 * 1024) as buf:
                 size = 0
                 for chunk in resp.iter_content(65536):
@@ -552,37 +420,35 @@ class TraceMigrator(BaseMigrator):
                 buf.seek(0)
                 return content_type, buf.read()
 
-    def materialise(self, run: Dict[str, Any], *, side: str = "source") -> Tuple[Dict[str, Any], List[str]]:
-        """Re-inline anything the source left in blob storage, and fetch attachments.
-
-        The query API usually resolves offloaded ``inputs`` / ``outputs`` /
-        ``extra`` for us; the blob reference is only followed when the inline
-        value is genuinely absent. Attachments are never inlined and always
-        need fetching. Returns ``(overrides, degraded_codes)`` - a failure is
-        explicit, never a placeholder.
-        """
+    def materialise(
+        self, run: Dict[str, Any], *, side: str = "source"
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Re-inline anything the source left in blob storage, and fetch attachments."""
         overrides: Dict[str, Any] = {}
         issues: List[str] = []
+        ceiling = self.run_sink.field_ceiling()
         src = side == "source"
         host = self._source_blob_host if src else self._dest_blob_host
         sess = (self.source if src else self.dest).session
 
         def pull(field: str, ref: Dict[str, Any], limit: int) -> None:
+            """Re-inline one offloaded field. Codes are payload-specific."""
             url = (ref or {}).get("presigned_url")
             if not url:
+                issues.append("payload_field_unavailable")
                 return
             try:
                 _, raw = self._fetch_blob(url, limit, host, sess)
                 overrides[field] = json.loads(raw)
             except PermissionError:
-                issues.append("attachment_host_rejected")
+                issues.append("payload_host_rejected")
             except Exception:
-                issues.append("attachment_fetch_failed")
+                issues.append("payload_fetch_failed")
 
         for field, key in (("inputs", "inputs_s3_urls"), ("outputs", "outputs_s3_urls")):
             refs = run.get(key) or {}
-            if run.get(field) is None and refs.get("ROOT"):
-                pull(field, refs["ROOT"], self.max_field_bytes)
+            if run.get(field) is None and "ROOT" in refs:
+                pull(field, refs["ROOT"], ceiling)
 
         attachments: Dict[str, Tuple[str, bytes]] = {}
         for key, ref in (run.get("s3_urls") or {}).items():
@@ -600,21 +466,16 @@ class TraceMigrator(BaseMigrator):
                 except Exception:
                     issues.append("attachment_fetch_failed")
             elif key in S3_URL_PAYLOAD_FIELDS and run.get(key) is None:
-                pull(key, ref, self.max_field_bytes)
+                pull(key, ref, ceiling)
         if attachments:
             overrides["attachments"] = attachments
         return overrides, issues
 
-    # ------------------------------------------------------------------
-    # Write path
-    # ------------------------------------------------------------------
-    def _oversized_fields(self, payload: Dict[str, Any]) -> List[str]:
-        """Fields the destination would silently replace with a placeholder.
+    def field_ceiling(self) -> int:
+        return self.max_field_bytes
 
-        The backend stubs an oversized ``inputs`` / ``outputs`` rather than
-        rejecting it, and does not advertise the limit, so this is checked
-        against the operator-supplied value before sending.
-        """
+    def oversized_fields(self, payload: Dict[str, Any]) -> List[str]:
+        """Fields the destination would silently replace with a placeholder."""
         return [
             field
             for field in ("inputs", "outputs")
@@ -625,26 +486,11 @@ class TraceMigrator(BaseMigrator):
     def ingest(
         self, payloads: List[Dict[str, Any]], frame: Optional[CompiledFrame] = None
     ) -> List[Tuple[str, str]]:
-        """Send one batch, isolating a bad run by binary split.
-
-        ``frame`` is a body compiled earlier, off this thread. A split has to
-        compile its halves here, since the parent's frame covers the whole batch.
-
-        Returns ``[(run_id, error)]`` for runs that could not be ingested.
-
-        The SDK reports neither a 409 (it breaks out of its retry loop
-        silently) nor any other non-2xx it has already logged, so failures are
-        read off the recorded response rather than from an exception.
-        """
+        """Send one batch, isolating a bad run by binary split."""
         if not payloads or self.config.migration.dry_run:
             return []
-        # Ordered, serial, single-threaded is the whole basis of "a failure
-        # leaves no gap". Fail loudly rather than quietly losing that.
         assert threading.get_ident() == self._main_thread, "ingest must run on the main thread"
         n, traces, size = self._shape(payloads)
-        # Deliberately louder than the query lines around it: this is the only
-        # step that writes, and it is otherwise invisible - multipart_ingest
-        # goes through the SDK, which does not emit the client's request logs.
         self.console.print(
             f"[bold cyan]  ==> MULTIPART INGEST -> destination[/bold cyan] "
             f"[cyan]runs {n} | traces {traces} | {self._human(size)}[/cyan]"
@@ -660,12 +506,6 @@ class TraceMigrator(BaseMigrator):
         self._report_ingest_responses()
         conflict = next((body for status, body in self._ingest_responses if status == 409), None)
         if conflict is not None:
-            # A 409 rejects the whole request, so splitting would only repeat
-            # it per run. What it does NOT say is where those runs are: the
-            # duplicate may be a copy in another project (a real rejection) or
-            # this very request's own earlier attempt, which landed. Only the
-            # destination can tell the two apart, so when verification is going
-            # to ask anyway, defer to it rather than guessing "blocked".
             if self.verify:
                 self.console.print(
                     "[yellow]  ==> 409 on ingest; leaving the verdict to verification[/yellow]"
@@ -687,11 +527,7 @@ class TraceMigrator(BaseMigrator):
         return self.ingest(payloads[:mid]) + self.ingest(payloads[mid:])
 
     def _send(self, payloads: List[Dict[str, Any]], frame: Optional[CompiledFrame] = None) -> None:
-        """Post one batch, compressing unless that is unavailable or refused.
-
-        ``frame`` is a body already compiled elsewhere; without one it is
-        compiled here. A split re-compiles, which is why this takes both.
-        """
+        """Post one batch, compressing unless that is unavailable or refused."""
         if self.compress_level is None:
             self.dest_ls_client.multipart_ingest(create=payloads)
             return
@@ -702,24 +538,16 @@ class TraceMigrator(BaseMigrator):
             f" -> {self._human(frame.sizes[1])}"
             f" ({frame.sizes[0] / max(frame.sizes[1], 1):.1f}x)[/dim]"
         )
-        # attempts=1 deliberately. Ingest is not idempotent - a run id is
-        # write-once per tenant - so a blind retry of a request whose outcome is
-        # unknown (a slow, large batch that the server did accept) earns a 409
-        # and makes a landed run look rejected. Verification establishes the
-        # truth instead; a genuinely lost batch shows up as missing there.
         self.dest_ls_client._send_compressed_multipart_req(frame.stream, frame.sizes, attempts=1)
 
     def _report_ingest_responses(self) -> None:
-        """Show what the multipart endpoint answered.
-
-        A non-2xx is printed unconditionally - it is the direct explanation for
-        runs that never arrive, and the SDK only logs it. A 2xx with a body is
-        printed too, because per-run rejections are reported that way.
-        """
+        """Show what the multipart endpoint answered."""
         for status, body in self._ingest_responses:
             interesting = body and body not in ("{}", "null", '""')
             if status >= 300:
-                self.console.print(f"[red]      ingest POST -> HTTP {status}: {body or '<empty body>'}[/red]")
+                self.console.print(
+                    f"[red]      ingest POST -> HTTP {status}: {body or '<empty body>'}[/red]"
+                )
             elif interesting:
                 self.console.print(f"[yellow]      ingest POST -> HTTP {status}: {body}[/yellow]")
             else:
@@ -727,27 +555,23 @@ class TraceMigrator(BaseMigrator):
 
     def last_ingest_summary(self) -> str:
         """Last multipart status codes, for blocked-run evidence."""
-        return ", ".join(f"HTTP {st}{': ' + bd if bd else ''}" for st, bd in self._ingest_responses) or "no response recorded"
+        return (
+            ", ".join(f"HTTP {st}{': ' + bd if bd else ''}" for st, bd in self._ingest_responses)
+            or "no response recorded"
+        )
 
-    # ------------------------------------------------------------------
-    # Sessions
-    # ------------------------------------------------------------------
     def list_source_sessions(self) -> List[Dict[str, Any]]:
         """Real tracing sessions only - never experiment/test-run sessions."""
         return [
             s
-            for s in self.source.get_paginated("/sessions", params={"reference_free": "true"}, page_size=100)
+            for s in self.source.get_paginated(
+                "/sessions", params={"reference_free": "true"}, page_size=100
+            )
             if isinstance(s, dict) and not s.get("reference_dataset_id")
         ]
 
     def get_source_session(self, value: str) -> Optional[Dict[str, Any]]:
-        """Fetch one source tracing session by ID. ``None`` when it is not one.
-
-        Only a 404 means "not a session ID". Anything else - a rate limit, a
-        gateway blip - is re-raised: swallowing it would make a transient
-        failure indistinguishable from a name the operator mistyped, and the
-        command would report success having migrated nothing.
-        """
+        """Fetch one source tracing session by ID. ``None`` when it is not one."""
         try:
             session = self.source.get(f"/sessions/{value}")
         except NotFoundError:
@@ -761,16 +585,7 @@ class TraceMigrator(BaseMigrator):
         return session
 
     def find_source_session(self, value: str) -> Tuple[Optional[Dict[str, Any]], str]:
-        """Resolve one ``--project`` value, by ID or by exact name.
-
-        Returns ``(session, reason)``. The name lookup uses the endpoint's own
-        ``name`` filter rather than enumerating sessions: a busy deployment has
-        tens of thousands of them, so a full walk would take minutes to answer
-        a question the backend answers in one request.
-        """
-        # Only try the ID endpoint when the value actually is one: it rejects a
-        # non-UUID path segment with a 422, and sniffing that out of an error
-        # string to decide "this was a name all along" is the wrong shape.
+        """Resolve one ``--project`` value, by ID or by exact name."""
         try:
             uuid.UUID(str(value))
         except (ValueError, AttributeError, TypeError):
@@ -781,7 +596,9 @@ class TraceMigrator(BaseMigrator):
                 return by_id, "id"
         matches = [
             s
-            for s in (self.source.get("/sessions", params={"name": value, "reference_free": "true"}) or [])
+            for s in (
+                self.source.get("/sessions", params={"name": value, "reference_free": "true"}) or []
+            )
             if isinstance(s, dict) and not s.get("reference_dataset_id")
         ]
         if len(matches) > 1:
@@ -789,27 +606,16 @@ class TraceMigrator(BaseMigrator):
         return (matches[0], "name") if matches else (None, "missing")
 
     def _dest_sessions_named(self, name: str) -> List[Dict[str, Any]]:
-        """Destination tracing projects with exactly this name.
-
-        Uses the endpoint's ``name`` filter rather than enumerating every
-        project: the previous full walk cost one request per 100 projects on
-        the destination, repeated for the canary and again for each project
-        being migrated, which dominated the request count on a busy tenant.
-        Returning every match keeps the ambiguity check intact.
-        """
+        """Destination tracing projects with exactly this name."""
         found = self.dest.get("/sessions", params={"name": name, "reference_free": "true"}) or []
         return [
-            s for s in found
+            s
+            for s in found
             if isinstance(s, dict) and s.get("name") == name and not s.get("reference_dataset_id")
         ]
 
     def resolve_dest_session(self, source_session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Operator mapping -> destination name match -> create.
-
-        Re-derived every invocation and never read back from state. Nothing
-        downstream may assume the two IDs are equal: reusing the source ID on
-        create is a convenience, and a rejection is normal progress.
-        """
+        """Operator mapping -> destination name match -> create."""
         source_id = str(source_session["id"])
         name = source_session.get("name")
         target_name = f"{name}{self.into_session_suffix}" if self.into_session_suffix else name
@@ -826,18 +632,21 @@ class TraceMigrator(BaseMigrator):
 
         matches = self._dest_sessions_named(target_name)
         if len(matches) > 1:
-            self.log(f"Ambiguous destination session name '{target_name}'; supply --project-mapping", "warning")
+            self.log(
+                f"Ambiguous destination session name '{target_name}'; supply --project-mapping",
+                "warning",
+            )
             return None
         if matches:
             return matches[0]
 
         if self.config.migration.dry_run:
-            return {"id": f"dry-run-{source_id}", "name": target_name, "trace_tier": LONGLIVED}
+            return {
+                "id": f"{_DRY_RUN_PREFIX}{source_id}",
+                "name": target_name,
+                "trace_tier": LONGLIVED,
+            }
 
-        # Unset fields are omitted rather than sent as null: an archive knows a
-        # project's name and ID and nothing else, and the endpoint answers 422 to
-        # "start_time": null. The tier is always sent - a nil tier resolves to
-        # the destination tenant's default, which cannot be repaired after ingest.
         payload = {
             key: value
             for key, value in (
@@ -853,8 +662,6 @@ class TraceMigrator(BaseMigrator):
         payload["trace_tier"] = (
             source_session.get("trace_tier") if self.emit_upgrade_list else LONGLIVED
         )
-        # Reusing the source ID is convenient, not load-bearing: a rejection
-        # just means the session gets mapped instead.
         with_id = payload if self.into_session_suffix else {**payload, "id": source_id}
         try:
             created = self.dest.post("/sessions", with_id)
@@ -867,17 +674,14 @@ class TraceMigrator(BaseMigrator):
             except Exception as exc:
                 _raise_if_tier_denied(exc)
                 raise
-            self.log(f"Destination session for '{name}' created with a new ID {created.get('id')}", "info")
+            self.log(
+                f"Destination session for '{name}' created with a new ID {created.get('id')}",
+                "info",
+            )
         return created
 
     def ensure_long_lived(self, dest_session: Dict[str, Any]) -> None:
-        """Raise an existing session's tier and wait until the raise is observable.
-
-        The ingest path caches session lookups, and a stale short-lived entry
-        writes blobs under the short-lived prefix - which cannot be repaired
-        afterwards. So we re-read until the new tier comes back before any run
-        is ingested into it.
-        """
+        """Raise an existing session's tier and wait until the raise is observable."""
         if self.emit_upgrade_list or self.config.migration.dry_run:
             return
         if dest_session.get("trace_tier") == LONGLIVED:
@@ -904,33 +708,11 @@ class TraceMigrator(BaseMigrator):
         except Exception as exc:
             self.log(f"Could not restore trace tier on {dest_session['id']}: {exc}", "warning")
 
-    # ------------------------------------------------------------------
-    # Pre-flight
-    # ------------------------------------------------------------------
     def canary(self) -> None:
-        """Prove the destination still accepts a timestamp at the far end of the range.
-
-        Historical ingest is refused outright by a deployment that enforces the
-        ±24h window, and the whole multipart request fails - so this is checked
-        once, before anything is migrated, rather than discovered mid-transfer.
-        The ID is fresh on every invocation. It used to be derived from the
-        scratch project and an hour-rounded stamp, so repeated runs would
-        "upsert one canary" - but the destination does not upsert a re-sent
-        run, it answers ``409 Run create payload already received``. The write
-        was therefore rejected and the read-back found the *previous* run,
-        so the check passed while proving nothing about this invocation. A
-        unique ID means the read-back can only succeed if our own write landed.
-
-        The cost is one tiny run per invocation in the scratch project, which
-        cannot be cleaned up because run deletion is not exposed. That is worth
-        paying for a gate that actually gates.
-        """
+        """Prove the destination still accepts a timestamp at the far end of the range."""
         if self.config.migration.dry_run:
             return
         session = self._scratch_session()
-        # The exact range start, not an hour-rounded one: with a unique ID
-        # there is no dedup pair to keep stable, so the canary can test the
-        # precise oldest instant this run will send.
         stamp = self.resolved_range_start()
         run_id = str(uuid.uuid4())
         payload = {
@@ -975,24 +757,14 @@ class TraceMigrator(BaseMigrator):
     def _scratch_session(self) -> Dict[str, Any]:
         existing = next(iter(self._dest_sessions_named(_CANARY_SESSION)), None)
         return existing or self.dest.post(
-            "/sessions", {"name": _CANARY_SESSION, "description": "langsmith-migrator pre-flight canary"}
+            "/sessions",
+            {"name": _CANARY_SESSION, "description": "langsmith-migrator pre-flight canary"},
         )
 
-    # ------------------------------------------------------------------
-    # The unit of work
-    # ------------------------------------------------------------------
     def prepare_slice(
         self, source_session: Dict[str, Any], dest_session: Dict[str, Any], window: Window
     ) -> SlicePrepared:
-        """Everything up to the write: diff, fetch, adapt, compile.
-
-        Runs off the main thread, so it touches no shared state - findings
-        accumulate into the returned value and are merged by ``commit_slice``.
-        The exceptions are ``self._page_limit`` and ``self._id_chunk``: both are
-        only ever lowered, toward a bound the server dictated, so concurrent
-        writes converge on the same value and a lost update just means one more
-        rejection before it sticks.
-        """
+        """Everything up to the write: diff, fetch, adapt, compile."""
         return self.run_source.prepare(
             source_session,
             dest_session,
@@ -1007,31 +779,22 @@ class TraceMigrator(BaseMigrator):
         window: Window,
         existing_ids,
     ) -> SlicePrepared:
-        """``RunSource.prepare`` for the LangSmith side.
-
-        The diff is taken *before* anything is fetched, so a re-run of a
-        finished window costs the identity scan and nothing else. For an export
-        the oracle answers empty, which is what an archive is for.
-        """
+        """``RunSource.prepare`` for the LangSmith side."""
         src_id, dst_id = str(source_session["id"]), str(target["id"])
         population = self.slice_runs(self.source, src_id, window)
         if not population:
             return SlicePrepared(window, src_id, dst_id, plan_slice(set(), set()), [])
         source_ids = {str(r["id"]) for r in population}
-        prepared = SlicePrepared(window, src_id, dst_id, plan_slice(source_ids, existing_ids()), population)
+        prepared = SlicePrepared(
+            window, src_id, dst_id, plan_slice(source_ids, existing_ids()), population
+        )
 
         if self.emit_upgrade_list:
-            # Derived from the window's source population, not the diff: built
-            # from the diff, a re-run whose differences are all empty would
-            # emit an empty list.
             prepared.upgrade_rows.extend(
                 (dst_id, str(r["trace_id"]), str(r["start_time"]))
                 for r in population
                 if str(r.get("trace_id")) == str(r.get("id"))
             )
-            # Reported against the whole population for the same reason, and
-            # kept out of the reconciliation buckets so the parts still
-            # partition the source total exactly once.
             prepared.issues.append(
                 (
                     "degraded",
@@ -1060,10 +823,8 @@ class TraceMigrator(BaseMigrator):
             payload_obj, dropped = to_ingest_payload(run, prepared.dst_id, overrides)
             payload = payload_obj.as_dict()
 
-            oversized = self._oversized_fields(payload)
+            oversized = self.run_sink.oversized_fields(payload)
             if oversized:
-                # The backend stubs an oversized field rather than rejecting
-                # it, so this run must not be reported as fully migrated.
                 prepared.degraded.setdefault("payload_oversized_for_destination", set()).add(run_id)
                 prepared.fidelity_notes.add("payloads exceeded --max-field-bytes")
                 continue
@@ -1073,18 +834,13 @@ class TraceMigrator(BaseMigrator):
                 codes.add("run_example_link_dropped")
             for code in codes:
                 prepared.degraded.setdefault(code, set()).add(run_id)
-                if code in ("attachment_fetch_failed", "attachment_host_rejected"):
+                if code in LOST_CONTENT_CODES:
                     prepared.fidelity_notes.add("some source blobs could not be fetched")
 
-            # Before compiling: _run_transform mutates the payload in place.
             if len(prepared.digests) < self.verify_content_sample:
                 prepared.digests[run_id] = self._digest_of(run, overrides)
             payloads.append(payload)
 
-        # The identity scan listed these; the payload fetch did not return them.
-        # On the migrate path the confirming re-query would eventually notice; an
-        # export has no destination to confirm against, so a run silently absent
-        # from the archive would still be reported as captured.
         absent = prepared.plan.to_ingest - fetched
         if absent:
             prepared.degraded.setdefault("run_not_returned_by_source", set()).update(absent)
@@ -1092,34 +848,33 @@ class TraceMigrator(BaseMigrator):
 
         max_runs, max_bytes = self.run_sink.batch_limits()
         for batch in batch_traces(
-            group_into_traces(payloads), max_runs=max_runs, max_bytes=max_bytes, size_of=payload_bytes
+            group_into_traces(payloads),
+            max_runs=max_runs,
+            max_bytes=max_bytes,
+            size_of=payload_bytes,
         ):
             prepared.batches.append((batch, self.compile_batch(batch)))
 
     def compile_batch(self, batch: List[Dict[str, Any]]) -> Optional[CompiledFrame]:
-        """The compressed ingest body for one batch, or None when unused.
-
-        Called from a prefetch worker on both paths - the API source builds its
-        own batches, the archive source re-batches a replayed window - which is
-        the whole point of compiling here rather than on the serial send.
-        """
-        if self.compress_level is None or self.config.migration.dry_run:
+        """The compressed ingest body for one batch, or None when unused."""
+        if self.compress_level is None or self.run_sink is not self:
             return None
         return compile_frame(self.dest_ls_client, batch, self.compress_level)
 
     def commit_slice(self, prepared: SlicePrepared) -> Reconciliation:
-        """Write one prepared slice, confirm it, and account for it.
-
-        Main thread only, and called in window order, so a failure leaves every
-        earlier window complete rather than a gap.
-        """
-        src_id, dst_id, window, plan = prepared.src_id, prepared.dst_id, prepared.window, prepared.plan
+        """Write one prepared slice, confirm it, and account for it."""
+        src_id, dst_id, window, plan = (
+            prepared.src_id,
+            prepared.dst_id,
+            prepared.window,
+            prepared.plan,
+        )
+        self.windows_scanned += 1
         if not prepared.population:
-            # Still committed: for an archive an empty window is a *file*, and
-            # "we looked here and found nothing" is a different fact from "we
-            # never looked". Only a file can carry the difference, and without
-            # it the sorted-files-are-contiguous coverage proof is false.
-            self.run_sink.commit(prepared.target or {"id": dst_id}, window, prepared, prepared.staged)
+            self.windows_empty += 1
+            self.run_sink.commit(
+                prepared.target or {"id": dst_id}, window, prepared, prepared.staged
+            )
             return Reconciliation(src_id, dst_id, window.label(), 0, 0, 0, 0, 0)
 
         self.upgrade_rows.extend(prepared.upgrade_rows)
@@ -1135,11 +890,11 @@ class TraceMigrator(BaseMigrator):
         ):
             blocked.add(run_id)
             rejected.setdefault(str(error), set()).add(run_id)
-        # Grouped by cause: twenty runs refused for one reason is one fact, not
-        # twenty truncated lines.
         for error, ids in rejected.items():
             self._record_blocked(
-                window, ids, "run_ingest_rejected",
+                window,
+                ids,
+                "run_ingest_rejected",
                 f"{len(ids)} run(s) refused by the destination on ingest: {error}",
             )
 
@@ -1153,15 +908,8 @@ class TraceMigrator(BaseMigrator):
 
         self._report_degraded(window, degraded)
 
-        # A run can be both degraded and blocked; blocked wins, so the parts
-        # stay a partition of the source total.
         degraded_ids = set().union(*degraded.values()) if degraded else set()
         degraded_only = degraded_ids - blocked
-        # Only a wholly clean slice yields a watermark: a slice that degraded
-        # or blocked anything cannot claim "everything up to here is complete".
-        # A watermark is a claim that everything up to it is confirmed on the
-        # destination, so it may only be made when a confirming query actually
-        # ran: --no-verify skips it, and a dry run wrote nothing to confirm.
         complete = (plan.to_ingest | plan.already_present) - blocked - degraded_ids
         clean = not (blocked or degraded_ids) and self.verify and not self.config.migration.dry_run
         earliest, latest = verified_bounds(prepared.population, complete) if clean else (None, None)
@@ -1190,7 +938,9 @@ class TraceMigrator(BaseMigrator):
     @staticmethod
     def _digest_of(run: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, str]:
         merged = {**run, **overrides}
-        sizes = {name: len(data) for name, (_, data) in (overrides.get("attachments") or {}).items()}
+        sizes = {
+            name: len(data) for name, (_, data) in (overrides.get("attachments") or {}).items()
+        }
         return payload_digest(merged, sizes)
 
     def _confirm(self, dest_session_id: str, window: Window, expected: Set[str]) -> Set[str]:
@@ -1206,7 +956,11 @@ class TraceMigrator(BaseMigrator):
         return missing
 
     def _check_content(
-        self, dest_session_id: str, window: Window, digests: Dict[str, Dict[str, str]], degraded: Dict[str, Set[str]]
+        self,
+        dest_session_id: str,
+        window: Window,
+        digests: Dict[str, Dict[str, str]],
+        degraded: Dict[str, Set[str]],
     ) -> None:
         """Compare sampled per-field digests. Reports field names, never values."""
         mismatched: Dict[str, List[str]] = {}
@@ -1216,9 +970,10 @@ class TraceMigrator(BaseMigrator):
                 continue
             overrides, issues = self.materialise(run, side="dest")
             if issues:
-                # Otherwise a read-back failure is indistinguishable from the
-                # destination genuinely holding different content.
-                self.log(f"Could not read back run {run_id} for comparison: {sorted(set(issues))}", "warning")
+                self.log(
+                    f"Could not read back run {run_id} for comparison: {sorted(set(issues))}",
+                    "warning",
+                )
                 continue
             fields = digest_mismatches(digests[run_id], self._digest_of(run, overrides))
             if fields:
@@ -1229,16 +984,11 @@ class TraceMigrator(BaseMigrator):
                 "degraded",
                 "run_fidelity_mismatch",
                 f"{len(mismatched)} sampled run(s) differ from the source ({window.label()})",
-                # Field names and counts only - never values.
                 evidence={"window": window.label(), "runs": dict(list(mismatched.items())[:20])},
             )
 
     def _report_degraded(self, window: Window, degraded: Dict[str, Set[str]]) -> None:
-        """One issue per (window, code), not per run.
-
-        ``record_issue`` rewrites the whole state file, so per-run issues would
-        make a large window quadratic in I/O for no extra information.
-        """
+        """One issue per (window, code), not per run."""
         for code, run_ids in sorted(degraded.items()):
             if code == "run_fidelity_mismatch":
                 continue  # already reported with its field names
@@ -1246,32 +996,29 @@ class TraceMigrator(BaseMigrator):
                 "degraded",
                 code,
                 f"{len(run_ids)} run(s) migrated with reduced fidelity ({code}) in {window.label()}",
-                evidence={"window": window.label(), "count": len(run_ids), "run_ids": sorted(run_ids)[:20]},
+                evidence={
+                    "window": window.label(),
+                    "count": len(run_ids),
+                    "run_ids": sorted(run_ids)[:20],
+                },
             )
 
     def _record_blocked(self, window: Window, run_ids: Set[str], code: str, summary: str) -> None:
-        """One record per (window, cause), whichever path blocked the runs.
-
-        Both the ingest rejection and the confirm miss land here, so a blocked
-        count always has a matching reason in the output and in state - rather
-        than a reason only for one of the two ways runs get blocked.
-        """
+        """One record per (window, cause), whichever path blocked the runs."""
         self.blocked_reasons.append(f"{window.label()}: {summary}")
         self.record_issue(
             "blocked",
             code,
             f"{summary} ({window.label()})",
-            evidence={"window": window.label(), "count": len(run_ids), "run_ids": sorted(run_ids)[:20]},
+            evidence={
+                "window": window.label(),
+                "count": len(run_ids),
+                "run_ids": sorted(run_ids)[:20],
+            },
         )
 
     def _diagnose_missing(self, dest_session_id: str, run_ids: Set[str]) -> Tuple[str, str]:
-        """Explain why runs are absent, by asking where they actually are.
-
-        The common cause is not a lost write: the destination keeps one copy of
-        a run id per tenant, so a run that already landed in another project
-        cannot be ingested into a second one - the write is accepted and then
-        dropped. Saying "still missing" for that is true but useless.
-        """
+        """Explain why runs are absent, by asking where they actually are."""
         for run_id in sorted(run_ids)[:3]:
             try:
                 run = self.dest.get(f"/runs/{run_id}")
@@ -1295,17 +1042,8 @@ class TraceMigrator(BaseMigrator):
         code, summary = self._diagnose_missing(dest_session_id, run_ids)
         self._record_blocked(window, run_ids, code, summary)
 
-    # ------------------------------------------------------------------
-    # Per-session driver
-    # ------------------------------------------------------------------
     def migrate_session(self, source_session: Dict[str, Any]) -> Optional[Reconciliation]:
-        """Raise tier -> migrate windows oldest-first -> verify -> restore.
-
-        ``close_target`` is called in a ``finally``: once an existing project
-        has been raised, walking away without deciding what to do about it
-        would leave a project long-lived indefinitely on any mid-run failure,
-        silently changing retention for traffic unrelated to this migration.
-        """
+        """Raise tier -> migrate windows oldest-first -> verify -> restore."""
         target = self.run_sink.open_target(source_session)
         if not target:
             return None
@@ -1318,17 +1056,16 @@ class TraceMigrator(BaseMigrator):
             for sliced in self._walk_windows(source_session, target, windows):
                 slices.append(sliced)
                 if sliced.source_total:
-                    # Per-slice detail is verbose-only: the range can be 180
-                    # windows wide, and the per-session total is always printed.
-                    # Named per line, not just under the project header: in
-                    # verbose mode the query and ingest lines of a single window
-                    # push that header off the screen.
                     self.log(
                         f"  {project} {sliced.window}:"
                         f" source {sliced.source_total} = ingested {sliced.ingested}"
                         f" + already present {sliced.already_present}"
                         f" + degraded {sliced.degraded} + blocked {sliced.blocked}"
-                        + (f" | verified {sliced.earliest} .. {sliced.latest}" if sliced.earliest else ""),
+                        + (
+                            f" | verified {sliced.earliest} .. {sliced.latest}"
+                            if sliced.earliest
+                            else ""
+                        ),
                         "info",
                     )
             recon = Reconciliation.of(str(source_session["id"]), str(target["id"]), slices)
@@ -1339,18 +1076,7 @@ class TraceMigrator(BaseMigrator):
     def _walk_windows(
         self, source_session: Dict[str, Any], dest_session: Dict[str, Any], windows
     ) -> Iterator[Reconciliation]:
-        """Prepare up to ``prefetch_windows`` slices at once; commit in order.
-
-        Retrieval is the slow half and parallelises cleanly. Ingest does not:
-        committing out of order would let a later window land while an earlier
-        one is missing, so a failure would leave a hole rather than a clean
-        prefix. Windows are therefore committed strictly oldest-first, and the
-        first failure stops the walk with every earlier window complete - which
-        is what makes the watermark a claim worth printing.
-
-        A failure still waits for the preparations already in flight, since a
-        thread mid-request cannot be interrupted; nothing further is committed.
-        """
+        """Prepare up to ``prefetch_windows`` slices at once; commit in order."""
         if self.prefetch_windows <= 1:
             for window in windows:
                 if self.stop_requested:
@@ -1364,9 +1090,8 @@ class TraceMigrator(BaseMigrator):
         with ThreadPoolExecutor(
             max_workers=self.prefetch_windows, thread_name_prefix="trace-prepare"
         ) as pool:
+
             def submit_next() -> None:
-                # Main thread only: ``windows`` is a generator, and advancing
-                # one from several threads is not safe.
                 window = None if self.stop_requested else next(windows, None)
                 if window is not None:
                     pending.append(
@@ -1377,10 +1102,6 @@ class TraceMigrator(BaseMigrator):
                 submit_next()
             while pending:
                 prepared = pending.popleft().result()  # in-order: raises here on failure
-                # Refilled before committing, not after: the commit is the slow
-                # serial POST, and that is exactly when readers should be busy.
-                # Peak residency is therefore prefetch_windows in flight plus
-                # the one being written.
                 submit_next()
                 if prepared is not None:
                     yield self.commit_slice(prepared)
@@ -1388,12 +1109,7 @@ class TraceMigrator(BaseMigrator):
     def _prepare_and_stage(
         self, source_session: Dict[str, Any], target: Dict[str, Any], window: Window
     ) -> Optional[SlicePrepared]:
-        """One window's worker-side work: skip, read, stage. Never the publish.
-
-        Staging here rather than in ``commit_slice`` is what keeps the archive's
-        tar+zstd encode off the serial path - a heavy window is ~18 s of
-        compression, which across thousands of windows would add hours.
-        """
+        """One window's worker-side work: skip, read, stage. Never the publish."""
         if self.run_sink.has_window(target, window):
             self.skipped_windows += 1
             return None
@@ -1404,13 +1120,7 @@ class TraceMigrator(BaseMigrator):
 
     @contextmanager
     def graceful_stop(self):
-        """Make the first Ctrl-C lose nothing, and the second abandon at once.
-
-        The first signal stops scheduling new windows; the walk then drains what
-        is already in flight and commits it in order, so the loss is zero rather
-        than one window. The handler is restored as it fires, so a second Ctrl-C
-        raises ``KeyboardInterrupt`` the way it normally would.
-        """
+        """Make the first Ctrl-C lose nothing, and the second abandon at once."""
         previous: Dict[int, Any] = {}
 
         def handle(signum, frame):  # pragma: no cover - signal delivery
@@ -1440,11 +1150,7 @@ class TraceMigrator(BaseMigrator):
         source_tier: Optional[str],
         recon: Optional[Reconciliation],
     ) -> None:
-        """Restore a raised destination tier, or say why it was left raised.
-
-        ``ensure_long_lived`` only mutates the session dict on a real raise, so
-        a changed tier is exactly "we raised this one".
-        """
+        """Restore a raised destination tier, or say why it was left raised."""
         if dest_session.get("trace_tier") == prior_tier:
             return
         restore = self.restore_session_tier
@@ -1455,14 +1161,15 @@ class TraceMigrator(BaseMigrator):
         if recon is not None and recon.complete:
             self.restore_tier(dest_session, prior_tier)
             return
-        # Left raised on purpose - a re-run must still ingest long-lived - but
-        # recorded, because an operator otherwise has no way to know this
-        # project's retention was changed and not put back.
         reason = "the migration did not finish" if recon is None else "the project has blocked runs"
         self.record_issue(
             "degraded",
             "dest_tier_left_raised",
             f"Destination project {dest_session['id']} was raised to {LONGLIVED} and left raised "
             f"because {reason}; its previous tier was '{prior_tier}'",
-            evidence={"dest_session_id": str(dest_session["id"]), "prior_tier": prior_tier, "reason": reason},
+            evidence={
+                "dest_session_id": str(dest_session["id"]),
+                "prior_tier": prior_tier,
+                "reason": reason,
+            },
         )

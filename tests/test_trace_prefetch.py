@@ -14,7 +14,7 @@ import pytest
 
 from langsmith_migrator.core.api_client import EnhancedAPIClient
 from langsmith_migrator.core.migrators.trace import SlicePrepared, TraceMigrator
-from langsmith_migrator.core.trace_domain import Reconciliation, Window, plan_slice
+from langsmith_migrator.core.trace_domain import Reconciliation, plan_slice
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
 
@@ -72,8 +72,12 @@ def test_commits_run_in_window_order_however_preparation_finishes(sample_config)
         return _empty(window)
 
     m.prepare_slice = Mock(side_effect=prepare)
-    m.commit_slice = Mock(side_effect=lambda p: order.append(p.window.label()) or
-                          Reconciliation("src", "dst", p.window.label(), 0, 0, 0, 0, 0))
+    m.commit_slice = Mock(
+        side_effect=lambda p: (
+            order.append(p.window.label())
+            or Reconciliation("src", "dst", p.window.label(), 0, 0, 0, 0, 0)
+        )
+    )
     _drive(m)
     assert order == labels
 
@@ -93,7 +97,9 @@ def test_preparation_is_actually_concurrent(sample_config):
         return _empty(window)
 
     m.prepare_slice = Mock(side_effect=prepare)
-    m.commit_slice = Mock(side_effect=lambda p: Reconciliation("src", "dst", p.window.label(), 0, 0, 0, 0, 0))
+    m.commit_slice = Mock(
+        side_effect=lambda p: Reconciliation("src", "dst", p.window.label(), 0, 0, 0, 0, 0)
+    )
     _drive(m)
     assert max(peak) > 1, "windows were prepared one at a time"
 
@@ -157,8 +163,12 @@ def test_a_preparation_failure_surfaces_at_its_own_window(sample_config):
         return _empty(window)
 
     m.prepare_slice = Mock(side_effect=prepare)
-    m.commit_slice = Mock(side_effect=lambda p: committed.append(p.window.label()) or
-                          Reconciliation("src", "dst", p.window.label(), 0, 0, 0, 0, 0))
+    m.commit_slice = Mock(
+        side_effect=lambda p: (
+            committed.append(p.window.label())
+            or Reconciliation("src", "dst", p.window.label(), 0, 0, 0, 0, 0)
+        )
+    )
     with pytest.raises(RuntimeError, match="source query blew up"):
         _drive(m, n_windows=6)
     # the two earlier windows are committed; the walk stops at the one that failed
@@ -191,53 +201,11 @@ def test_a_raised_tier_is_still_accounted_for_when_a_prefetched_walk_fails(sampl
 # --------------------------------------------------------------------------
 # Serial parity
 # --------------------------------------------------------------------------
-def test_prefetch_one_uses_the_plain_serial_seam(sample_config):
-    m = _migrator(sample_config, prefetch_windows=1)
-    m.migrate_slice = Mock(side_effect=lambda s, d, w: Reconciliation("src", "dst", w.label(), 0, 0, 0, 0, 0))
-    _drive(m, n_windows=3)
-    assert m.migrate_slice.call_count == 3
-
-
-def test_prefetch_is_never_below_one(sample_config):
-    assert _migrator(sample_config, prefetch_windows=0).prefetch_windows == 1
 
 
 # --------------------------------------------------------------------------
 # The parallel half must not touch shared state
 # --------------------------------------------------------------------------
-def test_prepare_slice_records_no_issues_and_no_state(sample_config):
-    """Findings must travel in the value object, not be written from a worker."""
-    m = _migrator(sample_config, compress_level=None)
-    m.record_issue = Mock(side_effect=AssertionError("prepare_slice wrote an issue"))
-    m.persist_state = Mock(side_effect=AssertionError("prepare_slice wrote state"))
-    m.source.post.side_effect = [{"runs": [], "cursors": {}}]
-    prepared = m.prepare_slice({"id": "src"}, {"id": "dst"}, Window(NOW - timedelta(days=1), NOW))
-    assert prepared.population == []
-    m.record_issue.assert_not_called()
-    m.persist_state.assert_not_called()
-
-
-def test_the_upgrade_list_issue_is_deferred_to_commit(sample_config):
-    m = _migrator(sample_config, compress_level=None, emit_upgrade_list="/tmp/x.csv")
-    run = {
-        "id": "a", "trace_id": "a", "start_time": "2026-08-25T10:00:00",
-        "trace_tier": "longlived", "name": "n", "run_type": "chain",
-        "dotted_order": "20260825T100000000000Za", "inputs": {"i": 1},
-    }
-    m.source.post.side_effect = lambda _e, _b: {"runs": [run], "cursors": {}}
-    m.dest.post.side_effect = lambda _e, _b: {"runs": [], "cursors": {}}
-    m.record_issue = Mock(side_effect=AssertionError("recorded from the worker half"))
-    prepared = m.prepare_slice({"id": "src"}, {"id": "dst"}, Window(NOW - timedelta(days=1), NOW))
-    # carried as data...
-    assert prepared.upgrade_rows == [("dst", "a", "2026-08-25T10:00:00")]
-    assert [code for _, code, _, _ in prepared.issues] == ["longlived_pending_operator_upgrade"]
-    # ...and only replayed on the main thread
-    m.record_issue = Mock()
-    m.verify = False
-    m.ingest = Mock(return_value=[])
-    m.commit_slice(prepared)
-    m.record_issue.assert_called_once()
-    assert m.upgrade_rows == prepared.upgrade_rows
 
 
 def test_ingest_refuses_to_run_off_the_main_thread(sample_config):

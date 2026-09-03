@@ -97,8 +97,8 @@ def test_loading_v1_state_upgrades_to_schema_v2(tmp_path):
     assert loaded.verification_summary["total"] == 1
 
 
-def test_remediation_bundle_records_outcomes_without_advice(tmp_path):
-    """The bundle carries evidence, not a synthesised plan of action."""
+def test_remediation_summary_groups_duplicate_actionable_items(tmp_path):
+    """Remediation summaries should collapse repeated user-role failures into one actionable step."""
 
     state = MigrationState(
         session_id="migration_grouped_actions",
@@ -131,9 +131,9 @@ def test_remediation_bundle_records_outcomes_without_advice(tmp_path):
 
     assert bundle_dir is not None
     summary = (bundle_dir / "summary.md").read_text(encoding="utf-8")
-    for advice in ("## Actionable Items", "Next:", "Affected:"):
-        assert advice not in summary, advice
-    # the evidence itself is still exported
-    items = json.loads((bundle_dir / "items.json").read_text(encoding="utf-8"))
-    assert len(items) == 2
-    assert all(i["outcome_code"] == "ws_member_add_failed" for i in items.values())
+    assert "Workspace memberships failed to add (2 items)" in summary
+    assert "Affected: alice@example.com, bob@example.com" in summary
+    assert (
+        "Next: Review the workspace membership create error in the remediation "
+        "bundle, then re-run `langsmith-migrator users`."
+    ) in summary

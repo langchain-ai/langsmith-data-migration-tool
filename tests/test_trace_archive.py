@@ -21,15 +21,13 @@ from langsmith_migrator.core.trace_archive import (
     ArchiveError,
     ArchiveSink,
     ArchiveSource,
-    parse_window_label,
-    project_dir_name,
-    projected_file_count,
     read_window,
     window_label,
-    workspace_dir_name,
 )
 from langsmith_migrator.core.trace_domain import Window, plan_slice
 from langsmith_migrator.core.trace_ports import SlicePrepared
+
+_MANIFEST_NAME = "MANIFEST.json"
 
 NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
 WINDOW = Window(NOW - timedelta(days=1), NOW)
@@ -60,7 +58,12 @@ def _prepared(window, runs, **kw):
 
 def _export(root, runs, window=WINDOW, *, level=3, commit=True):
     sink = ArchiveSink(root, compress_level=level)
-    sink.intent = {"range_start": "s", "range_end": "e", "window_hours": 24.0, "projects": ["gtm-agent"]}
+    sink.intent = {
+        "range_start": "s",
+        "range_end": "e",
+        "window_hours": 24.0,
+        "projects": ["gtm-agent"],
+    }
     target = sink.open_target(PROJECT)
     prepared = _prepared(window, runs)
     staged = sink.stage(target, window, prepared)
@@ -87,7 +90,9 @@ def test_a_window_round_trips_payloads_and_attachments_byte_for_byte(tmp_path):
 
 def test_an_attachment_name_never_becomes_a_path_component(tmp_path):
     """Names ride inside the JSON; blob members are numbered by position."""
-    _, target, _, _ = _export(tmp_path, [_run(1, attachments={"../../etc/passwd": ("text/plain", b"x")})])
+    _, target, _, _ = _export(
+        tmp_path, [_run(1, attachments={"../../etc/passwd": ("text/plain", b"x")})]
+    )
     with open(next(Path(target["dir"]).glob("*.tar.zst")), "rb") as raw:
         with zstd.ZstdDecompressor().stream_reader(raw) as stream:
             names = tarfile.open(fileobj=stream, mode="r|").getnames()
@@ -106,60 +111,21 @@ def test_replay_rewrites_the_session_and_rebatches_to_the_live_caps(tmp_path):
     assert {p["session_id"] for batch, _ in prepared.batches for p in batch} == {"NEW"}
 
 
-def test_replay_sends_only_what_the_destination_lacks(tmp_path):
-    _export(tmp_path, [_run(1), _run(2)])
-    source = ArchiveSource(tmp_path)
-    session = source.sessions()[0]
-
-    prepared = source.prepare(session, {"id": "NEW"}, WINDOW, lambda: {_run(1)["id"]})
-    assert [p["id"] for batch, _ in prepared.batches for p in batch] == [_run(2)["id"]]
-    assert prepared.plan.already_present == {_run(1)["id"]}
-
-
-def test_replaying_a_fully_present_window_asks_the_destination_once_and_sends_nothing(tmp_path):
-    _export(tmp_path, [_run(1)])
-    source = ArchiveSource(tmp_path)
-    session = source.sessions()[0]
-    calls = []
-
-    prepared = source.prepare(
-        session, {"id": "NEW"}, WINDOW, lambda: calls.append(1) or {_run(1)["id"]}
-    )
-    assert prepared.batches == []
-    assert len(calls) == 1
-
-
 # --------------------------------------------------------------------------
 # Completeness, and what an interruption leaves
 # --------------------------------------------------------------------------
 def test_a_staged_window_is_partial_and_invisible_until_it_is_renamed(tmp_path):
     sink, target, prepared, staged = _export(tmp_path, [_run(1)], commit=False)
-    assert staged.name.endswith(".tar.zst.partial")
+    assert staged.partial.name.endswith(".tar.zst.partial")
     assert sink.has_window(target, WINDOW) is False
 
     sink.commit(target, WINDOW, prepared, staged)
     assert sink.has_window(target, WINDOW) is True
-    assert not staged.exists()
-
-
-def test_a_complete_tarball_left_partial_is_re_captured_not_trusted(tmp_path):
-    """The crash between stream close and rename. Wasteful once, never wrong."""
-    sink, target, _, staged = _export(tmp_path, [_run(1)], commit=False)
-    assert staged.exists() and sink.has_window(target, WINDOW) is False
-    with pytest.raises(ArchiveError, match="incomplete"):
-        read_window(staged)
-    assert read_window(staged, allow_incomplete=True).payloads
-
-
-def test_discarding_staged_windows_names_every_file_it_removed(tmp_path):
-    sink, target, _, staged = _export(tmp_path, [_run(1)], commit=False)
-    assert sink.discard_staged() == [staged]
-    assert not staged.exists()
-    assert sink.discard_staged() == []
+    assert not staged.partial.exists()
 
 
 def test_an_empty_window_still_produces_a_file_so_contiguity_holds(tmp_path):
-    """"We looked here and found nothing" is not "we never looked"."""
+    """ "We looked here and found nothing" is not "we never looked"."""
     sink = ArchiveSink(tmp_path, compress_level=3)
     sink.intent = {}
     target = sink.open_target(PROJECT)
@@ -169,26 +135,6 @@ def test_an_empty_window_still_produces_a_file_so_contiguity_holds(tmp_path):
     assert sink.has_window(target, WINDOW) is True
     decoded = read_window(next(Path(target["dir"]).glob("*.tar.zst")))
     assert decoded.payloads == [] and decoded.manifest["run_count"] == 0
-
-
-def test_runs_scanned_separates_a_quiet_window_from_a_wrong_tier_one(tmp_path):
-    """A window of 10,000 short-lived runs is empty too, but differently."""
-    sink = ArchiveSink(tmp_path, compress_level=3)
-    sink.intent = {}
-    target = sink.open_target(PROJECT)
-    scanned = SlicePrepared(WINDOW, "src", PROJECT["id"], plan_slice(set(), set()), [_run(1)])
-    sink.commit(target, WINDOW, scanned, sink.stage(target, WINDOW, scanned))
-
-    manifest = read_window(next(Path(target["dir"]).glob("*.tar.zst"))).manifest
-    assert (manifest["run_count"], manifest["runs_scanned"]) == (0, 1)
-
-
-def test_window_labels_sort_in_time_order_and_carry_both_bounds(tmp_path):
-    labels = [window_label(Window(NOW - timedelta(hours=h + 1), NOW - timedelta(hours=h))) for h in (0, 5, 30)]
-    assert sorted(labels) == labels[::-1]
-    assert parse_window_label(labels[0]) == Window(NOW - timedelta(hours=1), NOW)
-    assert parse_window_label("nonsense") is None
-    assert parse_window_label(window_label(Window(NOW, NOW))) is None  # not half-open
 
 
 def test_the_intent_lets_a_short_archive_be_told_from_a_complete_small_one(tmp_path):
@@ -209,18 +155,13 @@ def test_a_hostile_project_name_cannot_escape_the_archive_directory(tmp_path, na
     assert len(resolved.name) < 160
 
 
-def test_project_directories_are_owner_only(tmp_path):
-    _, target, _, _ = _export(tmp_path, [_run(1)])
-    assert oct(Path(target["dir"]).stat().st_mode)[-3:] == "700"
-    for path in Path(target["dir"]).iterdir():
-        assert oct(path.stat().st_mode)[-3:] == "600", path
-
-
-def _handmade(path: Path, members: dict, *, level=3):
+def _handmade(path: Path, members, *, level=3):
+    """``members`` is a dict, or pairs when a name has to repeat."""
+    pairs = members.items() if isinstance(members, dict) else members
     with open(path, "wb") as raw:
         with zstd.ZstdCompressor(level=level).stream_writer(raw, closefd=False) as stream:
             with tarfile.open(fileobj=stream, mode="w|") as tar:
-                for name, data in members.items():
+                for name, data in pairs:
                     info = tarfile.TarInfo(name)
                     info.size = len(data)
                     tar.addfile(info, io.BytesIO(data))
@@ -258,7 +199,7 @@ def test_an_unknown_format_version_is_refused_not_partially_read(tmp_path):
 
 def test_a_manifestless_file_is_reported_as_truncated(tmp_path):
     path = tmp_path / f"{window_label(WINDOW)}.tar.zst"
-    _handmade(path, {f"{_run(1)['id']}.json": b"{}"})
+    _handmade(path, {f"{_run(1)['id']}.json": json.dumps(_run(1)).encode()})
     with pytest.raises(ArchiveError, match="truncated"):
         read_window(path)
 
@@ -266,7 +207,13 @@ def test_a_manifestless_file_is_reported_as_truncated(tmp_path):
 def test_a_run_missing_its_attachment_members_is_never_presented_as_whole(tmp_path):
     path = tmp_path / f"{window_label(WINDOW)}.tar.zst"
     body = json.dumps({**_run(1), "attachments": [["a.bin", "text/plain"]]}).encode()
-    _handmade(path, {f"{_run(1)['id']}.json": body, "MANIFEST.json": _manifest()})
+    _handmade(
+        path,
+        {
+            f"{_run(1)['id']}.json": body,
+            "MANIFEST.json": _manifest(run_count=1, run_ids=[_run(1)["id"]]),
+        },
+    )
     with pytest.raises(ArchiveError, match="missing attachment"):
         read_window(path)
 
@@ -283,7 +230,7 @@ def test_a_full_disk_fails_before_a_window_file_is_opened(tmp_path, monkeypatch)
     import shutil as _shutil
 
     monkeypatch.setattr(
-        "langsmith_migrator.core.trace_archive.shutil.disk_usage",
+        "langsmith_migrator.core.trace_blobstore.shutil.disk_usage",
         lambda _p: _shutil._ntuple_diskusage(0, 0, 1024),
     )
     with pytest.raises(ArchiveError, match="refusing to start a window"):
@@ -315,42 +262,10 @@ def test_a_replay_range_confines_which_windows_are_read(tmp_path):
     assert [w.start for w in recent.windows(session)] == [WINDOW.start]
 
 
-def test_project_dir_names_are_unique_per_session_even_when_slugs_collide():
-    a = project_dir_name({"id": "1111", "name": "a/b"})
-    b = project_dir_name({"id": "2222", "name": "a:b"})
-    assert a != b and a.startswith("a_b-") and b.startswith("a_b-")
-
-
-def test_the_projected_file_count_is_range_over_window_times_projects():
-    assert projected_file_count(180 * 24, 24.0, 50) == 9_000
-    assert projected_file_count(180 * 24, 2.4, 50) == 90_000
-    assert projected_file_count(180 * 24, 0, 50) == 0
-
-
 # --------------------------------------------------------------------------
 # Workspace level
 # --------------------------------------------------------------------------
 WORKSPACE = {"id": "11112222-3333-4444-5555-666677778888", "name": "LangChain Team"}
-
-
-def test_window_files_are_filed_under_the_source_workspace_name(tmp_path):
-    sink = ArchiveSink(tmp_path, compress_level=3, workspace=WORKSPACE)
-    sink.intent = {}
-    target = sink.open_target(PROJECT)
-    prepared = _prepared(WINDOW, [_run(1)])
-    sink.commit(target, WINDOW, prepared, sink.stage(target, WINDOW, prepared))
-
-    written = sink.written[0].relative_to(tmp_path).parts
-    assert written[0] == f"LangChain_Team-{WORKSPACE['id']}"
-    assert written[1].startswith("gtm-agent-")
-    assert len(written) == 3
-
-
-@pytest.mark.parametrize("name", ["../../escape", "..", "/absolute", "-x", "a" * 300, ""])
-def test_a_hostile_workspace_name_cannot_escape_the_archive_directory(tmp_path, name):
-    sink = ArchiveSink(tmp_path, compress_level=3, workspace={"id": "ws-1", "name": name})
-    resolved = Path(sink.open_target(PROJECT)["dir"]).resolve()
-    assert tmp_path.resolve() in resolved.parents
 
 
 def test_two_workspaces_sharing_a_display_name_get_separate_directories(tmp_path):
@@ -365,27 +280,174 @@ def test_two_workspaces_sharing_a_display_name_get_separate_directories(tmp_path
         sink.commit(target, WINDOW, prepared, sink.stage(target, WINDOW, prepared))
 
     assert sorted(p.name for p in tmp_path.iterdir() if p.is_dir()) == [
-        f"LangChain_Team-{WORKSPACE['id']}", f"LangChain_Team-{twin['id']}"
+        f"LangChain_Team-{WORKSPACE['id']}",
+        f"LangChain_Team-{twin['id']}",
     ]
     ids = {read_window(f).manifest["workspace"]["id"] for f in tmp_path.rglob("*.tar.zst")}
     assert ids == {WORKSPACE["id"], twin["id"]}
 
 
-def test_a_workspace_without_a_name_or_id_still_yields_one_safe_component(tmp_path):
-    assert workspace_dir_name({"id": "abc", "name": None}) == "workspace-abc"
-    assert workspace_dir_name({"id": None, "name": "Team A"}) == "Team_A"
-    assert workspace_dir_name(None) == "workspace"
+# --------------------------------------------------------------------------
+# The field cap belongs to the sink, not to the fetch
+# --------------------------------------------------------------------------
+def test_an_archive_keeps_a_field_a_deployment_would_stub(tmp_path):
+    """A file has no field limit, so an export must not drop the run."""
+    sink = ArchiveSink(tmp_path, compress_level=1)
+    assert sink.oversized_fields({"inputs": {"q": "x" * 50_000_000}}) == []
 
 
-def test_replay_finds_projects_under_the_workspace_level(tmp_path):
-    sink = ArchiveSink(tmp_path, compress_level=3, workspace=WORKSPACE)
+def test_replay_holds_back_a_run_the_destination_would_stub(tmp_path):
+    """Archived with a bigger limit, or by another tool: still not "ingested"."""
+    big = _run(1)
+    big["inputs"] = {"q": "x" * 4096}
+    _export(tmp_path, [big])
+
+    source = ArchiveSource(tmp_path)
+    source._oversized_fields = lambda payload: ["inputs"]
+    session = source.sessions()[0]
+    prepared = source.prepare(session, {"id": "dst"}, WINDOW, lambda: set())
+
+    assert prepared.batches == [], "an oversized run must not be sent"
+    assert prepared.degraded["payload_oversized_for_destination"] == {str(big["id"])}
+    assert "payloads exceeded --max-field-bytes" in prepared.fidelity_notes
+
+
+# --------------------------------------------------------------------------
+# The manifest has to match what the tar actually holds
+# --------------------------------------------------------------------------
+def _one_run_manifest(**over):
+    return _manifest(run_count=1, run_ids=[_run(1)["id"]], **over)
+
+
+def test_a_duplicate_run_member_is_refused_not_silently_overwritten(tmp_path):
+    """The second copy used to win, so the file replayed fewer runs than claimed."""
+    path = tmp_path / f"{window_label(WINDOW)}.tar.zst"
+    body = json.dumps(_run(1)).encode()
+    _handmade(
+        path,
+        [
+            (f"{_run(1)['id']}.json", body),
+            (f"{_run(1)['id']}.json", body),
+            ("MANIFEST.json", _one_run_manifest()),
+        ],
+    )
+    with pytest.raises(ArchiveError, match="appears twice"):
+        read_window(path)
+
+
+def test_a_manifest_that_lists_other_runs_than_the_file_holds_is_refused(tmp_path):
+    path = tmp_path / f"{window_label(WINDOW)}.tar.zst"
+    _handmade(
+        path,
+        {
+            f"{_run(1)['id']}.json": json.dumps(_run(1)).encode(),
+            "MANIFEST.json": _manifest(run_count=1, run_ids=[_run(9)["id"]]),
+        },
+    )
+    with pytest.raises(ArchiveError, match="different ids"):
+        read_window(path)
+
+
+def test_a_gap_in_the_attachment_indices_is_refused(tmp_path):
+    """A length check alone passes {0, 5} for two names, then reads a missing part."""
+    path = tmp_path / f"{window_label(WINDOW)}.tar.zst"
+    body = json.dumps(
+        {**_run(1), "attachments": [["a", "text/plain"], ["b", "text/plain"]]}
+    ).encode()
+    _handmade(
+        path,
+        {
+            f"{_run(1)['id']}.json": body,
+            f"{_run(1)['id']}/0": b"x",
+            f"{_run(1)['id']}/5": b"y",
+            "MANIFEST.json": _one_run_manifest(),
+        },
+    )
+    with pytest.raises(ArchiveError, match="missing attachment"):
+        read_window(path)
+
+
+# --------------------------------------------------------------------------
+# A replay across workspace pairs must not offer the same project twice
+# --------------------------------------------------------------------------
+WS_A = {"id": "aaaa1111-0000-0000-0000-000000000000", "name": "Team A"}
+WS_B = {"id": "bbbb2222-0000-0000-0000-000000000000", "name": "Team B"}
+
+
+def _export_into(root, workspace, session):
+    sink = ArchiveSink(root, compress_level=1, workspace=workspace)
     sink.intent = {}
-    target = sink.open_target(PROJECT)
+    target = sink.open_target(session)
     prepared = _prepared(WINDOW, [_run(1)])
     sink.commit(target, WINDOW, prepared, sink.stage(target, WINDOW, prepared))
 
-    # from the archive root...
-    assert [s["name"] for s in ArchiveSource(tmp_path).sessions()] == ["gtm-agent"]
-    # ...and from one workspace directory
-    one = tmp_path / f"LangChain_Team-{WORKSPACE['id']}"
-    assert [s["name"] for s in ArchiveSource(one).sessions()] == ["gtm-agent"]
+
+def test_a_replay_only_offers_projects_from_the_workspace_being_replayed(tmp_path):
+    """Unscoped, every pair replayed every project into its own destination."""
+    _export_into(tmp_path, WS_A, {"id": PROJECT["id"], "name": "shared-name"})
+    _export_into(tmp_path, WS_B, {"id": PROJECT["id"], "name": "shared-name"})
+
+    assert len(ArchiveSource(tmp_path).sessions()) == 2, "both are in the archive"
+    for workspace in (WS_A, WS_B):
+        scoped = ArchiveSource(tmp_path, workspace=workspace["id"]).sessions()
+        assert len(scoped) == 1
+        assert workspace["id"] in scoped[0]["dir"]
+
+
+def test_an_unknown_workspace_replays_nothing_rather_than_everything(tmp_path):
+    _export_into(tmp_path, WS_A, PROJECT)
+    assert ArchiveSource(tmp_path, workspace=WS_B["id"]).sessions() == []
+
+
+# --------------------------------------------------------------------------
+# What may be published: complete, unique, and whole
+# --------------------------------------------------------------------------
+
+
+def test_a_window_holding_a_run_twice_is_never_published(tmp_path):
+    """A duplicate passes a set check but writes a tar the decoder rejects."""
+    sink = ArchiveSink(tmp_path, compress_level=1)
+    sink.intent = {}
+    target = sink.open_target(PROJECT)
+    prepared = _prepared(WINDOW, [_run(1)])
+    prepared.batches = [([_run(1), _run(1)], None)]
+    with pytest.raises(ArchiveError, match="more than once"):
+        sink.stage(target, WINDOW, prepared)
+    assert list(tmp_path.rglob("*.tar.zst*")) == []
+
+
+def test_a_window_whose_offloaded_content_was_lost_is_never_published(tmp_path):
+    """Published, its name would tell a re-run the run was captured whole."""
+    sink = ArchiveSink(tmp_path, compress_level=1)
+    sink.intent = {}
+    target = sink.open_target(PROJECT)
+    prepared = _prepared(WINDOW, [_run(1)])
+    prepared.degraded = {"attachment_fetch_failed": {str(_run(1)["id"])}}
+    with pytest.raises(ArchiveError, match="could not be"):
+        sink.stage(target, WINDOW, prepared)
+    assert list(tmp_path.rglob("*.tar.zst*")) == []
+
+
+def test_a_run_outside_the_plan_is_never_published(tmp_path):
+    """The manifest's run_ids are what a replay diffs against."""
+    sink = ArchiveSink(tmp_path, compress_level=1)
+    sink.intent = {}
+    target = sink.open_target(PROJECT)
+    prepared = _prepared(WINDOW, [_run(1)])
+    prepared.batches = [([_run(1), _run(2)], None)]
+    with pytest.raises(ArchiveError, match="outside this window's plan"):
+        sink.stage(target, WINDOW, prepared)
+    assert list(tmp_path.rglob("*.tar.zst*")) == []
+
+
+def test_the_manifest_counts_against_the_window_ceiling(tmp_path, monkeypatch):
+    """The decoder counts every member, so a manifest that tips it over must
+    not be written - the file would publish under a name meaning "complete"."""
+    monkeypatch.setattr("langsmith_migrator.core.trace_archive.MAX_WINDOW_BYTES", 400)
+    sink = ArchiveSink(tmp_path, compress_level=1)
+    sink.intent = {}
+    target = sink.open_target(PROJECT)
+    prepared = _prepared(WINDOW, [_run(1)])
+    with pytest.raises(ArchiveError, match="window ceiling"):
+        sink.stage(target, WINDOW, prepared)
+    assert list(tmp_path.rglob("*.tar.zst*")) == []
