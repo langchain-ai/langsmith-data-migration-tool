@@ -1,0 +1,50 @@
+tests/test_trace_export.py
+  s_78dd0e6625b31a::t_97e552841abae9 20,237-243,247-256,258-259
+langsmith_migrator/core/trace_s3.py
+  s_78dd0e6625b31a::t_b1c31a4fb7e1c3 20,192-197
+langsmith_migrator/core/trace_ports.py
+  s_78dd0e6625b31a::t_1f88373fce8ef9 99-107
+tests/test_trace_archive.py
+  s_78dd0e6625b31a::t_5af712e1946cb4 220-222,226
+  s_78dd0e6625b31a::t_e505bc258d2f43 264,272-273
+  s_78dd0e6625b31a::t_a86282c12555be 500-531
+  s_78dd0e6625b31a::t_565ea3a549414d 27,429-499
+  s_78dd0e6625b31a::t_4f4332eeccda30 396-428
+langsmith_migrator/core/migrators/trace.py
+  s_78dd0e6625b31a::t_1f88373fce8ef9 630,1084
+tests/test_trace_s3.py
+  s_78dd0e6625b31a::t_8e577baff34b88 507-537
+langsmith_migrator/cli/main.py
+  s_78dd0e6625b31a::t_f8f43e34ee6a4a 6492-6494,6496-6508
+  s_78dd0e6625b31a::t_4587f6a9fc3f0a 6576
+langsmith_migrator/core/trace_archive.py
+  s_78dd0e6625b31a::t_4587f6a9fc3f0a 534,541-544,576-577,653-663
+  s_78dd0e6625b31a::t_97e552841abae9 266-267
+  s_78dd0e6625b31a::t_57828230237a5d 635-640
+  s_78dd0e6625b31a::t_1f88373fce8ef9 235-238
+  s_78dd0e6625b31a::t_4641787756d8b1 257-265,268-269
+  s_78dd0e6625b31a::t_e793190e06f5a9 440-450,454-460,481-486,488,491-497,503
+  s_78dd0e6625b31a::t_786877bf9f62af 487,489-490
+  s_78dd0e6625b31a::t_9af71e143f9764 554,564,631-634
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "354db8be0b8b5b8aade52aa169a7cd40d7197a90",
+  "prompts": {},
+  "humans": {
+    "h_f1ecc43c8f43eb": {
+      "author": "Emil Filipov <emil@langchain.dev>"
+    }
+  },
+  "sessions": {
+    "s_78dd0e6625b31a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6326abd8-c9df-4a19-8bb3-09c924a6d444",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Emil Filipov <emil@langchain.dev>"
+    }
+  }
+}
