@@ -1,0 +1,54 @@
+CHANGELOG.md
+  h_f1ecc43c8f43eb 29
+README.md
+  h_f1ecc43c8f43eb 627-628
+langsmith_migrator/cli/main.py
+  h_f1ecc43c8f43eb 595,603,1808,1835-1850,1871-1873,6300
+langsmith_migrator/core/migrators/trace.py
+  h_f1ecc43c8f43eb 1,73,86,101,236,245,351-354,361-367,372,381-385,402,408-412,423-426,435,478,489,530,544,548-550,558-561,567-569,574,588,599-601,609,612-613,618,635-638,645-647,677-680,684,712,760-761,767,782,788-790,851-854,859,865-871,875-877,895-897,941-943,959-963,973-976,991,999-1003,1007,1013-1017,1021,1046,1064-1068,1079,1093,1112,1123,1153,1170-1174
+langsmith_migrator/core/trace_archive.py
+  h_f1ecc43c8f43eb 1,67,77,96,111,124,182,186-190,196-198,204-206,222,271,305,341,344-346,403-405,452,476,482,497,502-504,522-524,530-534,539-547,569-572,578,591,627
+langsmith_migrator/core/trace_blobstore.py
+  h_f1ecc43c8f43eb 1,55,59,171
+langsmith_migrator/core/trace_domain.py
+  h_f1ecc43c8f43eb 1,11-19,26-30,41,64-66,91,99,112,117,125,134,169-172,197,213,219-221,225,238,262,272,297-299
+langsmith_migrator/core/trace_frames.py
+  h_f1ecc43c8f43eb 1,51-52
+langsmith_migrator/core/trace_ports.py
+  h_f1ecc43c8f43eb 1,16,25-27,51,64,67,82
+langsmith_migrator/core/trace_s3.py
+  h_f1ecc43c8f43eb 1,28,47-57,61,80-83,88,103-107,182-186,274,292,302-306,311
+langsmith_migrator/utils/state.py
+  h_f1ecc43c8f43eb 67-81,84-125,563-653,870-917
+tests/functional/test_cli_functional.py
+  h_f1ecc43c8f43eb 135-136,173-178
+tests/test_state_resolution.py
+  h_f1ecc43c8f43eb 100-101,134-139
+tests/test_trace_archive.py
+  h_f1ecc43c8f43eb 61-66,93-95,128,210-216,283-284,326-333,340-346,354-365
+tests/test_trace_export.py
+  h_f1ecc43c8f43eb 27-31,45-52,59-64,67-77,91-95,161-163,290,293-297,300-304,306
+tests/test_trace_migrator.py
+  h_f1ecc43c8f43eb 44-47,106-108,132-133,181,269-271,282-284,347-354,387-391,396-400,409-413,484-488,498,503,593-609,645-648,665-666,680-682,700-705,713-715,719-721,744-746,772-774,778-781,807-809,820-822,831-833,840-842,859-861,882-884
+tests/test_trace_prefetch.py
+  h_f1ecc43c8f43eb 17,75-80,100-102,166-171
+tests/test_trace_s3.py
+  h_f1ecc43c8f43eb 36,118-122,148,276,298,327-329,332-334,347-348,364-366,382
+tests/unit/test_trace_domain.py
+  h_f1ecc43c8f43eb 64,117-126,150-152,201-203,206-208,244-267,281-283
+tests/unit/test_trace_frames.py
+  h_f1ecc43c8f43eb 73-74,88-90
+tests/unit/test_trace_resume_hint.py
+  h_f1ecc43c8f43eb 15-25,66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5001c755f81082ba7143c63cc36b97fd46051a6c",
+  "prompts": {},
+  "humans": {
+    "h_f1ecc43c8f43eb": {
+      "author": "Emil Filipov <emil@langchain.dev>"
+    }
+  }
+}
