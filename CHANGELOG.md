@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`traces --to-archive s3://bucket/prefix` / `--from-archive s3://...`**: keep
+  the archive in S3 instead of on a local disk, with no window staged to local
+  disk first (single attachments over 8 MiB may still use a temp file). Same
+  layout as on disk, so `aws s3 sync` moves an archive either way and both read
+  the same. Needs the `s3` extra: `uv tool install
+  'langsmith-data-migration-tool[s3]'`.
+
+  - A window is uploaded in parts and appears only once complete, so there is no
+    `.partial` stage on S3 and `--allow-incomplete` is local-only. All the bytes,
+    including the last part, are sent while the window is being built; publishing
+    it afterwards is a single request that carries no data. That keeps an
+    interrupted export leaving an unbroken sequence, at thousands of windows.
+  - Unfinished uploads are aborted on exit. They are invisible in a bucket
+    listing and still cost money, so set a lifecycle rule as a backstop for what
+    a hard kill leaves behind (see README).
+  - Resuming costs one listing per project rather than one check per window.
+  - Transfer tuning via flags or `MIGRATION_S3_*` environment variables: part
+    size, upload/download concurrency, range size, pool, timeouts, retries,
+    endpoint (MinIO/Ceph), encryption, storage class. Defaults suit a modest
+    link, and the effective values are printed in the pre-flight table.
+  - Credentials come from the usual AWS chain. Static `AWS_*` variables cannot be
+    refreshed, so an export outliving a session token stops partway — safely, and
+    re-running continues.
+
 - **`traces --to-archive DIR` / `--from-archive DIR`**: save traces to disk as
   compressed files, and load them into a destination later. Useful for
   air-gapped transfers, or for capturing once and loading into several places.
@@ -28,7 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Archives are read as untrusted input: member names must match known
     patterns, decompressed size is capped, and an unknown `format_version` is
     rejected.
-  - Files are `0o600` and directories `0o700`. **Not encrypted** — an archive is
+  - Window files are `0o600` and each project's own directory is `0o700`. Any
+    parent directory the tool has to create gets your umask's default, which is
+    usually `0o755`, so create the archive root yourself with `chmod 700` (or run
+    under `umask 077`) if that matters. **Not encrypted** — an archive is
     plaintext trace data.
   - Make sure you run using the same time window - or remove the archive
     directory before running
@@ -39,9 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`traces --compress-level` / `--prefetch-windows`**: the upload body is now
   zstd-compressed by the same worker threads that fetch the data, so
-  compression is off the critical path and the level can be chosen. Measured on
-  real payloads: level 3 with long-distance matching is 68x smaller, against 6x
-  for the level 1 the SDK uses on its own. `--prefetch-windows` (default 4)
+  compression is off the critical path and the level can be chosen. The default
+  (level 3, with long-distance matching) shrinks the body far more than the
+  level 1 the SDK uses on its own; how much depends on the data, so measure
+  yours with `--dry-run`. `--prefetch-windows` (default 4)
   fetches several windows at once; **uploads stay serial and oldest-first
   regardless**, which is what stops a failure leaving a gap.
   `--no-compress-upload` sends uncompressed.
@@ -54,18 +82,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the tool's own configured HTTP session — with the blob host validated
   and redirects refused — and re-inlined, so a failed fetch is reported rather
   than migrating a run with a placeholder. Writes go through
-  `multipart_ingest` in trace-boundary batches sized to the destination's
-  advertised limits, with binary-split isolation on failure.
+  `multipart_ingest` in batches that keep a trace together where it fits inside
+  the destination's advertised limits. A single trace bigger than a limit is
+  still sent whole, so that batch goes over it; and if a batch is refused it is
+  split in half by run to find the run at fault.
 
-  The command is **stateless**: for each `(project, time window)` slice it
+  There is **no resumable checkpoint**: for each `(project, time window)` slice it
   ingests `source_ids - dest_ids` and re-queries to confirm the difference is
   empty, so the diff is the work-list, the skip-list and the completeness proof
   at once. A run the destination already holds is never re-sent: a fully
   ingested run is immutable (its `end_time` is persisted), so it cannot be
   repaired in place — repair means re-migrating that window into a fresh
-  destination project. There is no checkpoint and no resume — re-run instead,
-  and `resume` says so. A pre-flight canary verifies the destination still
-  accepts historical timestamps before anything is written, and destination
+  destination project. Re-run instead of resuming, and `resume` says so. Each
+  project's outcome is still recorded under `.langsmith-migrator/`. A pre-flight canary verifies the destination still
+  accepts historical timestamps before your traces are migrated - it leaves one
+  run in a `langsmith-migrator-canary` project, which nothing deletes - and destination
   projects are created with an explicit long-lived trace tier,
   scoped one project at a time. Run `model-pricing` before `traces`: token and
   cost rollups are recomputed by the destination, not replayed. Deliberately

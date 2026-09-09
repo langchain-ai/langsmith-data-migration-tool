@@ -1,44 +1,29 @@
-"""Long-lived traces on disk: one solid ``.tar.zst`` per ``(project, window)``.
-
-Why payloads and not compiled ingest frames: the ``session_id`` lives inside a
-compiled multipart body once per run, so remapping the destination project would
-mean decompress -> parse multipart -> patch -> re-encode. Payloads make it one
-field assignment, and keep the archive readable without the SDK internals the
-ingest path borrows. Re-compiling on replay costs ~1500 MB/s against a network
-three orders of magnitude slower.
-
-Why one solid stream and not per-record compression: measured on real trace
-bodies, compressing per run costs **17.4x more bytes** than compressing the
-whole file at once (4.0x against 69.7x). That single number rules out any
-container that compresses row-by-row, and is why tar members - which are pure
-framing, uncompressed by themselves - are the record format.
-
-Completeness is a file-level property, twice over: a window is written as
-``.partial`` and renamed only after its ``MANIFEST.json`` is appended as the
-final member. So ``ls`` answers "is this window done" without decompressing, and
-the manifest answers it again for anything that reads the file.
-
-An archive is **plaintext production trace data**. Files are 0o600 and
-directories 0o700; there is no encryption at rest, and the CLI says so.
-"""
+"""Long-lived traces on disk: one solid ``.tar.zst`` per ``(project, window)``."""
 
 from __future__ import annotations
 
 import io
 import json
 import math
-import os
 import re
-import shutil
 import tarfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import zstandard as zstd
 
+from .trace_blobstore import (
+    MARKER,
+    PARTIAL,
+    ArchiveError,
+    BlobStore,
+    CountingWriter,
+    open_store,
+)
 from .trace_domain import (
+    LOST_CONTENT_CODES,
     Window,
     batch_traces,
     group_into_traces,
@@ -46,44 +31,28 @@ from .trace_domain import (
     plan_slice,
 )
 
-# 2: intent.window_days became intent.window_hours.
-# 3: window files gained a source-workspace directory above the project one.
 FORMAT_VERSION = 3
 
-# The archive compresses a whole window file rather than a ~20 MB ingest frame,
-# so it can afford a larger match window than the ingest path's 24. Measured
-# 69.7x -> 70.8x on a 45 MB sample and flat beyond; a multi-GB window has more
-# cross-run redundancy to reach for, so re-measure before treating 25 as final.
 WINDOW_LOG = 25
 
-# A window is held whole in memory on both sides, so this is simultaneously the
-# memory ceiling and the decompression-bomb guard. A window larger than this
-# cannot be replayed in one piece anyway - shrink --window instead.
 MAX_WINDOW_BYTES = 8 * 1024**3
 
-# Refuse to start a window with less than this free. A floor, not a quota: it
-# stops "disk filled at hour six" from truncating a file, nothing more.
-FREE_SPACE_FLOOR = 1024**3
-
 _MANIFEST = "MANIFEST.json"
-_PROJECT = "PROJECT.json"
 _STAMP = "%Y%m%dT%H%M%SZ"
-_PARTIAL = ".partial"
 _SUFFIX = ".tar.zst"
 
-# Tar member names are untrusted: an archive is a file some other process wrote.
-# Nothing derived from one ever reaches the filesystem - members are read into
-# memory via extractfile() - and these are what a name must match to be read at
-# all. Attachment members are numbered rather than named so that an attachment
-# called "../x" cannot exist in the first place.
 _RUN_JSON = re.compile(r"^([0-9a-fA-F-]{36})\.json$")
 _RUN_BLOB = re.compile(r"^([0-9a-fA-F-]{36})/(\d{1,4})$")
 
 _WINDOW_FILE = re.compile(r"^(\d{8}T\d{6}Z)__(\d{8}T\d{6}Z)$")
 
+_LOST_CONTENT = LOST_CONTENT_CODES
 
-class ArchiveError(RuntimeError):
-    """An archive could not be written, or could not be trusted to be read."""
+
+def _sample(ids: Set[str], limit: int = 3) -> str:
+    """A few IDs for an error message, without printing thousands."""
+    shown = sorted(ids)[:limit]
+    return ", ".join(shown) + (", ..." if len(ids) > limit else "")
 
 
 def _iso(value: datetime) -> str:
@@ -95,12 +64,7 @@ def _stamp(value: datetime) -> str:
 
 
 def window_label(window: Window) -> str:
-    """``20260801T000000Z__20260802T000000Z``.
-
-    Both bounds, because sorting by the first gives the contiguity proof and
-    the second lets ``end_k == start_k+1`` be checked straight off a directory
-    listing - no manifest, no ``--window`` to remember.
-    """
+    """``20260801T000000Z__20260802T000000Z``."""
     return f"{_stamp(window.start)}__{_stamp(window.end)}"
 
 
@@ -110,8 +74,7 @@ def parse_window_label(label: str) -> Optional[Window]:
         return None
     try:
         bounds = [
-            datetime.strptime(part, _STAMP).replace(tzinfo=timezone.utc)
-            for part in match.groups()
+            datetime.strptime(part, _STAMP).replace(tzinfo=timezone.utc) for part in match.groups()
         ]
     except ValueError:
         return None
@@ -130,37 +93,12 @@ def project_dir_name(session: Dict[str, Any]) -> str:
 
 
 def workspace_dir_name(workspace: Optional[Dict[str, Any]]) -> str:
-    """``<slug>-<workspace id>``, the same shape as the project level below it.
-
-    The name because an archive is read by people and a bare UUID tells them
-    nothing; the ID because two workspaces can share a display name and must not
-    then share a directory. The ID is in every manifest as well, so the pairing
-    is recoverable from the data and not only from the path.
-    """
+    """``<slug>-<workspace id>``, the same shape as the project level below it."""
     ws = workspace or {}
     name = _slug(str(ws.get("name") or ""), 80, "workspace")
     return f"{name}-{_slug(str(ws['id']), 40, 'id')}" if ws.get("id") else name
 
 
-def _mkdir(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-
-
-def _open_private(path: Path):
-    return os.fdopen(os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb")
-
-
-def _contained(root: Path, child: Path) -> Path:
-    """Reject any path that resolves outside the archive directory."""
-    resolved, base = child.resolve(), root.resolve()
-    if resolved != base and base not in resolved.parents:
-        raise ArchiveError(f"refusing a path outside the archive directory: {child}")
-    return resolved
-
-
-# ----------------------------------------------------------------------
-# Writing
-# ----------------------------------------------------------------------
 def _tar_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> int:
     info = tarfile.TarInfo(name)
     info.size = len(data)
@@ -170,13 +108,7 @@ def _tar_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> int:
 
 
 def _encode_payload(payload: Dict[str, Any]) -> Tuple[bytes, List[bytes]]:
-    """Split one payload into its JSON member and its attachment members.
-
-    Attachment names are arbitrary source strings, so they stay *inside* the
-    JSON - as an ordered ``[[name, content_type], ...]`` list - and the blob
-    members are numbered by position. A name is therefore never a path
-    component, on write or on read.
-    """
+    """Split one payload into its JSON member and its attachment members."""
     attachments = payload.get("attachments") or {}
     ordered = sorted(attachments.items())
     body = {k: v for k, v in payload.items() if k != "attachments"}
@@ -189,13 +121,7 @@ def _encode_payload(payload: Dict[str, Any]) -> Tuple[bytes, List[bytes]]:
 
 
 class ArchiveSink:
-    """``RunSink`` writing one ``.tar.zst`` per window. Makes no destination claim.
-
-    A complete window file asserts that the source's window was read and
-    written - which is what ``has_window`` reports, and what makes a re-run skip
-    it. It asserts nothing about any deployment: verification belongs to replay,
-    where a real destination can answer.
-    """
+    """``RunSink`` writing one ``.tar.zst`` per window. Makes no destination claim."""
 
     def __init__(
         self,
@@ -204,112 +130,154 @@ class ArchiveSink:
         compress_level: int,
         dry_run: bool = False,
         workspace: Optional[Dict[str, Any]] = None,
+        store: Optional[BlobStore] = None,
+        **store_kwargs: Any,
     ):
-        self.root = Path(root)
-        # {"id", "name"} of the *source* workspace, or None when the deployment
-        # has no workspace concept to report.
+        self.root = root
+        self.store = store or open_store(root, **store_kwargs)
         self.workspace = workspace
         self.compress_level = compress_level
-        # A dry run scans and fetches exactly as a real one does, but must not
-        # leave files behind - otherwise the preview *is* the export.
         self.dry_run = dry_run
-        # Filled by the caller once project selection resolves: the *intended*
-        # extent of this export, so the full expected window list is
-        # reconstructible from any single file and a short archive cannot pass
-        # for a complete small one.
+        self.projected_bytes = 0
+        self.source_bytes = 0
         self.intent: Dict[str, Any] = {}
-        self.written: List[Path] = []
-        self.staged: List[Path] = []
+        self.written: List[str] = []
+        self.staged: List[Any] = []
 
-    # -- RunSink ----------------------------------------------------------
     def open_target(self, session: Dict[str, Any]) -> Dict[str, Any]:
-        directory = _contained(
-            self.root, self.root / workspace_dir_name(self.workspace) / project_dir_name(session)
+        container = self.store.container(
+            workspace_dir_name(self.workspace), project_dir_name(session)
         )
-        record = {"id": str(session["id"]), "name": session.get("name"), "dir": str(directory)}
+        workspace = (self.workspace or {}).get("id")
+        record = {"id": str(session["id"]), "name": session.get("name"), "dir": container}
+        record["names"] = self.store.names(container)
         if self.dry_run:
             return record
-        _mkdir(directory)
-        marker = directory / _PROJECT
-        if not marker.exists():
-            with _open_private(marker) as handle:
-                handle.write(json.dumps({k: record[k] for k in ("id", "name")}, indent=1).encode())
+        marker = {k: record[k] for k in ("id", "name")}
+        if workspace:
+            marker["workspace_id"] = str(workspace)
+        self.store.ensure_container(container, MARKER, json.dumps(marker, indent=1).encode())
         return record
 
     def batch_limits(self) -> Tuple[int, int]:
         """No destination caps apply; the replay side re-batches to its own."""
         return 10**9, MAX_WINDOW_BYTES
 
+    def field_ceiling(self) -> int:
+        """The window ceiling, not a destination's: a file stores the run whole."""
+        return MAX_WINDOW_BYTES
+
+    def oversized_fields(self, payload: Dict[str, Any]) -> List[str]:
+        """None. A file has no field limit, so an export keeps the whole run."""
+        return []
+
     def has_window(self, target: Dict[str, Any], window: Window) -> bool:
-        return self._final(target, window).exists()
+        return self._name(window) in target.get("names", ())
 
     def existing_ids(self, target: Dict[str, Any], window: Window) -> Set[str]:
         """Always empty: a window file holds all of a window or none of it."""
         return set()
 
-    def stage(self, target: Dict[str, Any], window: Window, prepared) -> Optional[Path]:
-        """Worker thread: write the whole file, manifest last, leave it ``.partial``.
-
-        The encode runs here rather than on the commit path deliberately - a
-        heavy window is tens of GB and ~18 s of compression, which on the serial
-        path would add hours to a multi-thousand-window export.
-        """
-        if self.dry_run:
-            return None
-        partial = Path(str(self._final(target, window)) + _PARTIAL)
-        free = shutil.disk_usage(partial.parent).free
-        if free < FREE_SPACE_FLOOR:
-            raise ArchiveError(
-                f"only {free:,} bytes free under {partial.parent}; refusing to start a window"
-            )
+    def stage(self, target: Dict[str, Any], window: Window, prepared) -> Any:
+        """Worker thread: encode the whole window, manifest last, publish nothing."""
         payloads = [p for batch, _ in prepared.batches for p in batch]
         run_ids = [str(p["id"]) for p in payloads]
-        counts = {"payloads": 0, "attachments": 0}
-        # write_checksum belongs in the params, not the compressor, and it is
-        # why the manifest carries no digest of its own: zstd verifies the frame.
-        params = zstd.ZstdCompressionParameters.from_level(
-            self.compress_level, enable_ldm=True, window_log=WINDOW_LOG, write_checksum=1
+        self._refuse_if_incomplete(window, prepared, run_ids)
+        writer = (
+            CountingWriter()
+            if self.dry_run
+            else self.store.begin(target["dir"], self._name(window))
         )
-        with _open_private(partial) as raw:
-            # closefd=False: the frame is flushed when this context exits, but
-            # the fd has to outlive it so the fsync below can reach it.
-            with zstd.ZstdCompressor(compression_params=params).stream_writer(raw, closefd=False) as stream:
+        counts = {"payloads": 0, "attachments": 0}
+        try:
+            params = zstd.ZstdCompressionParameters.from_level(
+                self.compress_level, enable_ldm=True, window_log=WINDOW_LOG, write_checksum=1
+            )
+            with zstd.ZstdCompressor(compression_params=params).stream_writer(
+                writer, closefd=False
+            ) as stream:
                 with tarfile.open(fileobj=stream, mode="w|") as tar:
                     for payload in payloads:
                         body, blobs = _encode_payload(payload)
                         counts["payloads"] += _tar_bytes(tar, f"{payload['id']}.json", body)
                         for index, blob in enumerate(blobs):
-                            counts["attachments"] += _tar_bytes(tar, f"{payload['id']}/{index}", blob)
-                    _tar_bytes(tar, _MANIFEST, self._manifest(target, window, prepared, run_ids, counts))
-            raw.flush()
-            os.fsync(raw.fileno())
-        self.staged.append(partial)
-        return partial
+                            counts["attachments"] += _tar_bytes(
+                                tar, f"{payload['id']}/{index}", blob
+                            )
+                        self._check_ceiling(window, counts)
+                    manifest = self._manifest(target, window, prepared, run_ids, counts)
+                    self._check_ceiling(window, counts, len(manifest))
+                    _tar_bytes(tar, _MANIFEST, manifest)
+            writer.flush_tail()
+            writer.uncompressed = counts["payloads"] + counts["attachments"]
+        except BaseException:
+            writer.abort()
+            raise
+        self.staged.append(writer)
+        return writer
 
     def commit(
-        self, target: Dict[str, Any], window: Window, prepared, staged: Optional[Path]
+        self, target: Dict[str, Any], window: Window, prepared, staged: Any
     ) -> List[Tuple[str, str]]:
-        """Main thread, in window order: publish the window by renaming it.
-
-        Ordering is what makes an interrupted export leave a contiguous prefix.
-        Unordered renames could publish a later window while an earlier one is
-        missing, and an interior hole in an archive nobody re-runs is invisible.
-        """
-        if staged is None:  # dry run
+        """Main thread, in window order: publish the window."""
+        if staged is None:
             return []
-        final = self._final(target, window)
-        os.replace(staged, final)
+        staged.finish()
         if staged in self.staged:
             self.staged.remove(staged)
-        self.written.append(final)
+        name = self._name(window)
+        self.source_bytes += getattr(staged, "uncompressed", 0)
+        if isinstance(staged, CountingWriter):
+            self.projected_bytes += staged.written
+        target.setdefault("names", set()).add(name)
+        self.written.append(self.store.describe(target["dir"], name))
         return []
 
     def close_target(self, target: Dict[str, Any], recon: Any = None) -> None:
         return None
 
-    # -- internals --------------------------------------------------------
-    def _final(self, target: Dict[str, Any], window: Window) -> Path:
-        return Path(target["dir"]) / f"{window_label(window)}{_SUFFIX}"
+    def _refuse_if_incomplete(self, window: Window, prepared, run_ids: List[str]) -> None:
+        name = self._name(window)
+        missing = prepared.plan.to_ingest - set(run_ids)
+        if missing:
+            raise ArchiveError(
+                f"{name} would be short {len(missing)} run(s) the source listed but did not "
+                f"return ({_sample(missing)}). Not writing an incomplete window; re-run to "
+                "retry, or move --since/--until past this window to skip it"
+            )
+        unplanned = set(run_ids) - prepared.plan.to_ingest
+        if unplanned:
+            raise ArchiveError(
+                f"{name} would hold {len(unplanned)} run(s) outside this window's plan "
+                f"({_sample(unplanned)})"
+            )
+        if len(run_ids) != len(set(run_ids)):
+            seen: Set[str] = set()
+            twice = {r for r in run_ids if r in seen or seen.add(r)}
+            raise ArchiveError(f"{name} would hold {_sample(twice)} more than once")
+        lost = {
+            run_id
+            for code, ids in (prepared.degraded or {}).items()
+            if code in _LOST_CONTENT
+            for run_id in ids & set(run_ids)
+        }
+        if lost:
+            raise ArchiveError(
+                f"{name} would hold {len(lost)} run(s) whose offloaded content could not be "
+                f"fetched ({_sample(lost)}); not writing a window that is missing their fields"
+            )
+
+    def _check_ceiling(self, window: Window, counts: Dict[str, int], extra: int = 0) -> None:
+        """Stop before writing past the limit a replay will refuse to read."""
+        if counts["payloads"] + counts["attachments"] + extra > MAX_WINDOW_BYTES:
+            raise ArchiveError(
+                f"{self._name(window)} exceeds the {MAX_WINDOW_BYTES:,}-byte window ceiling, "
+                "which is also the limit a replay will read; shrink --window"
+            )
+
+    @staticmethod
+    def _name(window: Window) -> str:
+        return f"{window_label(window)}{_SUFFIX}"
 
     def _manifest(self, target, window, prepared, run_ids, counts) -> bytes:
         written = set(run_ids)
@@ -319,16 +287,10 @@ class ArchiveSink:
                 "workspace": self.workspace or {},
                 "project": {"id": target["id"], "name": target.get("name")},
                 "window": {"start": _iso(window.start), "end": _iso(window.end)},
-                # Both counts, because a window with 10,000 short-lived runs and
-                # no long-lived ones is also empty - and an archive that cannot
-                # distinguish that from "we never looked" is not a coverage proof.
                 "run_count": len(run_ids),
                 "runs_scanned": len(prepared.population),
                 "run_ids": sorted(run_ids),
                 "bytes": counts,
-                # Only codes for runs actually in the file: a run dropped at
-                # export is absent, and the export's own reconciliation already
-                # counted it.
                 "degraded": {
                     code: sorted(ids & written)
                     for code, ids in (prepared.degraded or {}).items()
@@ -339,27 +301,24 @@ class ArchiveSink:
             indent=1,
         ).encode()
 
-    def discard_staged(self) -> List[Path]:
-        """Remove any ``.partial`` this process left behind, and name them."""
+    def discard_staged(self) -> List[str]:
+        """Drop anything this process started but never published, and name it."""
         removed = []
-        for path in list(self.staged):
+        for writer in list(self.staged):
             try:
-                path.unlink()
-                removed.append(path)
+                writer.abort()
+                removed.append(getattr(writer, "partial", writer))
             except OSError:
                 pass
-            self.staged.remove(path)
+            self.staged.remove(writer)
         return removed
 
 
-# ----------------------------------------------------------------------
-# Reading
-# ----------------------------------------------------------------------
 @dataclass(frozen=True)
 class ArchiveWindow:
     """One decoded window file."""
 
-    path: Path
+    name: str
     window: Window
     manifest: Dict[str, Any]
     payloads: List[Dict[str, Any]]
@@ -367,76 +326,118 @@ class ArchiveWindow:
 
 
 def read_window(path: Path, *, allow_incomplete: bool = False) -> ArchiveWindow:
-    """Decode one window file, treating every member name as untrusted.
+    """Decode one window file from the filesystem. See ``decode_window``."""
+    with open(path, "rb") as raw:
+        return decode_window(raw, Path(path).name, allow_incomplete=allow_incomplete)
 
-    Members are read into memory with ``extractfile``; ``extract``/``extractall``
-    are never used, so no name from the tar reaches the filesystem. Names must
-    match one of the three known shapes, sizes are capped in aggregate, and an
-    unknown ``format_version`` is refused rather than partially read.
-    """
-    incomplete = str(path).endswith(_PARTIAL)
+
+def read_blob(store, container: str, name: str, *, allow_incomplete: bool = False) -> ArchiveWindow:
+    """Decode one window out of any store."""
+    with store.read(container, name) as raw:
+        return decode_window(raw, name, allow_incomplete=allow_incomplete)
+
+
+def decode_window(raw: BinaryIO, name: str, *, allow_incomplete: bool = False) -> ArchiveWindow:
+    """Decode one window, treating every member name as untrusted."""
+    incomplete = name.endswith(PARTIAL)
     if incomplete and not allow_incomplete:
-        raise ArchiveError(f"{path.name} is incomplete (no manifest); pass --allow-incomplete to read it")
+        raise ArchiveError(
+            f"{name} is incomplete (no manifest); pass --allow-incomplete to read it"
+        )
 
     bodies: Dict[str, Dict[str, Any]] = {}
     blobs: Dict[str, Dict[int, bytes]] = {}
     manifest: Optional[Dict[str, Any]] = None
     total = 0
-    with open(path, "rb") as raw:
-        with zstd.ZstdDecompressor().stream_reader(raw) as stream:
-            with tarfile.open(fileobj=stream, mode="r|") as tar:
-                for member in tar:
-                    if not member.isfile():
-                        raise ArchiveError(f"{path.name}: unexpected member type {member.name!r}")
-                    total += member.size
-                    if total > MAX_WINDOW_BYTES:
+    with zstd.ZstdDecompressor().stream_reader(raw) as stream:
+        with tarfile.open(fileobj=stream, mode="r|") as tar:
+            for member in tar:
+                if not member.isfile():
+                    raise ArchiveError(f"{name}: unexpected member type {member.name!r}")
+                total += member.size
+                if total > MAX_WINDOW_BYTES:
+                    raise ArchiveError(
+                        f"{name} decompresses past {MAX_WINDOW_BYTES:,} bytes; refusing to read it"
+                    )
+                handle = tar.extractfile(member)
+                data = handle.read() if handle else b""
+                if member.name == _MANIFEST:
+                    if manifest is not None:
+                        raise ArchiveError(f"{name}: two {_MANIFEST} members")
+                    manifest = json.loads(data)
+                    continue
+                if manifest is not None:
+                    raise ArchiveError(f"{name}: {member.name!r} follows {_MANIFEST}")
+                if member.name == MARKER:
+                    continue
+                run_json = _RUN_JSON.match(member.name)
+                if run_json:
+                    run_id = run_json.group(1)
+                    if run_id in bodies:
+                        raise ArchiveError(f"{name}: run {run_id} appears twice")
+                    body = json.loads(data)
+                    if str(body.get("id")) != run_id:
                         raise ArchiveError(
-                            f"{path.name} decompresses past {MAX_WINDOW_BYTES:,} bytes; refusing to read it"
+                            f"{name}: member {member.name} holds run {body.get('id')!r}"
                         )
-                    handle = tar.extractfile(member)
-                    data = handle.read() if handle else b""
-                    if member.name == _MANIFEST:
-                        manifest = json.loads(data)
-                        continue
-                    if member.name == _PROJECT:
-                        continue
-                    run_json = _RUN_JSON.match(member.name)
-                    if run_json:
-                        bodies[run_json.group(1)] = json.loads(data)
-                        continue
-                    run_blob = _RUN_BLOB.match(member.name)
-                    if run_blob:
-                        blobs.setdefault(run_blob.group(1), {})[int(run_blob.group(2))] = data
-                        continue
-                    raise ArchiveError(f"{path.name}: unexpected member {member.name!r}")
+                    bodies[run_id] = body
+                    continue
+                run_blob = _RUN_BLOB.match(member.name)
+                if run_blob:
+                    run_id, index = run_blob.group(1), int(run_blob.group(2))
+                    parts = blobs.setdefault(run_id, {})
+                    if index in parts:
+                        raise ArchiveError(
+                            f"{name}: attachment {index} of run {run_id} appears twice"
+                        )
+                    parts[index] = data
+                    continue
+                raise ArchiveError(f"{name}: unexpected member {member.name!r}")
 
     if manifest is None:
         if not incomplete:
-            raise ArchiveError(f"{path.name} has no {_MANIFEST}; it was truncated")
+            raise ArchiveError(f"{name} has no {_MANIFEST}; it was truncated")
         manifest = {}
     version = manifest.get("format_version", FORMAT_VERSION if incomplete else None)
     if version != FORMAT_VERSION:
-        raise ArchiveError(f"{path.name}: unsupported format_version {version!r} (this build reads {FORMAT_VERSION})")
+        raise ArchiveError(
+            f"{name}: unsupported format_version {version!r} (this build reads {FORMAT_VERSION})"
+        )
 
-    window = parse_window_label(path.name.split(_SUFFIX)[0])
+    window = parse_window_label(name.split(_SUFFIX)[0])
     bounds = manifest.get("window") or {}
     if bounds.get("start") and bounds.get("end"):
         window = Window(
             datetime.fromisoformat(bounds["start"]), datetime.fromisoformat(bounds["end"])
         )
     if window is None:
-        raise ArchiveError(f"{path.name}: no window bounds in the name or the manifest")
+        raise ArchiveError(f"{name}: no window bounds in the name or the manifest")
+
+    if not incomplete:
+        orphans = set(blobs) - set(bodies)
+        if orphans:
+            raise ArchiveError(f"{name}: attachments for {len(orphans)} run(s) with no run body")
+        claimed = manifest.get("run_ids")
+        if claimed is not None and sorted(bodies) != sorted(claimed):
+            same_size = " with different ids" if len(claimed) == len(bodies) else ""
+            raise ArchiveError(
+                f"{name}: manifest lists {len(claimed)} run(s), "
+                f"the file holds {len(bodies)}{same_size}"
+            )
+        if manifest.get("run_count") not in (None, len(bodies)):
+            raise ArchiveError(
+                f"{name}: manifest says run_count {manifest['run_count']}, "
+                f"the file holds {len(bodies)}"
+            )
 
     payloads, dropped = [], []
     for run_id, body in bodies.items():
         names = body.pop("attachments", None) or []
         if names:
             parts = blobs.get(run_id) or {}
-            if len(parts) != len(names):
-                # A run without all its attachments must not be presented as
-                # whole. A complete file missing one is a defect, not a truncation.
+            if set(parts) != set(range(len(names))):
                 if not incomplete:
-                    raise ArchiveError(f"{path.name}: run {run_id} is missing attachment members")
+                    raise ArchiveError(f"{name}: run {run_id} is missing attachment members")
                 dropped.append(run_id)
                 continue
             body["attachments"] = {
@@ -444,17 +445,11 @@ def read_window(path: Path, *, allow_incomplete: bool = False) -> ArchiveWindow:
                 for index, (name, content_type) in enumerate(names)
             }
         payloads.append(body)
-    return ArchiveWindow(path, window, manifest, payloads, tuple(sorted(dropped)))
+    return ArchiveWindow(name, window, manifest, payloads, tuple(sorted(dropped)))
 
 
 class ArchiveSource:
-    """``RunSource`` reading window files back out of an archive directory.
-
-    Both sides of the port enumerate ``(project, window)``: the API source
-    derives windows from the walk plan, this one from directory entries. Same
-    shape, same driver - which is what makes ``RunSource`` a port rather than
-    two unrelated readers.
-    """
+    """``RunSource`` reading window files back out of an archive directory."""
 
     def __init__(
         self,
@@ -463,48 +458,57 @@ class ArchiveSource:
         allow_incomplete: bool = False,
         range_start: Optional[datetime] = None,
         range_end: Optional[datetime] = None,
+        workspace: Optional[str] = None,
+        store: Optional[BlobStore] = None,
+        **store_kwargs: Any,
     ):
-        self.root = Path(root)
+        self.root = root
+        self.store = store or open_store(root, **store_kwargs)
         self.allow_incomplete = allow_incomplete
-        # Windows wholly outside these bounds are not replayed. Lets a replay be
-        # confined to part of an archive - e.g. only what a destination that
-        # enforces a +/-24h ingest window will still accept.
+        self.workspace = workspace
         self.range_start = range_start
         self.range_end = range_end
-        # A replayed window is re-batched to *this* destination's caps, which
-        # need not match the ones in force when it was captured.
         self._batch_limits: Callable[[], Tuple[int, int]] = lambda: (100, 20_971_520)
         self._compile_batch: Callable[[List[Dict[str, Any]]], Any] = lambda batch: None
+        self._oversized_fields: Callable[[Dict[str, Any]], List[str]] = lambda payload: []
 
     def bind(self, sink) -> None:
-        """Take the live destination's batch caps and frame compiler.
-
-        Deferred rather than passed in: the sink is the migrator, which needs
-        this source at construction time.
-        """
+        """Take the live destination's batch caps and frame compiler."""
         self._batch_limits = sink.batch_limits
         self._compile_batch = sink.compile_batch
+        self._oversized_fields = sink.oversized_fields
 
-    # -- RunSource --------------------------------------------------------
     def sessions(self) -> List[Dict[str, Any]]:
-        """Every project in the archive, found by its ``PROJECT.json`` marker.
-
-        Located by search rather than by walking a fixed depth, so pointing
-        ``--from-archive`` at one workspace directory works as well as at the
-        archive root.
-        """
+        """Every project in the archive, found by its ``PROJECT.json`` marker."""
         found = []
-        for marker in sorted(self.root.rglob(_PROJECT)):
-            directory = marker.parent
-            if not self._window_paths(directory):
+        for container, body in self.store.find_containers():
+            record = json.loads(body)
+            if not self._in_workspace(container, record):
                 continue
-            record = json.loads(marker.read_text())
-            found.append({"id": record["id"], "name": record.get("name"), "dir": str(directory)})
+            names = self._window_names(container)
+            if not names:
+                continue
+            found.append(
+                {"id": record["id"], "name": record.get("name"), "dir": container, "names": names}
+            )
+        return found
+
+    def workspaces(self) -> Set[str]:
+        """Every source workspace the archive holds, from its own metadata."""
+        found = set()
+        for container, body in self.store.find_containers():
+            if not self._window_names(container):
+                continue
+            recorded = json.loads(body).get("workspace_id") or self._workspace_from_manifest(
+                container
+            )
+            if recorded:
+                found.add(str(recorded))
         return found
 
     def windows(self, session: Dict[str, Any]) -> Iterator[Window]:
-        for path in self._window_paths(Path(session["dir"])):
-            window = self._require_window(path)
+        for name in sorted(session.get("names") or self._window_names(session["dir"])):
+            window = self._require_window(name)
             if self.range_start and window.end <= self.range_start:
                 continue
             if self.range_end and window.start >= self.range_end:
@@ -514,25 +518,33 @@ class ArchiveSource:
     def prepare(self, session, target, window, existing_ids: Callable[[], Set[str]]):
         from .trace_ports import SlicePrepared
 
-        decoded = read_window(self._path_for(session, window), allow_incomplete=self.allow_incomplete)
+        decoded = read_blob(
+            self.store,
+            session["dir"],
+            self._name_for(session, window),
+            allow_incomplete=self.allow_incomplete,
+        )
         ids = {str(p["id"]) for p in decoded.payloads}
         plan = plan_slice(ids, existing_ids() if ids else set())
-        # Stands in for the API source's identity scan, off the same runs.
         population = [
-            {"id": str(p["id"]), "trace_id": str(p.get("trace_id")), "start_time": p.get("start_time")}
+            {
+                "id": str(p["id"]),
+                "trace_id": str(p.get("trace_id")),
+                "start_time": p.get("start_time"),
+            }
             for p in decoded.payloads
         ]
         prepared = SlicePrepared(window, str(session["id"]), str(target["id"]), plan, population)
         if decoded.dropped:
-            prepared.issues.append((
-                "degraded",
-                "archived_run_incomplete",
-                f"{len(decoded.dropped)} run(s) in {decoded.path.name} were truncated in the "
-                "archive and are missing attachment members; they were not replayed",
-                {"window": window.label(), "run_ids": list(decoded.dropped[:20])},
-            ))
-        # Restricted to what is actually being ingested, so the reconciliation
-        # parts stay a partition of the source total.
+            prepared.issues.append(
+                (
+                    "degraded",
+                    "archived_run_incomplete",
+                    f"{len(decoded.dropped)} run(s) in {decoded.name} were truncated in the "
+                    "archive and are missing attachment members; they were not replayed",
+                    {"window": window.label(), "run_ids": list(decoded.dropped[:20])},
+                )
+            )
         prepared.degraded = {
             code: set(run_ids) & plan.to_ingest
             for code, run_ids in (decoded.manifest.get("degraded") or {}).items()
@@ -543,44 +555,77 @@ class ArchiveSource:
 
         outgoing = []
         for payload in decoded.payloads:
-            if str(payload["id"]) not in plan.to_ingest:
+            run_id = str(payload["id"])
+            if run_id not in plan.to_ingest:
                 continue
-            # The whole of "optionally change the destination project".
+            if self._oversized_fields(payload):
+                prepared.degraded.setdefault("payload_oversized_for_destination", set()).add(run_id)
+                prepared.fidelity_notes.add("payloads exceeded --max-field-bytes")
+                continue
             payload["session_id"] = str(target["id"])
             outgoing.append(payload)
         max_runs, max_bytes = self._batch_limits()
         for batch in batch_traces(
-            group_into_traces(outgoing), max_runs=max_runs, max_bytes=max_bytes, size_of=payload_bytes
+            group_into_traces(outgoing),
+            max_runs=max_runs,
+            max_bytes=max_bytes,
+            size_of=payload_bytes,
         ):
             prepared.batches.append((batch, self._compile_batch(batch)))
         return prepared
 
-    # -- internals --------------------------------------------------------
-    def _window_paths(self, directory: Path) -> List[Path]:
-        suffixes = (_SUFFIX, _SUFFIX + _PARTIAL) if self.allow_incomplete else (_SUFFIX,)
-        return sorted(
-            path
-            for path in directory.iterdir()
-            if path.is_file()
-            and path.name.endswith(suffixes)
-            and _WINDOW_FILE.match(path.name.split(_SUFFIX)[0])
-        )
+    def _in_workspace(self, container: str, record: Dict[str, Any]) -> bool:
+        """Whether this project belongs to the workspace being replayed."""
+        if not self.workspace:
+            return True
+        recorded = record.get("workspace_id") or self._workspace_from_manifest(container)
+        if not recorded:
+            raise ArchiveError(
+                f"{self.store.describe(container)} records no workspace in its marker or its "
+                "windows, so it cannot be matched against --source-workspace; drop the flag "
+                "to replay the whole archive"
+            )
+        return str(recorded) == str(self.workspace)
+
+    def _workspace_from_manifest(self, container: str) -> Optional[str]:
+        """The workspace from any one window, for markers written before it."""
+        for name in sorted(self._window_names(container)):
+            try:
+                manifest = read_blob(
+                    self.store, container, name, allow_incomplete=self.allow_incomplete
+                ).manifest
+            except ArchiveError:
+                continue
+            found = (manifest.get("workspace") or {}).get("id")
+            if found:
+                return str(found)
+        return None
+
+    def _window_names(self, container: str) -> Set[str]:
+        suffixes = (_SUFFIX, _SUFFIX + PARTIAL) if self.allow_incomplete else (_SUFFIX,)
+        return {
+            name
+            for name in self.store.names(container)
+            if name.endswith(suffixes) and _WINDOW_FILE.match(name.split(_SUFFIX)[0])
+        }
 
     @staticmethod
-    def _require_window(path: Path) -> Window:
-        window = parse_window_label(path.name.split(_SUFFIX)[0])
+    def _require_window(name: str) -> Window:
+        window = parse_window_label(name.split(_SUFFIX)[0])
         if window is None:
-            raise ArchiveError(f"{path.name} is not a readable window label")
+            raise ArchiveError(f"{name} is not a readable window label")
         return window
 
-    def _path_for(self, session: Dict[str, Any], window: Window) -> Path:
-        base = Path(session["dir"]) / f"{window_label(window)}{_SUFFIX}"
-        if base.exists():
+    def _name_for(self, session: Dict[str, Any], window: Window) -> str:
+        names = session.get("names") or self._window_names(session["dir"])
+        base = f"{window_label(window)}{_SUFFIX}"
+        if base in names:
             return base
-        partial = Path(str(base) + _PARTIAL)
-        if self.allow_incomplete and partial.exists():
-            return partial
-        raise ArchiveError(f"no window file for {window_label(window)} under {session['dir']}")
+        if self.allow_incomplete and base + PARTIAL in names:
+            return base + PARTIAL
+        raise ArchiveError(
+            f"no window file for {window_label(window)} under {self.store.describe(session['dir'])}"
+        )
 
 
 def projected_file_count(range_hours: float, window_hours: float, projects: int) -> int:

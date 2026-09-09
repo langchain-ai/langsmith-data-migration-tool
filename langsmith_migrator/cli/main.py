@@ -40,7 +40,13 @@ from ..core.migrators import (
     FleetWebhookMigrator,
 )
 from ..core.migrators.trace import TracePreflightError
-from ..core.trace_archive import ArchiveSink, ArchiveSource, projected_file_count
+from ..core.trace_archive import (
+    MAX_WINDOW_BYTES,
+    ArchiveSink,
+    ArchiveSource,
+    projected_file_count,
+)
+from ..core.trace_blobstore import ArchiveError, is_s3
 from ..core.trace_frames import DEFAULT_COMPRESS_LEVEL
 from ..core.migrators.user_role import (
     is_workspace_role_union_id,
@@ -58,7 +64,7 @@ from ..utils.chart_mode import (
 from ..utils.chart_mode import (
     workspace_pair_allows_same_instance as _chart_workspace_pair_allows_same_instance,
 )
-from ..utils.config import Config
+from ..utils.config import Config, S3Config
 from ..utils.retry import RateLimitError
 from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
 from ..utils.workspace import (
@@ -582,6 +588,25 @@ def _auto_detect_chart_same_instance(
 _WS_CANCELLED = "__cancelled__"
 _WS_ABORTED = "__aborted__"
 
+
+def _archive_replay_workspaces(
+    from_archive, source_workspace, dest_workspace, *, allow_incomplete, store_kwargs
+):
+    """Resolve the archive workspace used for replay."""
+    if source_workspace:
+        return source_workspace, source_workspace
+    held = ArchiveSource(
+        from_archive, allow_incomplete=allow_incomplete, **store_kwargs
+    ).workspaces()
+    if len(held) == 1:
+        only = held.pop()
+        return only, only if dest_workspace else None
+    if held:
+        raise ArchiveError(
+            f"the archive holds {len(held)} workspaces ({', '.join(sorted(held))}); "
+            "pass --source-workspace to choose"
+        )
+    return None, dest_workspace or None
 
 def _resolve_workspaces(
     orchestrator,
@@ -1780,12 +1805,7 @@ def _run_preflight(orchestrator, config: Config, resources: Iterable[str]) -> No
 
 
 def _display_resolution_summary(orchestrator) -> None:
-    """Print a consistent migration resolution summary.
-
-    Counts and artifact locations only: the tool reports what happened and
-    never synthesises generic guidance to fill the gap when a migrator has
-    nothing specific to say.
-    """
+    """Print a consistent migration resolution summary."""
     if not orchestrator.state:
         return
 
@@ -1802,12 +1822,31 @@ def _display_resolution_summary(orchestrator) -> None:
         f"  Verified downgrade: {terminal.get(ResolutionOutcome.MIGRATED_WITH_VERIFIED_DOWNGRADE.value, 0)}"
     )
     console.print(f"  Blocked: {terminal.get(ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value, 0)}")
+    captured = terminal.get(ResolutionOutcome.ARCHIVE_CAPTURED.value, 0)
+    if captured:
+        console.print(f"  Captured to archive: {captured}")
     console.print(
         f"  Exported/manual apply: {terminal.get(ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY.value, 0)}"
     )
     if bundle_display:
         console.print(f"  Remediation bundle: {bundle_display}")
     console.print("  Resume command: langsmith-migrator resume")
+
+    actionable_groups = orchestrator.state.get_actionable_groups()
+    if actionable_groups:
+        console.print("\n[bold]Actionable Next Steps[/bold]")
+        for group in actionable_groups[:5]:
+            item_count = len(group["items"])
+            if item_count == 1:
+                console.print(f"  • {group['subjects'][0]}: {group['next_action']}")
+            else:
+                affected = orchestrator.state.format_actionable_subjects(
+                    group["subjects"],
+                    max_items=3,
+                )
+                console.print(
+                    f"  • {group['label']} ({item_count} items: {affected}): {group['next_action']}"
+                )
 
 
 def _needs_operator_action(state) -> bool:
@@ -1829,7 +1868,9 @@ def _exit_for_remediation_if_needed(ctx, config: Config, orchestrator) -> None:
         and orchestrator.state
         and _needs_operator_action(orchestrator.state)
     ):
-        console.print("\n[yellow]Some items did not migrate; see the issues above.[/yellow]")
+        console.print(
+            "\n[yellow]Manual or external follow-up is required. Review the remediation bundle and run `langsmith-migrator resume` after resolving the blockers.[/yellow]"
+        )
         ctx.exit(2)
 
 
@@ -6251,15 +6292,12 @@ def contexts(
 @click.option("--all", "select_all", is_flag=True, help="Migrate all tracing projects without prompting")
 @click.option(
     "--since",
-    "--max-age-stamp",
-    "since",
     required=True,
     help=(
         "Oldest trace to take, as an absolute stamp: 2026-08-27 or "
         "2026-08-27T18:00:00Z. Bounds a trace root's start_time. Absolute on "
         "purpose - a relative age denotes a different instant every time it is "
-        "evaluated, which slides the whole window grid. (Former name: "
-        "--max-age-stamp.)"
+        "evaluated, which slides the whole window grid."
     ),
 )
 @click.option(
@@ -6316,22 +6354,29 @@ def contexts(
 )
 @click.option(
     "--to-archive",
-    type=click.Path(file_okay=False),
     help=(
-        "Write windows to this directory as one .tar.zst per (project, window) "
-        "instead of ingesting into a destination. Give every run its own directory."
+        "Write windows here as one .tar.zst per (project, window) instead of "
+        "ingesting into a destination: a directory, or s3://bucket/prefix. "
+        "Give every run its own location."
     ),
 )
 @click.option(
     "--from-archive",
-    type=click.Path(exists=True, file_okay=False),
-    help="Replay window files from this directory instead of reading the source deployment",
+    help="Replay window files from this directory or s3://bucket/prefix instead of the source deployment",
 )
 @click.option(
     "--allow-incomplete",
     is_flag=True,
-    help="Replay a truncated (.partial) window file; without this such a file is refused",
+    help="Replay a truncated (.partial) window file; without this such a file is refused. Local archives only",
 )
+@click.option("--s3-part-bytes", type=int, help="Multipart part size [env: MIGRATION_S3_PART_BYTES; default 8 MiB, S3 floor 5 MiB]")
+@click.option("--s3-upload-concurrency", type=int, help="Parts in flight per window [env: MIGRATION_S3_UPLOAD_CONCURRENCY; default 4, measured optimum]")
+@click.option("--s3-download-concurrency", type=int, help="Ranges in flight per window on replay [env: MIGRATION_S3_DOWNLOAD_CONCURRENCY; default 4]")
+@click.option("--s3-download-chunk-bytes", type=int, help="Range size on replay [env: MIGRATION_S3_DOWNLOAD_CHUNK_BYTES; default 2 MiB]")
+@click.option("--s3-endpoint-url", help="S3-compatible endpoint (MinIO/Ceph) [env: MIGRATION_S3_ENDPOINT_URL]. Redirects where trace data is written - it is printed in the settings table")
+@click.option("--s3-sse", help="Server-side encryption: AES256 or aws:kms [env: MIGRATION_S3_SSE]")
+@click.option("--s3-kms-key-id", help="KMS key for --s3-sse aws:kms [env: MIGRATION_S3_SSE_KMS_KEY_ID]")
+@click.option("--s3-storage-class", help="e.g. STANDARD_IA [env: MIGRATION_S3_STORAGE_CLASS]")
 @click.option("--map-projects", is_flag=True, help="Interactively map source projects to destination projects")
 @click.option("--project-mapping", help='Headless project mapping: JSON object or file, {"src-id": "dest-id"}')
 @click.option(
@@ -6361,6 +6406,14 @@ def traces(
     to_archive,
     from_archive,
     allow_incomplete,
+    s3_part_bytes,
+    s3_upload_concurrency,
+    s3_download_concurrency,
+    s3_download_chunk_bytes,
+    s3_endpoint_url,
+    s3_sse,
+    s3_kms_key_id,
+    s3_storage_class,
     map_projects,
     project_mapping,
     restore_session_tier,
@@ -6385,19 +6438,79 @@ def traces(
         console.print("[red]Error: --to-archive and --from-archive are mutually exclusive[/red]")
         ctx.exit(1)
         return
+    if from_archive and map_workspaces:
+        console.print(
+            "[red]Error: --map-workspaces has no source deployment to map from on a "
+            "replay; pass --source-workspace (which part of the archive) and "
+            "--dest-workspace (where it goes)[/red]"
+        )
+        ctx.exit(1)
+        return
     if to_archive and (into_session_suffix or emit_upgrade_list):
         console.print("[red]Error: --to-archive writes no destination, so project-tier options do not apply[/red]")
         ctx.exit(1)
         return
+    archive = to_archive or from_archive
+    # The flags take a plain string now that they accept s3:// URLs, so the
+    # path checks Click used to make have to happen here for local ones.
+    if archive and not is_s3(archive):
+        location = Path(archive)
+        if location.exists() and not location.is_dir():
+            console.print(f"[red]Error: {archive} is not a directory[/red]")
+            ctx.exit(1)
+            return
+        if from_archive and not location.is_dir():
+            console.print(f"[red]Error: --from-archive {archive} does not exist[/red]")
+            ctx.exit(1)
+            return
+    if is_s3(archive):
+        if allow_incomplete:
+            # An incomplete multipart upload is not a readable object: there is
+            # no s3 equivalent of a .partial file to salvage.
+            console.print(
+                "[red]Error: --allow-incomplete is local-only. An interrupted s3 window "
+                "leaves an aborted upload, not a readable partial object[/red]"
+            )
+            ctx.exit(1)
+            return
+        try:
+            s3_config = S3Config.from_env(
+                part_bytes=s3_part_bytes,
+                upload_concurrency=s3_upload_concurrency,
+                download_concurrency=s3_download_concurrency,
+                download_chunk_bytes=s3_download_chunk_bytes,
+                endpoint_url=s3_endpoint_url,
+                sse=s3_sse,
+                sse_kms_key_id=s3_kms_key_id,
+                storage_class=s3_storage_class,
+            ).validate(MAX_WINDOW_BYTES).size_pool(prefetch_windows * (s3_upload_concurrency or 4))
+        except (ValueError, ArchiveError) as exc:
+            console.print(f"[red]Error: {exc}[/red]")
+            ctx.exit(1)
+            return
+        for note in s3_config.notes:
+            console.print(f"[yellow]note:[/yellow] {note}")
+    elif any((s3_part_bytes, s3_upload_concurrency, s3_download_concurrency,
+              s3_download_chunk_bytes, s3_endpoint_url, s3_sse, s3_kms_key_id,
+              s3_storage_class)):
+        console.print("[yellow]note:[/yellow] --s3-* options are ignored unless the archive is an s3:// location")
+        s3_config = None
+    else:
+        s3_config = None
+    store_kwargs = s3_config.store_kwargs() if s3_config else {}
+
+    # An archive mode uses one deployment. Pointing the unused side at the one
+    # in play means the shared validation, credential prompt and workspace
+    # discovery all keep working without ever requiring or contacting a
+    # deployment this run has no business touching. Unconditional: a configured
+    # destination is still not a destination an export writes to.
     if to_archive:
-        # An export writes to disk and never touches a destination, so it must
-        # not require destination credentials or a destination workspace. Both
-        # are satisfied with the source's, so the shared validation, connection
-        # test and workspace pairing still work unchanged.
-        if not config.destination.api_key:
-            config.destination.api_key = config.source.api_key
-            config.destination.base_url = config.source.base_url
+        config.destination.api_key = config.source.api_key
+        config.destination.base_url = config.source.base_url
         dest_workspace = dest_workspace or source_workspace
+    elif from_archive:
+        config.source.api_key = config.destination.api_key
+        config.source.base_url = config.destination.base_url
     if not ensure_config(config):
         return
 
@@ -6419,20 +6532,62 @@ def traces(
 
     orchestrator = MigrationOrchestrator(config, state_manager)
 
+    # An archive mode uses one deployment: an export never writes to a
+    # destination, a replay never reads from a source. Requiring or contacting
+    # the unused side would make an offline mode need credentials it never uses.
     console.print("Testing connections... ", end="")
-    source_ok, dest_ok, source_error, dest_error = orchestrator.test_connections_detailed()
-    if not source_ok or not dest_ok:
-        console.print(f"[red]✗ {'Source' if not source_ok else 'Destination'} connection failed[/red]")
-        if source_error or dest_error:
-            console.print(f"[red]  {source_error or dest_error}[/red]")
-        orchestrator.cleanup()
-        return
+    sides = []
+    if not from_archive:
+        sides.append(("Source", orchestrator.source_client))
+    if not to_archive:
+        sides.append(("Destination", orchestrator.dest_client))
+    for label, client in sides:
+        ok, error = client.test_connection()
+        if not ok:
+            console.print(f"[red]✗ {label} connection failed[/red]")
+            if error:
+                console.print(f"[red]  {error}[/red]")
+            orchestrator.cleanup()
+            return
     console.print("[green]✓[/green]\n")
 
-    ws_result = _resolve_workspaces(
-        orchestrator, source_workspace, dest_workspace, map_workspaces,
-        non_interactive=config.migration.non_interactive,
-    )
+    # Resolved before the workspace resolver, which refuses one side without
+    # the other - a replay only ever gets told the destination.
+    archive_workspace = None
+    if from_archive:
+        try:
+            archive_workspace, source_workspace = _archive_replay_workspaces(
+                from_archive, source_workspace, dest_workspace,
+                allow_incomplete=allow_incomplete, store_kwargs=store_kwargs,
+            )
+        except ArchiveError as exc:
+            console.print(f"[red]Error: {exc}[/red]")
+            orchestrator.cleanup()
+            ctx.exit(1)
+            return
+        if archive_workspace:
+            console.print(f"[dim]Archive workspace: {archive_workspace}[/dim]")
+
+    if from_archive and not dest_workspace:
+        # A replay has no source deployment to map *from*, so the source->dest
+        # mapping TUI does not apply - it would offer the destination as both
+        # sides and wait for an answer. The destination is either unambiguous
+        # or has to be named.
+        available = _list_workspaces(orchestrator.dest_client)
+        if len(available) > 1:
+            console.print(
+                f"[red]Error: the destination has {len(available)} workspaces; pass "
+                "--dest-workspace to say which one to replay into[/red]"
+            )
+            orchestrator.cleanup()
+            ctx.exit(1)
+            return
+        ws_result = None
+    else:
+        ws_result = _resolve_workspaces(
+            orchestrator, source_workspace, dest_workspace, map_workspaces,
+            non_interactive=config.migration.non_interactive,
+        )
     if ws_result is _WS_ABORTED:
         ctx.exit(1)
         return
@@ -6442,6 +6597,18 @@ def traces(
         return
 
     ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+
+    # A workspace *mapping* cannot say which part of an archive goes where, so
+    # every pair would replay all of it. One pair at a time.
+    if from_archive and len(ws_pairs) > 1:
+        console.print(
+            f"[red]Error: a replay covers one workspace pair at a time, got "
+            f"{len(ws_pairs)}. Re-run with an explicit --source-workspace (which part "
+            "of the archive) and --dest-workspace (where it goes).[/red]"
+        )
+        orchestrator.cleanup()
+        ctx.exit(1)
+        return
 
     # Run identity on the destination is (tenant, session, start_time, id), so
     # re-ingesting preserved IDs into the same tenant duplicates rather than
@@ -6467,6 +6634,7 @@ def traces(
     failed_projects = []
     interrupted = False
     archives_written = archives_skipped = 0
+    archive_bytes = archive_source_bytes = 0
 
     for src_ws, dst_ws in ws_pairs:
         if interrupted:
@@ -6482,6 +6650,7 @@ def traces(
                 compress_level=compress_level,
                 dry_run=config.migration.dry_run,
                 workspace=_source_workspace_ref(orchestrator, src_ws),
+                **store_kwargs,
             )
             if to_archive
             else None
@@ -6492,6 +6661,8 @@ def traces(
                 allow_incomplete=allow_incomplete,
                 range_start=range_start,
                 range_end=None,
+                workspace=archive_workspace,
+                **store_kwargs,
             )
             if from_archive
             else None
@@ -6532,7 +6703,7 @@ def traces(
             archive_source.range_end = migrator.walk_end()
         _print_trace_preflight(
             migrator, config, window_hours, max_field_bytes, no_verify, into_session_suffix,
-            to_archive=to_archive, from_archive=from_archive,
+            to_archive=to_archive, from_archive=from_archive, s3_config=s3_config,
             projects=len(projects) or None,
         )
 
@@ -6597,6 +6768,7 @@ def traces(
                     ctx, orchestrator, config, migrator, selected,
                     session_reports, failed_projects,
                     verified=not (no_verify or to_archive) and not config.migration.dry_run,
+                    to_archive=to_archive,
                 )
         except KeyboardInterrupt:
             console.print("\n[yellow]Abandoned.[/yellow]")
@@ -6605,9 +6777,13 @@ def traces(
             interrupted = interrupted or migrator.stop_requested
             if archive_sink is not None:
                 for removed in archive_sink.discard_staged():
-                    console.print(f"[yellow]Discarded incomplete window {removed.name}[/yellow]")
+                    console.print(f"[yellow]Discarded incomplete window {removed}[/yellow]")
                 archives_written += len(archive_sink.written)
                 archives_skipped += migrator.skipped_windows
+                # A dry run encodes for real, so it can report the size and
+                # ratio an actual export would produce.
+                archive_bytes += archive_sink.projected_bytes
+                archive_source_bytes += archive_sink.source_bytes
 
         upgrade_rows.extend(migrator.upgrade_rows)
         fidelity_notes |= migrator.fidelity_reduced
@@ -6620,8 +6796,13 @@ def traces(
 
     _print_trace_summary(session_reports, fidelity_notes, no_verify, failed_projects)
     if to_archive:
+        verb = "would be written" if config.migration.dry_run else "written"
+        measured = ""
+        if config.migration.dry_run and archive_bytes:
+            ratio = f", {archive_source_bytes / archive_bytes:.1f}x" if archive_bytes else ""
+            measured = f" ({_human_bytes(archive_bytes)} compressed{ratio})"
         console.print(
-            f"Archive: {archives_written} window file(s) written, "
+            f"Archive: {archives_written} window file(s) {verb}{measured}, "
             f"{archives_skipped} already captured and skipped, under {to_archive}"
         )
     if to_archive and (interrupted or failed_projects):
@@ -6662,7 +6843,8 @@ def _source_workspace_ref(orchestrator, workspace_id):
 
 
 def _run_trace_projects(
-    ctx, orchestrator, config, migrator, selected, session_reports, failed_projects, *, verified: bool
+    ctx, orchestrator, config, migrator, selected, session_reports, failed_projects,
+    *, verified: bool, to_archive=None,
 ) -> None:
     """Migrate each selected project, recording every outcome.
 
@@ -6672,6 +6854,10 @@ def _run_trace_projects(
     for source_session in selected:
         label = _trace_session_label(source_session)
         console.print(f"\n[bold]{label}[/bold] ({source_session['id']})")
+        # The migrator is shared across every project in this workspace pair,
+        # so its window counters are running totals; each project reports the
+        # delta it is responsible for.
+        before = (migrator.windows_scanned, migrator.windows_empty, migrator.skipped_windows)
         try:
             report = migrator.migrate_session(source_session)
         except KeyboardInterrupt:
@@ -6701,8 +6887,15 @@ def _run_trace_projects(
             console.print(f"  [red]blocked:[/red] {reason}")
         del migrator.blocked_reasons[:]
         session_reports.append((source_session.get("name"), report))
-        _record_trace_session_outcome(orchestrator, config, migrator, source_session, report)
-        _print_trace_reconciliation(report, migrator.batch_limits()[0], verified=verified)
+        _record_trace_session_outcome(
+            orchestrator, config, migrator, source_session, report, archive=to_archive
+        )
+        _print_trace_reconciliation(
+            report, migrator.batch_limits()[0], verified=verified,
+            scanned=migrator.windows_scanned - before[0],
+            empty=migrator.windows_empty - before[1],
+            skipped=migrator.skipped_windows - before[2],
+        )
 
 
 # Only parameters that differ from these end up in a printed resume command, so
@@ -6795,6 +6988,14 @@ def _select_trace_sessions(config: Config, migrator, projects, select_all: bool)
     )
 
 
+def _human_bytes(size: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:,.0f} {unit}" if unit == "B" else f"{size:,.1f} {unit}"
+        size /= 1024
+    return f"{size:,.1f} GiB"
+
+
 def _human_duration(hours: float) -> str:
     """``0.24`` -> ``14m24s``. str(timedelta) would say ``0:14:24``."""
     total = int(round(hours * 3600))
@@ -6808,7 +7009,7 @@ def _human_duration(hours: float) -> str:
 
 def _print_trace_preflight(
     migrator, config, window_hours, max_field_bytes, no_verify, into_session_suffix,
-    *, to_archive=None, from_archive=None, projects=None,
+    *, to_archive=None, from_archive=None, projects=None, s3_config=None,
 ):
     """Report the destination's configuration before writing anything."""
     max_runs, max_bytes = migrator.batch_limits()
@@ -6847,6 +7048,25 @@ def _print_trace_preflight(
         table.add_row("Archive compression", f"zstd level {migrator.run_sink.compress_level}", "--compress-level")
     if from_archive:
         table.add_row("Replaying from", str(from_archive), "--from-archive (the source deployment is not read)")
+    if s3_config:
+        # Printed so a run records what it was tuned to, and - for the endpoint
+        # - where the data actually went. A benchmark result a week later cannot
+        # be attributed to a configuration that was never written down.
+        table.add_row(
+            "S3 transfer",
+            f"part {s3_config.part_bytes // 1024**2} MiB x {s3_config.upload_concurrency} up\n"
+            f"range {s3_config.download_chunk_bytes // 1024**2} MiB x "
+            f"{s3_config.download_concurrency} down\n"
+            f"pool {s3_config.max_pool_connections}"
+            + (f"\nSSE {s3_config.sse}" if s3_config.sse else "")
+            + (f"\nclass {s3_config.storage_class}" if s3_config.storage_class else ""),
+            "--s3-* / MIGRATION_S3_*",
+        )
+        table.add_row(
+            "S3 endpoint",
+            s3_config.endpoint_url or "aws (default)",
+            "--s3-endpoint-url" if s3_config.endpoint_url else "",
+        )
     console.print(table)
     if to_archive:
         range_hours = (migrator.walk_end() - migrator.resolved_range_start()).total_seconds() / 3600
@@ -6860,7 +7080,8 @@ def _print_trace_preflight(
             )
         console.print(
             "[yellow]An archive is plaintext trace data - inputs, outputs and attachments - with "
-            "no encryption at rest. Files are 0o600 and directories 0o700; nothing more.[/yellow]"
+            "no encryption at rest. Window files are 0o600 and each project's own "
+            "directory 0o700; parents the tool creates get your umask.[/yellow]"
         )
     if config.migration.dry_run:
         console.print("[yellow]Dry run: no session creation, no canary, no ingest[/yellow]")
@@ -6870,7 +7091,9 @@ def _print_trace_preflight(
         console.print(f"[dim]Migrating into separate projects suffixed '{into_session_suffix}'[/dim]")
 
 
-def _record_trace_session_outcome(orchestrator, config, migrator, source_session, report) -> None:
+def _record_trace_session_outcome(
+    orchestrator, config, migrator, source_session, report, *, archive=None
+) -> None:
     """One state item per project, carrying its reconciliation.
 
     Deliberately not one per run: state is rewritten on every update, and the
@@ -6886,8 +7109,20 @@ def _record_trace_session_outcome(orchestrator, config, migrator, source_session
         "blocked": report.blocked,
         "dest_session_id": report.dest_session_id,
     }
+    if config.migration.dry_run:
+        # A preview wrote nothing, so it has no terminal outcome to claim.
+        return
     if report.blocked:
         migrator.mark_blocked(item_id, "run_not_ingested", next_action="", evidence=evidence)
+    elif archive:
+        # Nothing reached a destination, so this is neither a verified migration
+        # nor an export awaiting a manual apply - the latter reads as
+        # remediation and would fail a clean export's exit code.
+        migrator.mark_captured(
+            item_id,
+            "archived_with_reduced_fidelity" if report.degraded else "archived_to_file",
+            export_path=str(archive), degraded=bool(report.degraded), evidence=evidence,
+        )
     elif report.degraded:
         migrator.mark_degraded(item_id, "migrated_with_reduced_fidelity", evidence=evidence)
     else:
@@ -6919,13 +7154,25 @@ def _record_trace_session_failure(orchestrator, config, migrator, source_session
     )
 
 
-def _print_trace_reconciliation(report, batch_runs: int, verified: bool = True) -> None:
+def _print_trace_reconciliation(
+    report, batch_runs: int, verified: bool = True, *, scanned: int = 0, empty: int = 0, skipped: int = 0
+) -> None:
     console.print(
         f"  source {report.source_total} = ingested {report.ingested}"
         f" + already present {report.already_present}"
         f" + degraded {report.degraded} + blocked {report.blocked}"
         + (f"  [dim](destination also holds {report.extra_on_dest} run(s) the source did not)[/dim]" if report.extra_on_dest else "")
     )
+    # Says what the requests were for. Without it a project with nothing in it
+    # reports "source 0" after a run of unexplained POSTs, and the only way to
+    # learn that each was one window's scan is to count them by hand.
+    if scanned or skipped:
+        parts = [f"{scanned} window(s) scanned"]
+        if empty:
+            parts.append(f"{empty} empty" + (" (project had no runs in range)" if empty == scanned else ""))
+        if skipped:
+            parts.append(f"{skipped} already captured")
+        console.print(f"  [dim]{', '.join(parts)}[/dim]")
     _print_trace_watermark(report, batch_runs, verified)
 
 
