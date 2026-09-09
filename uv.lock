@@ -181,30 +181,30 @@ wheels = [
 
 [[package]]
 name = "boto3"
-version = "1.43.39"
+version = "1.43.87"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "botocore" },
     { name = "jmespath" },
     { name = "s3transfer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/35/d936d1f77098a84365ab57798cbf41cf935c07a6c397a4892dc95046a277/boto3-1.43.39.tar.gz", hash = "sha256:ca5701ddf1215ba25b9d973d18505bb4def3a75d3daa9b263c6d8c713b601cb3", size = 112679, upload-time = "2026-07-01T19:37:26.165Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5c/0c/b14374e9458030076cd22ff9381cf86d170f31b648fd901db1d88011094b/boto3-1.43.87.tar.gz", hash = "sha256:8d9521c7c292194b8ce9fb61043d52e45cdba29b5f690981f3eb5e75103ba57d", size = 112691, upload-time = "2026-09-02T19:23:13.603Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/b4/2a105025fa85e27022d55b0dae02b490c74acd20e904e81003d3b622fbbe/boto3-1.43.39-py3-none-any.whl", hash = "sha256:f4eef8bf98559342466a9a1a063b7efcf3e337e98a819479bc2f7a603b8b8ba7", size = 140030, upload-time = "2026-07-01T19:37:24.756Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/a9/7dd7cc1a2387f3c78f66e49682957b7e7d590706dc6552d108b48125022d/boto3-1.43.87-py3-none-any.whl", hash = "sha256:671cf88a353f887774603980898bc34249d05a994e1c5e24aba4f4e1bbef0951", size = 140026, upload-time = "2026-09-02T19:23:12.044Z" },
 ]
 
 [[package]]
 name = "botocore"
-version = "1.43.39"
+version = "1.43.91"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jmespath" },
     { name = "python-dateutil" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/19/03/8800770b04e6b306172af15c7e0e049cb06ae6fb6eff6744a09563c1b80c/botocore-1.43.39.tar.gz", hash = "sha256:a95b90ea13aca409d79cc90d87c75df7db1a104a4c8e93707b62a3593bfdd17d", size = 15640021, upload-time = "2026-07-01T19:37:16.076Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9a/1e/c6d26cb1124799e2bee54854813b02aa8a813c57335f97b0b8ed50f902ff/botocore-1.43.91.tar.gz", hash = "sha256:0f12bceb8c5d90a0c60f326e883bf674ded8c7d7c18ee0b559843b3a6c52f2ad", size = 16089153, upload-time = "2026-09-09T19:24:34.426Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f1/de/1155cade4db5fb1121b66d9936b5e958b663db446752d47acc56ad5d380a/botocore-1.43.39-py3-none-any.whl", hash = "sha256:7cd5fab9d33f487777e2c508573bca6ae230779230263d47a617f4af960d3003", size = 15321601, upload-time = "2026-07-01T19:37:12.952Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/1a/f672cc408d808035397c5d63a1b31a6a56ee95417a9d60d120d96349d182/botocore-1.43.91-py3-none-any.whl", hash = "sha256:f96363d4caf50bce45fe2fdc2d4d86b3bea7f5cd805169d53c1371c2dd4772b6", size = 15782250, upload-time = "2026-09-09T19:24:31.222Z" },
 ]
 
 [[package]]
@@ -1141,7 +1141,7 @@ wheels = [
 
 [[package]]
 name = "langsmith-data-migration-tool"
-version = "0.0.83"
+version = "0.0.84"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -1154,6 +1154,7 @@ dependencies = [
     { name = "rich" },
     { name = "textual" },
     { name = "urllib3" },
+    { name = "zstandard" },
 ]
 
 [package.optional-dependencies]
@@ -1172,6 +1173,9 @@ models = [
     { name = "langchain-google-genai" },
     { name = "langchain-groq" },
     { name = "langchain-mistralai" },
+]
+s3 = [
+    { name = "boto3" },
 ]
 test = [
     { name = "httpx" },
@@ -1193,6 +1197,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "boto3", marker = "extra == 's3'", specifier = "==1.43.87" },
     { name = "click", specifier = "==8.4.2" },
     { name = "httpx", marker = "extra == 'test'", specifier = "==0.28.1" },
     { name = "langchain-anthropic", specifier = "==1.5.4" },
@@ -1221,8 +1226,9 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'test'", specifier = "==0.16.1" },
     { name = "textual", specifier = "==8.2.8" },
     { name = "urllib3", specifier = "==2.7.0" },
+    { name = "zstandard", specifier = "==0.25.0" },
 ]
-provides-extras = ["test", "models", "all"]
+provides-extras = ["test", "s3", "models", "all"]
 
 [package.metadata.requires-dev]
 dev = [

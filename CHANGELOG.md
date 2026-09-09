@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.84] - 2026-09-09
+
 ### Added
 - **`traces --to-archive s3://bucket/prefix` / `--from-archive s3://...`**: keep
   the archive in S3 instead of on a local disk, with no window staged to local
@@ -749,7 +751,9 @@ and the summary misattributed the whole thing to feedback replay.
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.82...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.84...HEAD
+[0.0.84]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.83...v0.0.84
+[0.0.83]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.82...v0.0.83
 [0.0.82]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.81...v0.0.82
 [0.0.81]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.80...v0.0.81
 [0.0.80]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.79...v0.0.80
