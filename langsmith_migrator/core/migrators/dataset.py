@@ -3,6 +3,7 @@
 from typing import Dict, List, Any, Optional, Generator, Tuple
 import requests
 import tempfile
+from urllib.parse import urljoin, urlparse
 import os
 import json
 import hashlib
@@ -176,6 +177,19 @@ class DatasetMigrator(BaseMigrator):
         for example in self.source.get_paginated("/examples", params=params):
             yield example
 
+    def _absolute_source_url(self, url: str) -> str:
+        """Resolve a root-relative presigned URL against the source instance.
+
+        Self-hosted LangSmith serves attachment downloads through its own API
+        (``/api/v1/public/download?jwt=...``) and returns that path without a
+        scheme or host. ``requests`` rejects such a URL outright, so the
+        attachment would be skipped. Absolute URLs (cloud blob stores) pass
+        through unchanged.
+        """
+        if urlparse(url).scheme:
+            return url
+        return urljoin(self.source.base_url, url)
+
     def download_attachments(self, attachments: Dict[str, Any]) -> Dict[str, Tuple[str, str, str]]:
         """
         Download attachments from source to temporary files.
@@ -207,6 +221,7 @@ class DatasetMigrator(BaseMigrator):
                 if not presigned_url:
                     self.log(f"No presigned URL for attachment '{key}', skipping", "warning")
                     continue
+                presigned_url = self._absolute_source_url(presigned_url)
 
                 # Suppress SSL warnings if verification is disabled
                 if not self.source.verify_ssl:
@@ -427,11 +442,15 @@ class DatasetMigrator(BaseMigrator):
         sdk_url = self.dest.base_url.replace("/api/v1", "")
         api_key = self.dest.headers.get("X-API-Key") or self.dest.headers.get("x-api-key", "")
 
-        # Create client kwargs
+        # Hand the SDK the destination's /info payload rather than an empty dict:
+        # create_examples() only sends attachments when it can see
+        # instance_flags.dataset_examples_multipart_enabled, and silently strips
+        # them otherwise. Fetching through our own client keeps SSL/CA/proxy
+        # settings consistent.
         client_kwargs = {
             "api_url": sdk_url,
             "api_key": api_key,
-            "info": {}  # Skip automatic /info fetch to avoid compatibility issues
+            "info": self.dest.get("/info"),
         }
 
         # Add custom session with SSL verification disabled if needed
