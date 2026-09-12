@@ -178,17 +178,25 @@ class DatasetMigrator(BaseMigrator):
             yield example
 
     def _absolute_source_url(self, url: str) -> str:
-        """Resolve a root-relative presigned URL against the source instance.
+        """Resolve a presigned attachment URL and pin it to the source host.
 
         Self-hosted LangSmith serves attachment downloads through its own API
         (``/api/v1/public/download?jwt=...``) and returns that path without a
-        scheme or host. ``requests`` rejects such a URL outright, so the
-        attachment would be skipped. Absolute URLs (cloud blob stores) pass
-        through unchanged.
+        scheme or host, so root-relative URLs are resolved against the source
+        instance's own base URL. Anything that resolves to a different host is
+        rejected outright rather than silently followed - this also covers a
+        protocol-relative URL (``//evil/x``), which parses with an empty
+        ``scheme`` but still carries its own ``netloc`` that ``urljoin`` would
+        otherwise honor verbatim. This mirrors the validation the trace
+        migrator applies to the same class of URL (see
+        ``TraceMigrator._fetch_blob``).
         """
-        if urlparse(url).scheme:
-            return url
-        return urljoin(self.source.base_url, url)
+        source = urlparse(self.source.base_url)
+        resolved = urljoin(self.source.base_url, url)
+        parsed = urlparse(resolved)
+        if parsed.scheme != source.scheme or parsed.netloc != source.netloc:
+            raise PermissionError("attachment_host_rejected")
+        return resolved
 
     def download_attachments(self, attachments: Dict[str, Any]) -> Dict[str, Tuple[str, str, str]]:
         """
@@ -233,7 +241,7 @@ class DatasetMigrator(BaseMigrator):
                         presigned_url,
                         verify=self.source.verify_ssl,
                         timeout=30,
-                        allow_redirects=True
+                        allow_redirects=False
                     )
                     head_response.raise_for_status()
 
@@ -267,7 +275,8 @@ class DatasetMigrator(BaseMigrator):
                     presigned_url,
                     verify=self.source.verify_ssl,
                     timeout=300,  # 5 minute timeout for large files
-                    stream=True
+                    stream=True,
+                    allow_redirects=False
                 ) as response:
                     response.raise_for_status()
 
@@ -320,6 +329,9 @@ class DatasetMigrator(BaseMigrator):
                 continue
             except requests.exceptions.RequestException as e:
                 self.log(f"Network error downloading attachment '{key}': {e}", "error")
+                continue
+            except PermissionError as e:
+                self.log(f"Attachment '{key}' rejected: {e}", "error")
                 continue
             except ValueError as e:
                 self.log(f"Validation error for attachment '{key}': {e}", "error")
@@ -414,6 +426,32 @@ class DatasetMigrator(BaseMigrator):
             self.log(f"Individual example creation failed: {e}", "error")
             return None
 
+    def _get_dest_info(self) -> Dict[str, Any]:
+        """Fetch and cache the destination instance's /info payload.
+
+        create_examples() only includes attachments in the multipart request
+        when it can see instance_flags.dataset_examples_multipart_enabled, so
+        the SDK client needs this. But /info isn't reachable on every
+        destination topology (e.g. hitting the backend service directly
+        instead of through the frontend route), and the SDK's own client
+        constructor doesn't tolerate a malformed payload - so a failed fetch
+        falls back to an empty dict (attachments then get silently stripped
+        by the SDK, same as before this existed) instead of failing the whole
+        batch, and is only attempted once per migrator instance rather than
+        once per batch.
+        """
+        if not hasattr(self, '_dest_info'):
+            try:
+                self._dest_info = self.dest.get("/info") or {}
+            except Exception as e:
+                self.log(
+                    f"Could not fetch destination /info ({e}); attachments may "
+                    "be stripped by the SDK for this migration",
+                    "warning"
+                )
+                self._dest_info = {}
+        return self._dest_info
+
     def create_examples_with_attachments(
         self,
         dataset_id: str,
@@ -450,7 +488,7 @@ class DatasetMigrator(BaseMigrator):
         client_kwargs = {
             "api_url": sdk_url,
             "api_key": api_key,
-            "info": self.dest.get("/info"),
+            "info": self._get_dest_info(),
         }
 
         # Add custom session with SSL verification disabled if needed
