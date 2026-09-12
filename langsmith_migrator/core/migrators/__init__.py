@@ -12,6 +12,7 @@ from .issue import IssueMigrator
 from .chart import ChartMigrator
 from .model_price_map import ModelPriceMapMigrator
 from .user_role import UserRoleMigrator
+from .trace import TraceMigrator
 from .orchestrator import MigrationOrchestrator
 from .fleet_skill import FleetSkillMigrator
 from .fleet_mcp_server import FleetMcpServerMigrator
@@ -37,6 +38,7 @@ __all__ = [
     "ChartMigrator",
     "ModelPriceMapMigrator",
     "UserRoleMigrator",
+    "TraceMigrator",
     "MigrationOrchestrator",
     "FleetSkillMigrator",
     "FleetMcpServerMigrator",

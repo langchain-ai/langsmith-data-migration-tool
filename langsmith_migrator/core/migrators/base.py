@@ -280,6 +280,27 @@ class BaseMigrator:
             error=outcome_code,
         )
 
+    def mark_captured(
+        self,
+        item_id: str,
+        outcome_code: str,
+        *,
+        export_path: Optional[str],
+        degraded: bool = False,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """An archive holds it. Not a verified migration, not remediation."""
+        self.mark_terminal(
+            item_id,
+            ResolutionOutcome.ARCHIVE_CAPTURED,
+            outcome_code,
+            verification_state=(
+                VerificationState.DEGRADED if degraded else VerificationState.EXPORTED
+            ),
+            export_path=export_path,
+            evidence=evidence,
+        )
+
     def mark_exported(
         self,
         item_id: str,

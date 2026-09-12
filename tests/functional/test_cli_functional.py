@@ -62,6 +62,7 @@ def test_registered_command_names_match_public_cli_surface():
         "resume",
         "rules",
         "test",
+        "traces",
         "users",
     ]
 
@@ -3798,3 +3799,66 @@ def test_clean_command_deletes_saved_sessions(cli_harness):
     assert result.exit_code == 0
     assert cli_harness.state_manager.list_sessions() == []
     assert "All sessions deleted" in cli_harness.console.text
+
+
+# --------------------------------------------------------------------------
+# A replay is told the destination; the archive names its own source
+# --------------------------------------------------------------------------
+def _one_window_archive(root, workspaces):
+    """An archive holding one window per workspace given."""
+    from datetime import datetime, timedelta, timezone
+
+    from langsmith_migrator.core.trace_archive import ArchiveSink
+    from langsmith_migrator.core.trace_domain import Window, plan_slice
+    from langsmith_migrator.core.trace_ports import SlicePrepared
+
+    now = datetime(2026, 9, 3, tzinfo=timezone.utc)
+    window = Window(now, now + timedelta(days=1))
+    for index, workspace in enumerate(workspaces):
+        run_id = f"{index:08d}-1111-1111-1111-111111111111"
+        run = {
+            "id": run_id, "trace_id": run_id, "name": "r", "run_type": "chain",
+            "start_time": (now + timedelta(hours=1)).isoformat(),
+            "dotted_order": f"20260903T010000000000Z{run_id}",
+            "session_id": "s", "inputs": {},
+        }
+        sink = ArchiveSink(root, compress_level=1, workspace=workspace)
+        sink.intent = {}
+        target = sink.open_target({"id": f"{index}1111111-1111-1111-1111-111111111111",
+                                   "name": f"p{index}"})
+        prepared = SlicePrepared(window, "s", target["id"], plan_slice({run_id}, set()), [run])
+        prepared.batches = [([run], None)]
+        sink.commit(target, window, prepared, sink.stage(target, window, prepared))
+    return root
+
+
+def _replay_workspaces(root, source_workspace, dest_workspace):
+    return cli_main._archive_replay_workspaces(
+        str(root), source_workspace, dest_workspace,
+        allow_incomplete=False, store_kwargs={},
+    )
+
+
+def test_a_replay_takes_its_source_workspace_from_the_archive(tmp_path):
+    """--dest-workspace alone is enough: the archive knows where it came from."""
+    _one_window_archive(tmp_path, [{"id": "ws-a", "name": "A"}])
+    assert _replay_workspaces(tmp_path, None, "dst-1") == ("ws-a", "ws-a")
+
+
+
+
+def test_an_archive_of_several_workspaces_asks_which_one(tmp_path):
+    """Replaying all of them into one destination would duplicate every run."""
+    import pytest
+
+    from langsmith_migrator.core.trace_blobstore import ArchiveError
+
+    _one_window_archive(tmp_path, [{"id": "ws-a", "name": "A"}, {"id": "ws-b", "name": "B"}])
+    with pytest.raises(ArchiveError, match="holds 2 workspaces"):
+        _replay_workspaces(tmp_path, None, "dst-1")
+
+
+def test_an_archive_recording_no_workspace_replays_whole(tmp_path):
+    """Nothing to scope by, so the resolver just needs a source side present."""
+    _one_window_archive(tmp_path, [None])
+    assert _replay_workspaces(tmp_path, None, "dst-1") == (None, "dst-1")

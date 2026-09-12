@@ -10,6 +10,13 @@ from typing import Callable, Optional
 # Maximum backoff delay in seconds to prevent indefinite waits
 MAX_BACKOFF_SECONDS = 60.0
 
+# A 429 gets its own, larger budget than a server error, because it is the one
+# failure where the server states exactly how long to wait. Sharing the general
+# three attempts meant a burst of rate limits under concurrent readers gave up
+# after ~6 s of backoff against a limit measured in minutes - observed killing a
+# whole project one window into a trace export at --prefetch-windows 6.
+RATE_LIMIT_RETRIES = 6
+
 
 class RateLimitError(Exception):
     """Rate limit exceeded error."""
@@ -87,6 +94,24 @@ def retry_upstream_rejections(max_retries: int = 3, delay: float = 1.0, backoff:
     return decorator
 
 
+def _await_rate_limit(func: Callable, args, kwargs, delay: float, backoff: float):
+    """Call ``func``, waiting out 429s on their own budget.
+
+    Wraps the call rather than restructuring the attempt loop below, so a
+    rate limit does not consume an attempt that a server error needs. Once the
+    budget is spent the ``RateLimitError`` propagates to that loop, which still
+    treats it as the retryable error it always was.
+    """
+    wait = delay
+    for _ in range(RATE_LIMIT_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except RateLimitError as e:
+            time.sleep(min(e.retry_after or wait * 2, MAX_BACKOFF_SECONDS))
+            wait = min(wait * backoff, MAX_BACKOFF_SECONDS)
+    return func(*args, **kwargs)
+
+
 def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
     """
     Decorator to retry failed API calls with exponential backoff.
@@ -106,17 +131,14 @@ def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 
 
             for attempt in range(max_retries):
                 try:
-                    return func(*args, **kwargs)
-                except RateLimitError as e:
-                    # Always retry rate limits
-                    last_exception = e
-                    # Use Retry-After if provided, otherwise use exponential backoff
-                    if e.retry_after:
-                        wait_time = min(e.retry_after, MAX_BACKOFF_SECONDS)
-                    else:
-                        wait_time = min(current_delay * 2, MAX_BACKOFF_SECONDS)
-                    time.sleep(wait_time)
-                    current_delay = min(current_delay * backoff, MAX_BACKOFF_SECONDS)
+                    return _await_rate_limit(func, args, kwargs, current_delay, backoff)
+                except RateLimitError:
+                    # _await_rate_limit has already spent RATE_LIMIT_RETRIES
+                    # honouring the server's own Retry-After. Reaching here means
+                    # the limit is sustained rather than a burst, so more of the
+                    # same backoff will not help - and multiplying the two
+                    # budgets would wait for minutes before saying so.
+                    raise
                 except UpstreamRejectionError as e:
                     # An intermediary refused this before LangSmith saw it. Often
                     # transient, so retry rather than killing the caller's work item.
@@ -149,6 +171,10 @@ def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 
                     requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout,
                     requests.exceptions.ReadTimeout,
+                    # A truncated response body. Not a ConnectionError subclass,
+                    # so it needs naming: it is the usual way a full connection
+                    # pool surfaces once several readers are in flight.
+                    requests.exceptions.ChunkedEncodingError,
                     socket.timeout,
                 ) as e:
                     # Retry network errors

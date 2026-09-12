@@ -1,6 +1,6 @@
 [project]
 name = "langsmith-data-migration-tool"
-version = "0.0.83"
+version = "0.0.84"
 description = "A tool for migrating datasets, experiments, prompts, rules, annotation queues, charts, and Fleet resources between LangSmith instances"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -27,6 +27,9 @@ dependencies = [
     "requests==2.34.2",
     "urllib3==2.7.0",
     "langsmith==0.10.16",
+    # Used directly to compress the trace ingest body; arrives transitively via
+    # langsmith, but this pins it because trace_frames.py imports it.
+    "zstandard==0.25.0",
     "python-dotenv==1.2.2",
     "langchain-core==1.5.3",
     # Model packages required for pulling prompts with include_model=True
@@ -51,6 +54,12 @@ test = [
     "httpx==0.28.1",
     "respx==0.23.1",
     "ruff==0.16.1",
+]
+# S3-backed trace archives (--to-archive/--from-archive s3://...). Optional so
+# that anyone who never addresses a bucket carries no AWS dependency; pinned to
+# a botocore range compatible with langchain-aws, so [s3] and [models] coexist.
+s3 = [
+    "boto3==1.43.87",
 ]
 # Additional model providers for pulling prompts with include_model=True
 models = [

@@ -30,6 +30,7 @@ class ResolutionOutcome(Enum):
     MIGRATED_WITH_VERIFIED_DOWNGRADE = "migrated_with_verified_downgrade"
     BLOCKED_WITH_CHECKPOINT = "blocked_with_checkpoint"
     EXPORTED_WITH_MANUAL_APPLY = "exported_with_manual_apply"
+    ARCHIVE_CAPTURED = "archive_captured"
 
 
 class VerificationState(Enum):

@@ -7,7 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.84] - 2026-09-09
+
 ### Added
+- **`traces --to-archive s3://bucket/prefix` / `--from-archive s3://...`**: keep
+  the archive in S3 instead of on a local disk, with no window staged to local
+  disk first (single attachments over 8 MiB may still use a temp file). Same
+  layout as on disk, so `aws s3 sync` moves an archive either way and both read
+  the same. Needs the `s3` extra: `uv tool install
+  'langsmith-data-migration-tool[s3]'`.
+
+  - A window is uploaded in parts and appears only once complete, so there is no
+    `.partial` stage on S3 and `--allow-incomplete` is local-only. All the bytes,
+    including the last part, are sent while the window is being built; publishing
+    it afterwards is a single request that carries no data. That keeps an
+    interrupted export leaving an unbroken sequence, at thousands of windows.
+  - Unfinished uploads are aborted on exit. They are invisible in a bucket
+    listing and still cost money, so set a lifecycle rule as a backstop for what
+    a hard kill leaves behind (see README).
+  - Resuming costs one listing per project rather than one check per window.
+  - Transfer tuning via flags or `MIGRATION_S3_*` environment variables: part
+    size, upload/download concurrency, range size, pool, timeouts, retries,
+    endpoint (MinIO/Ceph), encryption, storage class. Defaults suit a modest
+    link, and the effective values are printed in the pre-flight table.
+  - Credentials come from the usual AWS chain. Static `AWS_*` variables cannot be
+    refreshed, so an export outliving a session token stops partway — safely, and
+    re-running continues.
+
+- **`traces --to-archive DIR` / `--from-archive DIR`**: save traces to disk as
+  compressed files, and load them into a destination later. Useful for
+  air-gapped transfers, or for capturing once and loading into several places.
+
+  One file is written per project and time window:
+  `<archive-dir>/<workspace>-<id>/<project>-<id>/<start>__<end>.tar.zst`
+
+  - Files hold run data, not ready-made HTTP bodies, so the destination project
+    can be changed on load and the format does not depend on SDK internals.
+  - A file is written as `.partial` and renamed once finished, so `ls` shows
+    what completed. Renames happen in time order, so an interrupted export
+    leaves an unbroken sequence — never a gap in the middle.
+  - An empty window still gets a file, so "looked, found nothing" is different
+    from "not looked at yet".
+  - To resume, run the same command again; finished windows are skipped. One
+    Ctrl-C finishes the windows already in flight and loses nothing, a second
+    aborts. Exit code 130, and the command to continue is printed.
+  - Archives are read as untrusted input: member names must match known
+    patterns, decompressed size is capped, and an unknown `format_version` is
+    rejected.
+  - Window files are `0o600` and each project's own directory is `0o700`. Any
+    parent directory the tool has to create gets your umask's default, which is
+    usually `0o755`, so create the archive root yourself with `chmod 700` (or run
+    under `umask 077`) if that matters. **Not encrypted** — an archive is
+    plaintext trace data.
+  - Make sure you run using the same time window - or remove the archive
+    directory before running
+
+- **`traces --since` / `--until`**, both required, both absolute timestamps.
+  They replace `--max-age-days` / `--min-age-days` and avoid the problem of
+  ever-sliding time windows due to `now()` being always different.
+
+- **`traces --compress-level` / `--prefetch-windows`**: the upload body is now
+  zstd-compressed by the same worker threads that fetch the data, so
+  compression is off the critical path and the level can be chosen. The default
+  (level 3, with long-distance matching) shrinks the body far more than the
+  level 1 the SDK uses on its own; how much depends on the data, so measure
+  yours with `--dry-run`. `--prefetch-windows` (default 4)
+  fetches several windows at once; **uploads stay serial and oldest-first
+  regardless**, which is what stops a failure leaving a gap.
+  `--no-compress-upload` sends uncompressed.
+
+- **Long-lived trace migration (`traces`)**: New command that migrates traces
+  whose `trace_tier` is `longlived` between deployments. Run `id`, `trace_id`,
+  `parent_run_id`, `dotted_order` and all timestamps are preserved verbatim
+  (there is no time-shifting option); tracing projects are mapped rather than
+  assumed equal. Attachments and offloaded `inputs`/`outputs` are fetched
+  through the tool's own configured HTTP session — with the blob host validated
+  and redirects refused — and re-inlined, so a failed fetch is reported rather
+  than migrating a run with a placeholder. Writes go through
+  `multipart_ingest` in batches that keep a trace together where it fits inside
+  the destination's advertised limits. A single trace bigger than a limit is
+  still sent whole, so that batch goes over it; and if a batch is refused it is
+  split in half by run to find the run at fault.
+
+  There is **no resumable checkpoint**: for each `(project, time window)` slice it
+  ingests `source_ids - dest_ids` and re-queries to confirm the difference is
+  empty, so the diff is the work-list, the skip-list and the completeness proof
+  at once. A run the destination already holds is never re-sent: a fully
+  ingested run is immutable (its `end_time` is persisted), so it cannot be
+  repaired in place — repair means re-migrating that window into a fresh
+  destination project. Re-run instead of resuming, and `resume` says so. Each
+  project's outcome is still recorded under `.langsmith-migrator/`. A pre-flight canary verifies the destination still
+  accepts historical timestamps before your traces are migrated - it leaves one
+  run in a `langsmith-migrator-canary` project, which nothing deletes - and destination
+  projects are created with an explicit long-lived trace tier,
+  scoped one project at a time. Run `model-pricing` before `traces`: token and
+  cost rollups are recomputed by the destination, not replayed. Deliberately
+  not wired into `migrate-all`.
+
 - **Custom model pricing migration (`model-pricing`)**: New command to migrate
   workspace-custom model price entries between instances/workspaces via
   `/model-price-map`. Only workspace-custom entries are copied; the global
@@ -16,6 +112,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   updated in place (or skipped with `--skip-existing`), and a server-side
   uniqueness conflict is treated as already-migrated. Also wired into
   `migrate-all` (Step 8) with a `--skip-model-pricing` flag.
+
+### Changed
+- **`traces --window` is in hours now, not days** (default 24, was 1). Sub-day
+  windows are the normal case — a busy project wants about 1.7 h — and writing
+  that as `0.07` of a day is unreadable. Fractions still work.
+- **An archive has a workspace directory above the project one**, named
+  `<workspace-name>-<workspace-id>`: the name so it is readable, the ID so two
+  workspaces with the same name cannot share a directory. `--from-archive`
+  accepts the archive root or a single workspace directory.
+- **Window labels in the output show the time, not just the date** —
+  `2026-09-01T22:00..23:00Z` rather than `2026-09-01..2026-09-01`, which looked
+  identical for every window in a day.
+- **The per-window progress line names its project**, because under `--verbose`
+  the project header has scrolled away by the time the summary prints.
+- Verbose query lines say `scan` or `fetch` instead of `query`. A fetch is one
+  request per ID batch, so its page counter always read `p1`.
+
+### Removed
+- **`traces --max-age-days` and `--min-age-days`.** A relative age means a
+  different moment each time it is read, which caused three bugs: window
+  filenames changed between runs, so a resumed export re-did everything instead
+  of skipping it; the two bounds were read moments apart, so a range that was an
+  exact multiple of `--window` grew a spurious sub-second window at the end; and
+  neither was visible in the output. Absolute `--since` / `--until` remove all
+  three, and the grid-snapping workaround the first two had needed.
+
+### Fixed
+- **Payload fetches shrink their ID batch on a 413/502/503 or read timeout**
+  instead of failing the project outright. 500 IDs of a heavy project is about
+  355 MB, which the gateway will not serve. The query timeout also went from
+  30 s to 120 s.
+- **A 429 gets its own retry budget.** It used to share three attempts with
+  server errors, so it gave up after ~6 s of backoff against a limit measured in
+  minutes, killing a whole project.
+- **A 409 on upload no longer reports runs that did land as blocked.** Uploads
+  are sent with `attempts=1`: a blind retry of a large batch the server accepted
+  slowly earns a 409, which made 1,025 written runs look rejected.
+- **`ChunkedEncodingError` is retried.** It is not a `ConnectionError` subclass,
+  so it was never in the retry list — and it is exactly what a full connection
+  pool produces. Pool size now matches the number of reader threads.
+- **Run data is copied before the upload body is built.** The SDK's serializer
+  removes `inputs`/`outputs`/`events` and more from the dict it is handed, so a
+  retry would have re-sent runs with no content.
+- **Both ends of the time range come from one clock reading**, and fields the
+  source does not have are left out when creating a destination project (a null
+  `start_time` was a 422).
+- **An export now reports a run the source listed but never returned**, rather
+  than counting it as saved — an export has no read-back check to catch it.
 
 ## [0.0.83] - 2026-07-31
 
@@ -607,7 +751,9 @@ and the summary misattributed the whole thing to feedback replay.
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.82...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.84...HEAD
+[0.0.84]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.83...v0.0.84
+[0.0.83]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.82...v0.0.83
 [0.0.82]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.81...v0.0.82
 [0.0.81]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.80...v0.0.81
 [0.0.80]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.79...v0.0.80
