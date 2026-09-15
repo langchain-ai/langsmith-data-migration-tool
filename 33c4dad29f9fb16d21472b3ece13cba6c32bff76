@@ -1,0 +1,28 @@
+README.md
+  s_dcd5a1b7c4204f::t_81e01f295275ea 9,209,212,217,222
+CHANGELOG.md
+  s_dcd5a1b7c4204f::t_81e01f295275ea 10-11,754-756
+uv.lock
+  s_dcd5a1b7c4204f::t_feea50ee73549a 184,191,193,198,205,207,1144,1157,1177-1179,1200,1229,1231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "33c4dad29f9fb16d21472b3ece13cba6c32bff76",
+  "prompts": {},
+  "humans": {
+    "h_255864e0abd836": {
+      "author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  },
+  "sessions": {
+    "s_dcd5a1b7c4204f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "54429360-caec-4aa1-ae25-b76fa3b64a55",
+        "model": "claude-opus-5"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
