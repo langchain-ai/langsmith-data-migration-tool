@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Dataset attachment migration**: a source instance that returns
+  root-relative presigned attachment URLs (e.g.
+  `/api/v1/public/download?jwt=...`, as self-hosted/BYOC instances do) had
+  every attachment silently skipped, since the URL had no host to send the
+  request to. These are now resolved against the source instance and, like
+  trace attachment downloads, pinned to the source's own host with
+  redirects refused. Also, the destination's `/info` is now fetched (once
+  per migration, non-fatally) so the LangSmith SDK can see
+  `dataset_examples_multipart_enabled` and actually include attachments in
+  the upload instead of silently stripping them.
+
 ## [0.0.84] - 2026-09-09
 
 ### Added
