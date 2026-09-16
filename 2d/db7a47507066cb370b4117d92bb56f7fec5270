@@ -1,0 +1,26 @@
+tests/unit/test_dataset_attachments.py
+  s_66a66c8d0b05f7::t_d7bc57104186ce 1-146
+langsmith_migrator/core/migrators/dataset.py
+  s_66a66c8d0b05f7::t_d7bc57104186ce 6,180-200,232,244,278-279,333-335,429-454,483-487,491
+CHANGELOG.md
+  s_66a66c8d0b05f7::t_18207e1c762101 21,29-33
+  s_66a66c8d0b05f7::t_d7bc57104186ce 10-20
+README.md
+  s_66a66c8d0b05f7::t_d7bc57104186ce 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2ddb7a47507066cb370b4117d92bb56f7fec5270",
+  "prompts": {},
+  "sessions": {
+    "s_66a66c8d0b05f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aa1d4849-ddb5-473e-bb1e-f2f780bb3805",
+        "model": "claude-opus-5"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
