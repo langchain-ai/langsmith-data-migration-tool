@@ -25,7 +25,7 @@ langsmith-migrator datasets
 - **Users & Roles**: Migrate custom roles, org members, and workspace memberships between instances
 - **Export Users to CSV**: Export active org and workspace members to a members CSV (`export-users`) that round-trips into the `users --members-csv` importer
 - **Single-Instance Access Sync**: Apply CSV-driven add/update or authoritative access sync to one LangSmith instance (`users --csv ... [--sync]`), including multi-row workspace role unionization for custom ABAC roles
-- **Datasets**: Migrate datasets with examples and file attachments
+- **Datasets**: Migrate datasets with examples and file attachments. Attachment downloads are resolved against the source instance (so self-hosted/BYOC sources, which return relative download URLs, work correctly) and pinned to that host
 - **Experiments**: Include experiments, runs, and feedback during dataset migration (`datasets --include-experiments`) or through `migrate-all`
 - **Annotation Queues**: Transfer queue configurations
 - **Project Rules**: Copy automation rules with project mapping and optional project creation in interactive flows
