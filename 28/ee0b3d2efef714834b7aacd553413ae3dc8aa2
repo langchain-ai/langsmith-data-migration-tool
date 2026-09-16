@@ -1,0 +1,21 @@
+langsmith_migrator/core/migrators/dataset.py
+  s_31a670dfc1abc1::t_6a7a50bbc669e0 6,180-192,224,445-449,453
+tests/unit/test_dataset_attachments.py
+  s_31a670dfc1abc1::t_6a7a50bbc669e0 1-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "28ee0b3d2efef714834b7aacd553413ae3dc8aa2",
+  "prompts": {},
+  "sessions": {
+    "s_31a670dfc1abc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f66bc3e-6f66-45a6-ac97-82421337dabf",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "gdibben <gethin.dibben@langchain.dev>"
+    }
+  }
+}

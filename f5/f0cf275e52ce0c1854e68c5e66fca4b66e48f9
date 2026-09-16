@@ -1,0 +1,19 @@
+README.md
+  s_31a670dfc1abc1::t_f992d97cd6e1eb 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "f5f0cf275e52ce0c1854e68c5e66fca4b66e48f9",
+  "prompts": {},
+  "sessions": {
+    "s_31a670dfc1abc1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2f66bc3e-6f66-45a6-ac97-82421337dabf",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "gdibben <gethin.dibben@langchain.dev>"
+    }
+  }
+}
