@@ -1,0 +1,33 @@
+langsmith_migrator/core/migrators/trace.py
+  s_66a66c8d0b05f7::t_36ac6fb7c5837e 751-756
+CHANGELOG.md
+  h_255864e0abd836 18
+  s_66a66c8d0b05f7::t_36ac6fb7c5837e 10-17,19
+README.md
+  s_66a66c8d0b05f7::t_c01f6a008d27ec 37,45-48,51-60,66-74
+  s_66a66c8d0b05f7::t_9d6ae00f079b6e 49-50,62-65,159
+  h_255864e0abd836 61
+langsmith_migrator/cli/main.py
+  s_66a66c8d0b05f7::t_36ac6fb7c5837e 6432-6440
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1bce9e08396c3eac41b3a176ca5cca69885a2b1c",
+  "prompts": {},
+  "humans": {
+    "h_255864e0abd836": {
+      "author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  },
+  "sessions": {
+    "s_66a66c8d0b05f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aa1d4849-ddb5-473e-bb1e-f2f780bb3805",
+        "model": "claude-opus-5"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
