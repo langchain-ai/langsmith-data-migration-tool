@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dataset_examples_multipart_enabled` and actually include attachments in
   the upload instead of silently stripping them.
 
+### Documentation
+- **`traces` is documented as self-hosted-only in practice**: writing historical
+  run timestamps depends on the destination's ingest time-window enforcement
+  being warn-only (`V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS`, default
+  `["*"]`, a deployment-level setting alongside the 24h
+  `RUN_POST_START_TIME_WINDOW_HOURS` / `RUN_PATCH_START_TIME_WINDOW_HOURS`
+  windows). Self-hosted and BYOC operators can set it; on LangChain-managed
+  SaaS it is a per-org allowlist customers cannot configure, so only roughly
+  the last 24 hours of traces are accepted and the pre-flight canary stops with
+  `historical_ingest_rejected`. Exporting *out* of SaaS via `--to-archive` is
+  unaffected. New README limitation, a note in `traces --help`, and the
+  remediation hint is now part of the `historical_ingest_rejected` issue text.
+
 ## [0.0.84] - 2026-09-09
 
 ### Added

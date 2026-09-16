@@ -6429,6 +6429,15 @@ def traces(
     are mapped. Stateless: there is no resume, just re-run the command.
     Run `model-pricing` first so migrated runs' costs are computed against the
     right price map.
+
+    Self-hosted destinations only in practice. Writing historical timestamps
+    needs the destination's ingest time-window enforcement to be warn-only
+    (V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS, which defaults to ["*"] and
+    is a deployment-level setting). On LangChain-managed SaaS that list is an
+    allowlist you cannot configure, so only about the last 24 hours of traces
+    are accepted and the pre-flight canary stops with
+    historical_ingest_rejected. Exporting out of SaaS with --to-archive is
+    unaffected. See the README limitation for details.
     """
     config = ctx.obj["config"]
     state_manager = ctx.obj["state_manager"]
