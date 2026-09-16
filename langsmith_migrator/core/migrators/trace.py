@@ -748,7 +748,12 @@ class TraceMigrator(BaseMigrator):
             "blocked",
             "historical_ingest_rejected",
             f"Destination refuses historical run timestamps "
-            f"(from {self.resolved_range_start().isoformat()}): {detail}",
+            f"(from {self.resolved_range_start().isoformat()}): {detail}. "
+            f"On a self-hosted destination, add the org to "
+            f"V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS (or set it back to "
+            f'["*"]) and restart, then re-run. On LangChain-managed SaaS that '
+            f"list is not customer-configurable, so only about the last 24 "
+            f"hours of traces can be ingested.",
             evidence={"range_start": self.resolved_range_start().isoformat(), "detail": detail},
         )
         del issue

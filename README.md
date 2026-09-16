@@ -34,13 +34,43 @@ langsmith-migrator datasets
 - **Custom Model Pricing**: Migrate workspace-custom model price entries (`model-pricing`). Global built-in prices are skipped since they already exist in every workspace. Idempotent: an equivalent entry on the destination is updated in place, or skipped with `--skip-existing`
 - **Engine Issues**: Migrate per-project LangSmith Engine issues-agent configs and detected issues as metadata (`issues`). Run links and trace deep-links are not migrated (see Limitations)
 - **Fleet**: Migrate agents, shared skills, MCP servers, integrations, auth providers, schedules, triggers, webhooks, usage limits, sandbox policies, and workspace secrets (`fleet`)
-- **Long-lived traces**: Migrate traces whose tier is `longlived` between deployments (`traces`), preserving run IDs, `dotted_order` and timestamps verbatim, carrying attachments and re-inlining offloaded payloads. No resumable checkpoint — work is a destination diff per time window, so re-run instead of resuming. Not part of `migrate-all`
+- **Long-lived traces**: Migrate traces whose tier is `longlived` between deployments (`traces`), preserving run IDs, `dotted_order` and timestamps verbatim, carrying attachments and re-inlining offloaded payloads. No resumable checkpoint — work is a destination diff per time window, so re-run instead of resuming. Not part of `migrate-all`. **Self-hosted destinations only in practice** (see Limitations)
 - **Context Hub**: Migrate Context Hub agents and skills (the versioned agent/skill repos in the LangSmith Context Hub), including files and repo metadata (description, readme, tags, is_public) (`contexts`). Replays the **full commit history** by default so the destination reproduces the source's commit chain; use `--latest-only` to copy just the latest commit. Also copies **commit tags**, including the `production` / `staging` environment tags behind the Context Hub promote feature, pointing each at the same commit on the destination (`--no-tags` to skip). Lists the same contexts the Context Hub UI shows (external-source repos are hidden by default; use `--include-external` to migrate them too). Scope with `--agents-only` / `--skills-only`; linked-repo commit pins are stripped and reported cross-instance, or preserved with `--same-instance`
 - **Workspace Scoping**: Run resource migrations per workspace pair with explicit IDs or interactive workspace mapping
 - **Remediation & Resume**: Persist migration state, write remediation bundles, print grouped actionable next steps, and retry pending/failed work with `resume`
 - **Interactive CLI**: TUI-based selection with search/filter, plus `--non-interactive` mode for automation
 
 ## Limitations
+
+### Trace Migration Assumes a Self-Hosted Destination
+
+`traces` is the only command that depends on the destination accepting **historical**
+run timestamps, and that is a server-side decision. Ingest validates a run's
+`start_time` against a window around now (`RUN_POST_START_TIME_WINDOW_HOURS` and
+`RUN_PATCH_START_TIME_WINDOW_HOURS`, both 24 by default, so roughly the last 24 hours),
+and `V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS` decides whether a violation is an
+error or just a warning.
+
+- **Self-hosted (and BYOC): configurable, and open by default.** The exclusion list
+  defaults to `["*"]`, which makes enforcement warn-only for every org, so a
+  self-hosted destination accepts migrated timestamps as shipped. If your operators
+  have narrowed it, put the destination org back in the list (or restore `["*"]`) for
+  the duration of the migration. It is a deployment-level environment variable, so it
+  is set wherever you configure the rest of the stack (Helm values, ECS task
+  definition, container env) and needs a restart of the affected services.
+- **LangChain-managed SaaS: not configurable by you.** Anything outside the ~24h window is
+  rejected outright, and because the check fails the *whole* multipart request a batch
+  is lost rather than partially written. Assume `traces` will not work against a SaaS
+  destination unless LangChain has allowlisted the destination org for the migration;
+  ask support before planning a cutover around it.
+
+The pre-flight canary (see "Destination configuration checklist") tests exactly this
+before any of your traces move: it writes one run stamped at the far end of your
+`--since`/`--until` range and reads it back by ID, stopping with
+`historical_ingest_rejected` if the destination refuses or silently rewrites the
+timestamp. Nothing else about `traces` is self-hosted-specific: the archive modes
+(`--to-archive` / `--from-archive`) read from any source, including SaaS, so exporting
+long-lived traces *out* of SaaS to disk or S3 is unaffected.
 
 ### Long-Lived Traces Only
 
@@ -126,7 +156,7 @@ destination's retention removes it. `--dry-run` skips the canary.
 
 | Setting | Default | Why it matters |
 | --- | --- | --- |
-| `V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS` | `["*"]` | Historical timestamps are rejected outright when the ±24h ingest window is enforced, and the *whole* multipart request fails. Keep `*` or add the org. The pre-flight canary — one run stamped at the far end of the requested range, read back by ID — enforces this before your traces are migrated, and stops with `historical_ingest_rejected` if it fails. The run it writes is left behind. |
+| `V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS` | `["*"]` | **Self-hosted only.** On SaaS this is a LangChain-maintained allowlist you cannot set (see "Trace Migration Assumes a Self-Hosted Destination"). Historical timestamps are rejected outright when the ±24h ingest window is enforced, and the *whole* multipart request fails. Keep `*` or add the org. The pre-flight canary — one run stamped at the far end of the requested range, read back by ID — enforces this before your traces are migrated, and stops with `historical_ingest_rejected` if it fails. The run it writes is left behind. |
 | `MAX_FIELD_SIZE_BYTES` | 25 MB | An oversized `inputs`/`outputs` is **silently replaced with a placeholder**, not rejected, and the limit is not advertised. Tell the tool via `--max-field-bytes`; a larger re-inlined payload is then reported as `payload_oversized_for_destination` instead of quietly stubbed. |
 | `MAX_ATTACHMENT_SIZE_BYTES` | 200 MB | Attachments above this are refused. |
 | `TRACE_TIER_TTL_DURATION_SEC_MAP`, `S3_TRACE_TIER_PREFIX_MAP` | `""` | Both need a `longlived` entry or tier handling errors. |

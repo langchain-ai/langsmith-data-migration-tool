@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **`traces` is documented as self-hosted-only in practice**: writing historical
+  run timestamps depends on the destination's ingest time-window enforcement
+  being warn-only (`V1_INGEST_ENFORCE_TIME_WINDOW_EXCLUDED_ORGS`, default
+  `["*"]`, a deployment-level setting alongside the 24h
+  `RUN_POST_START_TIME_WINDOW_HOURS` / `RUN_PATCH_START_TIME_WINDOW_HOURS`
+  windows). Self-hosted and BYOC operators can set it; on LangChain-managed
+  SaaS, only roughly the last 24 hours of traces are accepted and the pre-flight
+  canary stops with `historical_ingest_rejected`.
+
 ## [0.0.84] - 2026-09-09
 
 ### Added
