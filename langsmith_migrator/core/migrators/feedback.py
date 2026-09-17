@@ -235,6 +235,17 @@ class FeedbackMigrator(BaseMigrator):
             total_found += len(feedbacks)
             self.log(f"Found {len(feedbacks)} feedback records for experiment {source_exp_id}", "info")
 
+            if self.config.migration.dry_run:
+                # A dry run creates no runs, so there is no run mapping to remap feedback
+                # against; without this every record would count as unmapped and the
+                # experiment would be reported as a failed replay.
+                self.log(
+                    f"[DRY RUN] Would migrate {len(feedbacks)} feedback records for experiment {source_exp_id}",
+                    "info",
+                )
+                total_migrated += len(feedbacks)
+                continue
+
             # Transform feedback for destination
             migrated_feedbacks = []
             unmapped_runs = 0

@@ -9,6 +9,7 @@ from langsmith_migrator.core.migrators.dataset import DatasetMigrator
 SOURCE_BASE = "https://source.api.test.com/api/v1"
 DEST_BASE = "https://dest.api.test.com/api/v1"
 RELATIVE_PRESIGNED = "/api/v1/public/download?jwt=eyJhbGciOiJIUzI1NiJ9.payload.sig"
+DEST_WORKSPACE = "0131ade3-dce3-4d66-a5bd-ffcf002394eb"
 DEST_INFO = {"version": "0.17.23", "instance_flags": {"dataset_examples_multipart_enabled": True}}
 
 
@@ -19,6 +20,8 @@ def migrator(sample_config):
     source.verify_ssl = True
     dest = Mock()
     dest.base_url = DEST_BASE
+    dest.session = Mock()
+    dest.session.headers = {"X-Tenant-Id": DEST_WORKSPACE}
     dest.headers = {"X-API-Key": "dest-key"}
     dest.get.return_value = DEST_INFO
     return DatasetMigrator(source, dest, None, sample_config)
@@ -144,3 +147,18 @@ def test_destination_info_fetch_failure_falls_back_to_empty_dict(migrator, monke
     migrator.create_examples_with_attachments("dataset-123", [])
 
     assert captured_kwargs["info"] == {}
+
+
+def test_destination_sdk_client_is_scoped_to_the_destination_workspace(migrator, monkeypatch):
+    """An org-wide PAT without X-Tenant-Id posts into its default workspace, where the dataset is absent."""
+    captured_kwargs = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr("langsmith.Client", FakeClient)
+
+    migrator.create_examples_with_attachments("dataset-123", [])
+
+    assert captured_kwargs["workspace_id"] == DEST_WORKSPACE

@@ -490,6 +490,13 @@ class DatasetMigrator(BaseMigrator):
             "api_key": api_key,
             "info": self._get_dest_info(),
         }
+        # Scope the SDK client to the destination workspace. Without X-Tenant-Id an
+        # org-wide PAT posts into its default workspace, where the target dataset does
+        # not exist, and every example in an attachment batch fails with
+        # "404 dataset not found".
+        dest_workspace_id = self.dest.session.headers.get("X-Tenant-Id")
+        if dest_workspace_id:
+            client_kwargs["workspace_id"] = dest_workspace_id
 
         # Add custom session with SSL verification disabled if needed
         if not self.config.destination.verify_ssl:
