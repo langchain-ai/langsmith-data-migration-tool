@@ -1,0 +1,28 @@
+langsmith_migrator/core/migrators/prompt.py
+  s_33fad267e7c457::t_a448f385a99d73 500,502-504
+langsmith_migrator/core/migrators/dataset.py
+  s_33fad267e7c457::t_8ab64d29a16017 493-499
+tests/test_feedback_accounting.py
+  s_33fad267e7c457::t_cfc7a9caf7d95c 178-200
+tests/unit/test_dataset_attachments.py
+  s_33fad267e7c457::t_22c41695bc0f9c 12,23-24
+  s_33fad267e7c457::t_99297c87519d03 150-164
+langsmith_migrator/core/migrators/feedback.py
+  s_33fad267e7c457::t_b98e7ad38c9f61 238-248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a6a59c5c95fae5e60a3f39782df7ec135e231287",
+  "prompts": {},
+  "sessions": {
+    "s_33fad267e7c457": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1fb2303-3754-4191-8458-dcec36507525",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "gdibben <gethin.dibben@langchain.dev>"
+    }
+  }
+}
