@@ -175,3 +175,26 @@ def test_create_failures_are_reported_and_retried_next_pass(sample_config, migra
     item = migration_state.get_item("experiment_exp-src")
     assert item.metadata["feedback_migrated"] == 2
     assert item.metadata.get("feedback_verified") is not True
+
+
+def test_dry_run_counts_feedback_as_accounted_without_run_mapping(sample_config, migration_state):
+    """A dry run creates no runs, so nothing is in the run mapping.
+
+    Before the fix every record was skipped as unmapped, ``feedback_partial_replay``
+    was queued and the experiment was reported as a failed replay, so every dry run
+    with experiments exited non-zero even when nothing was wrong.
+    """
+    sample_config.migration.dry_run = True
+    feedbacks = [_feedback(1), _feedback(2), _feedback(3)]
+    source, dest = _clients(feedbacks)
+    migration_state.ensure_item(
+        "experiment_exp-src", "experiment", "exp-1", "exp-src", stage="migrate_feedback"
+    )
+
+    found, accounted = _migrator(source, dest, sample_config, migration_state).\
+        migrate_feedback_for_experiments({"exp-src": "exp-dst"}, {})
+
+    assert (found, accounted) == (3, 3)
+    assert not migration_state.remediation_queue
+    assert not [issue for issue in migration_state.issue_log if issue.code == "feedback_partial_replay"]
+    dest.post.assert_not_called()

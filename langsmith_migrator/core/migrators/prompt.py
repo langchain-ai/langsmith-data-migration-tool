@@ -497,10 +497,11 @@ class PromptMigrator(BaseMigrator):
                 error_dict = e.response.json()
                 error_detail = error_dict.get("detail", error_dict.get("error", str(error_dict)))
             except (ValueError, AttributeError):
-                error_detail = e.response.text[:500] if e.response else ""
+                error_detail = e.response.text[:500] if e.response is not None else ""
 
-            # Check for "nothing to commit" (already up to date) - various phrasings
-            if e.response and e.response.status_code == 409:
+            # Check for "nothing to commit" (already up to date) - various phrasings.
+            # A requests.Response is falsy for any 4xx, so test against None, not truthiness.
+            if e.response is not None and e.response.status_code == 409:
                 error_lower = str(error_detail).lower()
                 # Check for explicit "nothing to commit" messages
                 if any(phrase in error_lower for phrase in ["nothing to commit", "no changes", "already up to date", "identical"]):
