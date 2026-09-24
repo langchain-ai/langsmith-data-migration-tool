@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.85] - 2026-09-24
+
 ### Fixed
+- **Run-rule attachment requirements**: omit `require_attachments: false` when
+  creating code evaluators to preserve the default behavior. Preserve `true`
+  and report that the destination requires code evaluator v2, including in
+  failure remediation, instead of silently changing evaluator behavior.
 - **Dataset attachment migration**: a source instance that returns
   root-relative presigned attachment URLs (e.g.
   `/api/v1/public/download?jwt=...`, as self-hosted/BYOC instances do) had
@@ -776,7 +782,8 @@ and the summary misattributed the whole thing to feedback replay.
 - Configuration documentation
 - API reference for core classes
 
-[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.84...HEAD
+[Unreleased]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.85...HEAD
+[0.0.85]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.84...v0.0.85
 [0.0.84]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.83...v0.0.84
 [0.0.83]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.82...v0.0.83
 [0.0.82]: https://github.com/langchain-ai/langsmith-data-migration-tool/compare/v0.0.81...v0.0.82

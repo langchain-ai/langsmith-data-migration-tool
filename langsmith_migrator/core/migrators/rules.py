@@ -1195,10 +1195,20 @@ class RulesMigrator(BaseMigrator):
                     )
                     return None
 
-            # Copy code_evaluators array directly (contains code evaluator configs)
+            # Copy code evaluator configs without changing their behavior.
             # Each code evaluator has: { code: str, language?: 'python' | 'javascript' }
             if rule.get('code_evaluators'):
                 code_evaluators = self._clean_none_values(rule.get('code_evaluators'))
+                for evaluator in code_evaluators:
+                    # Omission preserves the default and works without code evaluator v2.
+                    if evaluator.get('require_attachments') is False:
+                        evaluator.pop('require_attachments')
+                if any(ev.get('require_attachments') is True for ev in code_evaluators):
+                    self.log(
+                        "require_attachments=true requires code evaluator v2 on the destination; "
+                        "preserving it to avoid changing evaluator behavior.",
+                        "warning",
+                    )
                 payload['code_evaluators'] = code_evaluators
                 self.log(f"Copying {len(code_evaluators)} code evaluator(s)", "info")
 
@@ -1496,6 +1506,16 @@ class RulesMigrator(BaseMigrator):
             error_str = str(e)
             self.log(f"Failed to create rule {rule_name}: {e}", "error")
             current_payload = locals().get("payload", {})
+            next_action = "Review the exported rule payload, then run `langsmith-migrator resume`."
+            if any(
+                ev.get('require_attachments') is True
+                for ev in current_payload.get('code_evaluators', [])
+            ):
+                next_action = (
+                    "Review the exported rule payload and ensure code evaluator v2 is enabled "
+                    "on the destination for require_attachments=true, then run "
+                    "`langsmith-migrator resume`."
+                )
 
             # Provide specific guidance for common errors
             if "RunnableSequence must have at least 2 steps" in error_str:
@@ -1536,7 +1556,7 @@ class RulesMigrator(BaseMigrator):
                 "rule_migration_failed",
                 f"Rule migration failed for '{rule_name}'",
                 item_id=locals().get("item_id"),
-                next_action="Review the exported rule payload, then run `langsmith-migrator resume`.",
+                next_action=next_action,
                 evidence={"error": error_str},
                 export_path=export_path,
             )
@@ -1552,7 +1572,7 @@ class RulesMigrator(BaseMigrator):
                 self.mark_exported(
                     locals()["item_id"],
                     "rule_migration_failed",
-                    next_action="Review the exported rule payload, then run `langsmith-migrator resume`.",
+                    next_action=next_action,
                     export_path=export_path,
                     evidence={"error": error_str},
                 )
