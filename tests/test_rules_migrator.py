@@ -1,6 +1,7 @@
 """Unit tests for RulesMigrator."""
 
 import pytest
+from copy import deepcopy
 from unittest.mock import Mock, patch
 from langsmith_migrator.core.api_client import EnhancedAPIClient
 from langsmith_migrator.core.migrators import RulesMigrator
@@ -129,6 +130,60 @@ class TestRulesMigrator:
 
         assert result == 'new-rule-123'
         mock_api_client.post.assert_called_once()
+
+    def test_create_rule_normalizes_attachment_requirements(
+        self, rules_migrator, mock_api_client, sample_config, sample_rule
+    ):
+        sample_config.migration.dry_run = False
+        mock_api_client.post.return_value = {'id': 'new-rule-123'}
+        evaluators = [
+            {'code': 'return False', 'language': 'python', 'require_attachments': False},
+            {'code': 'return True', 'language': 'python', 'require_attachments': True},
+            {'code': 'return 0', 'language': 'python'},
+            {'code': 'return null', 'language': 'javascript', 'require_attachments': None},
+        ]
+        sample_rule['code_evaluators'] = deepcopy(evaluators)
+
+        with patch.object(rules_migrator, 'log') as log:
+            result = rules_migrator.create_rule(sample_rule, target_project_id='dest-project')
+
+        assert result == 'new-rule-123'
+        payload = mock_api_client.post.call_args.args[1]
+        assert payload['code_evaluators'] == [
+            {'code': 'return False', 'language': 'python'},
+            evaluators[1],
+            evaluators[2],
+            {'code': 'return null', 'language': 'javascript'},
+        ]
+        assert sample_rule['code_evaluators'] == evaluators
+        assert any(
+            'requires code evaluator v2 on the destination' in call.args[0]
+            and call.args[1] == 'warning'
+            for call in log.call_args_list
+        )
+
+    def test_create_rule_preserves_attachment_requirement_on_rejection(
+        self, rules_migrator, mock_api_client, sample_config, sample_rule
+    ):
+        sample_config.migration.dry_run = False
+        sample_rule['code_evaluators'] = [
+            {'code': 'return True', 'language': 'python', 'require_attachments': True}
+        ]
+        mock_api_client.post.side_effect = Exception('require_attachments requires code evaluator v2')
+
+        with (
+            patch.object(rules_migrator, '_export_rule_manual_apply') as export,
+            patch.object(rules_migrator, 'record_issue', return_value=None) as record_issue,
+            patch.object(rules_migrator, 'mark_exported') as mark_exported,
+        ):
+            result = rules_migrator.create_rule(sample_rule, target_project_id='dest-project')
+
+        assert result is None
+        mock_api_client.post.assert_called_once()
+        assert mock_api_client.post.call_args.args[1]['code_evaluators'] == sample_rule['code_evaluators']
+        assert export.call_args.args[1]['code_evaluators'] == sample_rule['code_evaluators']
+        assert 'code evaluator v2' in record_issue.call_args.kwargs['next_action']
+        assert 'code evaluator v2' in mark_exported.call_args.kwargs['next_action']
 
     def test_create_rule_with_project(self, rules_migrator, mock_api_client, sample_config, sample_rule):
         """Test creating rule with project context."""
