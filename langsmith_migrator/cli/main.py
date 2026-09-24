@@ -1556,7 +1556,7 @@ def _single_instance_operator_notes(
     csv_rows: list[dict],
     org_members: list[dict],
 ) -> list[str]:
-    """Return operator-facing notes for lossy pending-invite shapes."""
+    """Explain how mixed workspace roles are staged for pending invitees."""
     direct_invite_by_email = {
         member["email"]
         for member in org_members
@@ -1579,9 +1579,9 @@ def _single_instance_operator_notes(
         if len(workspace_role_ids) > 1:
             notes.append(
                 f"{email} has multiple workspace roles; the initial org invite "
-                "cannot attach all workspace access in one pending invite. "
-                "Workspace membership will be applied in phase 3 when the target "
-                "accepts it; otherwise re-run after the invite is accepted."
+                "uses one workspace role for all included workspaces. "
+                "Phase 3 stages each workspace's role separately before acceptance. "
+                "Accepting the org invite activates all staged workspace memberships."
             )
     return notes
 

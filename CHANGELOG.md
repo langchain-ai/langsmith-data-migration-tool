@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.86] - 2026-09-24
+
+### Fixed
+- **Workspace access before invite acceptance**: `users` stages pending workspace
+  memberships for new and previously invited organization members, including
+  different mapped roles across workspaces. Accepting the organization invite
+  activates all staged workspace access without a second migration run. Existing
+  pending workspace roles are reconciled, respecting `--skip-existing` and
+  `--dry-run`. Unsupported targets and permission failures remain explicit
+  blockers with remediation guidance.
+
 ## [0.0.85] - 2026-09-24
 
 ### Fixed
