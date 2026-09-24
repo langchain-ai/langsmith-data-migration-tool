@@ -1439,25 +1439,213 @@ class TestUserRoleMigrator:
         assert (m, s, f) == (0, 1, 0)
         migrator.dest.post.assert_not_called()
 
-    def test_migrate_workspace_members_blocks_pending_org_invite_without_user_id(self, migrator):
-        """Pending org invites without user_id need acceptance before workspace add."""
+    @pytest.mark.parametrize("dry_run", [False, True])
+    @pytest.mark.parametrize("existing_invite", [False, True])
+    def test_pending_org_members_get_each_mapped_workspace_role(
+        self, migrator, dry_run, existing_invite
+    ):
+        """New invites and reruns stage distinct workspace roles before acceptance."""
+        migrator.config.migration.dry_run = dry_run
+        migrator._role_id_map = {
+            "src-org-user": "dst-org-user",
+            "src-ws-admin": "dst-ws-admin",
+            "src-ws-custom": "dst-ws-custom",
+        }
+        pending_identity = {
+            "id": "pending-org-identity-1",
+            "email": "alice@example.com",
+            "role_id": "dst-org-user",
+        }
+        staged = {}
+
+        def get_paginated(endpoint, params=None):
+            if endpoint == "/orgs/current/members/pending":
+                return iter([pending_identity] if existing_invite else [])
+            if endpoint == "/workspaces/current/members/pending":
+                assert params == {"emails": "alice@example.com"}
+                return iter(staged.get(migrator.dest.session.headers["X-Tenant-Id"], []))
+            return iter([])
+
+        def post(endpoint, payload):
+            if endpoint == "/orgs/current/members":
+                return pending_identity
+            assert endpoint == "/workspaces/current/members/batch"
+            workspace_id = migrator.dest.session.headers["X-Tenant-Id"]
+            staged[workspace_id] = [
+                {
+                    "id": workspace_id + "-pending",
+                    "email": "alice@example.com",
+                    "role_id": payload[0]["workspace_role_id"],
+                }
+            ]
+            return [pending_identity]
+
+        migrator.dest.get_paginated.side_effect = get_paginated
+        migrator.dest.post.side_effect = post
+        assert migrator.migrate_org_members(
+            [{"email": "alice@example.com", "role_id": "src-org-user"}]
+        ) == ((0, 1, 0) if existing_invite else (1, 0, 0))
+        migrator.ensure_dest_email_index(force=True)
+
+        for source_ws, dest_ws, source_role in [
+            ("src-ws-1", "dst-ws-1", "src-ws-admin"),
+            ("src-ws-2", "dst-ws-2", "src-ws-custom"),
+        ]:
+            migrator.source.session.headers["X-Tenant-Id"] = source_ws
+            migrator.dest.session.headers["X-Tenant-Id"] = dest_ws
+            members = [{"email": "alice@example.com", "role_id": source_role}]
+            assert migrator.migrate_workspace_members(members) == (1, 0, 0)
+            item = migrator.state.items[f"ws_member_{source_ws}_alice@example.com"]
+            assert item.outcome_code == "ws_member_pending_access_staged"
+            if not dry_run:
+                # A repeat reconciles existing pending access without another write.
+                assert migrator.migrate_workspace_members(members) == (0, 1, 0)
+
+        if dry_run:
+            migrator.dest.post.assert_not_called()
+        else:
+            workspace_calls = [
+                c
+                for c in migrator.dest.post.call_args_list
+                if c.args[0] == "/workspaces/current/members/batch"
+            ]
+            assert workspace_calls == [
+                call(
+                    "/workspaces/current/members/batch",
+                    [{"email": "alice@example.com", "workspace_role_id": "dst-ws-admin"}],
+                ),
+                call(
+                    "/workspaces/current/members/batch",
+                    [{"email": "alice@example.com", "workspace_role_id": "dst-ws-custom"}],
+                ),
+            ]
+        migrator.dest.patch.assert_not_called()
+        migrator.dest.delete.assert_not_called()
+
+    @pytest.fixture
+    def pending_workspace_migrator(self, migrator):
         migrator._role_id_map = {"src-ws-role": "dst-ws-role"}
         pending_identity = {"id": "pending-org-identity-1", "email": "alice@example.com"}
         migrator._pending_org_email_to_identity = {"alice@example.com": pending_identity}
         migrator._dest_email_to_identity = {"alice@example.com": pending_identity}
-        migrator.source.get_paginated.return_value = iter(
-            [
-                {"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"},
-            ]
+        migrator.source.get_paginated.side_effect = lambda *args, **kwargs: iter(
+            [{"id": "src-ws-m1", "email": "alice@example.com", "role_id": "src-ws-role"}]
         )
-        migrator.dest.get_paginated.return_value = iter([])
+        migrator.dest.get_paginated.side_effect = lambda *args, **kwargs: iter([])
+        return migrator
 
-        m, s, f = migrator.migrate_workspace_members()
+    @pytest.mark.parametrize("select_org_member", [False, True])
+    def test_pending_workspace_access_when_org_member_skipped(self, migrator, select_org_member):
+        """Workspace selection can add access even when the existing org invite is skipped."""
+        migrator.config.migration.skip_existing = True
+        migrator._role_id_map = {"src-org-role": "dst-org-role", "src-ws-role": "dst-ws-role"}
+        pending_org_member = {
+            "id": "pending-org-1",
+            "email": "alice@example.com",
+            "role_id": "old-org-role",
+        }
+        migrator.dest.get_paginated.side_effect = [
+            iter([]),
+            iter([pending_org_member]),
+            iter([]),
+            iter([]),
+        ]
+        org_members = [{"email": "alice@example.com", "role_id": "src-org-role"}]
+        migrator.migrate_org_members(org_members if select_org_member else [])
 
-        assert (m, s, f) == (0, 0, 1)
+        assert migrator.migrate_workspace_members(
+            [{"email": "alice@example.com", "role_id": "src-ws-role"}]
+        ) == (1, 0, 0)
+        migrator.dest.post.assert_called_once_with(
+            "/workspaces/current/members/batch",
+            [{"email": "alice@example.com", "workspace_role_id": "dst-ws-role"}],
+        )
+        migrator.dest.patch.assert_not_called()
+        migrator.dest.delete.assert_not_called()
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    @pytest.mark.parametrize("skip_existing", [False, True])
+    @pytest.mark.parametrize("existing_role", ["dst-ws-role", "different-role"])
+    def test_pending_workspace_role_reconciliation(
+        self, pending_workspace_migrator, dry_run, skip_existing, existing_role
+    ):
+        migrator = pending_workspace_migrator
+        migrator.config.migration.dry_run = dry_run
+        migrator.config.migration.skip_existing = skip_existing
+        migrator.dest.get_paginated.side_effect = [
+            iter([]),
+            iter(
+                [
+                    {
+                        "id": "pending-workspace-1",
+                        "email": "alice@example.com",
+                        "role_id": existing_role,
+                    }
+                ]
+            ),
+        ]
+
+        needs_update = existing_role != "dst-ws-role" and not skip_existing
+        assert migrator.migrate_workspace_members() == ((1, 0, 0) if needs_update else (0, 1, 0))
         migrator.dest.post.assert_not_called()
+        if needs_update and not dry_run:
+            migrator.dest.patch.assert_called_once_with(
+                "/workspaces/current/members/pending-workspace-1/pending",
+                {"role_id": "dst-ws-role"},
+            )
+        else:
+            migrator.dest.patch.assert_not_called()
+
+    @pytest.mark.parametrize("status", [401, 403, 404, 405, 409])
+    def test_pending_workspace_errors_are_blockers(self, pending_workspace_migrator, status):
+        migrator = pending_workspace_migrator
+        error = AuthenticationError if status in {401, 403} else APIError
+        migrator.dest.post.side_effect = error("Cannot stage access", status_code=status)
+
+        assert migrator.migrate_workspace_members() == (0, 0, 1)
         item = migrator.state.items["ws_member_ws-default-src_alice@example.com"]
-        assert item.outcome_code == "ws_member_pending_org_invite"
+        assert item.outcome_code == "ws_member_pending_access_failed"
+        assert item.terminal_state == "blocked_with_checkpoint"
+        assert "after the organization invite is accepted" in item.next_action
+
+    def test_pending_workspace_requires_destination_context(self, pending_workspace_migrator):
+        migrator = pending_workspace_migrator
+        migrator.dest.session.headers.pop("X-Tenant-Id")
+
+        assert migrator.migrate_workspace_members() == (0, 0, 1)
+        migrator.dest.post.assert_not_called()
+        migrator.dest.patch.assert_not_called()
+
+    def test_pending_workspace_requires_mapped_role(self, pending_workspace_migrator):
+        migrator = pending_workspace_migrator
+        migrator._role_id_map = {}
+
+        assert migrator.migrate_workspace_members() == (0, 0, 1)
+        migrator.dest.post.assert_not_called()
+        migrator.dest.patch.assert_not_called()
+        item = migrator.state.items["ws_member_ws-default-src_alice@example.com"]
+        assert item.outcome_code == "unmapped_role"
+
+    def test_acceptance_before_workspace_phase_uses_active_membership(
+        self, pending_workspace_migrator
+    ):
+        migrator = pending_workspace_migrator
+        migrator.dest.get_paginated.side_effect = [
+            iter([{"id": "active-org-1", "email": "alice@example.com", "user_id": "user-1"}]),
+            iter([]),
+        ]
+        migrator.ensure_dest_email_index(force=True)
+
+        assert migrator.migrate_workspace_members() == (1, 0, 0)
+        migrator.dest.post.assert_called_once_with(
+            "/workspaces/current/members",
+            {
+                "user_id": "user-1",
+                "workspace_ids": ["ws-default-dst"],
+                "workspace_role_id": "dst-ws-role",
+                "role_id": "dst-ws-role",
+            },
+        )
 
     def test_migrate_workspace_members_skips_when_org_pending_reconciliation_blocked(
         self, migrator

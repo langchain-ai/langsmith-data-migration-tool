@@ -6,7 +6,7 @@ A Python CLI for migrating users and roles, datasets, experiments, annotation qu
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.85-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -236,20 +236,20 @@ The destination's `POST /runs/batch` endpoint rejects runs with timestamps outsi
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.85-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.85-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.85-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.85-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -474,7 +474,8 @@ Notes:
 - `langsmith_role` should be a built-in LangSmith role name (for example `Organization Admin`, `Organization Operator`, `Organization User`, `Organization Viewer`, `Workspace Admin`, `Workspace User`, or `Workspace Viewer`) or a custom role `display_name`.
 - Multiple rows for the same user and workspace are combined. Built-in workspace roles collapse to the highest-privilege built-in role; custom ABAC roles are unioned with each other and with any built-in workspace role so their policy attachments are preserved.
 - Users who only appear in workspace rows are invited to the org with the source `ORGANIZATION_USER` role before workspace membership is applied.
-- Workspace-only users with multiple workspace roles cannot have all workspace access attached to the initial org invite. The command calls this out before apply, attempts phase 3 workspace membership application, and may require a rerun after the invite is accepted on target versions that block workspace membership for pending org invites.
+- Workspace access is staged before organization invite acceptance. Single-instance CSV users with one workspace role can receive it in the initial org invite; other users, including those with different roles across workspaces, receive pending workspace memberships during phase 3. Accepting the org invite activates all staged memberships, with no post-acceptance rerun needed.
+- Re-running `users` also stages missing workspace access for existing pending org invitees. Older targets that do not support pending workspace membership report a blocker; upgrade the target or rerun after acceptance in that case.
 - `Organization Admin` on a workspace row is treated as org-level admin access only. No explicit workspace membership is created because org admins already have workspace access.
 - Other org-scoped roles cannot be used on workspace rows. If you want org-level access, leave `workspace_id` empty.
 - Workspace-scoped roles such as `Workspace Admin` cannot be used on org-level rows.

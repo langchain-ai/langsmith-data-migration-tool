@@ -168,7 +168,6 @@ class UserRoleMigrator(BaseMigrator):
         self._pending_org_email_to_identity: Dict[str, Dict[str, Any]] = {}
         self._pending_workspace_invites: set[tuple[str, str]] = set()
         self._pending_org_blockers: Dict[str, Dict[str, Any]] = {}
-        self._pending_org_invite_wait_reported: set[str] = set()
         self._last_org_member_removals = 0
         self._last_workspace_member_removals = 0
 
@@ -300,6 +299,8 @@ class UserRoleMigrator(BaseMigrator):
                 for member in dest_members
                 if member.get("email")
             }
+            for email in active_by_email:
+                self._pending_org_email_to_identity.pop(email, None)
             for email, member in self._pending_org_email_to_identity.items():
                 active_by_email.setdefault(email, member)
             self._dest_email_to_identity = active_by_email
@@ -1004,11 +1005,7 @@ class UserRoleMigrator(BaseMigrator):
         Returns ``(migrated, skipped, failed)`` counts.
         """
         dest_members = self.list_dest_org_members()
-        pending_dest_members = (
-            self.list_dest_pending_org_members()
-            if (remove_pending or any(member.get("workspace_ids") for member in selected_members))
-            else []
-        )
+        pending_dest_members = self.list_dest_pending_org_members()
 
         dest_by_email: Dict[str, Dict[str, Any]] = {}
         for m in dest_members:
@@ -1022,7 +1019,12 @@ class UserRoleMigrator(BaseMigrator):
             if email:
                 pending_by_email[email] = m
 
-        self._dest_email_to_identity = dest_by_email
+        self._pending_org_email_to_identity = {
+            email: member
+            for email, member in pending_by_email.items()
+            if email not in dest_by_email
+        }
+        self._dest_email_to_identity = {**self._pending_org_email_to_identity, **dest_by_email}
 
         migrated = skipped = failed = 0
         removed = 0
@@ -1765,38 +1767,38 @@ class UserRoleMigrator(BaseMigrator):
                     failed += 1
                     continue
                 pending_org_member = self._pending_org_email_to_identity.get(email)
-                pending_user_id = pending_org_member and (
-                    pending_org_member.get("user_id")
-                    or (pending_org_member.get("user") or {}).get("id")
-                )
-                if pending_org_member and not pending_user_id:
-                    if email in self._pending_org_invite_wait_reported:
-                        self.log(
-                            f"Workspace membership for '{email}' is already waiting on pending org invite acceptance",
-                            "info",
-                        )
+                if pending_org_member:
+                    try:
+                        changed = self._stage_pending_workspace_member(email, mapped_role_id)
                         self.mark_migrated(
                             item_id,
-                            outcome_code="ws_member_skipped_pending_org_invite_waiting",
-                            evidence={"email": email},
+                            outcome_code=(
+                                "ws_member_pending_access_staged"
+                                if changed
+                                else "ws_member_skipped_existing"
+                            ),
                         )
-                        skipped += 1
-                        continue
-                    self._pending_org_invite_wait_reported.add(email)
-                    self.log(
-                        f"Cannot add '{email}' to workspace until the pending org invite is accepted",
-                        "warning",
-                    )
-                    self.mark_blocked(
-                        item_id,
-                        "ws_member_pending_org_invite",
-                        next_action=(
-                            "Wait for the pending org invite to be accepted, "
-                            "then re-run `langsmith-migrator users`."
-                        ),
-                        evidence={"email": email},
-                    )
-                    failed += 1
+                        migrated += int(changed)
+                        skipped += int(not changed)
+                    except APIError as e:
+                        self.log(f"Failed to stage workspace access for '{email}': {e}", "error")
+                        self.mark_blocked(
+                            item_id,
+                            "ws_member_pending_access_failed",
+                            next_action=(
+                                "Review the workspace invite error and destination permissions, "
+                                "then re-run `langsmith-migrator users`. If this target version "
+                                "does not support pending workspace membership, upgrade it or "
+                                "re-run after the organization invite is accepted."
+                            ),
+                            evidence={
+                                "email": email,
+                                "workspace_id": ws_pair.get("dest"),
+                                "status_code": e.status_code,
+                                "error": str(e),
+                            },
+                        )
+                        failed += 1
                     continue
 
                 try:
@@ -1870,6 +1872,48 @@ class UserRoleMigrator(BaseMigrator):
 
         self._last_workspace_member_removals = removed
         return migrated, skipped, failed
+
+    def _stage_pending_workspace_member(self, email: str, role_id: Optional[str]) -> bool:
+        """Stage access for a pending org member; return whether access changed."""
+        if not self.workspace_pair().get("dest"):
+            raise APIError("Destination workspace is required to stage pending membership")
+
+        pending_member = next(
+            (
+                member
+                for member in self.dest.get_paginated(
+                    "/workspaces/current/members/pending", params={"emails": email}
+                )
+                if (member.get("email") or "").lower() == email
+            ),
+            None,
+        )
+        if pending_member:
+            if (
+                self.config.migration.skip_existing
+                or not role_id
+                or pending_member.get("role_id") == role_id
+            ):
+                return False
+            if self.config.migration.dry_run:
+                self.log(f"[DRY RUN] Would update pending workspace role for {email}")
+            else:
+                self.dest.patch(
+                    f"/workspaces/current/members/{pending_member['id']}/pending",
+                    {"role_id": role_id},
+                )
+            return True
+
+        if self.config.migration.dry_run:
+            self.log(f"[DRY RUN] Would stage workspace access for {email}")
+            return True
+
+        payload = {"email": email}
+        if role_id:
+            payload["workspace_role_id"] = role_id
+        self.dest.post("/workspaces/current/members/batch", [payload])
+        self.log(f"Staged workspace access for {email}", "success")
+        return True
 
     def _add_workspace_member(
         self,
