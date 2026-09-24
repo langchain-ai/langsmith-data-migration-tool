@@ -38,6 +38,53 @@ class _FakeConsole:
         self.text += "".join(str(arg) for arg in args) + end
 
 
+def test_resume_pending_workspace_member_without_org_migration(
+    monkeypatch, sample_config, migration_state, tmp_path
+):
+    """A saved workspace item can stage access for an existing pending org invite."""
+    source, dest = _FakeClient(), _FakeClient()
+    clients = [source, dest]
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.EnhancedAPIClient",
+        lambda **kwargs: clients.pop(0),
+    )
+    pending_org = {"id": "pending-org-1", "email": "alice@example.com"}
+    dest.get_paginated = Mock(
+        side_effect=lambda endpoint, **kwargs: iter(
+            [pending_org] if endpoint == "/orgs/current/members/pending" else []
+        )
+    )
+
+    def post(endpoint, payload):
+        assert dest.session.headers["X-Tenant-Id"] == "ws-dst"
+        return [pending_org]
+
+    dest.post = Mock(side_effect=post)
+    orchestrator = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
+    orchestrator.state = migration_state
+    migration_state.id_mappings["roles"] = {"src-role": "dst-role"}
+    item = MigrationItem(
+        id="ws_member_ws-src_alice@example.com",
+        type="ws_member",
+        name="alice@example.com",
+        source_id="alice@example.com",
+        status=MigrationStatus.FAILED,
+        metadata={"member": {"email": "alice@example.com", "role_id": "src-role"}},
+        workspace_pair={"source": "ws-src", "dest": "ws-dst"},
+    )
+    migration_state.add_item(item)
+
+    results = orchestrator.resume_items([item])
+
+    assert results["blocked"] == []
+    assert "ws_member:alice@example.com" in results["resumed"]
+    assert item.outcome_code == "ws_member_pending_access_staged"
+    dest.post.assert_called_once_with(
+        "/workspaces/current/members/batch",
+        [{"email": "alice@example.com", "workspace_role_id": "dst-role"}],
+    )
+
+
 def test_resume_items_continues_non_user_items_when_dest_org_prefetch_fails(
     monkeypatch, sample_config, migration_state, tmp_path
 ):
@@ -78,7 +125,7 @@ def test_resume_items_continues_non_user_items_when_dest_org_prefetch_fails(
 
     user_role_migrator = Mock()
     user_role_migrator._dest_email_to_identity = {}
-    user_role_migrator.list_dest_org_members.side_effect = Exception("dest lookup unavailable")
+    user_role_migrator.ensure_dest_email_index.side_effect = Exception("dest lookup unavailable")
     monkeypatch.setattr(
         "langsmith_migrator.core.migrators.user_role.UserRoleMigrator",
         lambda *args, **kwargs: user_role_migrator,

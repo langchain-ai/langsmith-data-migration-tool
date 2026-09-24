@@ -605,7 +605,9 @@ class TestUserRoleMigrator:
         """Destination org identities are cached unless a refresh is requested."""
         migrator.dest.get_paginated.side_effect = [
             iter([{"id": "dst-1", "email": "alice@example.com"}]),
+            iter([{"id": "pending-2", "email": "bob@example.com"}]),
             iter([{"id": "dst-2", "email": "bob@example.com"}]),
+            iter([]),
         ]
 
         first = migrator.ensure_dest_email_index()
@@ -614,8 +616,9 @@ class TestUserRoleMigrator:
 
         assert first is second
         assert first["alice@example.com"]["id"] == "dst-1"
+        assert first["bob@example.com"]["id"] == "pending-2"
         assert refreshed["bob@example.com"]["id"] == "dst-2"
-        assert migrator.dest.get_paginated.call_count == 2
+        assert migrator.dest.get_paginated.call_count == 4
 
     # ── Phase 2: Org member migration ──
 
@@ -1632,6 +1635,7 @@ class TestUserRoleMigrator:
         migrator = pending_workspace_migrator
         migrator.dest.get_paginated.side_effect = [
             iter([{"id": "active-org-1", "email": "alice@example.com", "user_id": "user-1"}]),
+            iter([]),
             iter([]),
         ]
         migrator.ensure_dest_email_index(force=True)

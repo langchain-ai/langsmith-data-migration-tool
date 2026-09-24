@@ -291,14 +291,22 @@ class UserRoleMigrator(BaseMigrator):
         return members
 
     def ensure_dest_email_index(self, force: bool = False) -> Dict[str, Dict[str, Any]]:
-        """Fetch and cache the destination org-member email index."""
+        """Fetch and cache active and pending destination org members by email."""
         if self._dest_email_to_identity is None or force:
             dest_members = self.list_dest_org_members()
+            pending_members = self.list_dest_pending_org_members()
             active_by_email = {
                 (member.get("email") or "").lower(): member
                 for member in dest_members
                 if member.get("email")
             }
+            self._pending_org_email_to_identity.update(
+                {
+                    (member.get("email") or "").lower(): member
+                    for member in pending_members
+                    if member.get("email")
+                }
+            )
             for email in active_by_email:
                 self._pending_org_email_to_identity.pop(email, None)
             for email, member in self._pending_org_email_to_identity.items():

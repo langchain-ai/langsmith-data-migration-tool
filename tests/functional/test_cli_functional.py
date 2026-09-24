@@ -638,6 +638,56 @@ def test_users_command_always_refreshes_dest_org_identities_for_phase3(cli_harne
     user_role_migrator.migrate_workspace_members.assert_called_once()
 
 
+def test_users_workspace_selection_stages_pending_access_when_no_org_members_selected(
+    cli_harness, monkeypatch
+):
+    """Deselecting org members must still discover pending invitees for workspace access."""
+    cli_harness.controls.workspace_result = WorkspaceProjectResult(
+        workspace_mapping={"src-ws": "dst-ws"},
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+    cli_harness.controls.select_results = [[]]
+    source = cli_harness.orchestrator_factory.source_client
+    dest = cli_harness.orchestrator_factory.dest_client
+    source.get_responses["/orgs/current/roles"] = [{"id": "src-role", "name": "WORKSPACE_VIEWER"}]
+    dest.get_responses["/orgs/current/roles"] = [{"id": "dst-role", "name": "WORKSPACE_VIEWER"}]
+    source_members = {
+        "/orgs/current/members/active": [{"email": "alice@example.com"}],
+        "/workspaces/current/members/active": [
+            {"email": "alice@example.com", "role_id": "src-role"}
+        ],
+    }
+    pending_org = {"id": "pending-org-1", "email": "alice@example.com"}
+    monkeypatch.setattr(
+        source, "get_paginated", lambda endpoint, **kwargs: iter(source_members.get(endpoint, []))
+    )
+    monkeypatch.setattr(
+        dest,
+        "get_paginated",
+        lambda endpoint, **kwargs: iter(
+            [pending_org] if endpoint == "/orgs/current/members/pending" else []
+        ),
+    )
+
+    def post(endpoint, payload):
+        assert dest.session.headers["X-Tenant-Id"] == "dst-ws"
+        return [pending_org]
+
+    dest.post = Mock(side_effect=post)
+
+    result = cli_harness.invoke(["users", "--map-workspaces"])
+
+    assert result.exit_code == 0
+    assert "No members selected" in cli_harness.console.text
+    item = cli_harness.orchestrator_factory.state.items["ws_member_src-ws_alice@example.com"]
+    assert item.outcome_code == "ws_member_pending_access_staged"
+    dest.post.assert_called_once_with(
+        "/workspaces/current/members/batch",
+        [{"email": "alice@example.com", "workspace_role_id": "dst-role"}],
+    )
+
+
 def test_users_command_dest_org_refresh_failure_is_graceful(cli_harness, monkeypatch):
     """Failure refreshing destination identities logs warning and continues."""
     cli_harness.controls.workspace_result = WorkspaceProjectResult(
