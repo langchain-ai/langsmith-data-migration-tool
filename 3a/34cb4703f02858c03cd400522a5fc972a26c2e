@@ -1,0 +1,21 @@
+langsmith_migrator/core/migrators/feedback.py
+  s_e4e99a664f997d::t_025e37695ec0f6 5,44-45,48-61,63-72,74,76,80-90,167-168,180-182,184-185
+tests/test_dataset_selection_and_upsert.py
+  s_e4e99a664f997d::t_bca891babcc266 51-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3a34cb4703f02858c03cd400522a5fc972a26c2e",
+  "prompts": {},
+  "sessions": {
+    "s_e4e99a664f997d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4654d05e-905d-4b2d-8c7f-8603d6855765",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "gdibben <gethin.dibben@langchain.dev>"
+    }
+  }
+}
