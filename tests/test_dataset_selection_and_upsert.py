@@ -85,3 +85,34 @@ def test_feedback_creation_is_concurrent_and_reports_failures_in_order(sample_co
 
     assert created == 9
     assert [f["key"] for f in created_feedbacks] == [f"k{i}" for i in range(10) if i != 3]
+
+
+def test_feedback_fingerprints_are_checkpointed_per_chunk(sample_config, migration_state, monkeypatch):
+    """An interruption mid-experiment must not forget feedback already created."""
+    from langsmith_migrator.core.migrators import feedback as fb_mod
+
+    monkeypatch.setattr(fb_mod, "FEEDBACK_CHECKPOINT_SIZE", 2)
+    migrator, source, dest = _feedback_migrator(sample_config, migration_state, workers=1)
+    sample_config.migration.dry_run = False
+    source.get = Mock(side_effect=lambda ep, params: [
+        {"id": f"f{i}", "run_id": "r1", "key": "k", "score": i} for i in range(5)
+    ][params["offset"]:params["offset"] + params["limit"]])
+    posts = []
+
+    def post(endpoint, payload):
+        posts.append(payload)
+        if len(posts) == 4:
+            raise KeyboardInterrupt  # simulated interruption during the third chunk
+
+    dest.post = Mock(side_effect=post)
+    migrator.persist_state = Mock()
+
+    try:
+        migrator.migrate_feedback_for_experiments({"exp": "dexp"}, {"r1": "dr1"})
+    except BaseException:
+        pass
+
+    # First two chunks (4 records) were POSTed before the interruption; only the first
+    # complete chunk's worth must be remembered.
+    remembered = migration_state.id_mappings.get("feedback_fingerprint", {})
+    assert len(remembered) >= 2

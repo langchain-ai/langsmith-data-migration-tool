@@ -8,6 +8,11 @@ from typing import Dict, List, Any, Tuple
 from .base import BaseMigrator
 
 
+# Feedback is created and checkpointed in chunks of this size, so an interruption
+# (a crash, or a maintenance window hours into an experiment) loses at most one chunk.
+FEEDBACK_CHECKPOINT_SIZE = 1000
+
+
 class FeedbackMigrator(BaseMigrator):
     """Handles feedback migration for experiments."""
 
@@ -137,6 +142,16 @@ class FeedbackMigrator(BaseMigrator):
                     raise
 
         return all_feedback
+
+    def _record_replayed(self, created_feedbacks: List[Dict[str, Any]]) -> None:
+        """Persist the fingerprints of feedback just created so resumes skip them."""
+        if not self.state or not created_feedbacks:
+            return
+        for fb in created_feedbacks:
+            fingerprint = fb.get("_fingerprint")
+            if fingerprint:
+                self.state.set_mapped_id("feedback_fingerprint", fingerprint, fingerprint)
+        self.persist_state()
 
     def create_feedback(self, feedback: Dict[str, Any]) -> bool:
         """
@@ -321,7 +336,14 @@ class FeedbackMigrator(BaseMigrator):
             created = 0
             created_feedbacks: List[Dict[str, Any]] = []
             if migrated_feedbacks:
-                created, created_feedbacks = self.create_feedback_batch(migrated_feedbacks)
+                for start in range(0, len(migrated_feedbacks), FEEDBACK_CHECKPOINT_SIZE):
+                    chunk = migrated_feedbacks[start:start + FEEDBACK_CHECKPOINT_SIZE]
+                    chunk_created, chunk_feedbacks = self.create_feedback_batch(chunk)
+                    created += chunk_created
+                    created_feedbacks.extend(chunk_feedbacks)
+                    # Record replayed fingerprints now, not after the whole experiment, so a
+                    # resume does not re-create (and duplicate) feedback already sent.
+                    self._record_replayed(chunk_feedbacks)
                 self.log(
                     f"Migrated {created}/{len(migrated_feedbacks)} feedback for experiment {source_exp_id}",
                     "success"
@@ -335,12 +357,6 @@ class FeedbackMigrator(BaseMigrator):
             total_migrated += accounted
 
             if self.state:
-                for migrated_fb in created_feedbacks:
-                    fingerprint = migrated_fb.get("_fingerprint")
-                    if fingerprint:
-                        self.state.set_mapped_id(
-                            "feedback_fingerprint", fingerprint, fingerprint
-                        )
                 if accounted == len(feedbacks):
                     self.checkpoint_item(
                         experiment_item_id,
