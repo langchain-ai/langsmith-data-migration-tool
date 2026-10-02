@@ -25,6 +25,7 @@ class MigrationConfig:
     """Configuration for migration operations."""
     batch_size: int = 100
     concurrent_workers: int = 4
+    feedback_workers: int = 0  # Threads per experiment for feedback I/O; 0 = use concurrent_workers
     dry_run: bool = False
     skip_existing: bool = False
     resume_on_error: bool = True
@@ -236,7 +237,8 @@ class Config:
             non_interactive=non_interactive,
             stream_examples=os.getenv('MIGRATION_STREAM_EXAMPLES', 'true').lower() != 'false',
             chunk_size=parsed_chunk_size,
-            rate_limit_delay=parsed_rate_limit
+            rate_limit_delay=parsed_rate_limit,
+            feedback_workers=max(0, _env_int('MIGRATION_FEEDBACK_WORKERS', 0)),
         )
         self.state_manager = None
 

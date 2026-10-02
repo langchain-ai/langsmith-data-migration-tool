@@ -34,6 +34,13 @@ ALLOWED_ATTACHMENT_TYPES = {
 }
 
 
+def _example_unchanged(existing: Dict[str, Any], source: Dict[str, Any]) -> bool:
+    """True when the destination example already carries the source's outputs and metadata."""
+    return (existing.get("outputs") or {}) == (source.get("outputs") or {}) and (
+        existing.get("metadata") or {}
+    ) == (source.get("metadata") or {})
+
+
 class DatasetMigrator(BaseMigrator):
     """Handles dataset migration with streaming and batching."""
 
@@ -638,6 +645,7 @@ class DatasetMigrator(BaseMigrator):
         batch_count = 0
         total_migrated = 0
         total_updated = 0
+        total_unchanged = 0
         total_created = 0
 
         # If upserting, get existing examples from destination indexed by inputs hash
@@ -662,6 +670,17 @@ class DatasetMigrator(BaseMigrator):
             if upsert and inputs_hash in existing_examples:
                 existing = existing_examples[inputs_hash]
                 existing_id = existing.get("id")
+
+                # Identical outputs and metadata: keep the mapping, skip the request. On a
+                # re-run over a large workspace this is the difference between minutes and
+                # days (one PATCH per existing example otherwise).
+                if _example_unchanged(existing, example):
+                    id_mapping[example["id"]] = existing_id
+                    total_unchanged += 1
+                    total_migrated += 1
+                    if progress_callback:
+                        progress_callback(total_migrated)
+                    continue
 
                 # Update the existing example
                 try:
@@ -728,7 +747,11 @@ class DatasetMigrator(BaseMigrator):
             if progress_callback:
                 progress_callback(total_migrated)
 
-        self.log(f"Migration complete: {total_created} created, {total_updated} updated ({total_migrated} total)", "success")
+        self.log(
+            f"Migration complete: {total_created} created, {total_updated} updated, "
+            f"{total_unchanged} unchanged ({total_migrated} total)",
+            "success",
+        )
         return id_mapping
 
     def _process_example_batch(

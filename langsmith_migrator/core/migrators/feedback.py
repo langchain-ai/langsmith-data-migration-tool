@@ -2,13 +2,24 @@
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Tuple
 
 from .base import BaseMigrator
 
 
+# Feedback is created and checkpointed in chunks of this size, so an interruption
+# (a crash, or a maintenance window hours into an experiment) loses at most one chunk.
+FEEDBACK_CHECKPOINT_SIZE = 1000
+
+
 class FeedbackMigrator(BaseMigrator):
     """Handles feedback migration for experiments."""
+
+    def _feedback_workers(self) -> int:
+        """Threads for feedback paging/creation: MIGRATION_FEEDBACK_WORKERS, else MIGRATION_WORKERS."""
+        cfg = self.config.migration
+        return max(1, cfg.feedback_workers or cfg.concurrent_workers)
 
     def _feedback_fingerprint(
         self,
@@ -40,40 +51,52 @@ class FeedbackMigrator(BaseMigrator):
         Returns:
             List of feedback records
         """
-        all_feedback = []
+        workers = self._feedback_workers()
+        all_feedback: List[Dict[str, Any]] = []
         offset = 0
 
-        while True:
-            try:
-                response = self.source.get(
-                    "/feedback",
-                    params={"session": session_id, "limit": limit, "offset": offset}
-                )
+        # Offset pages are independent, so fetch a window of them at once. A 9.9M-record
+        # workspace paged one 100-record request at a time spent 7 hours just counting.
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            while True:
+                offsets = [offset + i * limit for i in range(workers)]
+                try:
+                    pages = list(
+                        executor.map(
+                            lambda o: self._fetch_feedback_page(session_id, limit, o), offsets
+                        )
+                    )
+                except Exception as e:
+                    self.log(f"Error fetching feedback for session {session_id}: {e}", "error")
+                    raise
 
-                # Handle response - could be list directly or dict with items
-                if isinstance(response, list):
-                    feedback_items = response
-                elif isinstance(response, dict):
-                    feedback_items = response.get("feedback", response.get("items", []))
-                else:
+                last_page = False
+                for page_offset, items in zip(offsets, pages):
+                    all_feedback.extend(items)
+                    if items:
+                        self.log(
+                            f"Fetched {len(items)} feedback records (offset={page_offset})", "info"
+                        )
+                    if len(items) < limit:
+                        last_page = True
+                        break
+
+                if last_page:
                     break
-
-                if not feedback_items:
-                    break
-
-                all_feedback.extend(feedback_items)
-                self.log(f"Fetched {len(feedback_items)} feedback records (offset={offset})", "info")
-
-                if len(feedback_items) < limit:
-                    break
-
-                offset += limit
-
-            except Exception as e:
-                self.log(f"Error fetching feedback for session {session_id}: {e}", "error")
-                raise
+                offset += workers * limit
 
         return all_feedback
+
+    def _fetch_feedback_page(self, session_id: str, limit: int, offset: int) -> List[Dict[str, Any]]:
+        """Fetch one page of feedback for a session; an unrecognised response is an empty page."""
+        response = self.source.get(
+            "/feedback", params={"session": session_id, "limit": limit, "offset": offset}
+        )
+        if isinstance(response, list):
+            return response
+        if isinstance(response, dict):
+            return response.get("feedback", response.get("items", []))
+        return []
 
     def list_feedback_for_runs(self, run_ids: List[str], limit: int = 100) -> List[Dict[str, Any]]:
         """
@@ -125,6 +148,16 @@ class FeedbackMigrator(BaseMigrator):
 
         return all_feedback
 
+    def _record_replayed(self, created_feedbacks: List[Dict[str, Any]]) -> None:
+        """Persist the fingerprints of feedback just created so resumes skip them."""
+        if not self.state or not created_feedbacks:
+            return
+        for fb in created_feedbacks:
+            fingerprint = fb.get("_fingerprint")
+            if fingerprint:
+                self.state.set_mapped_id("feedback_fingerprint", fingerprint, fingerprint)
+        self.persist_state()
+
     def create_feedback(self, feedback: Dict[str, Any]) -> bool:
         """
         Create a single feedback record in destination.
@@ -151,8 +184,8 @@ class FeedbackMigrator(BaseMigrator):
         """
         Create feedback records in destination.
 
-        Note: LangSmith doesn't have a /feedback/batch endpoint,
-        so we create them one at a time.
+        Note: LangSmith doesn't have a /feedback/batch endpoint, so each record is
+        its own POST; they are sent concurrently across the configured workers.
 
         Args:
             feedbacks: List of feedback records to create
@@ -164,14 +197,12 @@ class FeedbackMigrator(BaseMigrator):
             self.log(f"[DRY RUN] Would create {len(feedbacks)} feedback records", "info")
             return len(feedbacks), list(feedbacks)
 
-        created = 0
-        created_feedbacks: List[Dict[str, Any]] = []
-        for feedback in feedbacks:
-            if self.create_feedback(feedback):
-                created += 1
-                created_feedbacks.append(feedback)
+        workers = self._feedback_workers()
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(self.create_feedback, feedbacks))
 
-        return created, created_feedbacks
+        created_feedbacks = [fb for fb, ok in zip(feedbacks, results) if ok]
+        return len(created_feedbacks), created_feedbacks
 
     def migrate_feedback_for_experiments(
         self,
@@ -310,7 +341,14 @@ class FeedbackMigrator(BaseMigrator):
             created = 0
             created_feedbacks: List[Dict[str, Any]] = []
             if migrated_feedbacks:
-                created, created_feedbacks = self.create_feedback_batch(migrated_feedbacks)
+                for start in range(0, len(migrated_feedbacks), FEEDBACK_CHECKPOINT_SIZE):
+                    chunk = migrated_feedbacks[start:start + FEEDBACK_CHECKPOINT_SIZE]
+                    chunk_created, chunk_feedbacks = self.create_feedback_batch(chunk)
+                    created += chunk_created
+                    created_feedbacks.extend(chunk_feedbacks)
+                    # Record replayed fingerprints now, not after the whole experiment, so a
+                    # resume does not re-create (and duplicate) feedback already sent.
+                    self._record_replayed(chunk_feedbacks)
                 self.log(
                     f"Migrated {created}/{len(migrated_feedbacks)} feedback for experiment {source_exp_id}",
                     "success"
@@ -324,12 +362,6 @@ class FeedbackMigrator(BaseMigrator):
             total_migrated += accounted
 
             if self.state:
-                for migrated_fb in created_feedbacks:
-                    fingerprint = migrated_fb.get("_fingerprint")
-                    if fingerprint:
-                        self.state.set_mapped_id(
-                            "feedback_fingerprint", fingerprint, fingerprint
-                        )
                 if accounted == len(feedbacks):
                     self.checkpoint_item(
                         experiment_item_id,

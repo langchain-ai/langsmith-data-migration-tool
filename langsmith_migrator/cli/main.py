@@ -898,6 +898,15 @@ _MEMBER_COLUMNS = [
 ]
 
 
+def _filter_datasets(datasets: list, selectors) -> tuple[list, list]:
+    """Keep the datasets whose id or name is in ``selectors``; also return unmatched selectors."""
+    wanted = list(selectors)
+    chosen = [d for d in datasets if d.get("id") in wanted or d.get("name") in wanted]
+    matched = {d.get("id") for d in chosen} | {d.get("name") for d in chosen}
+    missing = [s for s in wanted if s not in matched]
+    return chosen, missing
+
+
 def _select_or_all(
     config: Config, items: list, *, select_all: bool, title: str, columns: list[dict]
 ) -> list:
@@ -2046,10 +2055,23 @@ def test(ctx):
 @ssl_option
 @click.option("--include-experiments", is_flag=True, help="Include experiments with datasets")
 @click.option("--all", "select_all", is_flag=True, help="Migrate all datasets")
+@click.option(
+    "--dataset",
+    "dataset_filters",
+    multiple=True,
+    help="Dataset name or ID to migrate; repeatable. Only the matched datasets (and, with "
+    "--include-experiments, their experiments) are migrated, without prompting.",
+)
 @workspace_options
 @click.pass_context
 def datasets(
-    ctx, include_experiments, select_all, source_workspace, dest_workspace, map_workspaces
+    ctx,
+    include_experiments,
+    select_all,
+    dataset_filters,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
 ):
     """Migrate datasets with interactive selection."""
     config = ctx.obj["config"]
@@ -2099,6 +2121,8 @@ def datasets(
         orchestrator.source_client, orchestrator.dest_client, None, config
     )
 
+    unmatched_filters = set(dataset_filters)
+
     try:
         for src_ws, dst_ws in ws_pairs:
             if src_ws and dst_ws:
@@ -2120,6 +2144,15 @@ def datasets(
                 continue
 
             console.print(f"found {len(ds)}\n")
+
+            if dataset_filters:
+                ds, missing = _filter_datasets(ds, dataset_filters)
+                # A selector only counts as missing if no workspace pair contains it.
+                unmatched_filters &= set(missing)
+                console.print(f"Restricted to {len(ds)} dataset(s) by --dataset")
+                if not ds:
+                    continue
+                select_all = True
 
             # Select datasets
             selected = _select_or_all(
@@ -2191,6 +2224,13 @@ def datasets(
         ctx.exit(1)
     finally:
         orchestrator.cleanup()
+
+    if unmatched_filters:
+        console.print(
+            f"[red]--dataset not found in any source workspace: "
+            f"{', '.join(sorted(unmatched_filters))}[/red]"
+        )
+        ctx.exit(1)
 
 
 def _select_resume_session(config: Config, state_manager: StateManager):

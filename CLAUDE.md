@@ -146,6 +146,7 @@ Environment variables (can also use CLI flags or a `.env` file — auto-loaded o
 - `LANGSMITH_OLD_BASE_URL` / `LANGSMITH_NEW_BASE_URL` - Instance URLs
 - `MIGRATION_BATCH_SIZE` (default: 100)
 - `MIGRATION_WORKERS` (default: 4)
+- `MIGRATION_FEEDBACK_WORKERS` (default: 0 = use `MIGRATION_WORKERS`) - threads per experiment for feedback paging and creation; raise it (e.g. 16-32) for feedback-heavy workspaces
 - `MIGRATION_CHUNK_SIZE` (default: 1000)
 - `MIGRATION_RATE_LIMIT_DELAY` (default: 0.1)
 - `MIGRATION_STREAM_EXAMPLES` (default: true)
