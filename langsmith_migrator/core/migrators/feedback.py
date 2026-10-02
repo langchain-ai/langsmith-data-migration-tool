@@ -16,6 +16,11 @@ FEEDBACK_CHECKPOINT_SIZE = 1000
 class FeedbackMigrator(BaseMigrator):
     """Handles feedback migration for experiments."""
 
+    def _feedback_workers(self) -> int:
+        """Threads for feedback paging/creation: MIGRATION_FEEDBACK_WORKERS, else MIGRATION_WORKERS."""
+        cfg = self.config.migration
+        return max(1, cfg.feedback_workers or cfg.concurrent_workers)
+
     def _feedback_fingerprint(
         self,
         source_experiment_id: str,
@@ -46,7 +51,7 @@ class FeedbackMigrator(BaseMigrator):
         Returns:
             List of feedback records
         """
-        workers = max(1, self.config.migration.concurrent_workers)
+        workers = self._feedback_workers()
         all_feedback: List[Dict[str, Any]] = []
         offset = 0
 
@@ -192,7 +197,7 @@ class FeedbackMigrator(BaseMigrator):
             self.log(f"[DRY RUN] Would create {len(feedbacks)} feedback records", "info")
             return len(feedbacks), list(feedbacks)
 
-        workers = max(1, self.config.migration.concurrent_workers)
+        workers = self._feedback_workers()
         with ThreadPoolExecutor(max_workers=workers) as executor:
             results = list(executor.map(self.create_feedback, feedbacks))
 

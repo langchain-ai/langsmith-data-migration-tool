@@ -112,7 +112,14 @@ def test_feedback_fingerprints_are_checkpointed_per_chunk(sample_config, migrati
     except BaseException:
         pass
 
-    # First two chunks (4 records) were POSTed before the interruption; only the first
-    # complete chunk's worth must be remembered.
+    # Chunks of 2: the first two complete chunks (4 records, the 4th POST raised) leave
+    # only the first chunk checkpointed; the interrupted chunk is not remembered.
     remembered = migration_state.id_mappings.get("feedback_fingerprint", {})
-    assert len(remembered) >= 2
+    assert len(remembered) == 2
+
+
+def test_feedback_workers_override_falls_back_to_migration_workers(sample_config, migration_state):
+    migrator, _, _ = _feedback_migrator(sample_config, migration_state, workers=4)
+    assert migrator._feedback_workers() == 4
+    sample_config.migration.feedback_workers = 16
+    assert migrator._feedback_workers() == 16
