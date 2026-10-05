@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+import pytest
+
 from langsmith_migrator.cli.main import _filter_datasets
 from langsmith_migrator.core.api_client import EnhancedAPIClient
 from langsmith_migrator.core.migrators import DatasetMigrator
 from langsmith_migrator.core.migrators.dataset import _example_unchanged
+from langsmith_migrator.utils.retry import APIError
 
 
 def test_filter_datasets_matches_id_or_name_and_reports_missing():
@@ -157,13 +160,71 @@ def test_multipart_failure_falls_back_to_individual_posts(sample_config, migrati
     migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=1)
     sample_config.migration.dry_run = False
     sample_config.migration.feedback_multipart = True
-    dest.post_multipart = Mock(side_effect=RuntimeError("422 bad part"))
+    dest.post_multipart = Mock(side_effect=APIError("422 bad part", status_code=422))
     dest.post = Mock(side_effect=lambda ep, payload: (_ for _ in ()).throw(RuntimeError("x")) if payload["key"] == "k1" else None)
 
     created, done = migrator.create_feedback_batch([_mp_feedback(i) for i in range(3)])
 
     assert created == 2 and [f["key"] for f in done] == ["k0", "k2"]
     assert dest.post.call_count == 3
+    # The replay reuses each multipart part's id, so a batch that did land is upserted.
+    part_ids = [name.split(".", 1)[1] for name, _ in dest.post_multipart.call_args.args[1]]
+    assert [c.args[1]["id"] for c in dest.post.call_args_list] == part_ids
+
+
+def test_multipart_ids_are_stable_across_resends(sample_config, migration_state):
+    migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=1)
+    sample_config.migration.dry_run = False
+    sample_config.migration.feedback_multipart = True
+    dest.post_multipart = Mock()
+
+    migrator.create_feedback_batch([_mp_feedback(0)])
+    migrator.create_feedback_batch([_mp_feedback(0)])
+
+    first, second = (c.args[1][0][0] for c in dest.post_multipart.call_args_list)
+    assert first == second
+
+
+def test_multipart_rate_limit_fails_batch_without_fanning_out(sample_config, migration_state):
+    from langsmith_migrator.utils.retry import RateLimitError
+
+    migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=1)
+    sample_config.migration.dry_run = False
+    sample_config.migration.feedback_multipart = True
+    dest.post_multipart = Mock(side_effect=RateLimitError("429"))
+    dest.post = Mock()
+
+    created, done = migrator.create_feedback_batch([_mp_feedback(i) for i in range(3)])
+
+    assert created == 0 and done == []
+    dest.post.assert_not_called()
+
+
+def test_multipart_server_error_fails_batch_without_fanning_out(sample_config, migration_state):
+    migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=1)
+    sample_config.migration.dry_run = False
+    sample_config.migration.feedback_multipart = True
+    dest.post_multipart = Mock(side_effect=APIError("503", status_code=503))
+    dest.post = Mock()
+
+    created, _ = migrator.create_feedback_batch([_mp_feedback(i) for i in range(3)])
+
+    assert created == 0
+    dest.post.assert_not_called()
+
+
+def test_multipart_auth_error_raises(sample_config, migration_state):
+    from langsmith_migrator.utils.retry import AuthenticationError
+
+    migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=1)
+    sample_config.migration.dry_run = False
+    sample_config.migration.feedback_multipart = True
+    dest.post_multipart = Mock(side_effect=AuthenticationError("Access denied.", status_code=403))
+    dest.post = Mock()
+
+    with pytest.raises(AuthenticationError, match="MIGRATION_FEEDBACK_MULTIPART"):
+        migrator.create_feedback_batch([_mp_feedback(0)])
+    dest.post.assert_not_called()
 
 
 def test_ineligible_feedback_skips_multipart(sample_config, migration_state):
@@ -189,7 +250,7 @@ def test_multipart_off_by_default_and_batch_size_bounded(monkeypatch):
     monkeypatch.setenv("MIGRATION_FEEDBACK_MULTIPART", "true")
     monkeypatch.setenv("MIGRATION_FEEDBACK_BATCH_SIZE", "100000")
     cfg = Config(source_api_key="a", dest_api_key="b").migration
-    assert cfg.feedback_multipart is True and cfg.feedback_batch_size == 500
+    assert cfg.feedback_multipart is True and cfg.feedback_batch_size == 100
 
 
 def test_post_multipart_sends_json_parts_with_length():

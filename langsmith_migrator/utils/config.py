@@ -242,8 +242,8 @@ class Config:
             rate_limit_delay=parsed_rate_limit,
             feedback_workers=max(0, _env_int('MIGRATION_FEEDBACK_WORKERS', 0)),
             feedback_multipart=os.getenv('MIGRATION_FEEDBACK_MULTIPART', 'false').lower() == 'true',
-            # Bounded so a typo cannot build an oversized request.
-            feedback_batch_size=min(500, max(1, _env_int('MIGRATION_FEEDBACK_BATCH_SIZE', 100))),
+            # Capped at the ingest size_limit (/info batch_ingest_config) so a typo cannot build an oversized request.
+            feedback_batch_size=min(100, max(1, _env_int('MIGRATION_FEEDBACK_BATCH_SIZE', 100))),
         )
         self.state_manager = None
 
