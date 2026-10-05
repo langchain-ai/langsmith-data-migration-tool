@@ -1,0 +1,30 @@
+langsmith_migrator/utils/config.py
+  s_e4e99a664f997d::t_9724f58aadf134 28-29,244-246
+tests/test_dataset_selection_and_upsert.py
+  s_e4e99a664f997d::t_dc0b38761f1119 195-196,199-203,205-212,215
+  s_e4e99a664f997d::t_ffb061b2197774 193-194,197-198,204,213-214
+  s_e4e99a664f997d::t_c37c68c9e0f6bf 126-192
+langsmith_migrator/core/api_client.py
+  s_e4e99a664f997d::t_9724f58aadf134 372-396
+langsmith_migrator/core/migrators/feedback.py
+  s_e4e99a664f997d::t_c37c68c9e0f6bf 195-198,213-216,219-222,224-229
+  s_e4e99a664f997d::t_02b558cd0e780f 5,12-18,211-212,217-218,223,230-231,233-235,240-283,407-413
+CLAUDE.md
+  s_e4e99a664f997d::t_23c375502fbc66 150-151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "74c6076151f8a6c4be9ac271fc9f12464e267cee",
+  "prompts": {},
+  "sessions": {
+    "s_e4e99a664f997d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4654d05e-905d-4b2d-8c7f-8603d6855765",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "gdibben <gethin.dibben@langchain.dev>"
+    }
+  }
+}
