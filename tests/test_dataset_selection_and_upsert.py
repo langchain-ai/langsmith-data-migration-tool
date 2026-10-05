@@ -123,3 +123,93 @@ def test_feedback_workers_override_falls_back_to_migration_workers(sample_config
     assert migrator._feedback_workers() == 4
     sample_config.migration.feedback_workers = 16
     assert migrator._feedback_workers() == 16
+
+
+def _mp_feedback(i, **extra):
+    return {"run_id": f"r{i}", "key": f"k{i}", "score": 1, "_fingerprint": f"fp{i}",
+            "_trace_id": f"t{i}", "_session_id": "sess", **extra}
+
+
+def test_multipart_batches_feedback_into_single_requests(sample_config, migration_state):
+    import json
+
+    migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=2)
+    sample_config.migration.dry_run = False
+    sample_config.migration.feedback_multipart = True
+    sample_config.migration.feedback_batch_size = 3
+    dest.post_multipart = Mock()
+    dest.post = Mock()
+
+    created, done = migrator.create_feedback_batch([_mp_feedback(i) for i in range(7)])
+
+    assert created == 7 and len(done) == 7
+    assert dest.post_multipart.call_count == 3  # 3 + 3 + 1
+    dest.post.assert_not_called()
+    parts = dest.post_multipart.call_args_list[0].args[1]
+    names = [n for n, _ in parts]
+    assert len(set(names)) == len(names) and all(n.startswith("feedback.") for n in names)
+    body = json.loads(parts[0][1])
+    assert body["trace_id"] == "t0" and body["session_id"] == "sess" and body["run_id"] == "r0"
+    assert "_fingerprint" not in body and body["id"] == names[0].split(".", 1)[1]
+
+
+def test_multipart_failure_falls_back_to_individual_posts(sample_config, migration_state):
+    migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=1)
+    sample_config.migration.dry_run = False
+    sample_config.migration.feedback_multipart = True
+    dest.post_multipart = Mock(side_effect=RuntimeError("422 bad part"))
+    dest.post = Mock(side_effect=lambda ep, payload: (_ for _ in ()).throw(RuntimeError("x")) if payload["key"] == "k1" else None)
+
+    created, done = migrator.create_feedback_batch([_mp_feedback(i) for i in range(3)])
+
+    assert created == 2 and [f["key"] for f in done] == ["k0", "k2"]
+    assert dest.post.call_count == 3
+
+
+def test_ineligible_feedback_skips_multipart(sample_config, migration_state):
+    migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=1)
+    sample_config.migration.dry_run = False
+    sample_config.migration.feedback_multipart = True
+    dest.post_multipart = Mock()
+    dest.post = Mock()
+
+    no_trace = {"run_id": "r", "key": "k", "_session_id": "sess"}
+    created, _ = migrator.create_feedback_batch([no_trace])
+
+    assert created == 1
+    dest.post_multipart.assert_not_called()
+    dest.post.assert_called_once()
+
+
+def test_multipart_off_by_default_and_batch_size_bounded(monkeypatch):
+    from langsmith_migrator.utils.config import Config
+
+    monkeypatch.delenv("MIGRATION_FEEDBACK_MULTIPART", raising=False)
+    assert Config(source_api_key="a", dest_api_key="b").migration.feedback_multipart is False
+    monkeypatch.setenv("MIGRATION_FEEDBACK_MULTIPART", "true")
+    monkeypatch.setenv("MIGRATION_FEEDBACK_BATCH_SIZE", "100000")
+    cfg = Config(source_api_key="a", dest_api_key="b").migration
+    assert cfg.feedback_multipart is True and cfg.feedback_batch_size == 500
+
+
+def test_post_multipart_sends_json_parts_with_length():
+    import requests
+
+    client = EnhancedAPIClient("https://dest.test/api/v1", {"X-API-Key": "k"}, rate_limit_delay=0)
+    response = requests.Response()
+    response.status_code = 202
+    response._content = b"{}"
+    response.request = requests.Request("POST", "https://dest.test/api/v1/runs/multipart").prepare()
+    client.session.post = Mock(return_value=response)
+
+    client.post_multipart("/runs/multipart", [("feedback.abc", b'{"key":"k"}')])
+
+    url = client.session.post.call_args.args[0]
+    files = client.session.post.call_args.kwargs["files"]
+    wire = requests.Request("POST", url, files=files).prepare()
+    assert wire.headers["Content-Type"].startswith("multipart/form-data; boundary=")
+    body = wire.body.decode()
+    assert url == "https://dest.test/api/v1/runs/multipart"
+    assert 'name="feedback.abc"' in body
+    assert "Content-Type: application/json; length=11" in body
+    assert '{"key":"k"}' in body
