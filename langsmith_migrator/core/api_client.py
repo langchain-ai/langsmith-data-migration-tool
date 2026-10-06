@@ -369,6 +369,31 @@ class EnhancedAPIClient:
         response = self.session.post(url, json=data, timeout=self.timeout)
         return self._handle_response(response, endpoint)
 
+    @retry_on_failure(max_retries=3)
+    def post_multipart(self, endpoint: str, parts: List[Tuple[str, bytes]]) -> Dict[str, Any]:
+        """
+        POST named JSON parts as multipart/form-data (the /runs/multipart ingest format).
+
+        Args:
+            endpoint: API endpoint
+            parts: (part name, JSON bytes) pairs; each part is sent as application/json
+                with the length parameter the ingest endpoint requires
+        """
+        url = self._prepare_url(endpoint)
+
+        if self.verbose:
+            self.console.print(f"[dim]POST {url} (multipart, {len(parts)} parts)[/dim]")
+
+        if self.rate_limit_delay > 0:
+            time.sleep(self.rate_limit_delay)
+
+        files = [
+            (name, (None, body, f"application/json; length={len(body)}"))
+            for name, body in parts
+        ]
+        response = self.session.post(url, files=files, timeout=self.timeout)
+        return self._handle_response(response, endpoint)
+
     @retry_upstream_rejections(max_retries=3)
     @retry_on_failure(max_retries=1)
     def patch(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:

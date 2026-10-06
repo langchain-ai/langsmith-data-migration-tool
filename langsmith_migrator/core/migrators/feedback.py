@@ -2,10 +2,25 @@
 
 import hashlib
 import json
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 
 from .base import BaseMigrator
+from ...utils.retry import APIError, AuthenticationError
+
+
+# Multipart statuses that mean a part was malformed, so the batch is replayed record by
+# record to isolate it. Anything else (rate limits, outages) would fail the same way per
+# record, so it fails the batch instead.
+_MULTIPART_FALLBACK_STATUSES = (400, 413, 422)
+
+
+def _run_namespace() -> uuid.UUID:
+    """Namespace the experiment migrator uses for destination run/trace ids."""
+    from .experiment import ExperimentMigrator
+
+    return ExperimentMigrator._RUN_NAMESPACE
 
 
 # Feedback is created and checkpointed in chunks of this size, so an interruption
@@ -184,8 +199,11 @@ class FeedbackMigrator(BaseMigrator):
         """
         Create feedback records in destination.
 
-        Note: LangSmith doesn't have a /feedback/batch endpoint, so each record is
-        its own POST; they are sent concurrently across the configured workers.
+        By default each record is its own POST /feedback, sent concurrently across the
+        configured workers. With MIGRATION_FEEDBACK_MULTIPART enabled, eligible records are
+        instead sent in batches via POST /runs/multipart, the same ingest path the LangSmith
+        SDK uses, which accepts feedback alongside runs and dedupes by id. A batch rejected
+        for a bad part is replayed record by record with the same ids.
 
         Args:
             feedbacks: List of feedback records to create
@@ -198,11 +216,119 @@ class FeedbackMigrator(BaseMigrator):
             return len(feedbacks), list(feedbacks)
 
         workers = self._feedback_workers()
+        results = [False] * len(feedbacks)
+
+        # Each task is (indexes, multipart): a batch of eligible records sent as one
+        # multipart request, or a single record sent on its own.
+        tasks: List[Tuple[List[int], bool]] = []
+        eligible: List[int] = []
+        if self.config.migration.feedback_multipart:
+            eligible = [i for i, fb in enumerate(feedbacks) if self._multipart_eligible(fb)]
+            if len(eligible) < len(feedbacks):
+                self.log(
+                    f"{len(feedbacks) - len(eligible)} of {len(feedbacks)} feedback record(s) "
+                    "lack a trace id and will be sent one POST at a time",
+                    "warning",
+                )
+            size = self.config.migration.feedback_batch_size
+            tasks.extend((eligible[i:i + size], True) for i in range(0, len(eligible), size))
+        batched = set(eligible)
+        tasks.extend(([i], False) for i in range(len(feedbacks)) if i not in batched)
+
+        def run(task: Tuple[List[int], bool]) -> List[Tuple[int, bool]]:
+            indexes, multipart = task
+            if not multipart:
+                return [(indexes[0], self.create_feedback(feedbacks[indexes[0]]))]
+            # Fix each record's id up front so a per-record replay upserts the same
+            # feedback rather than duplicating it if the batch had in fact landed.
+            batch = [self._with_feedback_id(feedbacks[i]) for i in indexes]
+            outcome = self._create_feedback_multipart(batch)
+            if outcome is None:
+                # One bad record rejects a whole multipart request, so replay the batch
+                # record by record: the good ones still land and the bad one is isolated.
+                return [(i, self.create_feedback(fb)) for i, fb in zip(indexes, batch)]
+            return [(i, outcome) for i in indexes]
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            results = list(executor.map(self.create_feedback, feedbacks))
+            for outcome in executor.map(run, tasks):
+                for index, ok in outcome:
+                    results[index] = ok
 
         created_feedbacks = [fb for fb, ok in zip(feedbacks, results) if ok]
         return len(created_feedbacks), created_feedbacks
+
+    @staticmethod
+    def _multipart_eligible(feedback: Dict[str, Any]) -> bool:
+        """Multipart feedback needs the run, its trace and the experiment (session) ids."""
+        return bool(
+            feedback.get("run_id") and feedback.get("_trace_id") and feedback.get("_session_id")
+        )
+
+    @staticmethod
+    def _with_feedback_id(feedback: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Return a copy of the record with a destination feedback id.
+
+        The id derives from the record's fingerprint, so it is unique per record (the
+        multipart endpoint silently drops a repeated part name) and stable across retries
+        and resumes, which lets both endpoints dedupe a resend.
+        """
+        fingerprint = feedback.get("_fingerprint")
+        feedback_id = (
+            str(uuid.uuid5(uuid.NAMESPACE_URL, f"langsmith-migrator/feedback/{fingerprint}"))
+            if fingerprint
+            else str(uuid.uuid4())
+        )
+        return {**feedback, "id": feedback_id}
+
+    def _create_feedback_multipart(self, batch: List[Dict[str, Any]]) -> Optional[bool]:
+        """
+        Send a batch of feedback in one POST /runs/multipart request.
+
+        Each part is named ``feedback.<id>`` using the id already on the record.
+
+        Returns:
+            True if the batch landed, None if it was rejected for a bad part (the caller
+            replays it record by record), or False if it failed for any other reason. A
+            rate limit or outage that outlasts the client's retries would fail every
+            per-record POST the same way, so the batch is left for a resume to resend.
+
+        Raises:
+            AuthenticationError: the key cannot use /runs/multipart at all.
+        """
+        parts: List[Tuple[str, bytes]] = []
+        for fb in batch:
+            body = {
+                k: v
+                for k, v in fb.items()
+                if not k.startswith("_") and v is not None
+            }
+            body.update({"trace_id": fb["_trace_id"], "session_id": fb["_session_id"]})
+            parts.append((f"feedback.{fb['id']}", json.dumps(body, default=str).encode("utf-8")))
+
+        try:
+            self.dest.post_multipart("/runs/multipart", parts)
+            return True
+        except AuthenticationError as e:
+            raise AuthenticationError(
+                f"{e.args[0] if e.args else e} Unset MIGRATION_FEEDBACK_MULTIPART to send "
+                "feedback one record at a time.",
+                status_code=e.status_code,
+                request_info=e.request_info,
+            ) from e
+        except APIError as e:
+            if e.status_code in _MULTIPART_FALLBACK_STATUSES:
+                self.log(
+                    f"Multipart feedback batch of {len(batch)} rejected ({e}); "
+                    "retrying individually",
+                    "warning",
+                )
+                return None
+            self.log(f"Multipart feedback batch of {len(batch)} failed: {e}", "warning")
+            return False
+        except Exception as e:
+            self.log(f"Multipart feedback batch of {len(batch)} failed: {e}", "warning")
+            return False
 
     def migrate_feedback_for_experiments(
         self,
@@ -327,6 +453,13 @@ class FeedbackMigrator(BaseMigrator):
                     migrated_fb["feedback_source"] = fb["feedback_source"]
 
                 migrated_fb["_fingerprint"] = fingerprint
+                # Used only by the multipart path (stripped from per-record POSTs).
+                source_trace_id = fb.get("trace_id")
+                if source_trace_id:
+                    migrated_fb["_trace_id"] = str(
+                        uuid.uuid5(_run_namespace(), source_trace_id)
+                    )
+                migrated_fb["_session_id"] = dest_exp_id
                 migrated_feedbacks.append(migrated_fb)
 
             if unmapped_runs > 0:
