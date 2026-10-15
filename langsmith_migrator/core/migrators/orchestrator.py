@@ -474,14 +474,19 @@ class MigrationOrchestrator:
 
             current_item = self.state.get_item(item_id)
             if current_item and current_item.stage in {"pending", "create_experiment", "migrate_runs", "in_progress"}:
-                total_runs, _, failed_run_count = experiment_migrator.migrate_runs_streaming(
-                    [source_experiment_id],
-                    {
-                        "experiments": {source_experiment_id: dest_experiment_id},
-                        "examples": self.state.id_mappings.get("examples", {}),
-                    },
-                    time_deltas=time_deltas,
-                )
+                if self.config.migration.skip_runs:
+                    # Runs arrive by another path under their source IDs; feedback
+                    # then references those IDs directly.
+                    total_runs, failed_run_count = 0, 0
+                else:
+                    total_runs, _, failed_run_count = experiment_migrator.migrate_runs_streaming(
+                        [source_experiment_id],
+                        {
+                            "experiments": {source_experiment_id: dest_experiment_id},
+                            "examples": self.state.id_mappings.get("examples", {}),
+                        },
+                        time_deltas=time_deltas,
+                    )
                 if failed_run_count > 0:
                     detail = f"{failed_run_count} run(s) failed during replay"
                     self.state.update_item_status(

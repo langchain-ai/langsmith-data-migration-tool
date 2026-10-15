@@ -79,6 +79,7 @@ from ..utils.workspace import (
 )
 from ..utils.workspace_resolver import (
     WorkspaceResolutionError,
+    match_workspaces_by_id,
     display_workspaces,
     resolve_workspace_context,
 )
@@ -614,6 +615,7 @@ def _resolve_workspaces(
     dest_workspace=None,
     map_workspaces=False,
     non_interactive=False,
+    all_workspaces=False,
 ):
     """Resolve workspace context from explicit IDs or auto-detection.
 
@@ -623,6 +625,20 @@ def _resolve_workspaces(
         - _WS_CANCELLED sentinel if the user explicitly cancelled the TUI
         - _WS_ABORTED sentinel if workspace resolution failed safely
     """
+    if all_workspaces:
+        if source_workspace or dest_workspace or map_workspaces:
+            console.print(
+                "[yellow]--all-workspaces cannot be combined with --source-workspace, "
+                "--dest-workspace or --map-workspaces[/yellow]"
+            )
+            return _WS_CANCELLED
+        try:
+            return match_workspaces_by_id(
+                orchestrator.source_client, orchestrator.dest_client, console
+            )
+        except WorkspaceResolutionError:
+            return _WS_ABORTED
+
     # Explicit single-pair override
     if source_workspace and dest_workspace:
         orchestrator.set_workspace_context(source_workspace, dest_workspace)
@@ -2062,7 +2078,19 @@ def test(ctx):
 @cli.command()
 @ssl_option
 @click.option("--include-experiments", is_flag=True, help="Include experiments with datasets")
+@click.option(
+    "--skip-runs",
+    is_flag=True,
+    help="With --include-experiments, create experiments and feedback but do not replay "
+    "their runs; requires --preserve-ids so feedback still points at the source run IDs",
+)
 @click.option("--all", "select_all", is_flag=True, help="Migrate all datasets")
+@click.option(
+    "--all-workspaces",
+    is_flag=True,
+    help="Migrate every source workspace into the destination workspace with the same ID, "
+    "without prompting",
+)
 @click.option(
     "--dataset",
     "dataset_filters",
@@ -2075,7 +2103,9 @@ def test(ctx):
 def datasets(
     ctx,
     include_experiments,
+    skip_runs,
     select_all,
+    all_workspaces,
     dataset_filters,
     source_workspace,
     dest_workspace,
@@ -2086,6 +2116,10 @@ def datasets(
     state_manager = ctx.obj["state_manager"]
 
     display_banner()
+
+    if skip_runs and not config.migration.preserve_ids:
+        raise click.ClickException("--skip-runs requires --preserve-ids")
+    config.migration.skip_runs = skip_runs
 
     if not ensure_config(config):
         return
@@ -2115,6 +2149,7 @@ def datasets(
         dest_workspace,
         map_workspaces,
         non_interactive=config.migration.non_interactive,
+        all_workspaces=all_workspaces,
     )
     if ws_result is _WS_ABORTED:
         ctx.exit(1)
@@ -2190,7 +2225,9 @@ def datasets(
                 )
 
             console.print(f"\nSelected {len(selected)} dataset(s)")
-            if inc_exp:
+            if inc_exp and skip_runs:
+                console.print("[dim]Including experiments and feedback; runs are not replayed[/dim]")
+            elif inc_exp:
                 console.print("[dim]Including experiments, runs, and feedback[/dim]")
             if config.migration.dry_run:
                 console.print("[dim]Mode: Dry Run (no changes)[/dim]")

@@ -69,6 +69,48 @@ def _validate_saved_mapping(
     return mapping, []
 
 
+def match_workspaces_by_id(
+    source_client: EnhancedAPIClient,
+    dest_client: EnhancedAPIClient,
+    console: Console,
+) -> WorkspaceProjectResult:
+    """Pair every source workspace with the destination workspace that has the same ID.
+
+    This is the mapping for a destination whose workspaces were created with their
+    source IDs. A source workspace without a counterpart is an error rather than a
+    skip, so nothing is silently left behind.
+    """
+    console.print("Discovering workspaces... ", end="")
+    source_workspaces = list_workspaces(source_client)
+    dest_workspaces = list_workspaces(dest_client)
+    console.print(
+        f"[green]\u2713[/green] ({len(source_workspaces)} source, {len(dest_workspaces)} destination)"
+    )
+    if not source_workspaces:
+        raise WorkspaceResolutionError("No source workspaces found.")
+
+    dest_ids = {ws.get("id") for ws in dest_workspaces}
+    missing = [ws for ws in source_workspaces if ws.get("id") not in dest_ids]
+    if missing:
+        listed = ", ".join(f"{get_workspace_name(ws)} ({ws.get('id')})" for ws in missing)
+        message = (
+            "The destination has no workspace with the same ID as these source "
+            f"workspaces: {listed}. Create them with their source IDs first, or map "
+            "workspaces explicitly."
+        )
+        console.print(f"[red]Error: {message}[/red]")
+        raise WorkspaceResolutionError(message)
+
+    mapping = {ws["id"]: ws["id"] for ws in source_workspaces}
+    for ws in source_workspaces:
+        console.print(f"  {get_workspace_name(ws)}: {ws['id']}")
+    return WorkspaceProjectResult(
+        workspace_mapping=mapping,
+        project_mappings={},
+        workspaces_to_create=[],
+    )
+
+
 def resolve_workspace_context(
     source_client: EnhancedAPIClient,
     dest_client: EnhancedAPIClient,

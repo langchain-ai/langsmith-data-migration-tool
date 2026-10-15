@@ -129,3 +129,63 @@ def test_feedback_keeps_source_id_and_trace(preserving_config, migration_state):
     payload = dest.post.call_args.args[1]
     assert payload["id"] == "fb-1"
     assert payload["run_id"] == "run-1"
+
+
+def test_feedback_falls_back_to_source_run_id_when_runs_were_not_replayed(preserving_config, migration_state):
+    source, dest = _client("https://s/api/v1"), _client("https://d/api/v1")
+    migrator = FeedbackMigrator(source, dest, migration_state, preserving_config)
+    feedback = {"id": "fb-1", "run_id": "run-1", "key": "correctness", "score": 1}
+    source.get = Mock(side_effect=lambda ep, params: [feedback] if params.get("offset", 0) == 0 else [])
+    dest.post = Mock(return_value={})
+
+    found, migrated = migrator.migrate_feedback_for_experiments({"exp-1": "exp-1"}, {})
+
+    assert (found, migrated) == (1, 1)
+    assert dest.post.call_args.args[1]["run_id"] == "run-1"
+
+
+def test_skip_runs_moves_straight_to_feedback(tmp_path):
+    from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
+    from langsmith_migrator.utils.config import Config
+    from langsmith_migrator.utils.state import StateManager
+
+    config = Config(source_api_key="s", dest_api_key="d", source_url="https://s.test", dest_url="https://d.test")
+    config.migration.preserve_ids = True
+    config.migration.skip_runs = True
+    orchestrator = MigrationOrchestrator(config, StateManager(state_dir=tmp_path / "state"))
+    state = orchestrator.ensure_state()
+    state.ensure_item(
+        "experiment_exp-1", "experiment", "exp", "exp-1", stage="create_experiment",
+        workspace_pair={"source": None, "dest": None},
+        metadata={"source_dataset_id": "ds-1", "dest_dataset_id": "ds-1"},
+    )
+    exp_mig, fb_mig = Mock(), Mock()
+    exp_mig.create_experiment.return_value = "exp-1"
+    fb_mig.migrate_feedback_for_experiments.return_value = (2, 2)
+
+    ok, _ = orchestrator._resolve_experiment_item({"id": "exp-1", "name": "exp"}, "ds-1", "ds-1", exp_mig, fb_mig)
+
+    assert ok is True
+    exp_mig.migrate_runs_streaming.assert_not_called()
+    fb_mig.migrate_feedback_for_experiments.assert_called_once_with({"exp-1": "exp-1"}, {})
+
+
+def test_all_workspaces_pairs_by_id_and_rejects_missing(monkeypatch):
+    from langsmith_migrator.utils import workspace_resolver
+    from langsmith_migrator.utils.workspace_resolver import WorkspaceResolutionError, match_workspaces_by_id
+
+    console = Mock()
+    source, dest = _client("https://s/api/v1"), _client("https://d/api/v1")
+    source_workspaces = [{"id": "ws-1", "display_name": "One"}, {"id": "ws-2", "display_name": "Two"}]
+    dest_workspaces = [{"id": "ws-1", "display_name": "One"}, {"id": "ws-2", "display_name": "Renamed"}]
+    monkeypatch.setattr(
+        workspace_resolver, "list_workspaces",
+        lambda client: source_workspaces if client is source else dest_workspaces,
+    )
+
+    result = match_workspaces_by_id(source, dest, console)
+    assert result.workspace_mapping == {"ws-1": "ws-1", "ws-2": "ws-2"}
+
+    dest_workspaces.pop()
+    with pytest.raises(WorkspaceResolutionError, match="Two \\(ws-2\\)"):
+        match_workspaces_by_id(source, dest, console)

@@ -430,6 +430,10 @@ class FeedbackMigrator(BaseMigrator):
 
                 if source_run_id:
                     dest_run_id = run_id_mapping.get(source_run_id)
+                    if not dest_run_id and self._preserve_ids:
+                        # Runs keep their source IDs, so a run not replayed by this
+                        # tool still exists on the destination under the same ID.
+                        dest_run_id = source_run_id
                     if not dest_run_id:
                         # Run wasn't migrated, skip this feedback
                         self.log(

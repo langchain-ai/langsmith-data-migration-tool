@@ -31,6 +31,7 @@ class MigrationConfig:
     dry_run: bool = False
     skip_existing: bool = False
     preserve_ids: bool = False  # Create resources with their source IDs instead of new ones
+    skip_runs: bool = False  # Migrate experiments and feedback without replaying their runs
     resume_on_error: bool = True
     verbose: bool = False
     interactive: bool = True

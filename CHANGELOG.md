@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Re-runs match existing resources by ID, runs keep their original
   `dotted_order` and timestamps, and a destination dataset or experiment that
   already uses the same name under a different ID is reported as a conflict.
+- **`datasets --skip-runs`**: with `--include-experiments` and `--preserve-ids`,
+  migrate experiments and feedback without replaying runs, for destinations
+  that receive run data by another path under the same IDs.
+- **`datasets --all-workspaces`**: migrate every source workspace into the
+  destination workspace with the same ID, with no workspace prompt; a source
+  workspace without a counterpart is an error.
 
 ## [0.0.86] - 2026-09-24
 

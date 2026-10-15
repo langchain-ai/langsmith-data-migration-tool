@@ -522,7 +522,9 @@ Operational notes:
 
 ```bash
 --include-experiments   Include experiments with datasets
+--skip-runs             With --include-experiments, create experiments and feedback without replaying runs (requires --preserve-ids)
 --all                   Migrate all datasets
+--all-workspaces        Migrate every source workspace into the destination workspace with the same ID
 ```
 
 ### Preserving IDs
@@ -539,6 +541,17 @@ Preserved runs keep their original timestamps and `dotted_order`, so the
 destination must accept historical ingest the way the `traces` command
 requires (see Limitations). A destination dataset or experiment that already
 uses the same name under a different ID is reported as a conflict.
+
+When run data reaches the destination by another path that keeps run IDs,
+add `--skip-runs` so experiments and feedback are migrated without replaying
+runs; feedback then references the source run IDs directly. When the
+destination workspaces were created with their source IDs too,
+`--all-workspaces` pairs every source workspace with its counterpart and
+fails if one is missing:
+
+```bash
+langsmith-migrator --preserve-ids --non-interactive datasets --all --all-workspaces --include-experiments --skip-runs
+```
 
 ### Prompt Options
 
