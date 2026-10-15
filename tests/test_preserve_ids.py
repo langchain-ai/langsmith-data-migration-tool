@@ -199,3 +199,121 @@ def test_byoc_migration_profile_preserves_ids_and_disables_prompts(sample_config
     assert sample_config.migration.preserve_ids is True
     assert sample_config.migration.non_interactive is True
     assert sample_config.migration.interactive is False
+
+
+def test_preserved_example_updates_when_only_inputs_changed(preserving_config, migration_state):
+    source, dest = _client("https://s/api/v1"), _client("https://d/api/v1")
+    migrator = DatasetMigrator(source, dest, migration_state, preserving_config)
+    existing = {"id": "ex-1", "inputs": {"q": "old"}, "outputs": {"a": 1}, "metadata": {}}
+    updated = {**existing, "inputs": {"q": "new"}}
+    migrator.stream_examples = Mock(return_value=iter([updated]))
+    dest.get_paginated.return_value = iter([existing])
+
+    assert migrator.migrate_examples_streaming("ds-1", "ds-1", upsert=True) == {"ex-1": "ex-1"}
+
+    dest.patch.assert_called_once_with(
+        "/examples/ex-1", {"inputs": {"q": "new"}, "outputs": {"a": 1}, "metadata": {}}
+    )
+    dest.post_batch.assert_not_called()
+
+
+@pytest.mark.parametrize("preserve_ids,skip_runs", [(False, False), (True, False), (True, True)])
+def test_resume_restores_migration_settings_from_disk(sample_config, tmp_path, preserve_ids, skip_runs):
+    from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
+    from langsmith_migrator.utils.state import StateManager
+
+    sample_config.migration.preserve_ids = preserve_ids
+    sample_config.migration.skip_runs = skip_runs
+    original = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
+    session_id = original.ensure_state().session_id
+    # A new invocation can have different defaults or environment settings.
+    sample_config.migration.preserve_ids = not preserve_ids
+    sample_config.migration.skip_runs = not skip_runs
+    manager = StateManager(tmp_path / "state")
+    resumed = MigrationOrchestrator(sample_config, manager)
+    resumed.state = manager.load_session(session_id)
+
+    resumed.resume_items([])
+
+    assert sample_config.migration.preserve_ids is preserve_ids
+    assert sample_config.migration.skip_runs is skip_runs
+    original.cleanup()
+    resumed.cleanup()
+
+
+@pytest.mark.parametrize("preserve_ids", [False, True])
+def test_legacy_session_keeps_current_settings(sample_config, migration_state, tmp_path, preserve_ids):
+    from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
+    from langsmith_migrator.utils.state import MigrationState, StateManager
+
+    legacy = migration_state.to_dict()
+    legacy.pop("migration_settings")
+    sample_config.migration.preserve_ids = preserve_ids
+    sample_config.migration.skip_runs = False
+    resumed = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
+    resumed.state = MigrationState.from_dict(legacy)
+
+    resumed.resume_items([])
+
+    assert sample_config.migration.preserve_ids is preserve_ids
+    assert sample_config.migration.skip_runs is False
+    resumed.cleanup()
+
+
+@pytest.mark.parametrize("settings", [{"preserve_ids": "false"}, {"base_url": True}, []])
+def test_invalid_saved_migration_settings_are_rejected(migration_state, settings):
+    from langsmith_migrator.utils.state import MigrationState
+
+    saved = migration_state.to_dict()
+    saved["migration_settings"] = settings
+    with pytest.raises(ValueError, match="Invalid migration settings"):
+        MigrationState.from_dict(saved)
+
+
+@pytest.mark.parametrize("stage", ["create_experiment", "migrate_runs", "migrate_feedback"])
+def test_byoc_resume_skips_run_replay_and_preserves_feedback_ids(
+    sample_config, tmp_path, monkeypatch, stage
+):
+    from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
+    from langsmith_migrator.utils.state import StateManager
+
+    sample_config.migration.preserve_ids = True
+    sample_config.migration.skip_runs = True
+    original = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
+    state = original.ensure_state()
+    state.ensure_item(
+        "experiment_exp-1", "experiment", "exp", "exp-1", stage=stage,
+        destination_id=None if stage == "create_experiment" else "exp-1",
+        metadata={"source_dataset_id": "ds-1", "dest_dataset_id": "ds-1"},
+    )
+    original.state_manager.save()
+    sample_config.migration.preserve_ids = False
+    sample_config.migration.skip_runs = False
+    manager = StateManager(tmp_path / "state")
+    resumed = MigrationOrchestrator(sample_config, manager)
+    resumed.state = manager.load_session(state.session_id)
+    exp_mig = Mock()
+    exp_mig.create_experiment.return_value = "exp-1"
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.ExperimentMigrator",
+        Mock(return_value=exp_mig),
+    )
+    # Exercise the real feedback migrator with the empty run mapping left by skip-runs.
+    feedback = {"id": "fb-1", "run_id": "run-1", "key": "correctness", "score": 1}
+    resumed.source_client.get = Mock(side_effect=lambda ep, **kw: (
+        {"id": "exp-1", "name": "exp"} if ep.startswith("/sessions/")
+        else ([feedback] if kw.get("params", {}).get("offset", 0) == 0 else [])
+    ))
+    resumed.dest_client.post = Mock(return_value={})
+
+    result = resumed.resume_items(list(resumed.state.items.values()))
+
+    assert result["resumed"] == ["experiment:exp-1"]
+    exp_mig.migrate_runs_streaming.assert_not_called()
+    if stage == "create_experiment":
+        assert exp_mig.create_experiment.call_args.kwargs["time_delta"] is None
+    payload = resumed.dest_client.post.call_args.args[1]
+    assert payload["id"] == "fb-1"
+    assert payload["run_id"] == "run-1"
+    original.cleanup()
+    resumed.cleanup()

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.88] - 2026-10-15
+
+### Fixed
+- **`--preserve-ids` example re-runs**: an existing example matched by ID is
+  now updated when only its inputs changed (inputs were not compared before).
+- **Resume keeps ID and run replay policy**: new sessions save `preserve_ids`
+  and `skip_runs`, and `resume` restores them instead of using the current
+  invocation's flags. Older sessions keep the current configuration. Invalid
+  saved settings are rejected on load.
+
 ## [0.0.87] - 2026-10-14
 
 ### Added
