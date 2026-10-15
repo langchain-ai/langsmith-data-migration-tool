@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.87] - 2026-10-14
+
+### Added
+- **`--preserve-ids`**: create datasets, examples, experiments, runs and
+  feedback with their source IDs (`MIGRATION_PRESERVE_IDS=true` also works).
+  Re-runs match existing resources by ID, runs keep their original
+  `dotted_order` and timestamps, and a destination dataset or experiment that
+  already uses the same name under a different ID is reported as a conflict.
+- **`datasets --skip-runs`**: with `--include-experiments` and `--preserve-ids`,
+  migrate experiments and feedback without replaying runs, for destinations
+  that receive run data by another path under the same IDs.
+- **`datasets --all-workspaces`**: migrate every source workspace into the
+  destination workspace with the same ID, with no workspace prompt; a source
+  workspace without a counterpart is an error.
+- **`datasets --byoc-migration`**: one flag for the self-hosted to BYOC run,
+  implying `--preserve-ids`, `--non-interactive`, `--all`, `--all-workspaces`,
+  `--include-experiments` and `--skip-runs`.
+
 ## [0.0.86] - 2026-09-24
 
 ### Fixed

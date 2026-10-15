@@ -31,6 +31,11 @@ FEEDBACK_CHECKPOINT_SIZE = 1000
 class FeedbackMigrator(BaseMigrator):
     """Handles feedback migration for experiments."""
 
+    @property
+    def _preserve_ids(self) -> bool:
+        """Create feedback with its source IDs, against runs that kept theirs."""
+        return bool(getattr(self.config.migration, "preserve_ids", False))
+
     def _feedback_workers(self) -> int:
         """Threads for feedback paging/creation: MIGRATION_FEEDBACK_WORKERS, else MIGRATION_WORKERS."""
         cfg = self.config.migration
@@ -273,6 +278,8 @@ class FeedbackMigrator(BaseMigrator):
         multipart endpoint silently drops a repeated part name) and stable across retries
         and resumes, which lets both endpoints dedupe a resend.
         """
+        if feedback.get("id"):
+            return dict(feedback)
         fingerprint = feedback.get("_fingerprint")
         feedback_id = (
             str(uuid.uuid5(uuid.NAMESPACE_URL, f"langsmith-migrator/feedback/{fingerprint}"))
@@ -423,6 +430,10 @@ class FeedbackMigrator(BaseMigrator):
 
                 if source_run_id:
                     dest_run_id = run_id_mapping.get(source_run_id)
+                    if not dest_run_id and self._preserve_ids:
+                        # Runs keep their source IDs, so a run not replayed by this
+                        # tool still exists on the destination under the same ID.
+                        dest_run_id = source_run_id
                     if not dest_run_id:
                         # Run wasn't migrated, skip this feedback
                         self.log(
@@ -439,6 +450,8 @@ class FeedbackMigrator(BaseMigrator):
                     "run_id": dest_run_id,
                     "key": fb["key"],
                 }
+                if self._preserve_ids and fb.get("id"):
+                    migrated_fb["id"] = fb["id"]
 
                 # Add optional fields if present
                 if fb.get("score") is not None:
@@ -456,8 +469,10 @@ class FeedbackMigrator(BaseMigrator):
                 # Used only by the multipart path (stripped from per-record POSTs).
                 source_trace_id = fb.get("trace_id")
                 if source_trace_id:
-                    migrated_fb["_trace_id"] = str(
-                        uuid.uuid5(_run_namespace(), source_trace_id)
+                    migrated_fb["_trace_id"] = (
+                        source_trace_id
+                        if self._preserve_ids
+                        else str(uuid.uuid5(_run_namespace(), source_trace_id))
                     )
                 migrated_fb["_session_id"] = dest_exp_id
                 migrated_feedbacks.append(migrated_fb)

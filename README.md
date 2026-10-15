@@ -6,7 +6,7 @@ A Python CLI for migrating users and roles, datasets, experiments, annotation qu
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.87-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -236,20 +236,20 @@ The destination's `POST /runs/batch` endpoint rejects runs with timestamps outsi
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.87-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.87-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.87-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.86-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.87-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -513,6 +513,7 @@ Operational notes:
 --workers INTEGER       Number of concurrent workers (1-10, default: 4)
 --dry-run               Run without making changes
 --skip-existing         Skip existing resources instead of updating them
+--preserve-ids          Create datasets, examples, experiments, runs and feedback with their source IDs
 --non-interactive       Disable prompts and exit with code 2 when remediation is required
 --verbose, -v           Verbose output
 ```
@@ -521,7 +522,45 @@ Operational notes:
 
 ```bash
 --include-experiments   Include experiments with datasets
+--skip-runs             With --include-experiments, create experiments and feedback without replaying runs (requires --preserve-ids)
 --all                   Migrate all datasets
+--all-workspaces        Migrate every source workspace into the destination workspace with the same ID
+--byoc-migration        Self-hosted to BYOC profile: implies --preserve-ids, --non-interactive, --all,
+                        --all-workspaces, --include-experiments and --skip-runs
+```
+
+### Preserving IDs
+
+By default the destination assigns new IDs and the tool keeps a mapping, so
+runs, feedback and `dotted_order` are rewritten to the new IDs. With
+`--preserve-ids` (or `MIGRATION_PRESERVE_IDS=true`) datasets, examples,
+experiments, runs and feedback are created with their source IDs instead, and
+re-runs match existing resources by ID rather than by name or inputs. Use it
+when other data references those IDs, for example trace data copied outside
+this tool.
+
+Preserved runs keep their original timestamps and `dotted_order`, so the
+destination must accept historical ingest the way the `traces` command
+requires (see Limitations). A destination dataset or experiment that already
+uses the same name under a different ID is reported as a conflict.
+
+When run data reaches the destination by another path that keeps run IDs,
+add `--skip-runs` so experiments and feedback are migrated without replaying
+runs; feedback then references the source run IDs directly. When the
+destination workspaces were created with their source IDs too,
+`--all-workspaces` pairs every source workspace with its counterpart and
+fails if one is missing:
+
+```bash
+langsmith-migrator --preserve-ids --non-interactive datasets --all --all-workspaces --include-experiments --skip-runs
+```
+
+`datasets --byoc-migration` is the same run in one flag, for moving a
+self-hosted installation into a BYOC data plane whose workspaces were created
+from the source inventory:
+
+```bash
+langsmith-migrator datasets --byoc-migration
 ```
 
 ### Prompt Options

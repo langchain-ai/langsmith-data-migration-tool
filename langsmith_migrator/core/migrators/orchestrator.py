@@ -429,7 +429,13 @@ class MigrationOrchestrator:
             return False, "missing experiment state item"
 
         dest_experiment_id = item.destination_id or item.metadata.get("destination_experiment_id")
-        time_delta = self._resolve_experiment_delta(experiment, item)
+        # Preserved run IDs keep their dotted_order, which embeds the original
+        # timestamps, so the experiment cannot be shifted to now.
+        time_delta = (
+            None
+            if self.config.migration.preserve_ids
+            else self._resolve_experiment_delta(experiment, item)
+        )
         time_deltas = (
             {source_experiment_id: time_delta} if time_delta is not None else None
         )
@@ -468,14 +474,19 @@ class MigrationOrchestrator:
 
             current_item = self.state.get_item(item_id)
             if current_item and current_item.stage in {"pending", "create_experiment", "migrate_runs", "in_progress"}:
-                total_runs, _, failed_run_count = experiment_migrator.migrate_runs_streaming(
-                    [source_experiment_id],
-                    {
-                        "experiments": {source_experiment_id: dest_experiment_id},
-                        "examples": self.state.id_mappings.get("examples", {}),
-                    },
-                    time_deltas=time_deltas,
-                )
+                if self.config.migration.skip_runs:
+                    # Runs arrive by another path under their source IDs; feedback
+                    # then references those IDs directly.
+                    total_runs, failed_run_count = 0, 0
+                else:
+                    total_runs, _, failed_run_count = experiment_migrator.migrate_runs_streaming(
+                        [source_experiment_id],
+                        {
+                            "experiments": {source_experiment_id: dest_experiment_id},
+                            "examples": self.state.id_mappings.get("examples", {}),
+                        },
+                        time_deltas=time_deltas,
+                    )
                 if failed_run_count > 0:
                     detail = f"{failed_run_count} run(s) failed during replay"
                     self.state.update_item_status(

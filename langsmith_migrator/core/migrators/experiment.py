@@ -14,9 +14,20 @@ class ExperimentMigrator(BaseMigrator):
 
     _RUN_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "langsmith-data-migration-tool/runs")
 
+    @property
+    def _preserve_ids(self) -> bool:
+        """Create experiments and runs with their source IDs."""
+        return bool(getattr(self.config.migration, "preserve_ids", False))
+
     def _deterministic_run_id(self, source_run_id: str) -> str:
         """Generate a stable destination run ID for idempotent replay."""
         return str(uuid.uuid5(self._RUN_NAMESPACE, source_run_id))
+
+    def _dest_run_id(self, source_run_id: str) -> str:
+        """Destination ID for a source run or trace: the source ID when preserved."""
+        if self._preserve_ids:
+            return source_run_id
+        return self._deterministic_run_id(source_run_id)
 
     def _experiment_item_id(self, experiment_id: str) -> str:
         """Return the tracked item id for an experiment."""
@@ -47,6 +58,8 @@ class ExperimentMigrator(BaseMigrator):
         """
         if not dotted_order:
             return None
+        if self._preserve_ids:
+            return dotted_order
 
         parts = dotted_order.split(".")
         new_parts = []
@@ -69,7 +82,7 @@ class ExperimentMigrator(BaseMigrator):
                 new_parts.append(timestamp + new_run_id)
             else:
                 # Map the UUID to its new value for parent chain
-                new_uuid = id_mapping.get(old_uuid, self._deterministic_run_id(old_uuid))
+                new_uuid = id_mapping.get(old_uuid, self._dest_run_id(old_uuid))
                 new_parts.append(timestamp + new_uuid)
 
         return ".".join(new_parts)
@@ -228,17 +241,52 @@ class ExperimentMigrator(BaseMigrator):
                     experiments.append(experiment)
         return experiments
 
-    def find_existing_experiment(self, name: str, dataset_id: str) -> Optional[str]:
+    def _find_experiment_by_id(self, experiment_id: str, dataset_id: str) -> bool:
+        """True when the destination has this experiment on the given dataset."""
+        try:
+            response = self.dest.get(f"/sessions/{experiment_id}")
+        except Exception:
+            return False
+        return (
+            isinstance(response, dict)
+            and response.get("id") == experiment_id
+            and str(response.get("reference_dataset_id")) == str(dataset_id)
+        )
+
+    def find_existing_experiment(
+        self, name: str, dataset_id: str, experiment_id: Optional[str] = None
+    ) -> Optional[str]:
         """
         Check if an experiment already exists in destination.
+
+        With preserve_ids the source ID is authoritative: a destination experiment
+        with that ID is reused, and one that only shares the name is a conflict,
+        because creating the experiment under its source ID would collide on the
+        name.
 
         Args:
             name: Experiment name
             dataset_id: Reference dataset ID
+            experiment_id: Source experiment ID, used when IDs are preserved
 
         Returns:
             The experiment ID if found, None otherwise
         """
+        if self._preserve_ids and experiment_id:
+            if self._find_experiment_by_id(experiment_id, dataset_id):
+                return experiment_id
+            by_name = self._find_experiment_by_name(name, dataset_id)
+            if by_name and by_name != experiment_id:
+                from ..api_client import APIError
+                raise APIError(
+                    f"Experiment '{name}' exists on the destination as {by_name}, not "
+                    f"{experiment_id}; rename or delete it, or migrate without --preserve-ids"
+                )
+            return None
+        return self._find_experiment_by_name(name, dataset_id)
+
+    def _find_experiment_by_name(self, name: str, dataset_id: str) -> Optional[str]:
+        """Destination experiment ID matching the name on the dataset, if any."""
         try:
             # List experiments for the dataset
             experiments = []
@@ -288,7 +336,9 @@ class ExperimentMigrator(BaseMigrator):
         time_delta: Optional[timedelta] = None,
     ) -> str:
         """Create or update experiment in destination, optionally shifting times."""
-        existing_id = self.find_existing_experiment(experiment["name"], new_dataset_id)
+        existing_id = self.find_existing_experiment(
+            experiment["name"], new_dataset_id, experiment.get("id")
+        )
 
         if existing_id:
             if self.config.migration.skip_existing:
@@ -321,6 +371,8 @@ class ExperimentMigrator(BaseMigrator):
             "extra": extra,
             "trace_tier": source_view.get("trace_tier"),
         }
+        if self._preserve_ids:
+            payload["id"] = experiment["id"]
 
         response = self.dest.post("/sessions", payload)
 
@@ -534,7 +586,7 @@ class ExperimentMigrator(BaseMigrator):
                     # Map parent_run_id if present and already migrated
                     parent_run_id = run.get("parent_run_id")
                     mapped_parent_id = (
-                        self._deterministic_run_id(parent_run_id) if parent_run_id else None
+                        self._dest_run_id(parent_run_id) if parent_run_id else None
                     )
 
                     # Map reference_example_id if present
@@ -548,11 +600,11 @@ class ExperimentMigrator(BaseMigrator):
                                 "warning",
                             )
 
-                    # Deterministic IDs make interrupted batches safe to replay.
-                    new_run_id = self._deterministic_run_id(source_run_id)
+                    # Stable IDs make interrupted batches safe to replay.
+                    new_run_id = self._dest_run_id(source_run_id)
                     source_trace_id = run.get("trace_id")
                     new_trace_id = (
-                        self._deterministic_run_id(source_trace_id)
+                        self._dest_run_id(source_trace_id)
                         if source_trace_id
                         else new_run_id
                     )
@@ -669,7 +721,7 @@ class ExperimentMigrator(BaseMigrator):
                     if "409" in error_text or "Conflict" in error_text:
                         created_mapping[source_run_id] = batch[0]["id"]
                         self.log(
-                            f"Run {source_run_id} already exists with deterministic ID; treating as replay success",
+                            f"Run {source_run_id} already exists with the expected ID; treating as replay success",
                             "warning",
                         )
                         return

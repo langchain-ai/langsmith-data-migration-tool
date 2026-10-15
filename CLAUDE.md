@@ -25,6 +25,9 @@ uv build
 uv run langsmith-migrator --help
 uv run langsmith-migrator test         # Test connections
 uv run langsmith-migrator datasets     # Migrate datasets
+uv run langsmith-migrator --preserve-ids datasets --include-experiments  # Keep source IDs on everything created
+uv run langsmith-migrator --preserve-ids datasets --all --all-workspaces --include-experiments --skip-runs  # Every workspace by ID, no run replay
+uv run langsmith-migrator datasets --byoc-migration  # Same run in one flag (self-hosted to BYOC)
 uv run langsmith-migrator queues       # Migrate annotation queues
 uv run langsmith-migrator prompts      # Migrate prompts
 uv run langsmith-migrator rules        # Migrate project rules

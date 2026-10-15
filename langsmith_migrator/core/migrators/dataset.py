@@ -44,6 +44,19 @@ def _example_unchanged(existing: Dict[str, Any], source: Dict[str, Any]) -> bool
 class DatasetMigrator(BaseMigrator):
     """Handles dataset migration with streaming and batching."""
 
+    @property
+    def _preserve_ids(self) -> bool:
+        """Create datasets and examples with their source IDs."""
+        return bool(getattr(self.config.migration, "preserve_ids", False))
+
+    def _find_dataset_by_id(self, dataset_id: str) -> bool:
+        """True when the destination already has a dataset with this ID."""
+        try:
+            response = self.dest.get(f"/datasets/{dataset_id}")
+        except NotFoundError:
+            return False
+        return isinstance(response, dict) and response.get("id") == dataset_id
+
     def list_datasets(self) -> List[Dict[str, Any]]:
         """List all datasets from source."""
         datasets = []
@@ -65,8 +78,27 @@ class DatasetMigrator(BaseMigrator):
             raise APIError(f"Invalid response format for dataset {dataset_id}")
         return response
 
-    def find_existing_dataset(self, name: str) -> Optional[str]:
-        """Check if dataset already exists in destination."""
+    def find_existing_dataset(self, name: str, dataset_id: Optional[str] = None) -> Optional[str]:
+        """Check if dataset already exists in destination.
+
+        With preserve_ids the source ID is authoritative: a destination dataset with
+        that ID is reused, and one that only shares the name is a conflict, because
+        creating the dataset under its source ID would collide on the name.
+        """
+        if self._preserve_ids and dataset_id:
+            if self._find_dataset_by_id(dataset_id):
+                return dataset_id
+            by_name = self._find_dataset_by_name(name)
+            if by_name and by_name != dataset_id:
+                raise APIError(
+                    f"Dataset '{name}' exists on the destination as {by_name}, not {dataset_id}; "
+                    "rename or delete it, or migrate without --preserve-ids"
+                )
+            return None
+        return self._find_dataset_by_name(name)
+
+    def _find_dataset_by_name(self, name: str) -> Optional[str]:
+        """Destination dataset ID for a unique name, if any."""
         try:
             response = self.dest.get("/datasets", params={"name": name})
             datasets = response if isinstance(response, list) else []
@@ -88,12 +120,23 @@ class DatasetMigrator(BaseMigrator):
         serialized = json.dumps(inputs, sort_keys=True, default=str)
         return hashlib.sha256(serialized.encode()).hexdigest()
 
+    def _example_key(self, example: Dict[str, Any]) -> Optional[str]:
+        """Key that matches a source example to its destination copy.
+
+        The example ID when IDs are preserved, otherwise a hash of the inputs.
+        """
+        if self._preserve_ids:
+            return example.get("id")
+        inputs = example.get("inputs")
+        return self._hash_inputs(inputs) if inputs else None
+
     def get_existing_examples(self, dataset_id: str) -> Dict[str, Dict[str, Any]]:
         """
-        Get existing examples from destination dataset, indexed by inputs hash.
+        Get existing examples from destination dataset, indexed by example key.
 
         Returns:
-            Dict mapping inputs_hash -> example dict (with id, inputs, outputs, metadata)
+            Dict mapping example key (see _example_key) -> example dict
+            (with id, inputs, outputs, metadata)
         """
         existing = {}
         params = {
@@ -101,9 +144,10 @@ class DatasetMigrator(BaseMigrator):
             "select": ["inputs", "outputs", "metadata"]
         }
         for example in self.dest.get_paginated("/examples", params=params):
-            if isinstance(example, dict) and example.get("inputs"):
-                inputs_hash = self._hash_inputs(example["inputs"])
-                existing[inputs_hash] = example
+            if isinstance(example, dict):
+                key = self._example_key(example)
+                if key:
+                    existing[key] = example
         return existing
 
     def update_example(self, example_id: str, example_data: Dict[str, Any]) -> None:
@@ -160,6 +204,8 @@ class DatasetMigrator(BaseMigrator):
             "data_type": dataset.get("data_type", "kv"),
             "metadata": dataset.get("metadata"),
         }
+        if self._preserve_ids:
+            payload["id"] = dataset["id"]
 
         # Remove None values
         payload = {k: v for k, v in payload.items() if v is not None}
@@ -374,6 +420,8 @@ class DatasetMigrator(BaseMigrator):
                 "outputs": example_data.get("outputs", {}),
                 "metadata": example_data.get("metadata", {}),
             }
+            if example_data.get("id"):
+                payload["id"] = example_data["id"]
 
             # Use POST /examples (singular) to create one example
             response = self.dest.post("/examples", payload)
@@ -550,6 +598,8 @@ class DatasetMigrator(BaseMigrator):
                     "metadata": example_data.get("metadata", {}),
                     "attachments": sdk_attachments,
                 }
+                if example_data.get("id"):
+                    example_dict["id"] = example_data["id"]
 
                 # Use SDK to create example
                 self.log(f"Creating example with {len(sdk_attachments)} attachment(s)...", "info")
@@ -633,8 +683,9 @@ class DatasetMigrator(BaseMigrator):
             source_dataset_id: Source dataset ID
             dest_dataset_id: Destination dataset ID
             progress_callback: Optional callback for progress updates
-            upsert: If True, update existing examples matched by inputs hash.
-                    If False, always create new examples.
+            upsert: If True, update existing examples matched by ID when IDs are
+                    preserved, otherwise by inputs hash. If False, always create
+                    new examples.
         """
         if self.config.migration.dry_run:
             self.log("[DRY RUN] Would migrate examples")
@@ -648,7 +699,7 @@ class DatasetMigrator(BaseMigrator):
         total_unchanged = 0
         total_created = 0
 
-        # If upserting, get existing examples from destination indexed by inputs hash
+        # If upserting, get existing examples from destination indexed by example key
         existing_examples = {}
         if upsert:
             self.log("Fetching existing examples from destination for upsert matching...")
@@ -664,11 +715,11 @@ class DatasetMigrator(BaseMigrator):
                     self.log(f"Outputs content: {example.get('outputs')}", "info")
 
             source_inputs = example.get("inputs", {})
-            inputs_hash = self._hash_inputs(source_inputs) if upsert else None
+            example_key = self._example_key(example) if upsert else None
 
-            # Check if this example already exists in destination (by inputs hash)
-            if upsert and inputs_hash in existing_examples:
-                existing = existing_examples[inputs_hash]
+            # Check if this example already exists in destination
+            if upsert and example_key in existing_examples:
+                existing = existing_examples[example_key]
                 existing_id = existing.get("id")
 
                 # Identical outputs and metadata: keep the mapping, skip the request. On a
@@ -721,6 +772,8 @@ class DatasetMigrator(BaseMigrator):
                 "created_at": example.get("created_at"),
                 "split": ((example.get("metadata") or {}).get("dataset_split") or "base")
             }
+            if self._preserve_ids:
+                migrated_example["id"] = example["id"]
 
             batch.append((example["id"], migrated_example, downloaded_attachments))
 
@@ -814,7 +867,7 @@ class DatasetMigrator(BaseMigrator):
         dataset = self.get_dataset(dataset_id)
 
         # Check if already exists
-        existing_id = self.find_existing_dataset(dataset["name"])
+        existing_id = self.find_existing_dataset(dataset["name"], dataset["id"])
 
         if existing_id:
             if self.config.migration.skip_existing:
