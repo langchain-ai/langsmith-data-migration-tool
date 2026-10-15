@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.87] - 2026-10-14
+
 ### Added
 - **`--preserve-ids`**: create datasets, examples, experiments, runs and
   feedback with their source IDs (`MIGRATION_PRESERVE_IDS=true` also works).
