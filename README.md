@@ -513,6 +513,7 @@ Operational notes:
 --workers INTEGER       Number of concurrent workers (1-10, default: 4)
 --dry-run               Run without making changes
 --skip-existing         Skip existing resources instead of updating them
+--preserve-ids          Create datasets, examples, experiments, runs and feedback with their source IDs
 --non-interactive       Disable prompts and exit with code 2 when remediation is required
 --verbose, -v           Verbose output
 ```
@@ -523,6 +524,21 @@ Operational notes:
 --include-experiments   Include experiments with datasets
 --all                   Migrate all datasets
 ```
+
+### Preserving IDs
+
+By default the destination assigns new IDs and the tool keeps a mapping, so
+runs, feedback and `dotted_order` are rewritten to the new IDs. With
+`--preserve-ids` (or `MIGRATION_PRESERVE_IDS=true`) datasets, examples,
+experiments, runs and feedback are created with their source IDs instead, and
+re-runs match existing resources by ID rather than by name or inputs. Use it
+when other data references those IDs, for example trace data copied outside
+this tool.
+
+Preserved runs keep their original timestamps and `dotted_order`, so the
+destination must accept historical ingest the way the `traces` command
+requires (see Limitations). A destination dataset or experiment that already
+uses the same name under a different ID is reported as a conflict.
 
 ### Prompt Options
 

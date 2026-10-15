@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`--preserve-ids`**: create datasets, examples, experiments, runs and
+  feedback with their source IDs (`MIGRATION_PRESERVE_IDS=true` also works).
+  Re-runs match existing resources by ID, runs keep their original
+  `dotted_order` and timestamps, and a destination dataset or experiment that
+  already uses the same name under a different ID is reported as a conflict.
+
 ## [0.0.86] - 2026-09-24
 
 ### Fixed

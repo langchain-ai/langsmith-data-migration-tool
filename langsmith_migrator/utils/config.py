@@ -30,6 +30,7 @@ class MigrationConfig:
     feedback_workers: int = 0  # Threads per experiment for feedback I/O; 0 = use concurrent_workers
     dry_run: bool = False
     skip_existing: bool = False
+    preserve_ids: bool = False  # Create resources with their source IDs instead of new ones
     resume_on_error: bool = True
     verbose: bool = False
     interactive: bool = True
@@ -169,7 +170,8 @@ class Config:
                  dry_run: bool = False,
                  skip_existing: Optional[bool] = None,
                  verbose: bool = False,
-                 non_interactive: bool = False):
+                 non_interactive: bool = False,
+                 preserve_ids: Optional[bool] = None):
         """
         Initialize configuration from CLI args, falling back to environment variables.
 
@@ -185,6 +187,8 @@ class Config:
             skip_existing: If True, skip existing resources; if False, update them (overrides env)
             verbose: Whether to enable verbose logging
             non_interactive: Disable guided remediation prompts
+            preserve_ids: Create datasets, examples, experiments, runs and feedback with their
+                source IDs (overrides env)
         """
         # Determine SSL verification setting
         # Priority: CLI arg > env var > default (True)
@@ -207,6 +211,7 @@ class Config:
         # Migration settings
         # Priority: CLI arg > env var > default (False, meaning update by default)
         should_skip = skip_existing if skip_existing is not None else (os.getenv('MIGRATION_SKIP_EXISTING', 'false').lower() == 'true')
+        should_preserve_ids = preserve_ids if preserve_ids is not None else (os.getenv('MIGRATION_PRESERVE_IDS', 'false').lower() == 'true')
 
         # Parse migration settings with safe defaults
         try:
@@ -235,6 +240,7 @@ class Config:
             dry_run=dry_run or os.getenv('MIGRATION_DRY_RUN', 'false').lower() == 'true',
             verbose=verbose or os.getenv('MIGRATION_VERBOSE', 'false').lower() == 'true',
             skip_existing=should_skip,
+            preserve_ids=should_preserve_ids,
             interactive=not non_interactive,
             non_interactive=non_interactive,
             stream_examples=os.getenv('MIGRATION_STREAM_EXAMPLES', 'true').lower() != 'false',

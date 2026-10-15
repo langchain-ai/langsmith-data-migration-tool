@@ -1972,6 +1972,12 @@ def ensure_config(config: Config) -> bool:
     is_flag=True,
     help="Disable prompts and emit exit code 2 when remediation is required",
 )
+@click.option(
+    "--preserve-ids",
+    is_flag=True,
+    help="Create datasets, examples, experiments, runs and feedback with their source IDs "
+    "so cross-resource references survive; runs keep their original timestamps",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose output")
 @click.pass_context
 def cli(
@@ -1986,6 +1992,7 @@ def cli(
     dry_run,
     skip_existing,
     non_interactive,
+    preserve_ids,
     verbose,
 ):
     """LangSmith Migration Tool - Migrate data between LangSmith instances."""
@@ -2005,6 +2012,7 @@ def cli(
         skip_existing=skip_existing if skip_existing else None,
         non_interactive=non_interactive,
         verbose=verbose,
+        preserve_ids=preserve_ids if preserve_ids else None,
     )
 
     ctx.obj["config"] = config
