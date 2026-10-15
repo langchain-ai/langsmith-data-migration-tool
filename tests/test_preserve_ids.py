@@ -189,3 +189,13 @@ def test_all_workspaces_pairs_by_id_and_rejects_missing(monkeypatch):
     dest_workspaces.pop()
     with pytest.raises(WorkspaceResolutionError, match="Two \\(ws-2\\)"):
         match_workspaces_by_id(source, dest, console)
+
+
+def test_byoc_migration_profile_preserves_ids_and_disables_prompts(sample_config):
+    from langsmith_migrator.cli.main import _apply_byoc_migration_profile
+
+    _apply_byoc_migration_profile(sample_config)
+
+    assert sample_config.migration.preserve_ids is True
+    assert sample_config.migration.non_interactive is True
+    assert sample_config.migration.interactive is False

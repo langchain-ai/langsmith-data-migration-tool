@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`datasets --all-workspaces`**: migrate every source workspace into the
   destination workspace with the same ID, with no workspace prompt; a source
   workspace without a counterpart is an error.
+- **`datasets --byoc-migration`**: one flag for the self-hosted to BYOC run,
+  implying `--preserve-ids`, `--non-interactive`, `--all`, `--all-workspaces`,
+  `--include-experiments` and `--skip-runs`.
 
 ## [0.0.86] - 2026-09-24
 

@@ -609,6 +609,18 @@ def _archive_replay_workspaces(
         )
     return None, dest_workspace or None
 
+def _apply_byoc_migration_profile(config) -> None:
+    """Configure a self-hosted to BYOC run: source IDs everywhere, no prompts.
+
+    The destination was created from the source inventory, so workspaces, runs and
+    everything the tool creates share the source IDs, and run data arrives through
+    the trace storage migration rather than replay.
+    """
+    config.migration.preserve_ids = True
+    config.migration.non_interactive = True
+    config.migration.interactive = False
+
+
 def _resolve_workspaces(
     orchestrator,
     source_workspace=None,
@@ -2092,6 +2104,12 @@ def test(ctx):
     "without prompting",
 )
 @click.option(
+    "--byoc-migration",
+    is_flag=True,
+    help="Self-hosted to BYOC profile: implies --preserve-ids, --non-interactive, --all, "
+    "--all-workspaces, --include-experiments and --skip-runs",
+)
+@click.option(
     "--dataset",
     "dataset_filters",
     multiple=True,
@@ -2106,6 +2124,7 @@ def datasets(
     skip_runs,
     select_all,
     all_workspaces,
+    byoc_migration,
     dataset_filters,
     source_workspace,
     dest_workspace,
@@ -2116,6 +2135,10 @@ def datasets(
     state_manager = ctx.obj["state_manager"]
 
     display_banner()
+
+    if byoc_migration:
+        _apply_byoc_migration_profile(config)
+        include_experiments = skip_runs = select_all = all_workspaces = True
 
     if skip_runs and not config.migration.preserve_ids:
         raise click.ClickException("--skip-runs requires --preserve-ids")

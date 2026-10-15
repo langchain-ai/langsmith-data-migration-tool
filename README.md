@@ -525,6 +525,8 @@ Operational notes:
 --skip-runs             With --include-experiments, create experiments and feedback without replaying runs (requires --preserve-ids)
 --all                   Migrate all datasets
 --all-workspaces        Migrate every source workspace into the destination workspace with the same ID
+--byoc-migration        Self-hosted to BYOC profile: implies --preserve-ids, --non-interactive, --all,
+                        --all-workspaces, --include-experiments and --skip-runs
 ```
 
 ### Preserving IDs
@@ -551,6 +553,14 @@ fails if one is missing:
 
 ```bash
 langsmith-migrator --preserve-ids --non-interactive datasets --all --all-workspaces --include-experiments --skip-runs
+```
+
+`datasets --byoc-migration` is the same run in one flag, for moving a
+self-hosted installation into a BYOC data plane whose workspaces were created
+from the source inventory:
+
+```bash
+langsmith-migrator datasets --byoc-migration
 ```
 
 ### Prompt Options
