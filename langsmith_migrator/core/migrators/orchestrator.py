@@ -100,6 +100,11 @@ class MigrationOrchestrator:
                 self.config.source.base_url,
                 self.config.destination.base_url,
             )
+            self.state.migration_settings = {
+                "preserve_ids": self.config.migration.preserve_ids,
+                "skip_runs": self.config.migration.skip_runs,
+            }
+            self.state_manager.save()
         elif not self.state.remediation_bundle_path:
             self.state.remediation_bundle_path = str(
                 self.state_manager._default_bundle_path(self.state.session_id).resolve()
@@ -765,6 +770,11 @@ class MigrationOrchestrator:
     def resume_items(self, items_to_process: List[MigrationItem]) -> Dict[str, List[str]]:
         """Resume pending and failed items using typed dispatch."""
         self.ensure_state()
+        # Older sessions have no saved settings and keep the caller's configuration.
+        # New sessions must retain their ID and run replay policy across retries.
+        for key in ("preserve_ids", "skip_runs"):
+            if key in self.state.migration_settings:
+                setattr(self.config.migration, key, self.state.migration_settings[key])
         results = {"resumed": [], "blocked": []}
 
         from .annotation_queue import AnnotationQueueMigrator

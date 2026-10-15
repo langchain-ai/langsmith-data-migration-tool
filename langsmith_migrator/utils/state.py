@@ -342,6 +342,7 @@ class MigrationState:
     remediation_bundle_path: Optional[str] = None
     resolution_decisions: Dict[str, Any] = field(default_factory=dict)
     resolution_provenance: Dict[str, Any] = field(default_factory=dict)
+    migration_settings: Dict[str, bool] = field(default_factory=dict)
 
     def touch(self) -> None:
         self.updated_at = _now()
@@ -947,6 +948,7 @@ class MigrationState:
             "verification_summary": self.verification_summary,
             "resolution_decisions": self.resolution_decisions,
             "resolution_provenance": self.resolution_provenance,
+            "migration_settings": self.migration_settings,
         }
         if self.source_workspace_id:
             d["source_workspace_id"] = self.source_workspace_id
@@ -961,6 +963,12 @@ class MigrationState:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MigrationState":
         """Create from dictionary."""
+        migration_settings = data.get("migration_settings", {})
+        if not isinstance(migration_settings, dict) or any(
+            key not in {"preserve_ids", "skip_runs"} or not isinstance(value, bool)
+            for key, value in migration_settings.items()
+        ):
+            raise ValueError("Invalid migration settings in saved session")
         state = cls(
             session_id=data["session_id"],
             started_at=data["started_at"],
@@ -979,6 +987,7 @@ class MigrationState:
             remediation_bundle_path=data.get("remediation_bundle_path"),
             resolution_decisions=data.get("resolution_decisions", {}),
             resolution_provenance=data.get("resolution_provenance", {}),
+            migration_settings=migration_settings,
         )
 
         for item_id, item_data in data.get("items", {}).items():

@@ -34,11 +34,15 @@ ALLOWED_ATTACHMENT_TYPES = {
 }
 
 
-def _example_unchanged(existing: Dict[str, Any], source: Dict[str, Any]) -> bool:
-    """True when the destination example already carries the source's outputs and metadata."""
-    return (existing.get("outputs") or {}) == (source.get("outputs") or {}) and (
-        existing.get("metadata") or {}
-    ) == (source.get("metadata") or {})
+def _example_unchanged(
+    existing: Dict[str, Any], source: Dict[str, Any], *, compare_inputs: bool = False
+) -> bool:
+    """Compare content, including inputs when matching by ID rather than input hash."""
+    fields = ("inputs", "outputs", "metadata") if compare_inputs else ("outputs", "metadata")
+    return all(
+        (existing.get(key) or {}) == (source.get(key) or {})
+        for key in fields
+    )
 
 
 class DatasetMigrator(BaseMigrator):
@@ -722,10 +726,10 @@ class DatasetMigrator(BaseMigrator):
                 existing = existing_examples[example_key]
                 existing_id = existing.get("id")
 
-                # Identical outputs and metadata: keep the mapping, skip the request. On a
+                # Identical inputs, outputs and metadata: keep the mapping, skip the request. On a
                 # re-run over a large workspace this is the difference between minutes and
                 # days (one PATCH per existing example otherwise).
-                if _example_unchanged(existing, example):
+                if _example_unchanged(existing, example, compare_inputs=self._preserve_ids):
                     id_mapping[example["id"]] = existing_id
                     total_unchanged += 1
                     total_migrated += 1
