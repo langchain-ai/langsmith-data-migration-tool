@@ -526,7 +526,7 @@ Operational notes:
 --all                   Migrate all datasets
 --all-workspaces        Migrate every source workspace into the destination workspace with the same ID
 --byoc-migration        Self-hosted to BYOC profile: implies --preserve-ids, --non-interactive, --all,
-                        --all-workspaces, --include-experiments and --skip-runs
+                        --all-workspaces, --include-experiments and --skip-runs; skips feedback
 ```
 
 ### Preserving IDs
@@ -555,9 +555,13 @@ fails if one is missing:
 langsmith-migrator --preserve-ids --non-interactive datasets --all --all-workspaces --include-experiments --skip-runs
 ```
 
-`datasets --byoc-migration` is the same run in one flag, for moving a
-self-hosted installation into a BYOC data plane whose workspaces were created
-from the source inventory:
+`datasets --byoc-migration` uses those settings and also skips feedback, for
+moving a self-hosted installation into a BYOC data plane whose workspaces were
+created from the source inventory. It migrates datasets, examples and experiment
+metadata; runs and feedback arrive through the separate data migration.
+Experiments are marked completed, and the feedback policy is saved so `resume`
+does not revisit them. Older sessions retain their original behavior; rerun
+`datasets --byoc-migration` to use this policy for an older migration:
 
 ```bash
 langsmith-migrator datasets --byoc-migration

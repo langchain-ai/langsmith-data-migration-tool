@@ -965,7 +965,7 @@ class MigrationState:
         """Create from dictionary."""
         migration_settings = data.get("migration_settings", {})
         if not isinstance(migration_settings, dict) or any(
-            key not in {"preserve_ids", "skip_runs"} or not isinstance(value, bool)
+            key not in {"preserve_ids", "skip_runs", "skip_feedback"} or not isinstance(value, bool)
             for key, value in migration_settings.items()
         ):
             raise ValueError("Invalid migration settings in saved session")

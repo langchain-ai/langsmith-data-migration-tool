@@ -103,6 +103,7 @@ class MigrationOrchestrator:
             self.state.migration_settings = {
                 "preserve_ids": self.config.migration.preserve_ids,
                 "skip_runs": self.config.migration.skip_runs,
+                "skip_feedback": self.config.migration.skip_feedback,
             }
             self.state_manager.save()
         elif not self.state.remediation_bundle_path:
@@ -516,6 +517,30 @@ class MigrationOrchestrator:
                 self.state_manager.save()
 
             current_item = self.state.get_item(item_id)
+            if (
+                current_item
+                and current_item.stage in {"migrate_feedback", "completed"}
+                and self.config.migration.skip_feedback
+            ):
+                self.state.update_item_checkpoint(
+                    item_id,
+                    stage="completed",
+                    metadata={"feedback_skipped": True},
+                )
+                self.state.mark_terminal(
+                    item_id,
+                    ResolutionOutcome.MIGRATED,
+                    "experiment_migrated_feedback_skipped",
+                    verification_state=VerificationState.VERIFIED,
+                    evidence={
+                        "destination_experiment_id": dest_experiment_id,
+                        "feedback_skipped": True,
+                    },
+                    error="",
+                )
+                self.state_manager.save()
+                return True, "migrated"
+
             # Pre-fix feedback migration persisted completed+verified before the
             # orchestrator persisted terminal_state. Repair those legacy sessions.
             if (
@@ -772,7 +797,7 @@ class MigrationOrchestrator:
         self.ensure_state()
         # Older sessions have no saved settings and keep the caller's configuration.
         # New sessions must retain their ID and run replay policy across retries.
-        for key in ("preserve_ids", "skip_runs"):
+        for key in ("preserve_ids", "skip_runs", "skip_feedback"):
             if key in self.state.migration_settings:
                 setattr(self.config.migration, key, self.state.migration_settings[key])
         results = {"resumed": [], "blocked": []}

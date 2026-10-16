@@ -197,6 +197,7 @@ def test_byoc_migration_profile_preserves_ids_and_disables_prompts(sample_config
     _apply_byoc_migration_profile(sample_config)
 
     assert sample_config.migration.preserve_ids is True
+    assert sample_config.migration.skip_feedback is True
     assert sample_config.migration.non_interactive is True
     assert sample_config.migration.interactive is False
 
@@ -217,18 +218,21 @@ def test_preserved_example_updates_when_only_inputs_changed(preserving_config, m
     dest.post_batch.assert_not_called()
 
 
+@pytest.mark.parametrize("skip_feedback", [False, True])
 @pytest.mark.parametrize("preserve_ids,skip_runs", [(False, False), (True, False), (True, True)])
-def test_resume_restores_migration_settings_from_disk(sample_config, tmp_path, preserve_ids, skip_runs):
+def test_resume_restores_migration_settings_from_disk(sample_config, tmp_path, preserve_ids, skip_runs, skip_feedback):
     from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
     from langsmith_migrator.utils.state import StateManager
 
     sample_config.migration.preserve_ids = preserve_ids
     sample_config.migration.skip_runs = skip_runs
+    sample_config.migration.skip_feedback = skip_feedback
     original = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
     session_id = original.ensure_state().session_id
     # A new invocation can have different defaults or environment settings.
     sample_config.migration.preserve_ids = not preserve_ids
     sample_config.migration.skip_runs = not skip_runs
+    sample_config.migration.skip_feedback = not skip_feedback
     manager = StateManager(tmp_path / "state")
     resumed = MigrationOrchestrator(sample_config, manager)
     resumed.state = manager.load_session(session_id)
@@ -237,6 +241,7 @@ def test_resume_restores_migration_settings_from_disk(sample_config, tmp_path, p
 
     assert sample_config.migration.preserve_ids is preserve_ids
     assert sample_config.migration.skip_runs is skip_runs
+    assert sample_config.migration.skip_feedback is skip_feedback
     original.cleanup()
     resumed.cleanup()
 
@@ -260,7 +265,7 @@ def test_legacy_session_keeps_current_settings(sample_config, migration_state, t
     resumed.cleanup()
 
 
-@pytest.mark.parametrize("settings", [{"preserve_ids": "false"}, {"base_url": True}, []])
+@pytest.mark.parametrize("settings", [{"preserve_ids": "false"}, {"skip_feedback": "true"}, {"base_url": True}, []])
 def test_invalid_saved_migration_settings_are_rejected(migration_state, settings):
     from langsmith_migrator.utils.state import MigrationState
 
@@ -317,3 +322,49 @@ def test_byoc_resume_skips_run_replay_and_preserves_feedback_ids(
     assert payload["run_id"] == "run-1"
     original.cleanup()
     resumed.cleanup()
+
+
+@pytest.mark.parametrize("stage", ["create_experiment", "migrate_feedback"])
+def test_byoc_skips_feedback_and_persists_terminal_experiment(sample_config, tmp_path, stage):
+    from langsmith_migrator.cli.main import _apply_byoc_migration_profile
+    from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
+    from langsmith_migrator.utils.state import MigrationStatus, StateManager
+
+    _apply_byoc_migration_profile(sample_config)
+    sample_config.migration.skip_runs = True
+    manager = StateManager(tmp_path / "state")
+    orchestrator = MigrationOrchestrator(sample_config, manager)
+    state = orchestrator.ensure_state()
+    item = state.ensure_item(
+        "experiment_exp-1", "experiment", "exp", "exp-1", stage=stage,
+        metadata={"source_dataset_id": "ds-1", "dest_dataset_id": "ds-1"},
+    )
+    if stage == "migrate_feedback":
+        item.destination_id = "exp-1"
+        item.status = MigrationStatus.FAILED
+        item.error = "Previous feedback failure"
+    exp_mig, fb_mig = Mock(), Mock()
+    exp_mig.create_experiment.return_value = "exp-1"
+
+    ok, _ = orchestrator._resolve_experiment_item(
+        {"id": "exp-1", "name": "exp"}, "ds-1", "ds-1", exp_mig, fb_mig,
+    )
+
+    assert ok
+    exp_mig.migrate_runs_streaming.assert_not_called()
+    fb_mig.migrate_feedback_for_experiments.assert_not_called()
+    if stage == "create_experiment":
+        exp_mig.create_experiment.assert_called_once()
+    else:
+        exp_mig.create_experiment.assert_not_called()
+    reloaded = StateManager(tmp_path / "state").load_session(state.session_id)
+    item = reloaded.get_item("experiment_exp-1")
+    assert item.status == MigrationStatus.COMPLETED
+    assert item.stage == "completed"
+    assert item.terminal_state == "migrated"
+    assert item.metadata["feedback_skipped"] is True
+    assert not item.metadata.get("feedback_verified")
+    assert not item.error
+    assert reloaded.get_resume_items() == []
+    assert reloaded.migration_settings["skip_feedback"] is True
+    orchestrator.cleanup()
