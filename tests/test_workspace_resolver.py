@@ -151,3 +151,16 @@ def test_resolve_workspace_context_raises_in_non_interactive_mode_without_valid_
         )
 
     assert "Workspace mapping is required in non-interactive mode" in console.text
+
+
+def test_single_workspace_returns_explicit_mapping_for_org_keys(monkeypatch):
+    source = _FakeClient("https://source.example/api/v1")
+    dest = _FakeClient("https://dest.example/api/v1")
+    monkeypatch.setattr(
+        workspace_resolver, "list_workspaces",
+        lambda client: [{"id": "src" if client is source else "dst"}],
+    )
+    result = workspace_resolver.resolve_workspace_context(
+        source, dest, _FakeConsole(), non_interactive=True,
+    )
+    assert result.workspace_mapping == {"src": "dst"}
