@@ -617,6 +617,7 @@ def _apply_byoc_migration_profile(config) -> None:
     the trace storage migration rather than replay.
     """
     config.migration.preserve_ids = True
+    config.migration.skip_feedback = True
     config.migration.non_interactive = True
     config.migration.interactive = False
 
@@ -2107,7 +2108,7 @@ def test(ctx):
     "--byoc-migration",
     is_flag=True,
     help="Self-hosted to BYOC profile: implies --preserve-ids, --non-interactive, --all, "
-    "--all-workspaces, --include-experiments and --skip-runs",
+    "--all-workspaces, --include-experiments and --skip-runs; skips feedback",
 )
 @click.option(
     "--dataset",
@@ -2248,7 +2249,9 @@ def datasets(
                 )
 
             console.print(f"\nSelected {len(selected)} dataset(s)")
-            if inc_exp and skip_runs:
+            if inc_exp and skip_runs and config.migration.skip_feedback:
+                console.print("[dim]Including experiment metadata; runs and feedback are not replayed[/dim]")
+            elif inc_exp and skip_runs:
                 console.print("[dim]Including experiments and feedback; runs are not replayed[/dim]")
             elif inc_exp:
                 console.print("[dim]Including experiments, runs, and feedback[/dim]")

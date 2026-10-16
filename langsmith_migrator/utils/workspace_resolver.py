@@ -123,7 +123,7 @@ def resolve_workspace_context(
 
     Steps:
         1. Discover workspaces on source and destination.
-        2. If both sides have <= 1 workspace and ``force_tui`` is False, return None.
+        2. If both sides have one workspace, map them without prompting.
         3. If ``saved_config`` has a workspace_mapping, offer to reuse it.
         4. Otherwise, launch the workspace mapping TUI.
         5. Create any new destination workspaces.
@@ -140,8 +140,14 @@ def resolve_workspace_context(
         f"[green]\u2713[/green] ({len(source_workspaces)} source, {len(dest_workspaces)} destination)"
     )
 
-    # If both sides are single-workspace (or empty), no mapping needed
+    # Even a single workspace needs an explicit tenant header with org-scoped keys.
     if not force_tui and len(source_workspaces) <= 1 and len(dest_workspaces) <= 1:
+        if source_workspaces and dest_workspaces:
+            return WorkspaceProjectResult(
+                workspace_mapping={source_workspaces[0]["id"]: dest_workspaces[0]["id"]},
+                project_mappings={},
+                workspaces_to_create=[],
+            )
         return None
 
     # Lazy-load saved config if not provided

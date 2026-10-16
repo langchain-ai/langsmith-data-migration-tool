@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.89] - 2026-10-15
+
+### Changed
+- **BYOC skips feedback replay**: `datasets --byoc-migration` now migrates
+  experiment metadata without replaying runs or feedback. Experiments are saved
+  as completed, and resume restores the saved feedback policy. Explicit
+  `--skip-runs` outside the BYOC profile still migrates feedback.
+
+### Fixed
+- **Org-scoped API keys**: connection checks verify workspace discovery when
+  dataset access requires `X-Tenant-ID`, allowing `datasets --byoc-migration`
+  to reach workspace mapping. Single-workspace migrations now map explicitly
+  so their requests also include the workspace header. Invalid keys and
+  permission failures still fail authentication.
+
 ## [0.0.88] - 2026-10-15
 
 ### Fixed

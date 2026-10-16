@@ -682,6 +682,28 @@ class EnhancedAPIClient:
                 self.get(endpoint, params=params)
                 return True, None
             except AuthenticationError as e:
+                # Org keys are valid without a tenant, but dataset reads are not.
+                # Verify against an authenticated org endpoint before workspace
+                # discovery; never turn this rejection into a public health check.
+                if (
+                    e.status_code == 403
+                    and "org-scoped" in str(e).lower()
+                    and "x-tenant-id" in str(e).lower()
+                    and not self.session.headers.get("X-Tenant-Id")
+                ):
+                    prefix = "" if has_api_version else "/api/v1"
+                    for workspace_endpoint in ("/workspaces", "/orgs/current/workspaces"):
+                        try:
+                            self.get(f"{prefix}{workspace_endpoint}")
+                            return True, None
+                        except NotFoundError:
+                            continue
+                        except Exception as workspace_error:
+                            return False, f"Workspace authentication check failed: {workspace_error}"
+                    return False, (
+                        "This org-scoped key requires a workspace, but workspace discovery "
+                        "is not supported by this server. Use a workspace-scoped key."
+                    )
                 # Auth errors won't be fixed by trying different endpoints
                 error_msg = (
                     f"Authentication failed: {e}. "

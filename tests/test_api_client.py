@@ -357,3 +357,90 @@ def test_prepare_url_absolute_url_passthrough():
     url = client._prepare_url("https://other.example.com/api/v1/foo")
     assert url == "https://other.example.com/api/v1/foo"
 
+
+
+@pytest.mark.parametrize("base_path", ["", "/api/v1"])
+@pytest.mark.parametrize(
+    "dataset_status,detail,workspace_status,expected",
+    [
+        (403, "This API key is org-scoped and requires workspace specification. Please provide 'X-Tenant-ID' header.", 200, True),
+        (403, "This API key is org-scoped and requires workspace specification. Please provide 'X-Tenant-ID' header.", 403, False),
+        (403, "This API key is org-scoped and requires workspace specification. Please provide 'X-Tenant-ID' header.", 404, False),
+        (401, "Invalid API key", 200, False),
+        (403, "Permission denied", 200, False),
+        (200, "", 200, True),
+    ],
+)
+def test_connection_auth_over_http(base_path, dataset_status, detail, workspace_status, expected):
+    """Exercise real requests, error parsing and fallback without real credentials."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append((self.path, self.headers.get("X-Tenant-Id")))
+            if self.path == "/api/v1/datasets?limit=1":
+                status, body = dataset_status, {"detail": detail}
+            elif self.path in ("/api/v1/workspaces", "/api/v1/orgs/current/workspaces"):
+                status, body = workspace_status, [{"id": "ws-1"}]
+            else:
+                status, body = 500, {"detail": "Unexpected endpoint"}
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = EnhancedAPIClient(
+            base_url=f"http://127.0.0.1:{server.server_port}{base_path}",
+            headers={"X-API-Key": "test-key"},
+            rate_limit_delay=0,
+            max_retries=0,
+        )
+        ok, error = client.test_connection()
+        assert ok is expected
+        assert (error is None) is expected
+        assert all("health" not in path for path, _ in seen)
+        assert all(tenant is None for _, tenant in seen)
+        assert "X-Tenant-Id" not in client.session.headers
+        if dataset_status == 403 and "org-scoped" in detail:
+            assert seen[1][0] == "/api/v1/workspaces"
+        else:
+            assert len(seen) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_org_key_connection_uses_legacy_workspace_endpoint(monkeypatch):
+    client = _client()
+    url = client.base_url
+    get = Mock(side_effect=[
+        _response("GET", url + "/datasets", 403, json_body={"detail": "org-scoped key requires X-Tenant-ID"}),
+        _response("GET", url + "/workspaces", 404, json_body={"detail": "Not found"}),
+        _response("GET", url + "/orgs/current/workspaces", 200, json_body=[]),
+    ])
+    monkeypatch.setattr(client.session, "get", get)
+    assert client.test_connection() == (True, None)
+    assert get.call_args_list[-1].args[0] == url + "/orgs/current/workspaces"
+
+
+def test_scoped_connection_does_not_bypass_workspace_rejection(monkeypatch):
+    client = _client()
+    client.set_workspace("selected-workspace")
+    get = Mock(return_value=_response(
+        "GET", client.base_url + "/datasets", 403,
+        json_body={"detail": "org-scoped key requires X-Tenant-ID"},
+    ))
+    monkeypatch.setattr(client.session, "get", get)
+    assert client.test_connection()[0] is False
+    get.assert_called_once()
