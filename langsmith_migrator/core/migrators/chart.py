@@ -8,6 +8,29 @@ from ..api_client import NotFoundError, APIError
 from ...utils.matching import unique_name_map
 
 
+# Destinations with dashboard V2 enabled (LangSmith SaaS) reject V1 chart
+# series on create/update with this 400 detail.
+V1_CHART_WRITE_REJECTION = "v1 chart series cannot be saved"
+CONVERT_V2_ENDPOINT = "/v1/platform/charts/convert-v2"
+V2_SERIES_KEYS = ("metric_definition", "group_by_definitions", "filter_definition")
+V1_SERIES_KEYS = ("name", "metric", "feedback_key", "workspace_id", "filters", "group_by")
+
+
+class ChartV2ConversionError(Exception):
+    """A V1 chart could not be converted to V2 definitions on the destination."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        skipped_series: Optional[List[Dict[str, Any]]] = None,
+    ):
+        super().__init__(message)
+        self.reason = reason
+        self.skipped_series = skipped_series or []
+
+
 class ChartMigrator(BaseMigrator):
     """Handles chart migration using global /api/v1/charts endpoints."""
 
@@ -20,6 +43,7 @@ class ChartMigrator(BaseMigrator):
         self._dataset_id_map = None  # Lazy-loaded cache
         self._dest_section_map = None  # Lazy-loaded cache for dest sections
         self._section_strategy = None
+        self._dest_requires_v2 = False  # Set once the destination rejects V1 series
 
     def _chart_item_id(self, chart: Dict[str, Any]) -> str:
         chart_id = chart.get("id") or chart.get("title") or chart.get("name") or "unknown"
@@ -135,6 +159,129 @@ class ChartMigrator(BaseMigrator):
                 downgraded = True
 
         return payload, downgraded
+
+    @staticmethod
+    def _series_has_v2_definitions(series: Any) -> bool:
+        """Mirror the backend check: any V2 definition field marks a series as V2."""
+        return isinstance(series, dict) and any(
+            series.get(key) is not None for key in V2_SERIES_KEYS
+        )
+
+    def _payload_has_v1_series(self, payload: Dict[str, Any]) -> bool:
+        return any(
+            not self._series_has_v2_definitions(series)
+            for series in payload.get("series") or []
+        )
+
+    @staticmethod
+    def _is_v1_write_rejection(error: APIError) -> bool:
+        return error.status_code == 400 and V1_CHART_WRITE_REJECTION in str(error).lower()
+
+    def _convert_payload_to_v2(self, payload: Dict[str, Any]) -> None:
+        """Replace V1 series with their V2 definitions in place via the destination converter.
+
+        The converter folds common_filters into each series' filter_definition, so
+        common_filters is dropped from the payload. The payload is only mutated once
+        every V1 series converted; otherwise ChartV2ConversionError is raised.
+        """
+        series_list = payload.get("series") or []
+        v1_indexes = [
+            idx
+            for idx, series in enumerate(series_list)
+            if not self._series_has_v2_definitions(series)
+        ]
+        if not v1_indexes:
+            return
+
+        request_chart = {
+            "title": payload.get("title"),
+            "chart_type": payload.get("chart_type"),
+            "common_filters": payload.get("common_filters"),
+            "series": [
+                {
+                    "id": str(idx),
+                    **{
+                        key: series_list[idx][key]
+                        for key in V1_SERIES_KEYS
+                        if series_list[idx].get(key) is not None
+                    },
+                }
+                for idx in v1_indexes
+            ],
+        }
+        request_chart = {k: v for k, v in request_chart.items() if v is not None}
+
+        try:
+            response = self.dest.post(CONVERT_V2_ENDPOINT, {"charts": [request_chart]})
+        except APIError as e:
+            raise ChartV2ConversionError(
+                f"Destination chart converter is unavailable: {e}",
+                reason="chart_v2_conversion_unavailable",
+            ) from e
+
+        charts = response.get("charts") if isinstance(response, dict) else None
+        converted_series = charts[0].get("series", []) if charts else []
+        converted_by_id = {
+            str(series.get("id")): series
+            for series in converted_series
+            if isinstance(series, dict)
+        }
+
+        skipped = []
+        for idx in v1_indexes:
+            converted = converted_by_id.get(str(idx))
+            if converted is None:
+                skipped.append({
+                    "name": series_list[idx].get("name"),
+                    "skip_reasons": ["missing_from_response"],
+                })
+            elif converted.get("skipped"):
+                skipped.append({
+                    "name": series_list[idx].get("name"),
+                    "skip_reasons": converted.get("skip_reasons") or [],
+                })
+        if skipped:
+            raise ChartV2ConversionError(
+                f"{len(skipped)} series could not be converted to V2: {skipped}",
+                reason="chart_v2_conversion_skipped",
+                skipped_series=skipped,
+            )
+
+        new_series = list(series_list)
+        for idx in v1_indexes:
+            converted = converted_by_id[str(idx)]
+            new_series[idx] = self._sanitize_chart_payload_value({
+                "name": series_list[idx].get("name"),
+                "metadata": series_list[idx].get("metadata"),
+                "workspace_id": converted.get("workspace_id"),
+                **{key: converted.get(key) for key in V2_SERIES_KEYS},
+            })
+        payload["series"] = new_series
+        payload.pop("common_filters", None)
+
+    def _write_chart_payload(self, write, payload: Dict[str, Any], probe: str) -> Any:
+        """Write a chart payload, converting V1 series to V2 if the destination requires it."""
+        if self._dest_requires_v2:
+            self._convert_payload_to_v2(payload)
+        try:
+            return write(payload)
+        except APIError as e:
+            if not (self._is_v1_write_rejection(e) and self._payload_has_v1_series(payload)):
+                raise
+            self.log(
+                "Destination requires V2 chart definitions; converting V1 series",
+                "info",
+            )
+            self._dest_requires_v2 = True
+            self.record_capability(
+                "charts",
+                "v1_chart_writes",
+                supported=False,
+                detail=str(e),
+                probe=probe,
+            )
+            self._convert_payload_to_v2(payload)
+            return write(payload)
 
     def _verify_chart(
         self,
@@ -478,6 +625,13 @@ class ChartMigrator(BaseMigrator):
                 value = obj.get(key)
                 if isinstance(value, str) and value:
                     session_ids.add(value)
+
+            # V2 series scope projects via filter_definition.project_ids
+            project_ids = obj.get("project_ids")
+            if isinstance(project_ids, list):
+                session_ids.update(
+                    value for value in project_ids if isinstance(value, str) and value
+                )
 
             for value in obj.values():
                 session_ids.update(self._chart_session_ids(value))
@@ -851,13 +1005,19 @@ class ChartMigrator(BaseMigrator):
             self.log(f"Failed to check for existing chart: {e}", "warning")
             return None
 
-    def update_chart(self, chart_id: str, chart_data: Dict[str, Any]) -> bool:
+    def update_chart(
+        self,
+        chart_id: str,
+        chart_data: Dict[str, Any],
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """
         Update an existing chart in destination.
 
         Args:
             chart_id: The chart ID to update
             chart_data: Chart configuration dict
+            payload: Optional prebuilt payload; converted to V2 in place if needed
 
         Returns:
             True if successful, False otherwise
@@ -867,12 +1027,17 @@ class ChartMigrator(BaseMigrator):
             self.log(f"[DRY RUN] Would update chart: {chart_title} ({chart_id})")
             return True
 
-        payload, _ = self._build_chart_payload(chart_data)
-        self._normalize_chart_filter_payload(payload)
+        if payload is None:
+            payload, _ = self._build_chart_payload(chart_data)
+            self._normalize_chart_filter_payload(payload)
 
         try:
             # Use PATCH to update the chart
-            self.dest.patch(f"/charts/{chart_id}", payload)
+            self._write_chart_payload(
+                lambda p: self.dest.patch(f"/charts/{chart_id}", p),
+                payload,
+                "PATCH /charts/{chart_id}",
+            )
             chart_title = chart_data.get("title") or chart_data.get("name") or "Untitled Chart"
             self.log(f"Updated chart: {chart_title} ({chart_id})", "success")
             return True
@@ -980,7 +1145,7 @@ class ChartMigrator(BaseMigrator):
             else:
                 self.log(f"Chart '{chart_title}' exists, updating...", "info")
                 self.checkpoint_item(item_id, stage="update_chart")
-                success = self.update_chart(existing_id, chart_copy)
+                success = self.update_chart(existing_id, chart_copy, payload=payload)
                 if not success:
                     issue = self.record_issue(
                         "transient",
@@ -1046,8 +1211,11 @@ class ChartMigrator(BaseMigrator):
         try:
             self.checkpoint_item(item_id, stage="create_chart")
             # Try to create
+            def post_create(p: Dict[str, Any]) -> Any:
+                return self.dest.post("/charts/create", p)
+
             try:
-                response = self.dest.post("/charts/create", payload)
+                response = self._write_chart_payload(post_create, payload, "POST /charts/create")
                 self.record_capability(
                     "charts",
                     "section_scoped_create",
@@ -1069,7 +1237,9 @@ class ChartMigrator(BaseMigrator):
                     self._section_strategy = "unsectioned"
                     del payload["section_id"]
                     downgraded_to_unsectioned = True
-                    response = self.dest.post("/charts/create", payload)
+                    response = self._write_chart_payload(
+                        post_create, payload, "POST /charts/create"
+                    )
                 else:
                     raise e
 
@@ -1148,6 +1318,44 @@ class ChartMigrator(BaseMigrator):
             )
             return None
 
+        except ChartV2ConversionError as e:
+            self.log(f"Failed to convert chart '{chart_title}' to V2: {e}", "error")
+            next_action = (
+                "Recreate the exported chart with V2 definitions (metric_definition, "
+                "group_by_definitions, filter_definition), then re-run `langsmith-migrator resume`."
+            )
+            evidence = {"error": str(e), "skipped_series": e.skipped_series}
+            export_path = self._export_chart_manual_apply(
+                chart_copy,
+                reason=e.reason,
+                payload=payload,
+                analysis=evidence,
+            )
+            issue = self.record_issue(
+                "capability",
+                e.reason,
+                f"Chart '{chart_title}' could not be converted to V2 chart definitions",
+                item_id=item_id,
+                next_action=next_action,
+                evidence=evidence,
+                export_path=export_path,
+            )
+            if issue:
+                self.queue_remediation(
+                    issue_id=issue.id,
+                    item_id=item_id,
+                    next_action=issue.next_action or "Review exported chart payload.",
+                    export_path=export_path,
+                    command="langsmith-migrator resume",
+                )
+            self.mark_exported(
+                item_id,
+                e.reason,
+                next_action=next_action,
+                export_path=export_path,
+                evidence=evidence,
+            )
+            return None
         except APIError as e:
             self.log(f"Failed to create chart '{chart_title}': {e}", "error")
             diagnostics = self._diagnose_chart_api_error(e)
