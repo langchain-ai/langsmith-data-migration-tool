@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.90] - 2026-10-21
+
+### Fixed
+- **V1 charts on V2-only destinations**: self-hosted sources keep legacy V1
+  chart series, which LangSmith SaaS rejects with `400 - V1 chart series
+  cannot be saved`. The chart migrator now converts such charts with the
+  destination's `POST /v1/platform/charts/convert-v2` endpoint and retries
+  the create/update; once a destination rejects V1, later charts convert
+  before the first write. Series the converter skips are exported for
+  manual apply with their skip reasons (`chart_v2_conversion_skipped`), on
+  both the create and the update path.
+- **Section fallback on chart rejection**: the V1 rejection no longer
+  triggers the retry-without-section fallback, which dropped section
+  placement for every later chart.
+- **Chart re-run dedupe for V2 charts**: existing destination charts are
+  matched by `filter_definition.project_ids`, including the narrower project
+  scope the converter keeps when series and common filters name different
+  projects, so re-runs no longer create duplicates of converted charts.
+
 ## [0.0.89] - 2026-10-15
 
 ### Changed

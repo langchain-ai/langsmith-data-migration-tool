@@ -1211,3 +1211,290 @@ def test_enrich_chart_sends_bounded_end_time(sample_config, migration_state):
 
     payload = _charts_payload(source_client)
     _assert_bounded_window(payload)
+
+
+# Chart from a self-hosted 0.13 source, after project mapping.
+_V1_ERROR_RATE_CHART = {
+    "id": "source-chart",
+    "title": "Error rate",
+    "chart_type": "bar",
+    "description": "",
+    "index": 5,
+    "common_filters": {
+        "filter": 'and(eq(is_root, true), eq(tag, "env:prod"))',
+        "session": ["dest-project"],
+    },
+    "series": [
+        {
+            "name": "Error Rate",
+            "metric": "error_rate",
+            "group_by": {"attribute": "metadata", "path": "model", "max_groups": 5},
+        }
+    ],
+}
+
+_V2_ERROR_RATE_SERIES = {
+    "name": "Error Rate",
+    "metric_definition": {
+        "type": "ratio",
+        "numerator": {"type": "count", "filter": 'eq(status, "error")'},
+        "denominator": {"type": "count"},
+    },
+    "group_by_definitions": [{"attribute": "metadata", "path": "model"}],
+    "filter_definition": {
+        "source_type": "tracing_project",
+        "run_filter": 'and(eq(is_root, true), eq(tag, "env:prod"))',
+        "trace_filter": None,
+        "tree_filter": None,
+        "project_ids": ["dest-project"],
+    },
+}
+
+_V1_REJECTION = APIError(
+    "API request failed: 400 - V1 chart series cannot be saved. "
+    "Use V2 chart definitions instead.",
+    status_code=400,
+    request_info={"endpoint": "/charts/create", "method": "POST"},
+)
+
+
+def _convert_response(series: dict, *, skipped: bool = False) -> dict:
+    converted = {"id": "0", "name": series["name"]}
+    if skipped:
+        converted.update({"skipped": True, "skip_reasons": ["unsupported_metric"]})
+    else:
+        converted.update({k: v for k, v in series.items() if k != "name"})
+    return {"charts": [{"title": "Error rate", "chart_type": "bar", "series": [converted]}]}
+
+
+def _created_chart(series: dict) -> dict:
+    return {
+        "id": "dest-chart",
+        "title": "Error rate",
+        "chart_type": "bar",
+        "series": [{**series, "id": "server-series-id", "metric": None, "filters": None}],
+    }
+
+
+def test_create_chart_converts_v1_series_when_destination_rejects_them(
+    sample_config,
+    migration_state,
+):
+    """A V1-only destination rejection should convert via convert-v2 and retry the create."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.side_effect = [
+        [],  # find_existing_chart
+        _V1_REJECTION,  # POST /charts/create with V1 series
+        _convert_response(_V2_ERROR_RATE_SERIES),  # POST convert-v2
+        _created_chart(_V2_ERROR_RATE_SERIES),  # POST /charts/create with V2 series
+        [_created_chart(_V2_ERROR_RATE_SERIES)],  # _verify_chart list refetch
+    ]
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+
+    assert migrator.create_chart(dict(_V1_ERROR_RATE_CHART)) == "dest-chart"
+
+    calls = [call.args for call in dest_client.post.call_args_list]
+    convert_endpoint, convert_body = calls[2]
+    assert convert_endpoint == "/v1/platform/charts/convert-v2"
+    request_chart = convert_body["charts"][0]
+    assert request_chart["common_filters"]["session"] == ["dest-project"]
+    assert request_chart["series"][0]["metric"] == "error_rate"
+    assert request_chart["series"][0]["group_by"]["path"] == "model"
+
+    create_endpoint, create_body = calls[3]
+    assert create_endpoint == "/charts/create"
+    assert "common_filters" not in create_body
+    assert create_body["series"][0]["metric_definition"]["type"] == "ratio"
+    assert create_body["series"][0]["filter_definition"]["project_ids"] == ["dest-project"]
+    assert "metric" not in create_body["series"][0]
+    assert "group_by" not in create_body["series"][0]
+
+    item = migration_state.items["chart_source-chart"]
+    assert item.outcome_code == "chart_migrated"
+    assert migrator._dest_requires_v2 is True
+
+
+def test_create_chart_converts_up_front_once_destination_requires_v2(
+    sample_config,
+    migration_state,
+):
+    """After the first rejection, later charts should convert before the create call."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.side_effect = [
+        [],  # find_existing_chart
+        _convert_response(_V2_ERROR_RATE_SERIES),  # POST convert-v2
+        _created_chart(_V2_ERROR_RATE_SERIES),  # POST /charts/create
+        [_created_chart(_V2_ERROR_RATE_SERIES)],  # _verify_chart list refetch
+    ]
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+    migrator._dest_requires_v2 = True
+
+    assert migrator.create_chart(dict(_V1_ERROR_RATE_CHART)) == "dest-chart"
+    endpoints = [call.args[0] for call in dest_client.post.call_args_list]
+    assert endpoints == ["/charts", "/v1/platform/charts/convert-v2", "/charts/create", "/charts"]
+
+
+def test_create_chart_exports_skipped_v2_conversion(sample_config, migration_state):
+    """Series the converter skips should be exported for manual apply, not created."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.side_effect = [
+        [],  # find_existing_chart
+        _V1_REJECTION,  # POST /charts/create
+        _convert_response(_V2_ERROR_RATE_SERIES, skipped=True),  # POST convert-v2
+    ]
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+    migrator._export_chart_manual_apply = Mock(return_value="/tmp/chart.json")
+
+    assert migrator.create_chart(dict(_V1_ERROR_RATE_CHART)) is None
+    assert dest_client.post.call_count == 3  # no second create
+    kwargs = migrator._export_chart_manual_apply.call_args.kwargs
+    assert kwargs["reason"] == "chart_v2_conversion_skipped"
+    assert kwargs["analysis"]["skipped_series"] == [
+        {"name": "Error Rate", "skip_reasons": ["unsupported_metric"]}
+    ]
+    # The exported payload is left as the unconverted V1 chart
+    assert kwargs["payload"]["series"][0]["metric"] == "error_rate"
+    item = migration_state.items["chart_source-chart"]
+    assert item.outcome_code == "chart_v2_conversion_skipped"
+
+
+def test_create_chart_v1_rejection_does_not_drop_section(sample_config, migration_state):
+    """The V1 rejection must be handled before the retry-without-section fallback."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    created = {**_created_chart(_V2_ERROR_RATE_SERIES), "section_id": "dest-section"}
+    dest_client.post.side_effect = [
+        [],  # find_existing_chart
+        _V1_REJECTION,  # POST /charts/create
+        _convert_response(_V2_ERROR_RATE_SERIES),  # POST convert-v2
+        created,  # POST /charts/create
+        [created],  # _verify_chart list refetch
+    ]
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+
+    chart = {**_V1_ERROR_RATE_CHART, "section_id": "dest-section"}
+    assert migrator.create_chart(chart) == "dest-chart"
+    create_body = dest_client.post.call_args_list[3].args[1]
+    assert create_body["section_id"] == "dest-section"
+    assert migrator._section_strategy != "unsectioned"
+
+
+def test_create_chart_does_not_convert_on_unrelated_400(sample_config, migration_state):
+    """Other 400s keep the existing export behavior and never call the converter."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.side_effect = [
+        [],  # find_existing_chart
+        APIError("API request failed: 400 - bad chart", status_code=400),
+    ]
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+    migrator._export_chart_manual_apply = Mock(return_value="/tmp/chart.json")
+
+    assert migrator.create_chart(dict(_V1_ERROR_RATE_CHART)) is None
+    endpoints = [call.args[0] for call in dest_client.post.call_args_list]
+    assert "/v1/platform/charts/convert-v2" not in endpoints
+    item = migration_state.items["chart_source-chart"]
+    assert item.outcome_code == "chart_create_failed"
+
+
+def test_update_chart_converts_v1_series_on_rejection(sample_config, migration_state):
+    """PATCH of an existing chart gets the same V1 -> V2 fallback as create."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.patch.side_effect = [_V1_REJECTION, {"id": "dest-chart"}]
+    dest_client.post.return_value = _convert_response(_V2_ERROR_RATE_SERIES)
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+
+    assert migrator.update_chart("dest-chart", dict(_V1_ERROR_RATE_CHART)) is True
+    patched = dest_client.patch.call_args_list[1].args
+    assert patched[0] == "/charts/dest-chart"
+    assert patched[1]["series"][0]["metric_definition"]["type"] == "ratio"
+    assert "common_filters" not in patched[1]
+
+
+def test_find_existing_chart_matches_v2_charts_by_project_ids(sample_config, migration_state):
+    """Re-runs must dedupe a V1 source chart against its converted V2 destination chart."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.return_value = [
+        {
+            "id": "other-project-chart",
+            "title": "Error rate",
+            "series": [{"filter_definition": {"project_ids": ["other-project"]}}],
+        },
+        _created_chart(_V2_ERROR_RATE_SERIES),
+    ]
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+
+    assert (
+        migrator.find_existing_chart("Error rate", payload=dict(_V1_ERROR_RATE_CHART))
+        == "dest-chart"
+    )
+
+
+def test_find_existing_chart_matches_converted_intersection_of_project_ids(
+    sample_config,
+    migration_state,
+):
+    """The converter keeps series sessions ∩ common sessions, so dedupe must accept that set."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.return_value = [_created_chart(_V2_ERROR_RATE_SERIES)]
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+
+    chart = {
+        **_V1_ERROR_RATE_CHART,
+        "common_filters": {
+            **_V1_ERROR_RATE_CHART["common_filters"],
+            "session": ["dest-project", "other-project"],
+        },
+        "series": [
+            {**_V1_ERROR_RATE_CHART["series"][0], "filters": {"session": ["dest-project"]}}
+        ],
+    }
+    assert migrator.find_existing_chart("Error rate", payload=chart) == "dest-chart"
+
+
+def test_create_chart_exports_skipped_v2_conversion_on_update(sample_config, migration_state):
+    """A skipped series on the PATCH path is exported like on create, not retried as transient."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.side_effect = [
+        [_created_chart(_V2_ERROR_RATE_SERIES)],  # find_existing_chart
+        _convert_response(_V2_ERROR_RATE_SERIES, skipped=True),  # POST convert-v2
+    ]
+    dest_client.patch.side_effect = [_V1_REJECTION]
+
+    sample_config.migration.skip_existing = False
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+    migrator._export_chart_manual_apply = Mock(return_value="/tmp/chart.json")
+
+    assert migrator.create_chart(dict(_V1_ERROR_RATE_CHART)) is None
+    assert dest_client.patch.call_count == 1  # no PATCH retry
+    kwargs = migrator._export_chart_manual_apply.call_args.kwargs
+    assert kwargs["reason"] == "chart_v2_conversion_skipped"
+    assert kwargs["analysis"]["skipped_series"] == [
+        {"name": "Error Rate", "skip_reasons": ["unsupported_metric"]}
+    ]
+    item = migration_state.items["chart_source-chart"]
+    assert item.outcome_code == "chart_v2_conversion_skipped"
