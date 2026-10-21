@@ -642,6 +642,25 @@ class ChartMigrator(BaseMigrator):
 
         return session_ids
 
+    def _v2_converted_session_ids(self, payload: Dict[str, Any]) -> set[str]:
+        """Project IDs a V2 conversion of this payload would scope its series to.
+
+        Mirrors the backend converter (smith-go charts combineProjectIDs): each V1
+        series keeps the intersection of its own sessions and common_filters.session,
+        falling back to whichever side is set. V2 series keep their own project IDs.
+        """
+        common_ids = self._chart_session_ids(payload.get("common_filters") or {})
+        session_ids: set[str] = set()
+        for series in payload.get("series") or []:
+            series_ids = self._chart_session_ids(series)
+            if self._series_has_v2_definitions(series) or not common_ids:
+                session_ids.update(series_ids)
+            elif not series_ids:
+                session_ids.update(common_ids)
+            else:
+                session_ids.update(series_ids & common_ids)
+        return session_ids
+
     def collect_project_dependency_ids(
         self,
         charts: Any,
@@ -981,6 +1000,13 @@ class ChartMigrator(BaseMigrator):
         try:
             charts = self._list_charts(self.dest, side="destination")
             target_session_ids = self._chart_session_ids(payload or {})
+            # A V2-only destination stores the converted project scope, which can be
+            # narrower than the V1 union, so accept either form.
+            target_session_id_sets = [target_session_ids]
+            if payload and self._payload_has_v1_series(payload):
+                converted_ids = self._v2_converted_session_ids(payload)
+                if converted_ids and converted_ids != target_session_ids:
+                    target_session_id_sets.append(converted_ids)
             title_matches = []
 
             for chart in charts:
@@ -997,7 +1023,7 @@ class ChartMigrator(BaseMigrator):
 
             for chart in title_matches:
                 existing_session_ids = self._chart_session_ids(chart)
-                if existing_session_ids == target_session_ids:
+                if existing_session_ids in target_session_id_sets:
                     return chart.get("id")
 
             return None
@@ -1021,6 +1047,9 @@ class ChartMigrator(BaseMigrator):
 
         Returns:
             True if successful, False otherwise
+
+        Raises:
+            ChartV2ConversionError: V1 series could not be converted for a V2-only destination
         """
         if self.config.migration.dry_run:
             chart_title = chart_data.get("title") or chart_data.get("name") or "Untitled Chart"
@@ -1041,10 +1070,59 @@ class ChartMigrator(BaseMigrator):
             chart_title = chart_data.get("title") or chart_data.get("name") or "Untitled Chart"
             self.log(f"Updated chart: {chart_title} ({chart_id})", "success")
             return True
+        except ChartV2ConversionError:
+            # Permanent; create_chart exports it for manual apply instead of retrying
+            raise
         except Exception as e:
             chart_title = chart_data.get("title") or chart_data.get("name") or "Untitled Chart"
             self.log(f"Failed to update chart '{chart_title}': {e}", "error")
             return False
+
+    def _export_v2_conversion_failure(
+        self,
+        error: ChartV2ConversionError,
+        chart_copy: Dict[str, Any],
+        payload: Dict[str, Any],
+        item_id: str,
+    ) -> None:
+        """Export a chart whose V1 series could not be converted, for manual apply."""
+        chart_title = chart_copy.get("title") or chart_copy.get("name") or "Untitled Chart"
+        self.log(f"Failed to convert chart '{chart_title}' to V2: {error}", "error")
+        next_action = (
+            "Recreate the exported chart with V2 definitions (metric_definition, "
+            "group_by_definitions, filter_definition), then re-run `langsmith-migrator resume`."
+        )
+        evidence = {"error": str(error), "skipped_series": error.skipped_series}
+        export_path = self._export_chart_manual_apply(
+            chart_copy,
+            reason=error.reason,
+            payload=payload,
+            analysis=evidence,
+        )
+        issue = self.record_issue(
+            "capability",
+            error.reason,
+            f"Chart '{chart_title}' could not be converted to V2 chart definitions",
+            item_id=item_id,
+            next_action=next_action,
+            evidence=evidence,
+            export_path=export_path,
+        )
+        if issue:
+            self.queue_remediation(
+                issue_id=issue.id,
+                item_id=item_id,
+                next_action=issue.next_action or "Review exported chart payload.",
+                export_path=export_path,
+                command="langsmith-migrator resume",
+            )
+        self.mark_exported(
+            item_id,
+            error.reason,
+            next_action=next_action,
+            export_path=export_path,
+            evidence=evidence,
+        )
 
     def create_chart(self, chart_data: Dict[str, Any]) -> Optional[str]:
         """
@@ -1145,7 +1223,11 @@ class ChartMigrator(BaseMigrator):
             else:
                 self.log(f"Chart '{chart_title}' exists, updating...", "info")
                 self.checkpoint_item(item_id, stage="update_chart")
-                success = self.update_chart(existing_id, chart_copy, payload=payload)
+                try:
+                    success = self.update_chart(existing_id, chart_copy, payload=payload)
+                except ChartV2ConversionError as e:
+                    self._export_v2_conversion_failure(e, chart_copy, payload, item_id)
+                    return None
                 if not success:
                     issue = self.record_issue(
                         "transient",
@@ -1319,42 +1401,7 @@ class ChartMigrator(BaseMigrator):
             return None
 
         except ChartV2ConversionError as e:
-            self.log(f"Failed to convert chart '{chart_title}' to V2: {e}", "error")
-            next_action = (
-                "Recreate the exported chart with V2 definitions (metric_definition, "
-                "group_by_definitions, filter_definition), then re-run `langsmith-migrator resume`."
-            )
-            evidence = {"error": str(e), "skipped_series": e.skipped_series}
-            export_path = self._export_chart_manual_apply(
-                chart_copy,
-                reason=e.reason,
-                payload=payload,
-                analysis=evidence,
-            )
-            issue = self.record_issue(
-                "capability",
-                e.reason,
-                f"Chart '{chart_title}' could not be converted to V2 chart definitions",
-                item_id=item_id,
-                next_action=next_action,
-                evidence=evidence,
-                export_path=export_path,
-            )
-            if issue:
-                self.queue_remediation(
-                    issue_id=issue.id,
-                    item_id=item_id,
-                    next_action=issue.next_action or "Review exported chart payload.",
-                    export_path=export_path,
-                    command="langsmith-migrator resume",
-                )
-            self.mark_exported(
-                item_id,
-                e.reason,
-                next_action=next_action,
-                export_path=export_path,
-                evidence=evidence,
-            )
+            self._export_v2_conversion_failure(e, chart_copy, payload, item_id)
             return None
         except APIError as e:
             self.log(f"Failed to create chart '{chart_title}': {e}", "error")

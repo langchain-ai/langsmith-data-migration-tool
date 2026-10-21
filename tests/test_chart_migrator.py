@@ -1447,3 +1447,54 @@ def test_find_existing_chart_matches_v2_charts_by_project_ids(sample_config, mig
         migrator.find_existing_chart("Error rate", payload=dict(_V1_ERROR_RATE_CHART))
         == "dest-chart"
     )
+
+
+def test_find_existing_chart_matches_converted_intersection_of_project_ids(
+    sample_config,
+    migration_state,
+):
+    """The converter keeps series sessions ∩ common sessions, so dedupe must accept that set."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.return_value = [_created_chart(_V2_ERROR_RATE_SERIES)]
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+
+    chart = {
+        **_V1_ERROR_RATE_CHART,
+        "common_filters": {
+            **_V1_ERROR_RATE_CHART["common_filters"],
+            "session": ["dest-project", "other-project"],
+        },
+        "series": [
+            {**_V1_ERROR_RATE_CHART["series"][0], "filters": {"session": ["dest-project"]}}
+        ],
+    }
+    assert migrator.find_existing_chart("Error rate", payload=chart) == "dest-chart"
+
+
+def test_create_chart_exports_skipped_v2_conversion_on_update(sample_config, migration_state):
+    """A skipped series on the PATCH path is exported like on create, not retried as transient."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.side_effect = [
+        [_created_chart(_V2_ERROR_RATE_SERIES)],  # find_existing_chart
+        _convert_response(_V2_ERROR_RATE_SERIES, skipped=True),  # POST convert-v2
+    ]
+    dest_client.patch.side_effect = [_V1_REJECTION]
+
+    sample_config.migration.skip_existing = False
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+    migrator._export_chart_manual_apply = Mock(return_value="/tmp/chart.json")
+
+    assert migrator.create_chart(dict(_V1_ERROR_RATE_CHART)) is None
+    assert dest_client.patch.call_count == 1  # no PATCH retry
+    kwargs = migrator._export_chart_manual_apply.call_args.kwargs
+    assert kwargs["reason"] == "chart_v2_conversion_skipped"
+    assert kwargs["analysis"]["skipped_series"] == [
+        {"name": "Error Rate", "skip_reasons": ["unsupported_metric"]}
+    ]
+    item = migration_state.items["chart_source-chart"]
+    assert item.outcome_code == "chart_v2_conversion_skipped"
