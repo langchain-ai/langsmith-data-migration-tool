@@ -937,9 +937,40 @@ def test_resume_items_blocks_queue_when_run_copy_incomplete(
 
     assert results["blocked"] == ["queue:queue-1"]
     stored = migration_state.get_item(item.id)
-    assert stored.terminal_state == ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value
-    assert stored.status != MigrationStatus.COMPLETED
+    # Still retryable: failed, no terminal state, destination kept, attempt counted.
+    assert stored.status == MigrationStatus.FAILED
+    assert stored.terminal_state is None
     assert stored.destination_id == "dest-queue-1"
+    assert stored.stage == "queue_runs"
+    assert stored.attempts == 1
+    assert stored in migration_state.get_resume_items()
+
+
+def test_resume_items_marks_queue_degraded_when_runs_skipped(
+    monkeypatch, sample_config, migration_state, tmp_path
+):
+    """Runs skipped for missing key fields are not a clean migration."""
+
+    queue_migrator = Mock()
+    queue_migrator.create_queue.return_value = "dest-queue-1"
+    queue_migrator.migrate_queue_runs.return_value = {
+        "total": 1, "added": 0, "skipped": 1, "failed": 0,
+        "errors": [("run-1", "missing run key fields")],
+    }
+    _patch_resume_migrators(monkeypatch, queue_migrator)
+
+    orchestrator = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
+    orchestrator.state = migration_state
+    item = _queue_item()
+    migration_state.add_item(item)
+
+    results = orchestrator.resume_items([item])
+
+    assert results["resumed"] == ["queue:queue-1"]
+    stored = migration_state.get_item(item.id)
+    assert stored.status == MigrationStatus.COMPLETED
+    assert stored.terminal_state == ResolutionOutcome.MIGRATED_WITH_VERIFIED_DOWNGRADE.value
+    assert stored.outcome_code == "queue_runs_skipped"
 
 
 def test_resume_items_skips_queue_runs_when_not_requested(

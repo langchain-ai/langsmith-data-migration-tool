@@ -13,6 +13,7 @@ from click.testing import CliRunner
 
 from langsmith_migrator.cli import main as cli_main
 from langsmith_migrator.core import migrators as migrators_module
+from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
 from langsmith_migrator.utils.state import MigrationState, StateManager
 
 
@@ -150,6 +151,12 @@ class FakeOrchestratorInstance:
 
     def test_connections_detailed(self) -> tuple[bool, bool, str | None, str | None]:
         return self.test_connections_detailed_value
+
+    def record_queue_runs_outcome(self, item_id, destination_id, run_result):
+        # Real state bookkeeping; it only touches self.state / self.state_manager.
+        return MigrationOrchestrator.record_queue_runs_outcome(
+            self, item_id, destination_id, run_result
+        )
 
     def migrate_datasets_parallel(
         self,

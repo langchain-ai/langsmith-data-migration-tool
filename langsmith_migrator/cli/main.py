@@ -945,62 +945,16 @@ def _migrate_queue_runs_for_item(
         return {"total": 0, "added": 0, "skipped": 0, "failed": 0, "errors": [], "error": str(e)}
 
 
-def _queue_runs_incomplete(run_result: dict | None) -> bool:
-    """True when a queue-run copy must be retried (failed runs or a listing error)."""
-    if not run_result:
-        return False
-    return bool(run_result.get("failed")) or bool(run_result.get("error"))
-
-
-def _queue_runs_error_message(run_result: dict) -> str:
-    if run_result.get("error"):
-        return f"Queue runs could not be copied: {run_result['error']}"
-    return (
-        f"{run_result.get('failed', 0)} of {run_result.get('total', 0)} queue run(s) "
-        "could not be added to the destination queue"
-    )
-
-
 def _finish_queue_state_item(orchestrator, item_id, dest_queue_id, run_result) -> None:
-    """Mark a queue item completed, or blocked when its run copy is incomplete.
+    """Record a queue item's outcome after its (optional) run copy.
 
-    The destination queue ID is kept either way so a resume reuses the queue
-    and only redoes the run copy.
+    Failed or unlisted runs leave the item ``failed`` with the destination queue
+    ID kept, so ``resume`` picks it up and only redoes the run copy. Runs skipped
+    for missing key fields mark the queue as a verified downgrade.
     """
-    if not _queue_runs_incomplete(run_result):
-        _mark_state_item_completed(
-            orchestrator,
-            item_id,
-            destination_id=dest_queue_id,
-            metadata={"queue_runs": run_result} if run_result else None,
-        )
-        return
     if not orchestrator.state:
         return
-    error = _queue_runs_error_message(run_result)
-    orchestrator.state.update_item_status(
-        item_id,
-        MigrationStatus.FAILED,
-        destination_id=dest_queue_id,
-        error=error,
-        stage="queue_runs",
-    )
-    orchestrator.state.update_item_checkpoint(item_id, metadata={"queue_runs": run_result})
-    item = orchestrator.state.get_item(item_id)
-    if item and not item.terminal_state:
-        orchestrator.state.mark_terminal(
-            item_id,
-            ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
-            "queue_runs_incomplete",
-            verification_state=VerificationState.BLOCKED,
-            next_action=(
-                "Ensure the runs exist on the destination with their source IDs, "
-                "then run `langsmith-migrator resume` to retry the queue run copy."
-            ),
-            evidence={"destination_id": dest_queue_id, "queue_runs": run_result},
-            error=error,
-        )
-    orchestrator.state_manager.save()
+    orchestrator.record_queue_runs_outcome(item_id, dest_queue_id, run_result)
 
 
 def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> None:
@@ -1017,10 +971,16 @@ def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> Non
     )
     for name, err in listing_errors:
         console.print(f"  [red]✗[/red] {name}: {err}")
-    if failed or skipped:
+    if failed or listing_errors:
         console.print(
             "[dim]Runs must already exist on the destination with their source IDs "
-            "(e.g. after a trace storage migration). Review progress is not copied.[/dim]"
+            "(e.g. after a trace storage migration). Run `langsmith-migrator resume` "
+            "to retry linking them.[/dim]"
+        )
+    if skipped:
+        console.print(
+            "[dim]Skipped runs had no session_id/start_time on the source; their queues "
+            "are recorded as a verified downgrade.[/dim]"
         )
     if config.migration.verbose:
         for name, r in queue_run_results:
@@ -1961,6 +1921,9 @@ def _display_resolution_summary(orchestrator) -> None:
         f"  Verified downgrade: {terminal.get(ResolutionOutcome.MIGRATED_WITH_VERIFIED_DOWNGRADE.value, 0)}"
     )
     console.print(f"  Blocked: {terminal.get(ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value, 0)}")
+    retryable = len(orchestrator.state.get_failed_items(max_attempts=None))
+    if retryable:
+        console.print(f"  Retryable with resume: {retryable}")
     captured = terminal.get(ResolutionOutcome.ARCHIVE_CAPTURED.value, 0)
     if captured:
         console.print(f"  Captured to archive: {captured}")
@@ -1997,6 +1960,7 @@ def _needs_operator_action(state) -> bool:
         terminal.get(ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value)
         or terminal.get(ResolutionOutcome.EXPORTED_WITH_MANUAL_APPLY.value)
         or state.remediation_queue
+        or state.get_failed_items(max_attempts=None)
     )
 
 

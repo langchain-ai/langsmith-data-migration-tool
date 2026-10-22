@@ -2094,12 +2094,15 @@ def test_queues_command_include_runs_copies_runs_and_reports(cli_harness):
     )
     assert "Queues: 1 migrated, 0 failed" in cli_harness.console.text
     assert "Queue runs: 2 added, 1 failed, 0 skipped" in cli_harness.console.text
-    # A failed run copy blocks the item for resume but keeps the destination queue.
+    # A failed run copy leaves the item retryable (failed, no terminal state)
+    # with the destination queue kept, so `resume` redoes only the run copy.
     item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
-    assert item.terminal_state == ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value
-    assert item.status != MigrationStatus.COMPLETED
+    assert item.status == MigrationStatus.FAILED
+    assert item.terminal_state is None
+    assert item.stage == "queue_runs"
     assert item.destination_id == "new-queue-1"
     assert item.metadata["queue_runs"]["failed"] == 1
+    assert item in cli_harness.orchestrator_factory.state.get_resume_items()
 
 
 def test_queues_command_include_runs_marks_complete_when_all_runs_added(cli_harness):
@@ -2133,11 +2136,73 @@ def test_queues_command_non_interactive_exits_2_when_run_copy_incomplete(cli_har
     result = cli_harness.invoke(["--non-interactive", "queues", "--include-runs"])
 
     assert result.exit_code == 2
+    assert "Retryable with resume: 1" in cli_harness.console.text
     item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
-    assert item.terminal_state == ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value
-    assert item.status != MigrationStatus.COMPLETED
+    assert item.status == MigrationStatus.FAILED
+    assert item.terminal_state is None
     assert item.destination_id == "new-queue-1"
     assert "forbidden" in (item.error or "")
+    assert item in cli_harness.orchestrator_factory.state.get_resume_items()
+
+
+def test_queues_command_skipped_runs_record_verified_downgrade(cli_harness):
+    """Runs without key fields cannot be linked; the queue is a verified downgrade, not a success."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 2, "added": 0, "skipped": 2, "failed": 0,
+        "errors": [("run-1", "missing run key fields"), ("run-2", "missing run key fields")],
+    }
+
+    result = cli_harness.invoke(["--non-interactive", "queues", "--include-runs"])
+
+    assert result.exit_code == 0
+    item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
+    assert item.status == MigrationStatus.COMPLETED
+    assert item.terminal_state == ResolutionOutcome.MIGRATED_WITH_VERIFIED_DOWNGRADE.value
+    assert item.outcome_code == "queue_runs_skipped"
+    assert "Verified downgrade: 1" in cli_harness.console.text
+
+
+def test_resume_command_selects_failed_queue_run_copies(cli_harness):
+    """A queue left failed at the queue_runs stage is picked up by the real resume selection."""
+
+    state = build_state("migration_resume_queue_runs")
+    state.add_item(
+        MigrationItem(
+            id="queue_default_queue-1",
+            type="queue",
+            name="Queue One",
+            source_id="queue-1",
+            destination_id="dest-queue-1",
+            status=MigrationStatus.FAILED,
+            stage="queue_runs",
+            error="1 of 2 queue run(s) could not be linked to the destination queue",
+            metadata={
+                "queue": {"id": "queue-1", "name": "Queue One"},
+                "include_runs": True,
+                "project_id_map": {},
+            },
+        )
+    )
+    save_session(cli_harness.state_manager, state)
+    cli_harness.console.inputs = ["1"]
+    cli_harness.controls.confirm_answers = [True]
+    cli_harness.migrators.queue.create_queue.return_value = "dest-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 2, "added": 2, "skipped": 0, "failed": 0, "errors": [],
+    }
+
+    result = cli_harness.invoke(["resume"])
+
+    assert result.exit_code == 0
+    assert "Resumable items: 1" in cli_harness.console.text
+    cli_harness.migrators.queue.migrate_queue_runs.assert_called_once_with(
+        "queue-1", "dest-queue-1", session_id_map={}
+    )
 
 
 def test_queues_command_all_workspaces_pairs_every_workspace_by_id(cli_harness, monkeypatch):

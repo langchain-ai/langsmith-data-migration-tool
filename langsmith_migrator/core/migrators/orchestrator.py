@@ -792,6 +792,82 @@ class MigrationOrchestrator:
         self.state_manager.save()
         return True, dest_session_id, current_same_instance
 
+    def record_queue_runs_outcome(
+        self, item_id: str, destination_id: Optional[str], run_result: Optional[Dict[str, Any]]
+    ) -> str:
+        """Record the outcome of a queue's run copy on its state item.
+
+        Returns ``"completed"`` when every run was linked (or no copy was
+        requested), ``"degraded"`` when runs were skipped for missing key fields
+        (retrying cannot fix the source data), and ``"retry"`` when runs failed
+        to link or the listing failed. A retryable item is left ``FAILED`` with
+        no terminal state and its destination ID kept, so ``resume`` redoes
+        only the run copy.
+        """
+        if not self.state:
+            return "completed"
+        run_result = run_result or {}
+        failed = int(run_result.get("failed") or 0)
+        skipped = int(run_result.get("skipped") or 0)
+        total = int(run_result.get("total") or 0)
+        listing_error = run_result.get("error")
+
+        if failed or listing_error:
+            error = (
+                f"Queue runs could not be listed: {listing_error}"
+                if listing_error
+                else f"{failed} of {total} queue run(s) could not be linked to the destination queue"
+            )
+            self.state.update_item_status(
+                item_id,
+                MigrationStatus.FAILED,
+                destination_id=destination_id,
+                error=error,
+                stage="queue_runs",
+            )
+            self.state.update_item_checkpoint(
+                item_id,
+                metadata={"queue_runs": run_result},
+                next_action=(
+                    "Ensure the runs exist on the destination with their source IDs, then "
+                    "run `langsmith-migrator resume` to retry linking them."
+                ),
+            )
+            self.state_manager.save()
+            return "retry"
+
+        self.state.update_item_status(
+            item_id,
+            MigrationStatus.COMPLETED,
+            destination_id=destination_id,
+            stage="completed",
+        )
+        if run_result:
+            self.state.update_item_checkpoint(item_id, metadata={"queue_runs": run_result})
+        if skipped:
+            self.state.mark_terminal(
+                item_id,
+                ResolutionOutcome.MIGRATED_WITH_VERIFIED_DOWNGRADE,
+                "queue_runs_skipped",
+                verification_state=VerificationState.DEGRADED,
+                next_action=(
+                    f"{skipped} of {total} queued run(s) had no session_id/start_time on the "
+                    "source and were not linked; add them to the destination queue by hand."
+                ),
+                evidence={"destination_id": destination_id, "queue_runs": run_result},
+            )
+            self.state_manager.save()
+            return "degraded"
+        self.state.mark_terminal(
+            item_id,
+            ResolutionOutcome.MIGRATED,
+            "queue_migrated",
+            verification_state=VerificationState.VERIFIED,
+            evidence={"destination_id": destination_id},
+        )
+        self.state_manager.save()
+        return "completed"
+
     def resume_items(self, items_to_process: List[MigrationItem]) -> Dict[str, List[str]]:
         """Resume pending and failed items using typed dispatch."""
         self.ensure_state()
@@ -911,49 +987,10 @@ class MigrationOrchestrator:
                             destination_id,
                             session_id_map=dict(item.metadata.get("project_id_map") or {}),
                         )
-                        self.state.update_item_checkpoint(
-                            item.id, metadata={"queue_runs": run_result}
-                        )
-                    if run_result and (run_result.get("failed") or run_result.get("error")):
-                        error = (
-                            f"{run_result.get('failed', 0)} of {run_result.get('total', 0)} "
-                            "queue run(s) could not be added to the destination queue"
-                        )
-                        self.state.update_item_status(
-                            item.id,
-                            MigrationStatus.FAILED,
-                            destination_id=destination_id,
-                            error=error,
-                            stage="queue_runs",
-                        )
-                        self.state.mark_terminal(
-                            item.id,
-                            ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
-                            "queue_runs_incomplete",
-                            verification_state=VerificationState.BLOCKED,
-                            next_action=(
-                                "Ensure the runs exist on the destination with their source "
-                                "IDs, then run `langsmith-migrator resume` again."
-                            ),
-                            evidence={"destination_id": destination_id, "queue_runs": run_result},
-                            error=error,
-                        )
+                    outcome = self.record_queue_runs_outcome(item.id, destination_id, run_result)
+                    if outcome == "retry":
                         results["blocked"].append(f"{item.type}:{item.source_id}")
-                        self.state_manager.save()
                         continue
-                    self.state.update_item_status(
-                        item.id,
-                        MigrationStatus.COMPLETED,
-                        destination_id=destination_id,
-                        stage="completed",
-                    )
-                    self.state.mark_terminal(
-                        item.id,
-                        ResolutionOutcome.MIGRATED,
-                        "queue_migrated",
-                        verification_state=VerificationState.VERIFIED,
-                        evidence={"destination_id": destination_id},
-                    )
                 elif item.type == "rule":
                     rules_migrator._project_id_map = dict(item.metadata.get("project_id_map") or {})
                     rule_payload = item.metadata.get("rule") or rules_migrator.get_rule(item.source_id)
