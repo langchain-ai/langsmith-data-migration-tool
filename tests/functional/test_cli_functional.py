@@ -2170,6 +2170,42 @@ def test_queues_command_all_workspaces_pairs_every_workspace_by_id(cli_harness, 
     assert "Workspace: ws-b -> ws-b" in cli_harness.console.text
 
 
+def test_queues_command_byoc_migration_implies_all_workspaces_runs_and_no_prompts(
+    cli_harness, monkeypatch
+):
+    """--byoc-migration should pair workspaces by ID, copy runs, and never prompt."""
+    from langsmith_migrator.cli import main as cli_main
+    from langsmith_migrator.utils.workspace_resolver import WorkspaceProjectResult
+
+    seen_kwargs = {}
+
+    def fake_resolve(orchestrator, *args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return WorkspaceProjectResult(
+            workspace_mapping={"ws-a": "ws-a"}, project_mappings={}, workspaces_to_create=[]
+        )
+
+    monkeypatch.setattr(cli_main, "_resolve_workspaces", fake_resolve)
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+        {"id": "queue-2", "name": "Queue Two", "description": "Second"},
+    ]
+    cli_harness.migrators.queue.create_queue.side_effect = ["new-queue-1", "new-queue-2"]
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 1, "added": 1, "skipped": 0, "failed": 0, "errors": [],
+    }
+
+    result = cli_harness.invoke(["queues", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert seen_kwargs["all_workspaces"] is True
+    assert seen_kwargs["non_interactive"] is True
+    # non-interactive selects every queue without the TUI
+    assert cli_harness.migrators.queue.create_queue.call_count == 2
+    assert cli_harness.migrators.queue.migrate_queue_runs.call_count == 2
+    assert "Queue runs: 2 added, 0 failed, 0 skipped" in cli_harness.console.text
+
+
 def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):
     """Queue runs are opt-in; the default command only migrates the queue config."""
 

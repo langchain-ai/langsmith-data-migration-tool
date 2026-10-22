@@ -10,11 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.0.91] - 2026-10-22
 
 ### Added
-- **Annotation queue runs**: `queues --include-runs` and
-  `migrate-all --include-queue-runs` add each queue's runs to the destination
-  queue. Runs must already exist there with their source IDs; review progress
-  is not copied. A queue whose runs fail to copy stays blocked for `resume`.
-- **`queues --all-workspaces`**: pair every workspace by ID without prompting.
+- **`queues --byoc-migration`**: pairs every workspace by ID and links each
+  queue's runs to the destination queue without prompting; run it after the
+  trace storage migration. Review progress is not copied, and a queue whose
+  runs fail to link stays blocked for `resume`. The underlying
+  `--all-workspaces` / `--include-runs` flags (and
+  `migrate-all --include-queue-runs`) are also available.
 
 ### Fixed
 - **Org-scoped keys on BYOC destinations**: a bare `403 Forbidden` from

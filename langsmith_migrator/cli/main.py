@@ -2471,16 +2471,32 @@ def _select_resume_session(config: Config, state_manager: StateManager):
     help="Migrate every source workspace into the destination workspace with the same ID, "
     "without prompting",
 )
+@click.option(
+    "--byoc-migration",
+    is_flag=True,
+    help="Self-hosted to BYOC profile: implies --non-interactive, --all-workspaces and "
+    "--include-runs. Run it after the trace storage migration so the runs exist.",
+)
 @workspace_options
 @click.pass_context
 def queues(
-    ctx, include_runs, all_workspaces, source_workspace, dest_workspace, map_workspaces
+    ctx,
+    include_runs,
+    all_workspaces,
+    byoc_migration,
+    source_workspace,
+    dest_workspace,
+    map_workspaces,
 ):
     """Migrate annotation queues."""
     config = ctx.obj["config"]
     state_manager = ctx.obj["state_manager"]
 
     display_banner()
+
+    if byoc_migration:
+        _apply_byoc_migration_profile(config)
+        all_workspaces = include_runs = True
 
     if not ensure_config(config):
         return
