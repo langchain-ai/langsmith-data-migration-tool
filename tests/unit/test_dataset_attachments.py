@@ -162,3 +162,53 @@ def test_destination_sdk_client_is_scoped_to_the_destination_workspace(migrator,
     migrator.create_examples_with_attachments("dataset-123", [])
 
     assert captured_kwargs["workspace_id"] == DEST_WORKSPACE
+
+
+SOURCE_CREATED_AT = "2025-03-04T05:06:07.123456+00:00"
+
+
+def _example_with_attachment(tmp_path):
+    attachment = tmp_path / "notes.txt"
+    attachment.write_bytes(b"hello")
+    return (
+        "source-example",
+        {"id": "source-example", "inputs": {"q": 1}, "created_at": SOURCE_CREATED_AT},
+        {"attachment.notes": ("text/plain", str(attachment), "notes.txt")},
+    )
+
+
+def test_sdk_path_keeps_the_source_created_at(migrator, monkeypatch, tmp_path):
+    """Experiments read examples as of their run time, so the first version needs the source timestamp."""
+    sent = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def create_examples(self, dataset_id, examples):
+            sent.extend(examples)
+            return {"example_ids": ["source-example"]}
+
+    monkeypatch.setattr("langsmith.Client", FakeClient)
+
+    migrator.create_examples_with_attachments("dataset-123", [_example_with_attachment(tmp_path)])
+
+    assert sent[0]["created_at"] == SOURCE_CREATED_AT
+
+
+def test_fallback_path_keeps_the_source_created_at(migrator, monkeypatch, tmp_path):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def create_examples(self, dataset_id, examples):
+            raise Exception("405 Not Allowed")
+
+    monkeypatch.setattr("langsmith.Client", FakeClient)
+    migrator.dest.post.return_value = {"id": "source-example"}
+
+    migrator.create_examples_with_attachments("dataset-123", [_example_with_attachment(tmp_path)])
+
+    path, payload = migrator.dest.post.call_args_list[0].args
+    assert path == "/examples"
+    assert payload["created_at"] == SOURCE_CREATED_AT

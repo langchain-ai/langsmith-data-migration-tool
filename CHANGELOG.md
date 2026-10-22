@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Empty experiment tables after migration**: examples with attachments were
+  created with the migration time instead of the source `created_at`, so
+  experiments, which read examples as of their run time, showed no rows. Both
+  attachment paths now keep the source `created_at`.
+
 ## [0.0.90] - 2026-10-21
 
 ### Fixed
