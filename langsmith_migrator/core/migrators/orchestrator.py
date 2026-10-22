@@ -904,6 +904,43 @@ class MigrationOrchestrator:
                 elif item.type == "queue":
                     queue_payload = item.metadata.get("queue") or queue_migrator.get_queue(item.source_id)
                     destination_id = queue_migrator.create_queue(queue_payload)
+                    run_result = None
+                    if item.metadata.get("include_runs") and destination_id:
+                        run_result = queue_migrator.migrate_queue_runs(
+                            item.source_id,
+                            destination_id,
+                            session_id_map=dict(item.metadata.get("project_id_map") or {}),
+                        )
+                        self.state.update_item_checkpoint(
+                            item.id, metadata={"queue_runs": run_result}
+                        )
+                    if run_result and (run_result.get("failed") or run_result.get("error")):
+                        error = (
+                            f"{run_result.get('failed', 0)} of {run_result.get('total', 0)} "
+                            "queue run(s) could not be added to the destination queue"
+                        )
+                        self.state.update_item_status(
+                            item.id,
+                            MigrationStatus.FAILED,
+                            destination_id=destination_id,
+                            error=error,
+                            stage="queue_runs",
+                        )
+                        self.state.mark_terminal(
+                            item.id,
+                            ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+                            "queue_runs_incomplete",
+                            verification_state=VerificationState.BLOCKED,
+                            next_action=(
+                                "Ensure the runs exist on the destination with their source "
+                                "IDs, then run `langsmith-migrator resume` again."
+                            ),
+                            evidence={"destination_id": destination_id, "queue_runs": run_result},
+                            error=error,
+                        )
+                        results["blocked"].append(f"{item.type}:{item.source_id}")
+                        self.state_manager.save()
+                        continue
                     self.state.update_item_status(
                         item.id,
                         MigrationStatus.COMPLETED,

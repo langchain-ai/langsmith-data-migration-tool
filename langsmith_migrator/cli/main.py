@@ -945,6 +945,64 @@ def _migrate_queue_runs_for_item(
         return {"total": 0, "added": 0, "skipped": 0, "failed": 0, "errors": [], "error": str(e)}
 
 
+def _queue_runs_incomplete(run_result: dict | None) -> bool:
+    """True when a queue-run copy must be retried (failed runs or a listing error)."""
+    if not run_result:
+        return False
+    return bool(run_result.get("failed")) or bool(run_result.get("error"))
+
+
+def _queue_runs_error_message(run_result: dict) -> str:
+    if run_result.get("error"):
+        return f"Queue runs could not be copied: {run_result['error']}"
+    return (
+        f"{run_result.get('failed', 0)} of {run_result.get('total', 0)} queue run(s) "
+        "could not be added to the destination queue"
+    )
+
+
+def _finish_queue_state_item(orchestrator, item_id, dest_queue_id, run_result) -> None:
+    """Mark a queue item completed, or blocked when its run copy is incomplete.
+
+    The destination queue ID is kept either way so a resume reuses the queue
+    and only redoes the run copy.
+    """
+    if not _queue_runs_incomplete(run_result):
+        _mark_state_item_completed(
+            orchestrator,
+            item_id,
+            destination_id=dest_queue_id,
+            metadata={"queue_runs": run_result} if run_result else None,
+        )
+        return
+    if not orchestrator.state:
+        return
+    error = _queue_runs_error_message(run_result)
+    orchestrator.state.update_item_status(
+        item_id,
+        MigrationStatus.FAILED,
+        destination_id=dest_queue_id,
+        error=error,
+        stage="queue_runs",
+    )
+    orchestrator.state.update_item_checkpoint(item_id, metadata={"queue_runs": run_result})
+    item = orchestrator.state.get_item(item_id)
+    if item and not item.terminal_state:
+        orchestrator.state.mark_terminal(
+            item_id,
+            ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+            "queue_runs_incomplete",
+            verification_state=VerificationState.BLOCKED,
+            next_action=(
+                "Ensure the runs exist on the destination with their source IDs, "
+                "then run `langsmith-migrator resume` to retry the queue run copy."
+            ),
+            evidence={"destination_id": dest_queue_id, "queue_runs": run_result},
+            error=error,
+        )
+    orchestrator.state_manager.save()
+
+
 def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> None:
     """Print the aggregated queue-run summary and per-queue failures."""
     if not queue_run_results:
@@ -2521,12 +2579,7 @@ def queues(
                         )
                         if run_result is not None:
                             queue_run_results.append((queue["name"], run_result))
-                    _mark_state_item_completed(
-                        orchestrator,
-                        item_id,
-                        destination_id=new_id,
-                        metadata={"queue_runs": run_result} if run_result else None,
-                    )
+                    _finish_queue_state_item(orchestrator, item_id, new_id, run_result)
                 except Exception as e:
                     failed_items.append((queue["name"], str(e)))
                     _mark_state_item_failed(orchestrator, item_id, e)
@@ -4646,7 +4699,11 @@ def _migrate_all_for_workspace(
                             "queue",
                             queue["id"],
                             queue["name"],
-                            metadata={"queue": queue, "include_runs": include_queue_runs},
+                            metadata={
+                                "queue": queue,
+                                "include_runs": include_queue_runs,
+                                "project_id_map": dict(project_id_map or {}),
+                            },
                         )
                         try:
                             _mark_state_item_started(orchestrator, item_id)
@@ -4663,12 +4720,7 @@ def _migrate_all_for_workspace(
                                 )
                                 if run_result is not None:
                                     queue_run_results.append((queue["name"], run_result))
-                            _mark_state_item_completed(
-                                orchestrator,
-                                item_id,
-                                destination_id=new_id,
-                                metadata={"queue_runs": run_result} if run_result else None,
-                            )
+                            _finish_queue_state_item(orchestrator, item_id, new_id, run_result)
                         except Exception as e:
                             failed_items.append((queue["name"], str(e)))
                             _mark_state_item_failed(orchestrator, item_id, e)

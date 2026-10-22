@@ -850,3 +850,111 @@ def test_resume_items_blocks_chart_when_stale_context_cannot_resolve_destination
     assert chart_item.terminal_state == ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value
     assert chart_item.outcome_code == "chart_resume_context_changed"
     assert "fresh `langsmith-migrator charts` run" in chart_item.next_action
+
+
+def _patch_resume_migrators(monkeypatch, queue_migrator):
+    clients = [_FakeClient(), _FakeClient()]
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.EnhancedAPIClient",
+        lambda **kwargs: clients.pop(0),
+    )
+    for target in (
+        "langsmith_migrator.core.migrators.chart.ChartMigrator",
+        "langsmith_migrator.core.migrators.prompt.PromptMigrator",
+        "langsmith_migrator.core.migrators.rules.RulesMigrator",
+        "langsmith_migrator.core.migrators.orchestrator.ExperimentMigrator",
+        "langsmith_migrator.core.migrators.orchestrator.FeedbackMigrator",
+    ):
+        monkeypatch.setattr(target, lambda *args, **kwargs: Mock())
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.annotation_queue.AnnotationQueueMigrator",
+        lambda *args, **kwargs: queue_migrator,
+    )
+
+
+def _queue_item(include_runs=True, project_id_map=None):
+    return MigrationItem(
+        id="queue_default_queue-1",
+        type="queue",
+        name="Queue One",
+        source_id="queue-1",
+        status=MigrationStatus.FAILED,
+        metadata={
+            "queue": {"id": "queue-1", "name": "Queue One"},
+            "include_runs": include_runs,
+            "project_id_map": project_id_map or {},
+        },
+    )
+
+
+def test_resume_items_copies_queue_runs_when_requested(
+    monkeypatch, sample_config, migration_state, tmp_path
+):
+    """Resume should redo the queue run copy recorded in the item metadata."""
+
+    queue_migrator = Mock()
+    queue_migrator.create_queue.return_value = "dest-queue-1"
+    queue_migrator.migrate_queue_runs.return_value = {
+        "total": 2, "added": 2, "skipped": 0, "failed": 0, "errors": [],
+    }
+    _patch_resume_migrators(monkeypatch, queue_migrator)
+
+    orchestrator = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
+    orchestrator.state = migration_state
+    item = _queue_item(project_id_map={"src-proj": "dst-proj"})
+    migration_state.add_item(item)
+
+    results = orchestrator.resume_items([item])
+
+    assert results["resumed"] == ["queue:queue-1"]
+    queue_migrator.migrate_queue_runs.assert_called_once_with(
+        "queue-1", "dest-queue-1", session_id_map={"src-proj": "dst-proj"}
+    )
+    stored = migration_state.get_item(item.id)
+    assert stored.status == MigrationStatus.COMPLETED
+    assert stored.destination_id == "dest-queue-1"
+    assert stored.metadata["queue_runs"]["added"] == 2
+
+
+def test_resume_items_blocks_queue_when_run_copy_incomplete(
+    monkeypatch, sample_config, migration_state, tmp_path
+):
+    """Failed run copies keep the queue blocked for another resume, with the dest ID kept."""
+
+    queue_migrator = Mock()
+    queue_migrator.create_queue.return_value = "dest-queue-1"
+    queue_migrator.migrate_queue_runs.return_value = {
+        "total": 2, "added": 1, "skipped": 0, "failed": 1, "errors": [("run-2", "missing")],
+    }
+    _patch_resume_migrators(monkeypatch, queue_migrator)
+
+    orchestrator = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
+    orchestrator.state = migration_state
+    item = _queue_item()
+    migration_state.add_item(item)
+
+    results = orchestrator.resume_items([item])
+
+    assert results["blocked"] == ["queue:queue-1"]
+    stored = migration_state.get_item(item.id)
+    assert stored.terminal_state == ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value
+    assert stored.status != MigrationStatus.COMPLETED
+    assert stored.destination_id == "dest-queue-1"
+
+
+def test_resume_items_skips_queue_runs_when_not_requested(
+    monkeypatch, sample_config, migration_state, tmp_path
+):
+    queue_migrator = Mock()
+    queue_migrator.create_queue.return_value = "dest-queue-1"
+    _patch_resume_migrators(monkeypatch, queue_migrator)
+
+    orchestrator = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
+    orchestrator.state = migration_state
+    item = _queue_item(include_runs=False)
+    migration_state.add_item(item)
+
+    results = orchestrator.resume_items([item])
+
+    assert results["resumed"] == ["queue:queue-1"]
+    queue_migrator.migrate_queue_runs.assert_not_called()

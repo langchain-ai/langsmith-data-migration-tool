@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Annotation queue runs**: `queues --include-runs` and
   `migrate-all --include-queue-runs` add each queue's runs to the destination
   queue. Runs must already exist there with their source IDs; review progress
-  is not copied.
+  is not copied. A queue whose runs fail to copy stays blocked for `resume`.
 - **`queues --all-workspaces`**: pair every workspace by ID without prompting.
 
 ### Fixed

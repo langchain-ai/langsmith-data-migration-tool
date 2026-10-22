@@ -3,6 +3,7 @@
 from typing import Any, Dict, Iterator, List, Optional
 
 from ..api_client import APIError, NotFoundError
+from ...utils.pagination import PaginationHelper
 from .base import BaseMigrator
 
 QUEUE_RUNS_BATCH_SIZE = 100
@@ -111,12 +112,35 @@ class AnnotationQueueMigrator(BaseMigrator):
     # ------------------------------------------------------------------
 
     def iter_queue_runs(self, queue_id: str) -> Iterator[Dict[str, Any]]:
-        """Yield the runs currently in a source annotation queue, one page at a time."""
-        for run in self.source.get_paginated(
-            f"/annotation-queues/{queue_id}/runs", page_size=QUEUE_RUNS_BATCH_SIZE
-        ):
-            if isinstance(run, dict):
+        """Yield the runs currently in a source annotation queue, one page at a time.
+
+        Pages with offset/limit directly instead of ``get_paginated`` so a
+        failed page (permission error, exhausted retries) raises rather than
+        looking like the end of the queue.
+        """
+        endpoint = f"/annotation-queues/{queue_id}/runs"
+        page_size = QUEUE_RUNS_BATCH_SIZE
+        offset = 0
+        seen: set = set()
+        while True:
+            response = self.source.get(endpoint, {"limit": page_size, "offset": offset})
+            items = PaginationHelper._extract_items(response)
+            if not items:
+                return
+            new_items = 0
+            for run in items:
+                if not isinstance(run, dict):
+                    continue
+                run_id = run.get("id") or run.get("run_id")
+                if run_id and run_id in seen:
+                    continue
+                if run_id:
+                    seen.add(run_id)
+                new_items += 1
                 yield run
+            if new_items == 0 or len(items) < page_size:
+                return
+            offset += len(items)
 
     def list_queue_runs(self, queue_id: str) -> List[Dict[str, Any]]:
         """List the runs currently in a source annotation queue."""

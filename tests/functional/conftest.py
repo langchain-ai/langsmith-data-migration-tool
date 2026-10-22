@@ -195,7 +195,13 @@ class FakeOrchestratorInstance:
                 )
                 results["resumed"].append(f"prompt:{item.source_id}")
             elif item.type == "queue":
-                self.migrators.queue.create_queue(item.metadata.get("queue"))
+                dest_id = self.migrators.queue.create_queue(item.metadata.get("queue"))
+                if item.metadata.get("include_runs"):
+                    self.migrators.queue.migrate_queue_runs(
+                        item.source_id,
+                        dest_id,
+                        session_id_map=dict(item.metadata.get("project_id_map") or {}),
+                    )
                 results["resumed"].append(f"queue:{item.source_id}")
             elif item.type == "rule":
                 self.migrators.rules._project_id_map = dict(

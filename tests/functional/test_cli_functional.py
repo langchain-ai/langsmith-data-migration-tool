@@ -2094,6 +2094,50 @@ def test_queues_command_include_runs_copies_runs_and_reports(cli_harness):
     )
     assert "Queues: 1 migrated, 0 failed" in cli_harness.console.text
     assert "Queue runs: 2 added, 1 failed, 0 skipped" in cli_harness.console.text
+    # A failed run copy blocks the item for resume but keeps the destination queue.
+    item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
+    assert item.terminal_state == ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value
+    assert item.status != MigrationStatus.COMPLETED
+    assert item.destination_id == "new-queue-1"
+    assert item.metadata["queue_runs"]["failed"] == 1
+
+
+def test_queues_command_include_runs_marks_complete_when_all_runs_added(cli_harness):
+    """A clean run copy completes the item and records the counts."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 2, "added": 2, "skipped": 0, "failed": 0, "errors": [],
+    }
+
+    result = cli_harness.invoke(["--non-interactive", "queues", "--include-runs"])
+
+    assert result.exit_code == 0
+    item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
+    assert item.status == MigrationStatus.COMPLETED
+    assert item.metadata["queue_runs"]["added"] == 2
+
+
+def test_queues_command_non_interactive_exits_2_when_run_copy_incomplete(cli_harness):
+    """Non-interactive runs must not report success when queue runs failed to copy."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.side_effect = Exception("forbidden")
+
+    result = cli_harness.invoke(["--non-interactive", "queues", "--include-runs"])
+
+    assert result.exit_code == 2
+    item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
+    assert item.terminal_state == ResolutionOutcome.BLOCKED_WITH_CHECKPOINT.value
+    assert item.status != MigrationStatus.COMPLETED
+    assert item.destination_id == "new-queue-1"
+    assert "forbidden" in (item.error or "")
 
 
 def test_queues_command_all_workspaces_pairs_every_workspace_by_id(cli_harness, monkeypatch):
