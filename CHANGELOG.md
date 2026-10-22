@@ -11,34 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Annotation queue runs**: `queues --include-runs` and
-  `migrate-all --include-queue-runs` copy each source queue's queued runs
-  into the destination queue after the queue itself is created. Runs are
-  listed with `GET /annotation-queues/{id}/runs` and added with
-  `POST /annotation-queues/{id}/runs/by-key` (`run_id`, `session_id`,
-  `start_time`), falling back to the plain run-ID endpoint on servers
-  without `by-key`. A rejected batch is replayed per run so one missing run
-  does not block the rest. Runs must already exist on the destination with
-  their source IDs (e.g. after a trace storage migration); review progress
-  (reviewed / done / per-reviewer cursor) is not exposed by the API and is
-  not copied. Counts are stored on the queue's state item.
-- **`queues --all-workspaces`**: pair every source workspace with the
-  destination workspace of the same ID without prompting, as `datasets`
-  already does, so all annotation queues can be migrated in one
-  non-interactive run.
+  `migrate-all --include-queue-runs` add each source queue's runs to the
+  destination queue by run key (`POST /annotation-queues/{id}/runs/by-key`,
+  with a run-ID fallback and per-run replay of a rejected batch). Runs must
+  already exist on the destination with their source IDs; review progress
+  is not copied.
+- **`queues --all-workspaces`**: pair every workspace by ID without
+  prompting, as `datasets` already does.
 
 ### Fixed
-- **Org-scoped keys rejected by BYOC destinations**: the connection check
-  only fell back to workspace discovery when the `/datasets` 403 body said
-  the key was org-scoped and needed `X-Tenant-ID`. BYOC deployments return a
-  bare `403 Forbidden` for the same case, so `test` and every migration
-  command failed with "Destination connection failed". Any 403 from the
-  datasets probe without a tenant header now verifies the key against the
-  authenticated workspace endpoints; the original 403 is still reported
-  when that check fails too.
-- **Empty experiment tables after migration**: examples with attachments were
-  created with the migration time instead of the source `created_at`, so
-  experiments, which read examples as of their run time, showed no rows. Both
-  attachment paths now keep the source `created_at`.
+- **Org-scoped keys on BYOC destinations**: a bare `403 Forbidden` from the
+  `/datasets` probe now falls back to the authenticated workspace check
+  instead of failing the connection.
+- **Empty experiment tables**: examples with attachments keep their source
+  `created_at`, so experiments that read examples as of their run time show
+  rows again.
 
 ## [0.0.90] - 2026-10-21
 
