@@ -1,8 +1,11 @@
 """Annotation queue migration logic."""
 
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
+from ..api_client import APIError, NotFoundError
 from .base import BaseMigrator
+
+QUEUE_RUNS_BATCH_SIZE = 100
 
 
 class AnnotationQueueMigrator(BaseMigrator):
@@ -102,3 +105,132 @@ class AnnotationQueueMigrator(BaseMigrator):
             raise APIError(f"Invalid response creating queue: missing 'id' field. Response: {response}")
 
         return response["id"]
+
+    # ------------------------------------------------------------------
+    # Queue items (runs)
+    # ------------------------------------------------------------------
+
+    def iter_queue_runs(self, queue_id: str) -> Iterator[Dict[str, Any]]:
+        """Yield the runs currently in a source annotation queue, one page at a time."""
+        for run in self.source.get_paginated(
+            f"/annotation-queues/{queue_id}/runs", page_size=QUEUE_RUNS_BATCH_SIZE
+        ):
+            if isinstance(run, dict):
+                yield run
+
+    def list_queue_runs(self, queue_id: str) -> List[Dict[str, Any]]:
+        """List the runs currently in a source annotation queue."""
+        return list(self.iter_queue_runs(queue_id))
+
+    @staticmethod
+    def _run_key(
+        run: Dict[str, Any], session_id_map: Optional[Dict[str, str]]
+    ) -> Optional[Dict[str, str]]:
+        """Build the by-key payload for one queue run, or None when a field is missing."""
+        run_id = run.get("id") or run.get("run_id")
+        session_id = run.get("session_id")
+        start_time = run.get("start_time")
+        if not (run_id and session_id and start_time):
+            return None
+        if session_id_map:
+            session_id = session_id_map.get(str(session_id), session_id)
+        if hasattr(start_time, "isoformat"):
+            start_time = start_time.isoformat()
+        return {
+            "run_id": str(run_id),
+            "session_id": str(session_id),
+            "start_time": str(start_time),
+        }
+
+    def _add_runs_to_queue(self, dest_queue_id: str, keys: List[Dict[str, str]]) -> None:
+        """Add runs to a destination queue, preferring the keyed endpoint.
+
+        `/runs/by-key` locates runs by their partition key (required on SmithDB
+        workspaces). Older servers answer 404 for it, so fall back to the plain
+        run-id list endpoint.
+        """
+        try:
+            self.dest.post(f"/annotation-queues/{dest_queue_id}/runs/by-key", keys)
+        except NotFoundError as e:
+            if "by-key" not in str(e):
+                raise
+            self.dest.post(
+                f"/annotation-queues/{dest_queue_id}/runs", [k["run_id"] for k in keys]
+            )
+
+    def migrate_queue_runs(
+        self,
+        source_queue_id: str,
+        dest_queue_id: str,
+        session_id_map: Optional[Dict[str, str]] = None,
+        batch_size: int = QUEUE_RUNS_BATCH_SIZE,
+    ) -> Dict[str, Any]:
+        """Copy the runs queued in a source queue into the destination queue.
+
+        Runs are addressed by ID, so this only works when the runs already exist
+        on the destination with their source IDs (for example after a trace
+        storage migration). Review progress (reviewed / done / reviewer cursors)
+        is not exposed by the API and is not copied.
+
+        Returns counts: ``total`` runs listed, ``added``, ``skipped`` (missing key
+        fields), ``failed``, and ``errors`` as ``(run_id, message)`` pairs.
+        """
+        batch_size = max(1, min(batch_size, QUEUE_RUNS_BATCH_SIZE))
+        result: Dict[str, Any] = {
+            "total": 0, "added": 0, "skipped": 0, "failed": 0, "errors": [],
+        }
+        dry_run = self.config.migration.dry_run
+
+        batch: List[Dict[str, str]] = []
+
+        def flush() -> None:
+            if not batch:
+                return
+            keys = list(batch)
+            batch.clear()
+            if dry_run:
+                result["added"] += len(keys)
+                return
+            try:
+                self._add_runs_to_queue(dest_queue_id, keys)
+                result["added"] += len(keys)
+                return
+            except APIError as batch_error:
+                self.log(
+                    f"Batch of {len(keys)} queue run(s) rejected ({batch_error}); "
+                    "retrying one by one",
+                    "warning",
+                )
+            for key in keys:
+                try:
+                    self._add_runs_to_queue(dest_queue_id, [key])
+                    result["added"] += 1
+                except APIError as run_error:
+                    result["failed"] += 1
+                    result["errors"].append((key["run_id"], str(run_error)))
+
+        for run in self.iter_queue_runs(source_queue_id):
+            result["total"] += 1
+            key = self._run_key(run, session_id_map)
+            if key is None:
+                result["skipped"] += 1
+                result["errors"].append(
+                    (str(run.get("id") or run.get("run_id") or "?"), "missing run key fields")
+                )
+                continue
+            batch.append(key)
+            if len(batch) >= batch_size:
+                flush()
+        flush()
+
+        if dry_run:
+            self.log(
+                f"[DRY RUN] Would add {result['added']} run(s) to queue {dest_queue_id}"
+            )
+        else:
+            self.log(
+                f"Queue {dest_queue_id}: {result['added']} run(s) added, "
+                f"{result['failed']} failed, {result['skipped']} skipped",
+                "success" if not result["failed"] else "warning",
+            )
+        return result

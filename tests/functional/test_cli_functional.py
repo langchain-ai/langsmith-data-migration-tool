@@ -2071,6 +2071,63 @@ def test_queues_command_migrates_selected_queues_and_reports_failures(cli_harnes
     assert "Queues: 1 migrated, 1 failed" in cli_harness.console.text
 
 
+def test_queues_command_include_runs_copies_runs_and_reports(cli_harness):
+    """--include-runs should add each migrated queue's runs and summarize the result."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 3,
+        "added": 2,
+        "skipped": 0,
+        "failed": 1,
+        "errors": [("run-3", "not found")],
+    }
+
+    result = cli_harness.invoke(["queues", "--include-runs"])
+
+    assert result.exit_code == 0
+    cli_harness.migrators.queue.migrate_queue_runs.assert_called_once_with(
+        "queue-1", "new-queue-1", session_id_map=None
+    )
+    assert "Queues: 1 migrated, 0 failed" in cli_harness.console.text
+    assert "Queue runs: 2 added, 1 failed, 0 skipped" in cli_harness.console.text
+
+
+def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):
+    """Queue runs are opt-in; the default command only migrates the queue config."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+
+    result = cli_harness.invoke(["queues"])
+
+    assert result.exit_code == 0
+    cli_harness.migrators.queue.migrate_queue_runs.assert_not_called()
+    assert "Queue runs:" not in cli_harness.console.text
+
+
+def test_queues_command_include_runs_survives_listing_failure(cli_harness):
+    """A queue whose runs cannot be copied still counts as migrated."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.side_effect = Exception("runs listing failed")
+
+    result = cli_harness.invoke(["queues", "--include-runs"])
+
+    assert result.exit_code == 0
+    assert "Queues: 1 migrated, 0 failed" in cli_harness.console.text
+    assert "1 queue(s) could not be listed" in cli_harness.console.text
+    assert "runs listing failed" in cli_harness.console.text
+
+
 def test_list_projects_requires_a_target_side(cli_harness):
     """The list-projects helper should demand --source or --dest."""
 

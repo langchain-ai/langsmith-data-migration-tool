@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Annotation queue runs**: `queues --include-runs` and
+  `migrate-all --include-queue-runs` copy each source queue's queued runs
+  into the destination queue after the queue itself is created. Runs are
+  listed with `GET /annotation-queues/{id}/runs` and added with
+  `POST /annotation-queues/{id}/runs/by-key` (`run_id`, `session_id`,
+  `start_time`), falling back to the plain run-ID endpoint on servers
+  without `by-key`. A rejected batch is replayed per run so one missing run
+  does not block the rest. Runs must already exist on the destination with
+  their source IDs (e.g. after a trace storage migration); review progress
+  (reviewed / done / per-reviewer cursor) is not exposed by the API and is
+  not copied. Counts are stored on the queue's state item.
+
 ### Fixed
 - **Org-scoped keys rejected by BYOC destinations**: the connection check
   only fell back to workspace discovery when the `/datasets` 403 body said

@@ -302,6 +302,7 @@ langsmith-migrator datasets --include-experiments  # With experiments, runs, and
 
 # Annotation queues
 langsmith-migrator queues
+langsmith-migrator queues --include-runs       # Also copy the runs queued in each queue
 
 # Prompts
 langsmith-migrator prompts
@@ -612,6 +613,7 @@ The prompt default is `No` (rules are created disabled).
 --skip-rules            Skip rules migration
 --skip-charts           Skip chart migration
 --include-all-commits   Include all prompt commit history
+--include-queue-runs    Also copy the runs queued in each annotation queue
 --strip-projects        Strip project associations from rules
 --map-projects          Launch interactive TUI to map source projects to destination projects
 --project-mapping TEXT  JSON string or file path with project ID mapping (headless, no TUI; mutually exclusive with --map-projects)
@@ -844,6 +846,7 @@ Rules and charts reference projects by ID. When migrating between instances, pro
 
 - **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, `issues`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input, and pressing `Enter` on a unique suggestion records the destination project ID used by downstream chart/rule validation. Supports auto-match by name, skip, and custom name entry. For ID-based chart/rule remapping, unresolved text entries remain unmapped instead of being counted as resolved.
 - **Headless mapping (`--project-mapping`)**: Available on `rules`, `charts`, and `migrate-all`. Supply an explicit source->destination project ID mapping as a JSON string or a file path (e.g. `'{"<source-project-id>": "<dest-project-id>"}'`). Use `list-projects --source` and `list-projects --dest` to get IDs. This runs the mapping with no interactive TUI, so the migration can be driven from a backend/CI onboarding job. For `rules`, the mapping is applied to both top-level project associations and project IDs embedded inside rule filters. Mutually exclusive with `--map-projects`.
+- **Annotation queue runs**: `queues --include-runs` (or `migrate-all --include-queue-runs`) lists each source queue's runs and adds them to the destination queue by run key (`run_id`, `session_id`, `start_time`). The runs themselves are not migrated by this step: they must already exist on the destination with their source IDs, for example after a trace storage (SmithDB) migration, so run this after that migration. A rejected batch is retried one run at a time and failures are reported per run. Each run's review progress in the queue (reviewed, done, per-reviewer cursor) cannot be set through the API and is not copied; the annotations themselves are feedback and travel with the runs.
 - **Rules queue targets**: When a rule references an annotation queue, the migrator first reuses any saved queue migration mapping, then falls back to an exact-name queue match in the destination workspace. If neither is safe, the rule is exported for remediation instead of being posted with the source queue ID.
 - **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination. When both sides point at the same deployment URL but use different API keys/workspaces, charts still remap project/session IDs; the tool does not treat that as `--same-instance`. Workspace-scoped `--map-projects` mappings are resolved against the active workspace pair so duplicate project names in other workspaces are ignored. Chart dependency validation also verifies that saved destination project IDs still exist before migration. Chart filters are normalized to the destination API's `session`/`session_id` project-scoping shape before create or update.
 - **`migrate-all`**: Supports `--strip-projects`, `--map-projects`, `--project-mapping` (headless JSON/file mapping applied to both rules and charts), and `--rules-create-enabled` for rules.
