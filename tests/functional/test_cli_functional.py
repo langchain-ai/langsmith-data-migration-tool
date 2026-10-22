@@ -2071,6 +2071,238 @@ def test_queues_command_migrates_selected_queues_and_reports_failures(cli_harnes
     assert "Queues: 1 migrated, 1 failed" in cli_harness.console.text
 
 
+def test_queues_command_include_runs_copies_runs_and_reports(cli_harness):
+    """--include-runs should add each migrated queue's runs and summarize the result."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 3,
+        "added": 2,
+        "skipped": 0,
+        "failed": 1,
+        "errors": [("run-3", "not found")],
+    }
+
+    result = cli_harness.invoke(["queues", "--include-runs"])
+
+    assert result.exit_code == 0
+    cli_harness.migrators.queue.migrate_queue_runs.assert_called_once_with(
+        "queue-1", "new-queue-1", session_id_map=None
+    )
+    assert "Queues: 1 migrated, 0 failed" in cli_harness.console.text
+    assert "Queue runs: 2 added, 1 failed, 0 skipped" in cli_harness.console.text
+    # A failed run copy leaves the item retryable (failed, no terminal state)
+    # with the destination queue kept, so `resume` redoes only the run copy.
+    item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
+    assert item.status == MigrationStatus.FAILED
+    assert item.terminal_state is None
+    assert item.stage == "queue_runs"
+    assert item.destination_id == "new-queue-1"
+    assert item.metadata["queue_runs"]["failed"] == 1
+    assert item in cli_harness.orchestrator_factory.state.get_resume_items()
+
+
+def test_queues_command_include_runs_marks_complete_when_all_runs_added(cli_harness):
+    """A clean run copy completes the item and records the counts."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 2, "added": 2, "skipped": 0, "failed": 0, "errors": [],
+    }
+
+    result = cli_harness.invoke(["--non-interactive", "queues", "--include-runs"])
+
+    assert result.exit_code == 0
+    item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
+    assert item.status == MigrationStatus.COMPLETED
+    assert item.metadata["queue_runs"]["added"] == 2
+
+
+def test_queues_command_non_interactive_exits_2_when_run_copy_incomplete(cli_harness):
+    """Non-interactive runs must not report success when queue runs failed to copy."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.side_effect = Exception("forbidden")
+
+    result = cli_harness.invoke(["--non-interactive", "queues", "--include-runs"])
+
+    assert result.exit_code == 2
+    assert "Retryable with resume: 1" in cli_harness.console.text
+    item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
+    assert item.status == MigrationStatus.FAILED
+    assert item.terminal_state is None
+    assert item.destination_id == "new-queue-1"
+    assert "forbidden" in (item.error or "")
+    assert item in cli_harness.orchestrator_factory.state.get_resume_items()
+
+
+def test_queues_command_skipped_runs_record_verified_downgrade(cli_harness):
+    """Runs without key fields cannot be linked; the queue is a verified downgrade, not a success."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 2, "added": 0, "skipped": 2, "failed": 0,
+        "errors": [("run-1", "missing run key fields"), ("run-2", "missing run key fields")],
+    }
+
+    result = cli_harness.invoke(["--non-interactive", "queues", "--include-runs"])
+
+    assert result.exit_code == 0
+    item = cli_harness.orchestrator_factory.state.items["queue_default_queue-1"]
+    assert item.status == MigrationStatus.COMPLETED
+    assert item.terminal_state == ResolutionOutcome.MIGRATED_WITH_VERIFIED_DOWNGRADE.value
+    assert item.outcome_code == "queue_runs_skipped"
+    assert "Verified downgrade: 1" in cli_harness.console.text
+
+
+def test_resume_command_selects_failed_queue_run_copies(cli_harness):
+    """A queue left failed at the queue_runs stage is picked up by the real resume selection."""
+
+    state = build_state("migration_resume_queue_runs")
+    state.add_item(
+        MigrationItem(
+            id="queue_default_queue-1",
+            type="queue",
+            name="Queue One",
+            source_id="queue-1",
+            destination_id="dest-queue-1",
+            status=MigrationStatus.FAILED,
+            stage="queue_runs",
+            error="1 of 2 queue run(s) could not be linked to the destination queue",
+            metadata={
+                "queue": {"id": "queue-1", "name": "Queue One"},
+                "include_runs": True,
+                "project_id_map": {},
+            },
+        )
+    )
+    save_session(cli_harness.state_manager, state)
+    cli_harness.console.inputs = ["1"]
+    cli_harness.controls.confirm_answers = [True]
+    cli_harness.migrators.queue.create_queue.return_value = "dest-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 2, "added": 2, "skipped": 0, "failed": 0, "errors": [],
+    }
+
+    result = cli_harness.invoke(["resume"])
+
+    assert result.exit_code == 0
+    assert "Resumable items: 1" in cli_harness.console.text
+    cli_harness.migrators.queue.migrate_queue_runs.assert_called_once_with(
+        "queue-1", "dest-queue-1", session_id_map={}
+    )
+
+
+def test_queues_command_all_workspaces_pairs_every_workspace_by_id(cli_harness, monkeypatch):
+    """--all-workspaces should resolve every workspace pair by ID and migrate each one."""
+    from langsmith_migrator.cli import main as cli_main
+    from langsmith_migrator.utils.workspace_resolver import WorkspaceProjectResult
+
+    seen_kwargs = {}
+
+    def fake_resolve(orchestrator, *args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return WorkspaceProjectResult(
+            workspace_mapping={"ws-a": "ws-a", "ws-b": "ws-b"},
+            project_mappings={},
+            workspaces_to_create=[],
+        )
+
+    monkeypatch.setattr(cli_main, "_resolve_workspaces", fake_resolve)
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+
+    result = cli_harness.invoke(["queues", "--all-workspaces"])
+
+    assert result.exit_code == 0
+    assert seen_kwargs["all_workspaces"] is True
+    assert cli_harness.migrators.queue.create_queue.call_count == 2
+    assert "Workspace: ws-a -> ws-a" in cli_harness.console.text
+    assert "Workspace: ws-b -> ws-b" in cli_harness.console.text
+
+
+def test_queues_command_byoc_migration_implies_all_workspaces_runs_and_no_prompts(
+    cli_harness, monkeypatch
+):
+    """--byoc-migration should pair workspaces by ID, copy runs, and never prompt."""
+    from langsmith_migrator.cli import main as cli_main
+    from langsmith_migrator.utils.workspace_resolver import WorkspaceProjectResult
+
+    seen_kwargs = {}
+
+    def fake_resolve(orchestrator, *args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return WorkspaceProjectResult(
+            workspace_mapping={"ws-a": "ws-a"}, project_mappings={}, workspaces_to_create=[]
+        )
+
+    monkeypatch.setattr(cli_main, "_resolve_workspaces", fake_resolve)
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+        {"id": "queue-2", "name": "Queue Two", "description": "Second"},
+    ]
+    cli_harness.migrators.queue.create_queue.side_effect = ["new-queue-1", "new-queue-2"]
+    cli_harness.migrators.queue.migrate_queue_runs.return_value = {
+        "total": 1, "added": 1, "skipped": 0, "failed": 0, "errors": [],
+    }
+
+    result = cli_harness.invoke(["queues", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert seen_kwargs["all_workspaces"] is True
+    assert seen_kwargs["non_interactive"] is True
+    # non-interactive selects every queue without the TUI
+    assert cli_harness.migrators.queue.create_queue.call_count == 2
+    assert cli_harness.migrators.queue.migrate_queue_runs.call_count == 2
+    assert "Queue runs: 2 added, 0 failed, 0 skipped" in cli_harness.console.text
+
+
+def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):
+    """Queue runs are opt-in; the default command only migrates the queue config."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+
+    result = cli_harness.invoke(["queues"])
+
+    assert result.exit_code == 0
+    cli_harness.migrators.queue.migrate_queue_runs.assert_not_called()
+    assert "Queue runs:" not in cli_harness.console.text
+
+
+def test_queues_command_include_runs_survives_listing_failure(cli_harness):
+    """A queue whose runs cannot be copied still counts as migrated."""
+
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+    cli_harness.migrators.queue.migrate_queue_runs.side_effect = Exception("runs listing failed")
+
+    result = cli_harness.invoke(["queues", "--include-runs"])
+
+    assert result.exit_code == 0
+    assert "Queues: 1 migrated, 0 failed" in cli_harness.console.text
+    assert "1 queue(s) could not be listed" in cli_harness.console.text
+    assert "runs listing failed" in cli_harness.console.text
+
+
 def test_list_projects_requires_a_target_side(cli_harness):
     """The list-projects helper should demand --source or --dest."""
 

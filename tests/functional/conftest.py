@@ -13,6 +13,7 @@ from click.testing import CliRunner
 
 from langsmith_migrator.cli import main as cli_main
 from langsmith_migrator.core import migrators as migrators_module
+from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
 from langsmith_migrator.utils.state import MigrationState, StateManager
 
 
@@ -151,6 +152,12 @@ class FakeOrchestratorInstance:
     def test_connections_detailed(self) -> tuple[bool, bool, str | None, str | None]:
         return self.test_connections_detailed_value
 
+    def record_queue_runs_outcome(self, item_id, destination_id, run_result):
+        # Real state bookkeeping; it only touches self.state / self.state_manager.
+        return MigrationOrchestrator.record_queue_runs_outcome(
+            self, item_id, destination_id, run_result
+        )
+
     def migrate_datasets_parallel(
         self,
         dataset_ids: list[str],
@@ -195,7 +202,13 @@ class FakeOrchestratorInstance:
                 )
                 results["resumed"].append(f"prompt:{item.source_id}")
             elif item.type == "queue":
-                self.migrators.queue.create_queue(item.metadata.get("queue"))
+                dest_id = self.migrators.queue.create_queue(item.metadata.get("queue"))
+                if item.metadata.get("include_runs"):
+                    self.migrators.queue.migrate_queue_runs(
+                        item.source_id,
+                        dest_id,
+                        session_id_map=dict(item.metadata.get("project_id_map") or {}),
+                    )
                 results["resumed"].append(f"queue:{item.source_id}")
             elif item.type == "rule":
                 self.migrators.rules._project_id_map = dict(

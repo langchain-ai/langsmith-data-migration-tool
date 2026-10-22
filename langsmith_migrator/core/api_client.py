@@ -683,14 +683,12 @@ class EnhancedAPIClient:
                 return True, None
             except AuthenticationError as e:
                 # Org keys are valid without a tenant, but dataset reads are not.
-                # Verify against an authenticated org endpoint before workspace
-                # discovery; never turn this rejection into a public health check.
-                if (
-                    e.status_code == 403
-                    and "org-scoped" in str(e).lower()
-                    and "x-tenant-id" in str(e).lower()
-                    and not self.session.headers.get("X-Tenant-Id")
-                ):
+                # Some deployments (e.g. BYOC) reject them with a bare 403
+                # "Forbidden" rather than the "org-scoped ... X-Tenant-ID"
+                # message, so any 403 without a tenant header is verified
+                # against an authenticated workspace endpoint. A public health
+                # check is never used as the success signal here.
+                if e.status_code == 403 and not self.session.headers.get("X-Tenant-Id"):
                     prefix = "" if has_api_version else "/api/v1"
                     for workspace_endpoint in ("/workspaces", "/orgs/current/workspaces"):
                         try:
@@ -699,10 +697,16 @@ class EnhancedAPIClient:
                         except NotFoundError:
                             continue
                         except Exception as workspace_error:
-                            return False, f"Workspace authentication check failed: {workspace_error}"
+                            return False, (
+                                f"Authentication failed: {e}. Workspace authentication "
+                                f"check also failed: {workspace_error}. Please verify "
+                                "your API key is correct, not expired, and has access "
+                                "to the destination workspace."
+                            )
                     return False, (
-                        "This org-scoped key requires a workspace, but workspace discovery "
-                        "is not supported by this server. Use a workspace-scoped key."
+                        f"Authentication failed: {e}. This key cannot read datasets "
+                        "without a workspace, and workspace discovery is not supported "
+                        "by this server. Use a workspace-scoped key."
                     )
                 # Auth errors won't be fixed by trying different endpoints
                 error_msg = (

@@ -6,7 +6,7 @@ A Python CLI for migrating users and roles, datasets, experiments, annotation qu
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.90-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.91-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -25,7 +25,7 @@ langsmith-migrator datasets
 - **Users & Roles**: Migrate custom roles, org members, and workspace memberships between instances
 - **Export Users to CSV**: Export active org and workspace members to a members CSV (`export-users`) that round-trips into the `users --members-csv` importer
 - **Single-Instance Access Sync**: Apply CSV-driven add/update or authoritative access sync to one LangSmith instance (`users --csv ... [--sync]`), including multi-row workspace role unionization for custom ABAC roles
-- **Datasets**: Migrate datasets with examples and file attachments. Attachment downloads are resolved against the source instance (so self-hosted/BYOC sources, which return relative download URLs, work correctly) and pinned to that host
+- **Datasets**: Migrate datasets with examples and file attachments. Attachment downloads are resolved against the source instance (so self-hosted/BYOC sources, which return relative download URLs, work correctly) and pinned to that host. Examples keep their source `created_at`, so migrated experiments, which read examples as of their run time, still show their rows
 - **Experiments**: Include experiments, runs, and feedback during dataset migration (`datasets --include-experiments`) or through `migrate-all`
 - **Annotation Queues**: Transfer queue configurations
 - **Project Rules**: Copy automation rules with project mapping and optional project creation in interactive flows
@@ -236,20 +236,20 @@ The destination's `POST /runs/batch` endpoint rejects runs with timestamps outsi
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.90-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.91-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.90-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.91-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.90-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.91-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.90-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.91-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -302,6 +302,7 @@ langsmith-migrator datasets --include-experiments  # With experiments, runs, and
 
 # Annotation queues
 langsmith-migrator queues
+langsmith-migrator queues --byoc-migration     # Self-hosted to BYOC: every workspace by ID, with queued runs, no prompts
 
 # Prompts
 langsmith-migrator prompts
@@ -567,9 +568,22 @@ does not revisit them. Older sessions retain their original behavior; rerun
 langsmith-migrator datasets --byoc-migration
 ```
 
+`queues --byoc-migration` is the matching step for annotation queues: it pairs
+every workspace by ID, migrates each queue, and links the queued runs to the
+destination queue without prompting. Run it after the trace storage migration so
+the runs exist on the destination:
+
+```bash
+langsmith-migrator queues --byoc-migration
+```
+
 Org-scoped API keys are supported: the connection check authenticates through
 workspace discovery, and dataset requests use the selected workspace's
 `X-Tenant-ID`. Keys still need access to the source and destination workspaces.
+Deployments that answer the initial `/datasets` probe with a bare `403
+Forbidden` (for example BYOC) are handled the same way: the key is verified
+against the authenticated workspace endpoints before the connection is
+reported as failed.
 
 ### Prompt Options
 
@@ -840,6 +854,7 @@ Rules and charts reference projects by ID. When migrating between instances, pro
 
 - **Interactive TUI (`--map-projects`)**: Launch a visual TUI to map source projects to destination projects. Available on `rules`, `charts`, `issues`, and `migrate-all` commands. Select a source project and type a destination name directly — existing projects appear as filterable suggestions below the input, and pressing `Enter` on a unique suggestion records the destination project ID used by downstream chart/rule validation. Supports auto-match by name, skip, and custom name entry. For ID-based chart/rule remapping, unresolved text entries remain unmapped instead of being counted as resolved.
 - **Headless mapping (`--project-mapping`)**: Available on `rules`, `charts`, and `migrate-all`. Supply an explicit source->destination project ID mapping as a JSON string or a file path (e.g. `'{"<source-project-id>": "<dest-project-id>"}'`). Use `list-projects --source` and `list-projects --dest` to get IDs. This runs the mapping with no interactive TUI, so the migration can be driven from a backend/CI onboarding job. For `rules`, the mapping is applied to both top-level project associations and project IDs embedded inside rule filters. Mutually exclusive with `--map-projects`.
+- **Annotation queue runs (BYOC)**: `queues --byoc-migration` lists each source queue's runs and links them to the destination queue by run key (`run_id`, `session_id`, `start_time`). The runs themselves are not migrated by this step: they arrive through the trace storage (SmithDB) migration with their source IDs, so run this after that migration. A rejected batch is retried one run at a time, failures are reported per run, and a queue with failed runs stays failed so `resume` retries the run linking (the destination queue is kept). Runs the source lists without a `session_id` or `start_time` cannot be linked; their queue is recorded as a verified downgrade. Each run's review progress in the queue (reviewed, done, per-reviewer cursor) cannot be set through the API and is not copied; the annotations themselves are feedback and travel with the runs.
 - **Rules queue targets**: When a rule references an annotation queue, the migrator first reuses any saved queue migration mapping, then falls back to an exact-name queue match in the destination workspace. If neither is safe, the rule is exported for remediation instead of being posted with the source queue ID.
 - **Charts**: Without `--map-projects`, project mapping is built automatically by matching project names between source and destination. When both sides point at the same deployment URL but use different API keys/workspaces, charts still remap project/session IDs; the tool does not treat that as `--same-instance`. Workspace-scoped `--map-projects` mappings are resolved against the active workspace pair so duplicate project names in other workspaces are ignored. Chart dependency validation also verifies that saved destination project IDs still exist before migration. Chart filters are normalized to the destination API's `session`/`session_id` project-scoping shape before create or update.
 - **`migrate-all`**: Supports `--strip-projects`, `--map-projects`, `--project-mapping` (headless JSON/file mapping applied to both rules and charts), and `--rules-create-enabled` for rules.

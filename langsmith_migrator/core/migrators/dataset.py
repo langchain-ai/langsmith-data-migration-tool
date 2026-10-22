@@ -426,6 +426,8 @@ class DatasetMigrator(BaseMigrator):
             }
             if example_data.get("id"):
                 payload["id"] = example_data["id"]
+            if example_data.get("created_at"):
+                payload["created_at"] = example_data["created_at"]
 
             # Use POST /examples (singular) to create one example
             response = self.dest.post("/examples", payload)
@@ -604,6 +606,10 @@ class DatasetMigrator(BaseMigrator):
                 }
                 if example_data.get("id"):
                     example_dict["id"] = example_data["id"]
+                # Experiments read the example version that existed when they ran, so
+                # the first version must carry the source creation time, not now.
+                if example_data.get("created_at"):
+                    example_dict["created_at"] = example_data["created_at"]
 
                 # Use SDK to create example
                 self.log(f"Creating example with {len(sdk_attachments)} attachment(s)...", "info")
