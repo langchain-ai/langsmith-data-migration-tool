@@ -13,9 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`queues --byoc-migration`**: pairs every workspace by ID and links each
   queue's runs to the destination queue without prompting; run it after the
   trace storage migration. Review progress is not copied, and a queue whose
-  runs fail to link stays blocked for `resume`. The underlying
-  `--all-workspaces` / `--include-runs` flags (and
-  `migrate-all --include-queue-runs`) are also available.
+  runs fail to link stays blocked for `resume`.
 
 ### Fixed
 - **Org-scoped keys on BYOC destinations**: a bare `403 Forbidden` from

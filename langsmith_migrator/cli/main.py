@@ -2459,11 +2459,8 @@ def _select_resume_session(config: Config, state_manager: StateManager):
 @click.option(
     "--include-runs",
     is_flag=True,
-    help=(
-        "Also add each queue's runs to the destination queue. Runs must already exist "
-        "on the destination with their source IDs (e.g. after a trace storage "
-        "migration). Review progress is not copied."
-    ),
+    hidden=True,
+    help="Link each queue's runs to the destination queue (set by --byoc-migration).",
 )
 @click.option(
     "--all-workspaces",
@@ -2474,8 +2471,8 @@ def _select_resume_session(config: Config, state_manager: StateManager):
 @click.option(
     "--byoc-migration",
     is_flag=True,
-    help="Self-hosted to BYOC profile: implies --non-interactive, --all-workspaces and "
-    "--include-runs. Run it after the trace storage migration so the runs exist.",
+    help="Self-hosted to BYOC profile: pair every workspace by ID, migrate each queue and "
+    "link its queued runs, without prompting. Run it after the trace storage migration.",
 )
 @workspace_options
 @click.pass_context
@@ -4240,15 +4237,6 @@ def issues(
 @click.option("--skip-fleet", is_flag=True, help="Skip Fleet resource migration")
 @click.option("--skip-contexts", is_flag=True, help="Skip Context Hub (agents & skills) migration")
 @click.option("--include-all-commits", is_flag=True, help="Include all prompt commit history")
-@click.option(
-    "--include-queue-runs",
-    is_flag=True,
-    help=(
-        "Also add each annotation queue's runs to the destination queue. Runs must "
-        "already exist on the destination with their source IDs (e.g. after a trace "
-        "storage migration). Review progress is not copied."
-    ),
-)
 @click.option("--strip-projects", is_flag=True, help="Strip project associations from rules")
 @click.option(
     "--map-projects",
@@ -4287,7 +4275,6 @@ def migrate_all(
     skip_fleet,
     skip_contexts,
     include_all_commits,
-    include_queue_runs,
     strip_projects,
     map_projects,
     project_mapping,
@@ -4453,7 +4440,6 @@ def migrate_all(
             skip_fleet=skip_fleet,
             skip_contexts=skip_contexts,
             skip_model_pricing=skip_model_pricing,
-            include_queue_runs=include_queue_runs,
         )
 
     if ws_result:
@@ -4487,7 +4473,6 @@ def _migrate_all_for_workspace(
     skip_fleet=True,
     skip_contexts=True,
     skip_model_pricing=True,
-    include_queue_runs=False,
 ):
     """Run the full migrate_all flow for a single workspace pair (or no workspace).
 
@@ -4704,7 +4689,6 @@ def _migrate_all_for_workspace(
                 queue_migrator.state = orchestrator.state
                 success_count = 0
                 failed_items = []
-                queue_run_results = []
 
                 with Progress(console=console) as progress:
                     task = progress.add_task("Migrating queues...", total=len(queues))
@@ -4715,28 +4699,13 @@ def _migrate_all_for_workspace(
                             "queue",
                             queue["id"],
                             queue["name"],
-                            metadata={
-                                "queue": queue,
-                                "include_runs": include_queue_runs,
-                                "project_id_map": dict(project_id_map or {}),
-                            },
+                            metadata={"queue": queue},
                         )
                         try:
                             _mark_state_item_started(orchestrator, item_id)
                             new_id = queue_migrator.create_queue(queue)
                             success_count += 1
-                            run_result = None
-                            if include_queue_runs:
-                                run_result = _migrate_queue_runs_for_item(
-                                    orchestrator,
-                                    queue_migrator,
-                                    queue,
-                                    new_id,
-                                    session_id_map=project_id_map,
-                                )
-                                if run_result is not None:
-                                    queue_run_results.append((queue["name"], run_result))
-                            _finish_queue_state_item(orchestrator, item_id, new_id, run_result)
+                            _mark_state_item_completed(orchestrator, item_id, destination_id=new_id)
                         except Exception as e:
                             failed_items.append((queue["name"], str(e)))
                             _mark_state_item_failed(orchestrator, item_id, e)
@@ -4746,7 +4715,6 @@ def _migrate_all_for_workspace(
                 if failed_items and config.migration.verbose:
                     for name, err in failed_items:
                         console.print(f"  [red]✗[/red] {name}: {err}")
-                _report_queue_runs(config, queue_run_results)
                 console.print()
             else:
                 console.print("[yellow]Skipped queues[/yellow]\n")
