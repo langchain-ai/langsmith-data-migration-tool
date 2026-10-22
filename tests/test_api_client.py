@@ -367,7 +367,10 @@ def test_prepare_url_absolute_url_passthrough():
         (403, "This API key is org-scoped and requires workspace specification. Please provide 'X-Tenant-ID' header.", 403, False),
         (403, "This API key is org-scoped and requires workspace specification. Please provide 'X-Tenant-ID' header.", 404, False),
         (401, "Invalid API key", 200, False),
-        (403, "Permission denied", 200, False),
+        # BYOC deployments reject org keys on /datasets with a bare "Forbidden".
+        (403, "Forbidden", 200, True),
+        (403, "Forbidden", 403, False),
+        (403, "Permission denied", 404, False),
         (200, "", 200, True),
     ],
 )
@@ -411,10 +414,14 @@ def test_connection_auth_over_http(base_path, dataset_status, detail, workspace_
         assert all("health" not in path for path, _ in seen)
         assert all(tenant is None for _, tenant in seen)
         assert "X-Tenant-Id" not in client.session.headers
-        if dataset_status == 403 and "org-scoped" in detail:
+        if dataset_status == 403:
             assert seen[1][0] == "/api/v1/workspaces"
+            if workspace_status == 404:
+                assert seen[2][0] == "/api/v1/orgs/current/workspaces"
         else:
             assert len(seen) == 1
+        if dataset_status == 403 and not expected:
+            assert "Access denied for" in error and "datasets" in error
     finally:
         server.shutdown()
         server.server_close()

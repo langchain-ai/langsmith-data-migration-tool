@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Org-scoped keys rejected by BYOC destinations**: the connection check
+  only fell back to workspace discovery when the `/datasets` 403 body said
+  the key was org-scoped and needed `X-Tenant-ID`. BYOC deployments return a
+  bare `403 Forbidden` for the same case, so `test` and every migration
+  command failed with "Destination connection failed". Any 403 from the
+  datasets probe without a tenant header now verifies the key against the
+  authenticated workspace endpoints; the original 403 is still reported
+  when that check fails too.
 - **Empty experiment tables after migration**: examples with attachments were
   created with the migration time instead of the source `created_at`, so
   experiments, which read examples as of their run time, showed no rows. Both

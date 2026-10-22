@@ -570,6 +570,10 @@ langsmith-migrator datasets --byoc-migration
 Org-scoped API keys are supported: the connection check authenticates through
 workspace discovery, and dataset requests use the selected workspace's
 `X-Tenant-ID`. Keys still need access to the source and destination workspaces.
+Deployments that answer the initial `/datasets` probe with a bare `403
+Forbidden` (for example BYOC) are handled the same way: the key is verified
+against the authenticated workspace endpoints before the connection is
+reported as failed.
 
 ### Prompt Options
 
