@@ -11,21 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Annotation queue runs**: `queues --include-runs` and
-  `migrate-all --include-queue-runs` add each source queue's runs to the
-  destination queue by run key (`POST /annotation-queues/{id}/runs/by-key`,
-  with a run-ID fallback and per-run replay of a rejected batch). Runs must
-  already exist on the destination with their source IDs; review progress
+  `migrate-all --include-queue-runs` add each queue's runs to the destination
+  queue. Runs must already exist there with their source IDs; review progress
   is not copied.
-- **`queues --all-workspaces`**: pair every workspace by ID without
-  prompting, as `datasets` already does.
+- **`queues --all-workspaces`**: pair every workspace by ID without prompting.
 
 ### Fixed
-- **Org-scoped keys on BYOC destinations**: a bare `403 Forbidden` from the
-  `/datasets` probe now falls back to the authenticated workspace check
-  instead of failing the connection.
+- **Org-scoped keys on BYOC destinations**: a bare `403 Forbidden` from
+  `/datasets` no longer fails the connection check.
 - **Empty experiment tables**: examples with attachments keep their source
-  `created_at`, so experiments that read examples as of their run time show
-  rows again.
+  `created_at`.
 
 ## [0.0.90] - 2026-10-21
 
