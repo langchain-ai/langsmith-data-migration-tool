@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.91] - 2026-10-22
+
 ### Added
 - **Annotation queue runs**: `queues --include-runs` and
   `migrate-all --include-queue-runs` copy each source queue's queued runs
