@@ -2096,6 +2096,36 @@ def test_queues_command_include_runs_copies_runs_and_reports(cli_harness):
     assert "Queue runs: 2 added, 1 failed, 0 skipped" in cli_harness.console.text
 
 
+def test_queues_command_all_workspaces_pairs_every_workspace_by_id(cli_harness, monkeypatch):
+    """--all-workspaces should resolve every workspace pair by ID and migrate each one."""
+    from langsmith_migrator.cli import main as cli_main
+    from langsmith_migrator.utils.workspace_resolver import WorkspaceProjectResult
+
+    seen_kwargs = {}
+
+    def fake_resolve(orchestrator, *args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return WorkspaceProjectResult(
+            workspace_mapping={"ws-a": "ws-a", "ws-b": "ws-b"},
+            project_mappings={},
+            workspaces_to_create=[],
+        )
+
+    monkeypatch.setattr(cli_main, "_resolve_workspaces", fake_resolve)
+    cli_harness.migrators.queue.list_queues.return_value = [
+        {"id": "queue-1", "name": "Queue One", "description": "First"},
+    ]
+    cli_harness.migrators.queue.create_queue.return_value = "new-queue-1"
+
+    result = cli_harness.invoke(["queues", "--all-workspaces"])
+
+    assert result.exit_code == 0
+    assert seen_kwargs["all_workspaces"] is True
+    assert cli_harness.migrators.queue.create_queue.call_count == 2
+    assert "Workspace: ws-a -> ws-a" in cli_harness.console.text
+    assert "Workspace: ws-b -> ws-b" in cli_harness.console.text
+
+
 def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):
     """Queue runs are opt-in; the default command only migrates the queue config."""
 

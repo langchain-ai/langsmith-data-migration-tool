@@ -2407,9 +2407,17 @@ def _select_resume_session(config: Config, state_manager: StateManager):
         "migration). Review progress is not copied."
     ),
 )
+@click.option(
+    "--all-workspaces",
+    is_flag=True,
+    help="Migrate every source workspace into the destination workspace with the same ID, "
+    "without prompting",
+)
 @workspace_options
 @click.pass_context
-def queues(ctx, include_runs, source_workspace, dest_workspace, map_workspaces):
+def queues(
+    ctx, include_runs, all_workspaces, source_workspace, dest_workspace, map_workspaces
+):
     """Migrate annotation queues."""
     config = ctx.obj["config"]
     state_manager = ctx.obj["state_manager"]
@@ -2434,6 +2442,7 @@ def queues(ctx, include_runs, source_workspace, dest_workspace, map_workspaces):
         dest_workspace,
         map_workspaces,
         non_interactive=config.migration.non_interactive,
+        all_workspaces=all_workspaces,
     )
     if ws_result is _WS_ABORTED:
         ctx.exit(1)

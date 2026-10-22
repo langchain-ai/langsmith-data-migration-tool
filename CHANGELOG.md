@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their source IDs (e.g. after a trace storage migration); review progress
   (reviewed / done / per-reviewer cursor) is not exposed by the API and is
   not copied. Counts are stored on the queue's state item.
+- **`queues --all-workspaces`**: pair every source workspace with the
+  destination workspace of the same ID without prompting, as `datasets`
+  already does, so all annotation queues can be migrated in one
+  non-interactive run.
 
 ### Fixed
 - **Org-scoped keys rejected by BYOC destinations**: the connection check

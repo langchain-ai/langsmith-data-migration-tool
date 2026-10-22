@@ -303,6 +303,7 @@ langsmith-migrator datasets --include-experiments  # With experiments, runs, and
 # Annotation queues
 langsmith-migrator queues
 langsmith-migrator queues --include-runs       # Also copy the runs queued in each queue
+langsmith-migrator --non-interactive queues --all-workspaces --include-runs  # Every workspace by ID, no prompts
 
 # Prompts
 langsmith-migrator prompts
