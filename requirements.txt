@@ -2,7 +2,7 @@
 #    uv pip compile pyproject.toml -o requirements.txt
 annotated-types==0.8.0
     # via pydantic
-anthropic==2.1.0
+anthropic==2.3.0
     # via langchain-anthropic
 anyio==4.15.1
     # via
@@ -40,26 +40,26 @@ idna==3.20
     #   anyio
     #   httpx
     #   requests
-jiter==0.17.0
+jiter==0.18.0
     # via
     #   anthropic
     #   openai
-jsonpatch==1.36
+jsonpatch==1.38
     # via langchain-core
-jsonpointer==3.4
+jsonpointer==3.6
     # via jsonpatch
-langchain-anthropic==1.7.6
+langchain-anthropic==1.7.7
     # via langsmith-data-migration-tool (pyproject.toml)
-langchain-core==1.7.0
+langchain-core==1.7.3
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-anthropic
     #   langchain-openai
-langchain-openai==1.7.2
+langchain-openai==1.7.3
     # via langsmith-data-migration-tool (pyproject.toml)
 langchain-protocol==0.0.20
     # via langchain-core
-langsmith==0.14.12
+langsmith==0.14.16
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-core
@@ -74,7 +74,7 @@ mdit-py-plugins==0.6.1
     # via textual
 mdurl==0.1.2
     # via markdown-it-py
-openai==3.37.0
+openai==3.41.0
     # via langchain-openai
 orjson==3.13.0
     # via langsmith
@@ -82,16 +82,16 @@ packaging==26.3
     # via
     #   langchain-core
     #   langsmith
-platformdirs==4.13.5
+platformdirs==4.14.0
     # via textual
-pydantic==2.14.1
+pydantic==2.14.2
     # via
     #   anthropic
     #   langchain-anthropic
     #   langchain-core
     #   langsmith
     #   openai
-pydantic-core==2.50.1
+pydantic-core==2.50.2
     # via pydantic
 pygments==2.21.0
     # via
@@ -147,7 +147,7 @@ urllib3==2.8.0
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   requests
-uuid-utils==1.1.0
+uuid-utils==1.2.0
     # via
     #   langchain-core
     #   langsmith
