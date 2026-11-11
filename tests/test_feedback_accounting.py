@@ -198,3 +198,80 @@ def test_dry_run_counts_feedback_as_accounted_without_run_mapping(sample_config,
     assert not migration_state.remediation_queue
     assert not [issue for issue in migration_state.issue_log if issue.code == "feedback_partial_replay"]
     dest.post.assert_not_called()
+
+
+def test_per_record_post_carries_destination_session_id(sample_config, migration_state):
+    """POST /feedback requires session_id on SmithDB-backed servers."""
+    source, dest = _clients([_feedback(1)])
+    migration_state.ensure_item(
+        "experiment_exp-src", "experiment", "exp-1", "exp-src", stage="migrate_feedback"
+    )
+
+    _migrator(source, dest, sample_config, migration_state).migrate_feedback_for_experiments(
+        {"exp-src": "exp-dst"}, {"run-1": "dest-run-1"}
+    )
+
+    endpoint, payload = dest.post.call_args.args
+    assert endpoint == "/feedback"
+    assert payload["session_id"] == "exp-dst"
+    assert payload["run_id"] == "dest-run-1"
+    assert not any(key.startswith("_") for key in payload)
+
+
+def test_create_feedback_without_session_id_omits_the_field(sample_config, migration_state):
+    source, dest = _clients([])
+
+    ok = _migrator(source, dest, sample_config, migration_state).create_feedback(
+        {"run_id": "dest-run-1", "key": "correctness", "score": 1}
+    )
+
+    assert ok is True
+    assert "session_id" not in dest.post.call_args.args[1]
+
+
+def test_per_record_post_sends_recorded_run_start_time_and_trace_id(
+    sample_config, migration_state
+):
+    """A start_time recorded at replay is trusted, so trace_id goes with it."""
+    feedback = {**_feedback(1), "trace_id": "trace-1", "start_time": "2026-01-01T00:00:00"}
+    source, dest = _clients([feedback])
+    migration_state.ensure_item(
+        "experiment_exp-src", "experiment", "exp-1", "exp-src", stage="migrate_feedback"
+    )
+    migration_state.set_mapped_id(
+        "run_start_time", "dest-run-1", "2026-11-11T20:00:00.000000+00:00"
+    )
+
+    _migrator(source, dest, sample_config, migration_state).migrate_feedback_for_experiments(
+        {"exp-src": "exp-dst"}, {"run-1": "dest-run-1"}
+    )
+
+    payload = dest.post.call_args.args[1]
+    assert payload["session_id"] == "exp-dst"
+    assert payload["start_time"] == "2026-11-11T20:00:00.000000+00:00"
+    assert payload["trace_id"]
+    assert not any(key.startswith("_") for key in payload)
+
+
+def test_per_record_post_derives_start_time_from_source_and_stored_shift(
+    sample_config, migration_state
+):
+    """Without a recorded value the source's time is shifted, and trace_id is withheld."""
+    feedback = {**_feedback(1), "trace_id": "trace-1", "start_time": "2026-01-01T00:00:00"}
+    source, dest = _clients([feedback])
+    migration_state.ensure_item(
+        "experiment_exp-src",
+        "experiment",
+        "exp-1",
+        "exp-src",
+        stage="migrate_feedback",
+        metadata={"time_shift_seconds": 3600},
+    )
+
+    _migrator(source, dest, sample_config, migration_state).migrate_feedback_for_experiments(
+        {"exp-src": "exp-dst"}, {"run-1": "dest-run-1"}
+    )
+
+    payload = dest.post.call_args.args[1]
+    assert payload["start_time"] == "2026-01-01T01:00:00.000000+00:00"
+    assert "trace_id" not in payload

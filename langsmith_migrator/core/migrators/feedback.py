@@ -6,8 +6,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional, Tuple
 
+from datetime import timedelta
+
 from .base import BaseMigrator
 from ...utils.retry import APIError, AuthenticationError
+from ...utils.time_shift import shift_iso
 
 
 # Multipart statuses that mean a part was malformed, so the batch is replayed record by
@@ -168,6 +171,32 @@ class FeedbackMigrator(BaseMigrator):
 
         return all_feedback
 
+    def _dest_run_start_time(
+        self, source_exp_id: str, dest_run_id: str, feedback: Dict[str, Any]
+    ) -> Tuple[Optional[str], bool]:
+        """
+        Return the destination run's start_time and whether it was recorded at replay.
+
+        The recorded value is what this tool sent when it created the run. Without one
+        (state written by an older version, or runs not replayed with --skip-runs), fall
+        back to the start_time the source reports on the feedback record, moved by the
+        same shift the experiment's runs received.
+        """
+        if self.state:
+            recorded = self.state.get_mapped_id("run_start_time", dest_run_id)
+            if recorded:
+                return recorded, True
+        delta = timedelta(0)
+        if self.state and not self._preserve_ids:
+            item = self.state.get_item(f"experiment_{source_exp_id}")
+            shift = item.metadata.get("time_shift_seconds") if item else None
+            if shift is not None:
+                delta = timedelta(seconds=float(shift))
+        try:
+            return shift_iso(feedback.get("start_time"), delta), False
+        except (TypeError, ValueError):
+            return None, False
+
     def _record_replayed(self, created_feedbacks: List[Dict[str, Any]]) -> None:
         """Persist the fingerprints of feedback just created so resumes skip them."""
         if not self.state or not created_feedbacks:
@@ -194,6 +223,19 @@ class FeedbackMigrator(BaseMigrator):
 
         try:
             payload = {k: v for k, v in feedback.items() if not k.startswith("_")}
+            # POST /feedback requires the owning project (session) id on SmithDB-backed
+            # servers; older servers accept it as an optional field.
+            session_id = feedback.get("_session_id")
+            if session_id and not payload.get("session_id"):
+                payload["session_id"] = session_id
+            # With session_id and start_time the server can look the run up in SmithDB.
+            # trace_id as well makes it skip that lookup and trust start_time, so it is
+            # only sent when start_time is the value this tool wrote to the destination.
+            start_time = feedback.get("_start_time")
+            if session_id and start_time:
+                payload["start_time"] = start_time
+                if feedback.get("_start_time_recorded") and feedback.get("_trace_id"):
+                    payload["trace_id"] = feedback["_trace_id"]
             self.dest.post("/feedback", payload)
             return True
         except Exception as e:
@@ -466,7 +508,8 @@ class FeedbackMigrator(BaseMigrator):
                     migrated_fb["feedback_source"] = fb["feedback_source"]
 
                 migrated_fb["_fingerprint"] = fingerprint
-                # Used only by the multipart path (stripped from per-record POSTs).
+                # Internal fields: stripped from the request body and re-added by name
+                # where each create path needs them.
                 source_trace_id = fb.get("trace_id")
                 if source_trace_id:
                     migrated_fb["_trace_id"] = (
@@ -475,6 +518,13 @@ class FeedbackMigrator(BaseMigrator):
                         else str(uuid.uuid5(_run_namespace(), source_trace_id))
                     )
                 migrated_fb["_session_id"] = dest_exp_id
+                if dest_run_id:
+                    start_time, recorded = self._dest_run_start_time(
+                        source_exp_id, dest_run_id, fb
+                    )
+                    if start_time:
+                        migrated_fb["_start_time"] = start_time
+                        migrated_fb["_start_time_recorded"] = recorded
                 migrated_feedbacks.append(migrated_fb)
 
             if unmapped_runs > 0:
