@@ -1,0 +1,30 @@
+langsmith_migrator/core/migrators/experiment.py
+  s_de48591c22cdda::t_4351dcd65f0163 458-460,463-466
+tests/test_experiment_resume.py
+  s_de48591c22cdda::t_669cf3fd2c2583 68,102-104
+tests/test_feedback_accounting.py
+  s_de48591c22cdda::t_669cf3fd2c2583 230-277
+langsmith_migrator/core/migrators/feedback.py
+  s_de48591c22cdda::t_4351dcd65f0163 9-10,13,174-199,231-238,511-512,521-527
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c328ca6522617a4e77bf3fd7e0c98f7689bf072f",
+  "prompts": {},
+  "humans": {
+    "h_255864e0abd836": {
+      "author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  },
+  "sessions": {
+    "s_de48591c22cdda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "183dd2ca-5bf6-4d26-b434-c340f61f3b5e",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
