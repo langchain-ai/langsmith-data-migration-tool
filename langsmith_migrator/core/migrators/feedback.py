@@ -194,6 +194,11 @@ class FeedbackMigrator(BaseMigrator):
 
         try:
             payload = {k: v for k, v in feedback.items() if not k.startswith("_")}
+            # POST /feedback requires the owning project (session) id on SmithDB-backed
+            # servers; older servers accept it as an optional field.
+            session_id = feedback.get("_session_id")
+            if session_id and not payload.get("session_id"):
+                payload["session_id"] = session_id
             self.dest.post("/feedback", payload)
             return True
         except Exception as e:
@@ -467,6 +472,7 @@ class FeedbackMigrator(BaseMigrator):
 
                 migrated_fb["_fingerprint"] = fingerprint
                 # Used only by the multipart path (stripped from per-record POSTs).
+                # _session_id below is sent by both paths.
                 source_trace_id = fb.get("trace_id")
                 if source_trace_id:
                     migrated_fb["_trace_id"] = (
