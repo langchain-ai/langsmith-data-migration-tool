@@ -1,0 +1,29 @@
+langsmith_migrator/core/migrators/base.py
+  s_de48591c22cdda::t_88700c5aa6dfc5 6,45-62
+  s_de48591c22cdda::t_f4ef003f2274a3 63
+CLAUDE.md
+  s_de48591c22cdda::t_88700c5aa6dfc5 155
+langsmith_migrator/utils/config.py
+  s_de48591c22cdda::t_62570ae2c954e3 29,254
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0ff9f6000e78fb06cce5e6d1496659cf565e44ce",
+  "prompts": {},
+  "humans": {
+    "h_255864e0abd836": {
+      "author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  },
+  "sessions": {
+    "s_de48591c22cdda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "183dd2ca-5bf6-4d26-b434-c340f61f3b5e",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
