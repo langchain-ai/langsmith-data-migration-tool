@@ -111,12 +111,75 @@ class AnnotationQueueMigrator(BaseMigrator):
     # Queue items (runs)
     # ------------------------------------------------------------------
 
+    _ITEMS_QUERY = {"status": "needs_my_review", "item_type": "RUN"}
+
+    @staticmethod
+    def _items_endpoint(queue_id: str) -> str:
+        return f"/platform/annotation-queues/{queue_id}/items"
+
+    def _items_supported(self, side: str, queue_id: str) -> bool:
+        """Whether one instance serves the queue items API, checked once per side.
+
+        The items API replaces the deprecated ``/annotation-queues/{id}/runs``
+        endpoints. Servers that predate it answer 404; so does a missing queue,
+        so a 404 is only read as "unsupported" once the queue is confirmed to exist.
+        """
+        cache = self.__dict__.setdefault("_items_support", {})
+        if side not in cache:
+            client = self.source if side == "source" else self.dest
+            try:
+                client.get(self._items_endpoint(queue_id), {**self._ITEMS_QUERY, "page_size": 1})
+                cache[side] = True
+            except NotFoundError:
+                client.get(f"/annotation-queues/{queue_id}")  # raises if the queue is missing
+                self.use_deprecated_endpoint(side, "annotation queue items")
+                cache[side] = False
+        return cache[side]
+
     def iter_queue_runs(self, queue_id: str) -> Iterator[Dict[str, Any]]:
         """Yield the runs currently in a source annotation queue, one page at a time.
 
+        Each run is a dict with ``id``, ``session_id`` and ``start_time``. A failed
+        page (permission error, exhausted retries) raises rather than looking
+        like the end of the queue.
+        """
+        if self._items_supported("source", queue_id):
+            yield from self._iter_queue_items(queue_id)
+        else:
+            yield from self._iter_queue_runs_legacy(queue_id)
+
+    def _iter_queue_items(self, queue_id: str) -> Iterator[Dict[str, Any]]:
+        """List run items through the queue items API (cursor pagination)."""
+        endpoint = self._items_endpoint(queue_id)
+        params: Dict[str, Any] = {**self._ITEMS_QUERY, "page_size": QUEUE_RUNS_BATCH_SIZE}
+        seen: set = set()
+        while True:
+            response = self.source.get(endpoint, dict(params))
+            page = response if isinstance(response, dict) else {}
+            items = page.get("items") or []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                run_id = item.get("run_id")
+                if run_id and run_id in seen:
+                    continue
+                if run_id:
+                    seen.add(run_id)
+                yield {
+                    "id": run_id,
+                    "session_id": item.get("project_id") or item.get("session_id"),
+                    "start_time": item.get("start_time"),
+                }
+            cursor = page.get("next_cursor")
+            if not cursor or not items:
+                return
+            params["cursor"] = cursor
+
+    def _iter_queue_runs_legacy(self, queue_id: str) -> Iterator[Dict[str, Any]]:
+        """List runs through the deprecated ``/runs`` endpoint (offset pagination).
+
         Pages with offset/limit directly instead of ``get_paginated`` so a
-        failed page (permission error, exhausted retries) raises rather than
-        looking like the end of the queue.
+        failed page raises rather than looking like the end of the queue.
         """
         endpoint = f"/annotation-queues/{queue_id}/runs"
         page_size = QUEUE_RUNS_BATCH_SIZE
@@ -167,12 +230,18 @@ class AnnotationQueueMigrator(BaseMigrator):
         }
 
     def _add_runs_to_queue(self, dest_queue_id: str, keys: List[Dict[str, str]]) -> None:
-        """Add runs to a destination queue, preferring the keyed endpoint.
+        """Add runs to a destination queue.
 
-        `/runs/by-key` locates runs by their partition key (required on SmithDB
-        workspaces). Older servers answer 404 for it, so fall back to the plain
-        run-id list endpoint.
+        Uses the queue items API where the destination has it. Older servers get
+        the deprecated endpoints: `/runs/by-key`, which locates runs by their
+        partition key, then the plain run-id list for servers without that either.
         """
+        if self._items_supported("dest", dest_queue_id):
+            self.dest.post(
+                self._items_endpoint(dest_queue_id),
+                {"items": [{"item_type": "RUN", **key} for key in keys]},
+            )
+            return
         try:
             self.dest.post(f"/annotation-queues/{dest_queue_id}/runs/by-key", keys)
         except NotFoundError as e:
@@ -204,6 +273,10 @@ class AnnotationQueueMigrator(BaseMigrator):
             "total": 0, "added": 0, "skipped": 0, "failed": 0, "errors": [],
         }
         dry_run = self.config.migration.dry_run
+        if not dry_run:
+            # Settle which endpoints the destination has before any run is sent, so
+            # MIGRATION_NO_DEPRECATED_FALLBACK stops the copy instead of failing each run.
+            self._items_supported("dest", dest_queue_id)
 
         batch: List[Dict[str, str]] = []
 
