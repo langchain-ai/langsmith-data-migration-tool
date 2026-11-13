@@ -152,6 +152,7 @@ Environment variables (can also use CLI flags or a `.env` file — auto-loaded o
 - `MIGRATION_FEEDBACK_WORKERS` (default: 0 = use `MIGRATION_WORKERS`) - threads per experiment for feedback paging and creation; raise it (e.g. 16-32) for feedback-heavy workspaces
 - `MIGRATION_FEEDBACK_MULTIPART` (default: false) - send experiment feedback in batches via `POST /runs/multipart` (`feedback.<id>` parts) instead of one `POST /feedback` per record; a batch rejected for a bad part (400/413/422) is replayed per record with the same ids
 - `MIGRATION_FEEDBACK_BATCH_SIZE` (default: 100, max 100, the ingest `size_limit`) - feedback records per multipart request
+- `MIGRATION_NO_DEPRECATED_FALLBACK` (default: false) - fail instead of falling back to a deprecated endpoint when an instance lacks its replacement; use it to confirm a run exercised the current endpoints
 - `MIGRATION_CHUNK_SIZE` (default: 1000)
 - `MIGRATION_RATE_LIMIT_DELAY` (default: 0.1)
 - `MIGRATION_STREAM_EXAMPLES` (default: true)

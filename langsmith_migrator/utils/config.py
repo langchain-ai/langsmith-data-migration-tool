@@ -26,6 +26,7 @@ class MigrationConfig:
     batch_size: int = 100
     concurrent_workers: int = 4
     feedback_multipart: bool = False  # Send feedback via /runs/multipart in batches
+    no_deprecated_fallback: bool = False  # Fail instead of falling back to a deprecated endpoint
     feedback_batch_size: int = 100  # Feedback records per multipart request
     feedback_workers: int = 0  # Threads per experiment for feedback I/O; 0 = use concurrent_workers
     dry_run: bool = False
@@ -250,6 +251,7 @@ class Config:
             rate_limit_delay=parsed_rate_limit,
             feedback_workers=max(0, _env_int('MIGRATION_FEEDBACK_WORKERS', 0)),
             feedback_multipart=os.getenv('MIGRATION_FEEDBACK_MULTIPART', 'false').lower() == 'true',
+            no_deprecated_fallback=os.getenv('MIGRATION_NO_DEPRECATED_FALLBACK', 'false').lower() == 'true',
             # Capped at the ingest size_limit (/info batch_ingest_config) so a typo cannot build an oversized request.
             feedback_batch_size=min(100, max(1, _env_int('MIGRATION_FEEDBACK_BATCH_SIZE', 100))),
         )
