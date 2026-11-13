@@ -3,7 +3,7 @@
 from typing import Any, Dict, Iterable, Optional
 from rich.console import Console
 
-from ..api_client import EnhancedAPIClient
+from ..api_client import APIError, EnhancedAPIClient
 from ...utils.state import (
     MigrationState,
     ResolutionOutcome,
@@ -41,6 +41,25 @@ class BaseMigrator:
         }.get(level, "")
 
         self.console.print(f"[{style}]{message}[/{style}]")
+
+    def use_deprecated_endpoint(self, side: str, what: str) -> None:
+        """Note a fallback to a deprecated endpoint, or refuse it.
+
+        Call this before using a deprecated endpoint because the server lacks
+        its replacement. With MIGRATION_NO_DEPRECATED_FALLBACK set it raises
+        instead, so a run meant to exercise the current endpoints cannot pass
+        by quietly using the old ones.
+        """
+        if self.config.migration.no_deprecated_fallback is True:
+            raise APIError(
+                f"The {side} instance does not support the current {what} endpoints, "
+                "and MIGRATION_NO_DEPRECATED_FALLBACK is set"
+            )
+        self.log(
+            f"The {side} instance does not support the current {what} endpoints; "
+            "using the deprecated ones",
+            "warning",
+        )
 
     def workspace_pair(self) -> Dict[str, Optional[str]]:
         """Return the active workspace pair from request headers."""
