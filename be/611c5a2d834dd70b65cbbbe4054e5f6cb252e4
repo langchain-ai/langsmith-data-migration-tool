@@ -1,0 +1,32 @@
+langsmith_migrator/core/migrators/annotation_queue.py
+  s_de48591c22cdda::t_39c51cf897233f 276-279
+  s_de48591c22cdda::t_88700c5aa6dfc5 114-138,142-180,182,233,235-237,239-244
+tests/test_annotation_queue_runs.py
+  s_de48591c22cdda::t_045b05b9d78470 25,29-32,38-58,64-65,67,88,117,209-244,246-273
+  s_de48591c22cdda::t_6055e40bc19389 245
+  s_de48591c22cdda::t_39c51cf897233f 275-283
+  s_de48591c22cdda::t_ada3b9a5c51f25 274,284
+README.md
+  s_de48591c22cdda::t_d7e4935d3782ac 857
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "be611c5a2d834dd70b65cbbbe4054e5f6cb252e4",
+  "prompts": {},
+  "humans": {
+    "h_255864e0abd836": {
+      "author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  },
+  "sessions": {
+    "s_de48591c22cdda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "183dd2ca-5bf6-4d26-b434-c340f61f3b5e",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
