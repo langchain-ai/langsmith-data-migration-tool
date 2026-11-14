@@ -1,0 +1,33 @@
+tests/test_trace_export.py
+  s_de48591c22cdda::t_d3848d8a658773 38-39
+tests/test_trace_prefetch.py
+  s_de48591c22cdda::t_d3848d8a658773 26-27
+tests/test_trace_v2.py
+  s_de48591c22cdda::t_11574114371e7d 1-126
+tests/test_trace_migrator.py
+  s_de48591c22cdda::t_6c59fd15274252 35-36
+langsmith_migrator/core/migrators/trace.py
+  s_de48591c22cdda::t_d3848d8a658773 12
+  s_de48591c22cdda::t_6c59fd15274252 23,165-167,327,356-365,369,372-402,778,833-854,1090-1092
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "397a9a05e835c12612dd8c8b634dc6226757acda",
+  "prompts": {},
+  "humans": {
+    "h_255864e0abd836": {
+      "author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  },
+  "sessions": {
+    "s_de48591c22cdda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "183dd2ca-5bf6-4d26-b434-c340f61f3b5e",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
