@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from tempfile import SpooledTemporaryFile
@@ -20,6 +20,7 @@ import requests
 from langsmith import Client
 
 from ..api_client import APIError, NotFoundError
+from ..run_query import RunQuery
 from ..trace_frames import (
     DEFAULT_COMPRESS_LEVEL,
     CompiledFrame,
@@ -161,6 +162,9 @@ class TraceMigrator(BaseMigrator):
         self.blocked_reasons: List[str] = []
 
         self._page_limit = {"source": _PAGE_LIMIT, "dest": _PAGE_LIMIT}
+        self._run_query = RunQuery(self)
+        self._source_tier_cache: Dict[str, bool] = {}
+        self._shortlived_reported: Set[str] = set()
         self._id_chunk = _ID_CHUNK
         for client in (source_client, dest_client):
             if getattr(client, "timeout", 0) and client.timeout < _QUERY_TIMEOUT:
@@ -320,7 +324,7 @@ class TraceMigrator(BaseMigrator):
         page_num, seen = 0, 0
         while True:
             try:
-                response = client.post("/runs/query", body) or {}
+                runs, cursor = self._run_query.page(side, body)
             except APIError as exc:
                 cap = _page_limit_cap(exc)
                 if cap is None or cap >= body["limit"]:
@@ -328,7 +332,6 @@ class TraceMigrator(BaseMigrator):
                 self._page_limit[side] = cap
                 body = {**body, "limit": cap}
                 continue
-            runs = response.get("runs") or []
             page_num += 1
             seen += len(runs)
             if self.config.migration.verbose:
@@ -341,7 +344,6 @@ class TraceMigrator(BaseMigrator):
                     f"{f' | total {seen:>6}' if scan else ''}[/dim]"
                 )
             yield from runs
-            cursor = (response.get("cursors") or {}).get("next")
             if not cursor or not runs:
                 return
             body = {**body, "cursor": cursor}
@@ -351,12 +353,52 @@ class TraceMigrator(BaseMigrator):
     def slice_runs(
         self, client, session_id: str, window: Window, *, tier_filter: bool = True
     ) -> List[Dict[str, Any]]:
-        """The long-lived runs of one slice, projected to identity fields only."""
+        """The long-lived runs of one slice, projected to identity fields only.
+
+        The v1 run query reports each run's tier. The v2 one does not, so there the
+        project's tier stands in: every run of a long-lived project, none of a
+        short-lived one.
+        """
+        side = "source" if client is self.source else "dest"
+        per_run_tier = not self._run_query.uses_v2(side, session_id)
+        if tier_filter and not per_run_tier and not self._project_long_lived(side, session_id):
+            return []
         return [
             run
             for run in self._query_runs(client, session_id, window, select=self._ID_SELECT)
-            if run.get("id") and (not tier_filter or is_long_lived(run))
+            if run.get("id") and (not tier_filter or not per_run_tier or is_long_lived(run))
         ]
+
+    def _project_long_lived(self, side: str, session_id: str) -> bool:
+        """Whether a project's own tier is long-lived."""
+        if side == "source" and session_id in self._source_tier_cache:
+            return self._source_tier_cache[session_id]
+        client = self.source if side == "source" else self.dest
+        project = client.get(f"/sessions/{session_id}") or {}
+        long_lived = project.get("trace_tier") == LONGLIVED
+        if side == "source":
+            # The destination's tier is changed during a run, so it is read each time.
+            self._source_tier_cache[session_id] = long_lived
+        return long_lived
+
+    def _read_run(
+        self, side: str, session_id: str, run_id: str, start: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """One run by ID. The v2 query needs its project and a lower time bound."""
+        client = self.source if side == "source" else self.dest
+        if not self._run_query.uses_v2(side, session_id):
+            return client.get(f"/runs/{run_id}")
+        runs, _ = self._run_query.page(
+            side,
+            {
+                "session": [session_id],
+                "id": [run_id],
+                "select": ["id", "start_time", "session_id"],
+                "start_time": (as_utc(start) - timedelta(minutes=1)).isoformat(),
+                "limit": 1,
+            },
+        )
+        return runs[0] if runs else None
 
     def long_lived_run_ids(
         self, client, session_id: str, window: Window, *, tier_filter: bool = True
@@ -733,7 +775,7 @@ class TraceMigrator(BaseMigrator):
         for attempt in range(_VERIFY_ATTEMPTS):
             time.sleep(_VERIFY_BACKOFF * (attempt + 1))
             try:
-                run = self.dest.get(f"/runs/{run_id}")
+                run = self._read_run("dest", str(session["id"]), run_id, stamp)
             except Exception:
                 run = None
             if run and run.get("start_time"):
@@ -788,7 +830,28 @@ class TraceMigrator(BaseMigrator):
         src_id, dst_id = str(source_session["id"]), str(target["id"])
         population = self.slice_runs(self.source, src_id, window)
         if not population:
-            return SlicePrepared(window, src_id, dst_id, plan_slice(set(), set()), [])
+            empty = SlicePrepared(window, src_id, dst_id, plan_slice(set(), set()), [])
+            if (
+                src_id not in self._shortlived_reported
+                and self._run_query.uses_v2("source", src_id)
+                and not self._project_long_lived("source", src_id)
+            ):
+                self._shortlived_reported.add(src_id)
+                summary = (
+                    f"Project {source_session.get('name') or src_id} is short-lived and its "
+                    "source does not report a tier per run, so none of its runs were "
+                    "migrated. Traces upgraded to long-lived inside it are not copied."
+                )
+                self.console.print(f"[yellow]  {summary}[/yellow]")
+                empty.issues.append(
+                    (
+                        "degraded",
+                        "shortlived_project_not_migrated",
+                        summary,
+                        {"source_session_id": src_id, "dest_session_id": dst_id},
+                    )
+                )
+            return empty
         source_ids = {str(r["id"]) for r in population}
         prepared = SlicePrepared(
             window, src_id, dst_id, plan_slice(source_ids, existing_ids()), population
@@ -1024,7 +1087,9 @@ class TraceMigrator(BaseMigrator):
 
     def _diagnose_missing(self, dest_session_id: str, run_ids: Set[str]) -> Tuple[str, str]:
         """Explain why runs are absent, by asking where they actually are."""
-        for run_id in sorted(run_ids)[:3]:
+        # Only the v1 read can find a run without knowing its project.
+        lookup = [] if self._run_query.uses_v2("dest", dest_session_id) else sorted(run_ids)[:3]
+        for run_id in lookup:
             try:
                 run = self.dest.get(f"/runs/{run_id}")
             except Exception:

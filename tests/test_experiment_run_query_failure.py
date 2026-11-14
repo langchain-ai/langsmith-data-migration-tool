@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from langsmith_migrator.core.api_client import EnhancedAPIClient
+from langsmith_migrator.core.api_client import EnhancedAPIClient, NotFoundError
 from langsmith_migrator.core.migrators import ExperimentMigrator, FeedbackMigrator
 from langsmith_migrator.utils.retry import UpstreamRejectionError
 
@@ -24,14 +24,29 @@ def _clients():
     return source, dest
 
 
+def _v1_only(*responses):
+    """POST handler for a server without the v2 run query: v2 is 404, v1 serves `responses`."""
+    remaining = list(responses)
+
+    def post(endpoint, data=None):
+        if endpoint.startswith("/api/v2/"):
+            raise NotFoundError(f"Not found: {endpoint}", status_code=404)
+        outcome = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    return post
+
+
 def test_failed_run_query_raises_instead_of_reporting_zero_runs(
     sample_config,
     migration_state,
 ):
     """Silently returning zero runs left empty experiments on the destination."""
     source, dest = _clients()
-    source.post.side_effect = UpstreamRejectionError(
-        "403 for /runs/query came from an intermediary", status_code=403
+    source.post.side_effect = _v1_only(
+        UpstreamRejectionError("403 for /runs/query came from an intermediary", status_code=403)
     )
     migration_state.ensure_item(
         "experiment_exp-src", "experiment", "exp-1", "exp-src", stage="migrate_runs"
@@ -61,10 +76,10 @@ def test_later_query_failure_does_not_skip_a_buffered_page(
         "session_id": "exp-src",
         "dotted_order": "20260101T000000000000Z11111111-1111-1111-1111-111111111111",
     }
-    source.post.side_effect = [
+    source.post.side_effect = _v1_only(
         {"runs": [source_run], "cursors": {"next": "cursor-2"}},
         RuntimeError("connection reset"),
-    ]
+    )
     dest.post.return_value = {"errors": []}
     migration_state.ensure_item(
         "experiment_exp-src", "experiment", "exp-1", "exp-src", stage="migrate_runs"
@@ -86,7 +101,7 @@ def test_later_query_failure_does_not_skip_a_buffered_page(
 def test_failed_run_query_records_a_run_query_issue(sample_config, migration_state):
     """The operator needs the real error, not a downstream feedback symptom."""
     source, dest = _clients()
-    source.post.side_effect = RuntimeError("connection reset")
+    source.post.side_effect = _v1_only(RuntimeError("connection reset"))
     migration_state.ensure_item(
         "experiment_exp-src", "experiment", "exp-1", "exp-src", stage="migrate_runs"
     )
@@ -116,7 +131,7 @@ def test_feedback_is_not_attempted_after_a_failed_run_query(
     run failure was swallowed and this surfaced as a feedback problem instead.
     """
     source, dest = _clients()
-    source.post.side_effect = RuntimeError("connection reset")
+    source.post.side_effect = _v1_only(RuntimeError("connection reset"))
     migration_state.ensure_item(
         "experiment_exp-src", "experiment", "exp-1", "exp-src", stage="migrate_runs"
     )
