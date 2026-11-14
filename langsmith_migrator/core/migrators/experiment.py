@@ -6,6 +6,7 @@ import copy
 import uuid
 
 from .base import BaseMigrator
+from ..run_query import RunQuery
 from ...utils.time_shift import shift_experiment_payload, shift_run_payload
 
 
@@ -427,6 +428,8 @@ class ExperimentMigrator(BaseMigrator):
         total_skipped = 0
         total_failed = 0
 
+        run_query = RunQuery(self)
+
         # Query runs for EACH experiment separately
         # The LangSmith /runs/query API only processes the first session ID when given a list
         for exp_idx, experiment_id in enumerate(experiment_ids, 1):
@@ -434,6 +437,10 @@ class ExperimentMigrator(BaseMigrator):
             experiment_item_id = self._experiment_item_id(experiment_id)
             experiment_item = self.state.get_item(experiment_item_id) if self.state else None
             start_cursor = experiment_item.metadata.get("run_cursor") if experiment_item else None
+            saved_cursor_api = (
+                experiment_item.metadata.get("run_cursor_api", "v1") if experiment_item else "v1"
+            )
+            cursor_api: Optional[str] = None
             pending_run_mapping: Dict[str, str] = {}
             batch: List[Dict[str, Any]] = []
             experiment_runs_created = 0
@@ -510,7 +517,18 @@ class ExperimentMigrator(BaseMigrator):
             while True:
                 page_num += 1
                 try:
-                    response = self.source.post("/runs/query", payload)
+                    if cursor_api is None:
+                        cursor_api = "v2" if run_query.uses_v2("source", experiment_id) else "v1"
+                        if payload.get("cursor") and saved_cursor_api != cursor_api:
+                            # A cursor only means something to the endpoint that issued
+                            # it. Start over; runs already replayed are skipped below.
+                            self.log(
+                                f"Ignoring the saved run cursor for experiment {experiment_id}: "
+                                f"it came from the {saved_cursor_api} run query, not {cursor_api}",
+                                "warning",
+                            )
+                            del payload["cursor"]
+                    runs, next_cursor = run_query.page("source", payload)
                 except Exception as e:
                     # Do not swallow this. Breaking out leaves the failure counter at
                     # zero, so the caller concludes the run stage succeeded and moves
@@ -542,8 +560,6 @@ class ExperimentMigrator(BaseMigrator):
                                 command="langsmith-migrator resume",
                             )
                     raise
-
-                runs = response.get("runs", [])
 
                 # Sort runs by dotted_order to ensure parents are processed before children
                 # dotted_order format: {timestamp}Z{uuid}.{timestamp}Z{uuid}...
@@ -654,8 +670,6 @@ class ExperimentMigrator(BaseMigrator):
                 flush_batch()
                 page_had_failures = experiment_failed_runs > failures_before_page
 
-                cursors = response.get("cursors")
-                next_cursor = cursors.get("next") if cursors else None
                 checkpoint_cursor = current_cursor if page_had_failures else next_cursor
 
                 if experiment_item:
@@ -664,6 +678,7 @@ class ExperimentMigrator(BaseMigrator):
                         stage="migrate_runs",
                         metadata={
                             "run_cursor": checkpoint_cursor,
+                            "run_cursor_api": cursor_api,
                             "run_failures": experiment_failed_runs,
                             "runs_migrated": experiment_runs_created,
                         },

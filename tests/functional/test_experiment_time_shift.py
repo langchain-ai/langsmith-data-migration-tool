@@ -12,6 +12,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from langsmith_migrator.core.api_client import NotFoundError
 from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
 from langsmith_migrator.utils.config import Config
 from langsmith_migrator.utils.state import StateManager
@@ -118,6 +119,9 @@ def test_runs_shifted_consistently_preserves_offsets(tmp_path: Path):
         if endpoint == "/runs/query":
             # Only return runs on first call; cursor=None signals end of pages
             return {"runs": [RUN_A, RUN_B], "cursors": {"next": None}}
+        if endpoint == "/api/v2/runs/query":
+            # This source predates the v2 run query.
+            raise NotFoundError(f"Not found: {endpoint}", status_code=404)
         raise AssertionError(f"Unexpected source POST: {endpoint!r}")
 
     def dest_get(endpoint, params=None):

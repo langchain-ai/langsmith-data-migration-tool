@@ -168,6 +168,8 @@ class EnhancedAPIClient:
         """Prepare full URL from endpoint.
 
         If the endpoint starts with 'http', it is used as-is (absolute URL).
+        If the endpoint starts with '/api/v2/', it replaces the base URL's
+        '/api/v1' suffix, so v2 endpoints share the base URL's host and prefix.
         If the endpoint starts with '/v1/', it is treated as a root-relative
         path on the same host, bypassing the /api/v1 base path. This is used
         by Fleet endpoints which live at /v1/fleet/* rather than
@@ -176,6 +178,8 @@ class EnhancedAPIClient:
         """
         if endpoint.startswith('http'):
             return endpoint
+        if endpoint.startswith('/api/v2/') and self.base_url.endswith('/api/v1'):
+            return f"{self.base_url[:-len('/api/v1')]}{endpoint}"
         if endpoint.startswith('/v1/'):
             from urllib.parse import urlparse
 
