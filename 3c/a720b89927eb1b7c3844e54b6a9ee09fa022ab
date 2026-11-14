@@ -1,0 +1,40 @@
+langsmith_migrator/core/api_client.py
+  s_de48591c22cdda::t_86168341f68418 171-172,181-182
+langsmith_migrator/core/run_query.py
+  s_de48591c22cdda::t_86168341f68418 1-45,47-48,52,54-71,81-104,107-134,139-179
+  s_de48591c22cdda::t_6c59fd15274252 46,49-51,53,74-80
+  s_de48591c22cdda::t_19f9b1636eb4d8 72-73,135-138
+  s_de48591c22cdda::t_e1be923cdfaf42 105-106
+langsmith_migrator/core/migrators/experiment.py
+  s_de48591c22cdda::t_86168341f68418 9,431-432,531,681
+  s_de48591c22cdda::t_47958417ed7d5c 440-443,520-530
+tests/functional/test_experiment_time_shift.py
+  s_de48591c22cdda::t_b4bdd5fc2d932b 15
+  s_de48591c22cdda::t_47958417ed7d5c 122-124
+tests/test_run_query.py
+  s_de48591c22cdda::t_b4bdd5fc2d932b 1-192
+  s_de48591c22cdda::t_19f9b1636eb4d8 193-205
+tests/test_experiment_run_query_failure.py
+  s_de48591c22cdda::t_47958417ed7d5c 9,27-41,48-49,79,82,104,134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3ca720b89927eb1b7c3844e54b6a9ee09fa022ab",
+  "prompts": {},
+  "humans": {
+    "h_255864e0abd836": {
+      "author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  },
+  "sessions": {
+    "s_de48591c22cdda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "183dd2ca-5bf6-4d26-b434-c340f61f3b5e",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "lutan-langchain <lucy.tan@langchain.dev>"
+    }
+  }
+}
