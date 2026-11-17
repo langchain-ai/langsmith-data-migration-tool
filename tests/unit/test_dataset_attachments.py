@@ -118,7 +118,7 @@ def test_destination_sdk_client_receives_instance_info(migrator, monkeypatch):
 
     migrator.dest.get.assert_called_once_with("/info")
     assert captured_kwargs["info"] == DEST_INFO
-    assert captured_kwargs["api_url"] == "https://dest.api.test.com"
+    assert captured_kwargs["api_url"] == "https://dest.api.test.com/api/v1"
 
 
 def test_destination_info_is_fetched_once_and_cached(migrator, monkeypatch):

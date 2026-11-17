@@ -922,3 +922,12 @@ def test_an_offloaded_field_with_no_url_is_a_loss_not_a_no_op(sample_config):
     assert issues == ["payload_field_unavailable"]
     assert "inputs" not in overrides
     assert set(issues) <= LOST_CONTENT_CODES, "an archive must refuse to publish this"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["https://smith.example.com", "https://smith.example.com/", "https://smith.example.com/api/v1", "https://smith.example.com/api/v1/"],
+)
+def test_the_ingest_client_keeps_the_api_prefix_for_self_hosted(base_url):
+    # Self-hosted only has the prefixed (/api/v1) path
+    assert TraceMigrator._api_url(base_url) == "https://smith.example.com/api/v1"
