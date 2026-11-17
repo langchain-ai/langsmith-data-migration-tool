@@ -124,3 +124,20 @@ def test_missing_run_diagnosis_skips_the_lookup_v2_cannot_do(sample_config):
 
     assert code == "run_not_ingested"
     m.dest.get.assert_not_called()
+
+
+def test_ingest_client_keeps_the_api_prefix(sample_config):
+    """A single-domain self-hosted instance only serves the API under /api/v1."""
+    sample_config.destination.base_url = "https://langsmith.example.com"
+    with patch("langsmith_migrator.core.migrators.trace.Client") as client_cls:
+        TraceMigrator(
+            _client("longlived"),
+            _client("longlived"),
+            None,
+            sample_config,
+            range_start=NOW - timedelta(days=1),
+            range_end=NOW,
+        )
+
+    assert client_cls.call_args.kwargs["api_url"] == "https://langsmith.example.com/api/v1"
+    assert TraceMigrator._api_url("https://x.test/api/v1/") == "https://x.test/api/v1"

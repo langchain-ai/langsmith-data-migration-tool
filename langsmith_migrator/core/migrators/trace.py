@@ -212,7 +212,7 @@ class TraceMigrator(BaseMigrator):
         self._dest_session_http.request = _record_ingest
         self.dest_ls_client = Client(
             api_key=config.destination.api_key,
-            api_url=self._host(config.destination.base_url),
+            api_url=self._api_url(config.destination.base_url),
             session=self._dest_session_http,
             omit_traced_runtime_info=True,
             tracing_error_callback=self._ingest_errors.append,
@@ -290,6 +290,16 @@ class TraceMigrator(BaseMigrator):
     def _host(base_url: str) -> str:
         clean = (base_url or "").rstrip("/")
         return clean[: -len("/api/v1")] if clean.endswith("/api/v1") else clean
+
+    @staticmethod
+    def _api_url(base_url: str) -> str:
+        """The API URL for the SDK ingest client, which appends its paths to it.
+
+        The ``/api/v1`` prefix is kept: an instance served from a single domain has
+        its web UI at the host root, so ``<host>/runs/multipart`` is not the API.
+        """
+        clean = (base_url or "").rstrip("/")
+        return clean if clean.endswith("/api/v1") else f"{clean}/api/v1"
 
     def _sync_dest_headers(self) -> None:
         ws = self.dest.session.headers.get("X-Tenant-Id")
