@@ -111,7 +111,16 @@ class AnnotationQueueMigrator(BaseMigrator):
     # Queue items (runs)
     # ------------------------------------------------------------------
 
-    _ITEMS_QUERY = {"status": "needs_my_review", "item_type": "RUN"}
+    # The items API requires a status. These two cover every item still in the queue:
+    # which one an item is in depends on whether the caller has reviewed it, so both
+    # are listed to copy the same runs whoever's key runs the migration. Archived
+    # items are done and are left out, as the deprecated endpoint does by default.
+    _ITEM_STATUSES = ("needs_my_review", "needs_others_review")
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        # Whether each side ("source"/"dest") serves the queue items API.
+        self._items_support: Dict[str, bool] = {}
 
     @staticmethod
     def _items_endpoint(queue_id: str) -> str:
@@ -124,22 +133,24 @@ class AnnotationQueueMigrator(BaseMigrator):
         endpoints. Servers that predate it answer 404; so does a missing queue,
         so a 404 is only read as "unsupported" once the queue is confirmed to exist.
         """
-        cache = self.__dict__.setdefault("_items_support", {})
-        if side not in cache:
+        if side not in self._items_support:
             client = self.source if side == "source" else self.dest
             try:
-                client.get(self._items_endpoint(queue_id), {**self._ITEMS_QUERY, "page_size": 1})
-                cache[side] = True
+                client.get(
+                    self._items_endpoint(queue_id),
+                    {"status": self._ITEM_STATUSES[0], "item_type": "RUN", "page_size": 1},
+                )
+                self._items_support[side] = True
             except NotFoundError:
                 client.get(f"/annotation-queues/{queue_id}")  # raises if the queue is missing
                 self.use_deprecated_endpoint(side, "annotation queue items")
-                cache[side] = False
-        return cache[side]
+                self._items_support[side] = False
+        return self._items_support[side]
 
     def iter_queue_runs(self, queue_id: str) -> Iterator[Dict[str, Any]]:
         """Yield the runs currently in a source annotation queue, one page at a time.
 
-        Each run is a dict with ``id``, ``session_id`` and ``start_time``. A failed
+        Each run has at least ``id``, ``session_id`` and ``start_time``. A failed
         page (permission error, exhausted retries) raises rather than looking
         like the end of the queue.
         """
@@ -149,31 +160,36 @@ class AnnotationQueueMigrator(BaseMigrator):
             yield from self._iter_queue_runs_legacy(queue_id)
 
     def _iter_queue_items(self, queue_id: str) -> Iterator[Dict[str, Any]]:
-        """List run items through the queue items API (cursor pagination)."""
+        """List run items through the queue items API, one status at a time."""
         endpoint = self._items_endpoint(queue_id)
-        params: Dict[str, Any] = {**self._ITEMS_QUERY, "page_size": QUEUE_RUNS_BATCH_SIZE}
         seen: set = set()
-        while True:
-            response = self.source.get(endpoint, dict(params))
-            page = response if isinstance(response, dict) else {}
-            items = page.get("items") or []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                run_id = item.get("run_id")
-                if run_id and run_id in seen:
-                    continue
-                if run_id:
-                    seen.add(run_id)
-                yield {
-                    "id": run_id,
-                    "session_id": item.get("project_id") or item.get("session_id"),
-                    "start_time": item.get("start_time"),
-                }
-            cursor = page.get("next_cursor")
-            if not cursor or not items:
-                return
-            params["cursor"] = cursor
+        for status in self._ITEM_STATUSES:
+            params: Dict[str, Any] = {
+                "status": status, "item_type": "RUN", "page_size": QUEUE_RUNS_BATCH_SIZE,
+            }
+            while True:
+                response = self.source.get(endpoint, dict(params))
+                page = response if isinstance(response, dict) else {}
+                items = page.get("items") or []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    run_id = item.get("run_id")
+                    if run_id and run_id in seen:
+                        continue
+                    if run_id:
+                        seen.add(run_id)
+                    yield {
+                        "id": run_id,
+                        "session_id": item.get("project_id") or item.get("session_id"),
+                        "start_time": item.get("start_time"),
+                    }
+                # A page can be empty and still have a next cursor (the server skips
+                # unusable rows), so follow the cursor rather than stopping early.
+                cursor = page.get("next_cursor")
+                if not cursor or cursor == params.get("cursor"):
+                    break
+                params["cursor"] = cursor
 
     def _iter_queue_runs_legacy(self, queue_id: str) -> Iterator[Dict[str, Any]]:
         """List runs through the deprecated ``/runs`` endpoint (offset pagination).

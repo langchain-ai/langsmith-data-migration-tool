@@ -50,7 +50,7 @@ class BaseMigrator:
         instead, so a run meant to exercise the current endpoints cannot pass
         by quietly using the old ones.
         """
-        if self.config.migration.no_deprecated_fallback is True:
+        if self.config.migration.no_deprecated_fallback:
             raise APIError(
                 f"The {side} instance does not support the current {what} endpoints, "
                 "and MIGRATION_NO_DEPRECATED_FALLBACK is set"

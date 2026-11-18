@@ -56,6 +56,19 @@ def _items_page(runs, next_cursor=None):
     }
 
 
+def _items_server(pages_by_status):
+    """Serve the items API: each status has a list of pages, chained by cursor."""
+
+    def get(endpoint, params=None):
+        params = params or {}
+        pages = pages_by_status.get(params.get("status"), [[]])
+        index = int(params.get("cursor") or 0)
+        next_cursor = str(index + 1) if index + 1 < len(pages) else None
+        return _items_page(pages[index], next_cursor)
+
+    return get
+
+
 @pytest.fixture
 def migrator(sample_config):
     source = _client()
@@ -211,20 +224,32 @@ def test_migrate_queue_runs_empty_queue(migrator):
 # --- queue items API (replaces the deprecated /runs endpoints) ---------------
 
 
-def test_items_api_is_used_for_listing_and_adding_when_both_sides_support_it(migrator):
-    pages = [_items_page([]), _items_page([_run(1), _run(2)], "cur-1"), _items_page([_run(3)])]
-    migrator.source.get.side_effect = lambda endpoint, params=None: pages.pop(0)
-    migrator.dest.get.side_effect = None
-    migrator.dest.get.return_value = _items_page([])
+def test_items_api_lists_every_active_item_and_adds_by_key(migrator):
+    """Both active statuses are listed, so the caller's own reviews hide nothing."""
+    migrator.source.get.side_effect = _items_server(
+        {
+            # the empty page still has a next cursor, so listing goes on past it
+            "needs_my_review": [[_run(1)], [], [_run(2)]],
+            # run-1 was reviewed mid-listing, so it is listed twice but copied once
+            "needs_others_review": [[_run(3), _run(1)]],
+            "archived": [[_run(4)]],  # review complete: not copied
+        }
+    )
+    migrator.dest.get.side_effect = _items_server({})
 
     result = migrator.migrate_queue_runs("q-src", "q-dst")
 
     assert result["total"] == 3
     assert result["added"] == 3
-    listing = migrator.source.get.call_args_list
+    listing = migrator.source.get.call_args_list[1:]  # after the support probe
     assert {c.args[0] for c in listing} == {"/platform/annotation-queues/q-src/items"}
-    assert listing[1].args[1] == {"status": "needs_my_review", "item_type": "RUN", "page_size": 100}
-    assert listing[2].args[1]["cursor"] == "cur-1"
+    assert listing[0].args[1] == {"status": "needs_my_review", "item_type": "RUN", "page_size": 100}
+    assert [(c.args[1]["status"], c.args[1].get("cursor")) for c in listing] == [
+        ("needs_my_review", None),
+        ("needs_my_review", "1"),
+        ("needs_my_review", "2"),
+        ("needs_others_review", None),
+    ]
     endpoint, body = migrator.dest.post.call_args.args
     assert endpoint == "/platform/annotation-queues/q-dst/items"
     assert body == {
@@ -242,8 +267,7 @@ def test_items_api_is_used_for_listing_and_adding_when_both_sides_support_it(mig
 
 def test_each_side_is_probed_once_and_falls_back_independently(migrator):
     """A new source and an old destination in the same run."""
-    pages = [_items_page([]), _items_page([_run(1)]), _items_page([_run(2)])]
-    migrator.source.get.side_effect = lambda endpoint, params=None: pages.pop(0)
+    migrator.source.get.side_effect = _items_server({"needs_my_review": [[_run(1)]]})
 
     migrator.migrate_queue_runs("q-src", "q-dst")
     migrator.migrate_queue_runs("q-src-2", "q-dst-2")
@@ -261,14 +285,15 @@ def test_missing_queue_is_not_mistaken_for_a_missing_items_api(migrator):
 
     with pytest.raises(NotFoundError):
         list(migrator.iter_queue_runs("q-gone"))
-    assert migrator.__dict__.get("_items_support", {}) == {}
+    assert migrator._items_support == {}
 
 
-def test_no_deprecated_fallback_refuses_the_old_endpoints(migrator):
+def test_no_deprecated_fallback_refuses_the_old_listing_on_the_source(migrator):
     migrator.config.migration.no_deprecated_fallback = True
-    _serve(migrator, [_run(1)])
+    _serve(migrator, [_run(1)])  # the source predates the items API
+    migrator.dest.get.side_effect = _items_server({})  # the destination has it
 
-    with pytest.raises(APIError, match="MIGRATION_NO_DEPRECATED_FALLBACK"):
+    with pytest.raises(APIError, match="source instance.*MIGRATION_NO_DEPRECATED_FALLBACK"):
         migrator.migrate_queue_runs("q-src", "q-dst")
     assert _run_list_calls(migrator) == []
     migrator.dest.post.assert_not_called()
