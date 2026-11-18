@@ -353,6 +353,11 @@ class FeedbackMigrator(BaseMigrator):
                 if not k.startswith("_") and v is not None
             }
             body.update({"trace_id": fb["_trace_id"], "session_id": fb["_session_id"]})
+            # Without start_time, SmithDB-only ingest can only place feedback on runs
+            # it ingested in the last few hours. It trusts the value as given, so only
+            # a start_time this tool wrote itself is sent.
+            if fb.get("_start_time_recorded"):
+                body["start_time"] = fb["_start_time"]
             parts.append((f"feedback.{fb['id']}", json.dumps(body, default=str).encode("utf-8")))
 
         try:
