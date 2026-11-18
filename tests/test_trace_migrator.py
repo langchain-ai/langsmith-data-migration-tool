@@ -931,3 +931,19 @@ def test_an_offloaded_field_with_no_url_is_a_loss_not_a_no_op(sample_config):
 def test_the_ingest_client_keeps_the_api_prefix_for_self_hosted(base_url):
     # Self-hosted only has the prefixed (/api/v1) path
     assert TraceMigrator._api_url(base_url) == "https://smith.example.com/api/v1"
+
+
+def test_the_sdk_ingest_client_is_built_with_the_api_prefix(sample_config):
+    """The SDK client itself, not just the helper, gets the prefixed URL."""
+    sample_config.destination.base_url = "https://smith.example.com"
+    with patch("langsmith_migrator.core.migrators.trace.Client") as client_cls:
+        TraceMigrator(
+            _client(),
+            _client(),
+            None,
+            sample_config,
+            range_start=NOW - timedelta(days=1),
+            range_end=NOW,
+        )
+
+    assert client_cls.call_args.kwargs["api_url"] == "https://smith.example.com/api/v1"
