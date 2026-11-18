@@ -838,9 +838,9 @@ class TraceMigrator(BaseMigrator):
             ):
                 self._shortlived_reported.add(src_id)
                 summary = (
-                    f"Project {source_session.get('name') or src_id} is short-lived and its "
-                    "source does not report a tier per run, so none of its runs were "
-                    "migrated. Traces upgraded to long-lived inside it are not copied."
+                    f"Project {source_session.get('name') or src_id} is short-lived and the "
+                    "source's v2 run query does not report each run's tier, so none of its "
+                    "runs were migrated, including traces upgraded to long-lived inside it."
                 )
                 self.console.print(f"[yellow]  {summary}[/yellow]")
                 empty.issues.append(

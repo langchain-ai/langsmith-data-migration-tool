@@ -32,8 +32,6 @@ def _client() -> Mock:
     client = Mock(spec=EnhancedAPIClient)
     client.session = Mock()
     client.session.headers = {}
-    # These tests model servers that predate the v2 run query.
-    client.runs_v2_supported = False
     return client
 
 

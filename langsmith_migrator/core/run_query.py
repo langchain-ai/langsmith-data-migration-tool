@@ -1,8 +1,9 @@
-"""Query runs through the current (v2) endpoint, falling back to v1 on older servers.
+"""Query runs through v1, or through v2 on instances where v1 no longer answers.
 
-`POST /api/v1/runs/query` is deprecated in favour of `POST /api/v2/runs/query`.
-Callers keep building the v1 request body and reading v1 field names; this
-module translates both ways, so a migrator does not care which one answered.
+`POST /api/v1/runs/query` is deprecated in favour of `POST /api/v2/runs/query`,
+and returns 501 on SmithDB-only instances. Callers keep building the v1 request
+body and reading v1 field names; this module translates both ways, so a migrator
+does not care which one answered.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -82,24 +83,63 @@ def to_v1_run(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class RunQuery:
-    """Run queries for one migrator, against whichever endpoint each instance has."""
+    """Run queries for one migrator, against whichever endpoint each instance needs."""
 
     def __init__(self, migrator: Any):
         self.migrator = migrator
+        self._uses_v2: Dict[str, bool] = {}  # per side
+        self._min_start: Dict[Tuple[str, str], str] = {}  # per (side, project)
 
     def _client(self, side: str) -> EnhancedAPIClient:
         return self.migrator.source if side == "source" else self.migrator.dest
 
     def uses_v2(self, side: str, session_id: str) -> bool:
-        """Whether one instance serves the v2 run query, checked once per client.
+        """Whether to query one instance through v2, decided once per side.
+
+        As in the LangSmith SDK, v1 stays in use wherever it still answers: it reports
+        each run's tier and the URLs of offloaded payloads, and v2 does not. v2 is used
+        where v1 cannot answer (SmithDB-only instances return 501 for it), and wherever
+        v2 exists when MIGRATION_NO_DEPRECATED_FALLBACK is set.
+        """
+        if side not in self._uses_v2:
+            if self._smithdb_only(side):
+                v2 = True
+            elif self.migrator.config.migration.no_deprecated_fallback:
+                v2 = self._has_v2(side, session_id)
+                if not v2:
+                    self.migrator.use_deprecated_endpoint(side, "run query")  # raises
+            else:
+                v2 = False
+            self._uses_v2[side] = v2
+        return self._uses_v2[side]
+
+    def _smithdb_only(self, side: str) -> bool:
+        """Whether ``/info`` says the instance serves run queries from SmithDB only.
+
+        Mirrors the SDK's ``get_query_backend``: an older server that omits the flags
+        has ClickHouse queries on and SmithDB queries off.
+        """
+        try:
+            info = self._client(side).get("/info")
+        except Exception as exc:
+            self.migrator.log(
+                f"Could not read /info from the {side} instance ({exc}); "
+                "using the v1 run query",
+                "warning",
+            )
+            return False
+        flags = info.get("instance_flags") if isinstance(info, dict) else None
+        if not isinstance(flags, dict):
+            return False
+        return not flags.get("ch_query_enabled", True) and bool(flags.get("sdb_query_enabled"))
+
+    def _has_v2(self, side: str, session_id: str) -> bool:
+        """Probe for the v2 endpoint.
 
         Servers that predate it answer 404. So does a missing project, so a 404
         only counts as "no v2" once the project is confirmed to exist.
         """
         client = self._client(side)
-        known = client.__dict__.get("runs_v2_supported")
-        if known is not None:
-            return known
         probe = {
             "project_ids": [str(session_id)],
             # Must be earlier than the server's "now", which is its default upper bound.
@@ -109,14 +149,10 @@ class RunQuery:
         }
         try:
             response = client.post(V2_RUNS_QUERY, probe)
-            supported = isinstance(response, dict) and "items" in response
         except NotFoundError:
             client.get(f"/sessions/{session_id}")  # raises if the project is missing
-            supported = False
-        if not supported:
-            self.migrator.use_deprecated_endpoint(side, "run query")
-        client.__dict__["runs_v2_supported"] = supported
-        return supported
+            return False
+        return isinstance(response, dict) and "items" in response
 
     def page(
         self, side: str, body: Dict[str, Any]
@@ -156,12 +192,11 @@ class RunQuery:
 
     def _project_min_start(self, side: str, session_id: str) -> str:
         """The earliest a run of this project can have started, cached per project."""
-        client = self._client(side)
-        cache = client.__dict__.setdefault("_project_min_start", {})
-        if session_id not in cache:
+        key = (side, session_id)
+        if key not in self._min_start:
             start = None
             try:
-                project = client.get(f"/sessions/{session_id}") or {}
+                project = self._client(side).get(f"/sessions/{session_id}") or {}
                 raw = str(project.get("start_time") or "")
                 if raw:
                     start = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -171,8 +206,8 @@ class RunQuery:
             except (ValueError, TypeError):
                 start = None
             floor = datetime.now(timezone.utc) - _MAX_LOOKBACK
-            cache[session_id] = _iso(max(start, floor) if start else floor)
-        return cache[session_id]
+            self._min_start[key] = _iso(max(start, floor) if start else floor)
+        return self._min_start[key]
 
 
 def _iso(value: datetime) -> str:

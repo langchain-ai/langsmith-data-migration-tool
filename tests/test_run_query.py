@@ -1,4 +1,4 @@
-"""Run queries use the v2 endpoint where an instance has it, and v1 otherwise."""
+"""Run queries stay on v1 where it still answers, and use v2 where it does not."""
 
 from __future__ import annotations
 
@@ -12,15 +12,23 @@ from langsmith_migrator.core.run_query import REPLAY_SELECT, RunQuery, to_v1_run
 
 ROOT = "11111111-1111-1111-1111-111111111111"
 CHILD = "22222222-2222-2222-2222-222222222222"
+V1 = "/runs/query"
 V2 = "/api/v2/runs/query"
 
+SMITHDB_ONLY = {"ch_query_enabled": False, "sdb_query_enabled": True}
+DUAL = {"ch_query_enabled": True, "sdb_query_enabled": True}  # e.g. LangSmith Cloud
 
-def _client() -> Mock:
+
+def _client(flags=None) -> Mock:
+    """A client whose /info reports ``flags``; every other GET returns the project."""
     client = Mock(spec=EnhancedAPIClient)
     client.base_url = "https://example.test/api/v1"
     client.session = Mock()
     client.session.headers = {}
-    client.get.return_value = {"id": "exp-src", "start_time": "2026-03-01T00:00:00Z"}
+    project = {"id": "exp-src", "start_time": "2026-03-01T00:00:00Z"}
+    client.get.side_effect = lambda endpoint, params=None: (
+        {"instance_flags": flags or {}} if endpoint == "/info" else project
+    )
     return client
 
 
@@ -38,7 +46,7 @@ def _v2_item(run_id: str = ROOT, dotted: str | None = None) -> dict:
 
 
 def _v2_server(*pages):
-    """POST handler for a server with the v2 run query; the first call is the probe."""
+    """POST handler for a server with the v2 run query; answers the probe as well."""
     remaining = list(pages)
 
     def post(endpoint, data=None):
@@ -61,7 +69,8 @@ def _v1_server(response):
 
 @pytest.fixture
 def migrator(sample_config, migration_state):
-    return ExperimentMigrator(_client(), _client(), migration_state, sample_config)
+    """The source is SmithDB-only, so it is queried through v2."""
+    return ExperimentMigrator(_client(SMITHDB_ONLY), _client(), migration_state, sample_config)
 
 
 def test_to_v1_run_restores_the_field_names_migrators_read():
@@ -118,37 +127,65 @@ def test_v2_query_without_a_start_time_is_bounded_by_the_project_start(migrator)
     assert len(body["selects"]) == len(REPLAY_SELECT)
 
 
-def test_server_without_v2_gets_the_v1_request_unchanged(migrator):
-    migrator.source.post.side_effect = _v1_server(
-        {"runs": [{"id": ROOT}], "cursors": {"next": "c2"}}
-    )
+@pytest.mark.parametrize("flags", [DUAL, {}], ids=["dual", "older-server"])
+def test_instance_that_still_serves_v1_gets_the_v1_request_unchanged(migrator, flags):
+    """v1 reports per-run tiers and offloaded-payload URLs, so it stays in use."""
+    migrator.source = _client(flags)
+    migrator.source.post.return_value = {"runs": [{"id": ROOT}], "cursors": {"next": "c2"}}
     body = {"session": ["exp-src"], "skip_pagination": False}
     query = RunQuery(migrator)
 
     assert query.page("source", body) == ([{"id": ROOT}], "c2")
     query.page("source", body)
 
-    calls = migrator.source.post.call_args_list
-    assert [c.args[0] for c in calls] == [V2, "/runs/query", "/runs/query"]  # probed once
-    assert calls[1].args[1] == body
+    assert [c.args for c in migrator.source.post.call_args_list] == [(V1, body), (V1, body)]
+    assert [c.args[0] for c in migrator.source.get.call_args_list] == ["/info"]  # read once
 
 
-def test_missing_project_is_not_mistaken_for_a_server_without_v2(migrator):
-    migrator.source.post.side_effect = NotFoundError("project not found", status_code=404)
-    migrator.source.get.side_effect = NotFoundError("project not found", status_code=404)
+def test_unreadable_info_falls_back_to_v1(migrator):
+    migrator.source.get.side_effect = RuntimeError("connection reset")
+    migrator.source.post.return_value = {"runs": [], "cursors": {}}
 
-    with pytest.raises(NotFoundError):
-        RunQuery(migrator).uses_v2("source", "exp-gone")
-    assert "runs_v2_supported" not in migrator.source.__dict__
+    RunQuery(migrator).page("source", {"session": ["exp-src"]})
+
+    assert migrator.source.post.call_args.args[0] == V1
+
+
+def test_no_deprecated_fallback_uses_v2_where_v1_still_works(migrator):
+    migrator.config.migration.no_deprecated_fallback = True
+    migrator.source = _client(DUAL)
+    migrator.source.post.side_effect = _v2_server({"items": [], "next_cursor": None})
+
+    RunQuery(migrator).page("source", {"session": ["exp-src"]})
+
+    assert {c.args[0] for c in migrator.source.post.call_args_list} == {V2}
 
 
 def test_no_deprecated_fallback_refuses_the_v1_run_query(migrator):
     migrator.config.migration.no_deprecated_fallback = True
+    migrator.source = _client()
     migrator.source.post.side_effect = _v1_server({"runs": []})
 
     with pytest.raises(APIError, match="MIGRATION_NO_DEPRECATED_FALLBACK"):
         RunQuery(migrator).page("source", {"session": ["exp-src"]})
     assert [c.args[0] for c in migrator.source.post.call_args_list] == [V2]
+
+
+def test_missing_project_is_not_mistaken_for_a_server_without_v2(migrator):
+    migrator.config.migration.no_deprecated_fallback = True
+
+    def get(endpoint, params=None):
+        if endpoint == "/info":
+            return {}
+        raise NotFoundError("project not found", status_code=404)
+
+    migrator.source.get.side_effect = get
+    migrator.source.post.side_effect = NotFoundError("project not found", status_code=404)
+    query = RunQuery(migrator)
+
+    with pytest.raises(NotFoundError):
+        query.uses_v2("source", "exp-gone")
+    assert "source" not in query._uses_v2
 
 
 def test_experiment_runs_replay_from_the_v2_endpoint(migrator, migration_state):
@@ -174,7 +211,7 @@ def test_experiment_runs_replay_from_the_v2_endpoint(migrator, migration_state):
     assert migration_state.get_item("experiment_exp-src").metadata["run_cursor_api"] == "v2"
 
 
-def test_saved_v1_cursor_is_dropped_when_the_source_now_serves_v2(migrator, migration_state):
+def test_saved_v1_cursor_is_dropped_when_the_source_now_needs_v2(migrator, migration_state):
     migrator.source.post.side_effect = _v2_server({"items": [], "next_cursor": None})
     migration_state.ensure_item(
         "experiment_exp-src",
