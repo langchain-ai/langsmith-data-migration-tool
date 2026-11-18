@@ -1,0 +1,22 @@
+langsmith_migrator/core/migrators/feedback.py
+  s_62fcd8c5ff5731::t_2daac6f69a3c1c 174,180-182,190
+  s_62fcd8c5ff5731::t_fb0d0f7b937577 225-226,228,230-237
+  s_62fcd8c5ff5731::t_79501a7f722159 8
+  s_62fcd8c5ff5731::t_ffbd6c3a32a474 522
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "01dfccc77d32d71f8e2d1da268284037a3bc2eca",
+  "prompts": {},
+  "sessions": {
+    "s_62fcd8c5ff5731": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f8ee6673-a818-4472-9631-0ccbcfe6fb01",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
