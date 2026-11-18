@@ -455,8 +455,15 @@ class ExperimentMigrator(BaseMigrator):
                 if created_mapping:
                     run_id_mapping.update(created_mapping)
                     if self.state:
+                        # Kept so feedback can send each run's start_time with its
+                        # trace_id, which spares the server a run lookup.
+                        start_times = {run.get("id"): run.get("start_time") for run in batch}
                         for old_id, new_id in created_mapping.items():
                             self.state.set_mapped_id("run", old_id, new_id)
+                            if start_times.get(new_id):
+                                self.state.set_mapped_id(
+                                    "run_start_time", new_id, start_times[new_id]
+                                )
                         self.persist_state()
                     self.log(
                         f"Created batch of {len(created_mapping)} runs (total: {total_runs})",

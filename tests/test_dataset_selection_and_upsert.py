@@ -156,6 +156,24 @@ def test_multipart_batches_feedback_into_single_requests(sample_config, migratio
     assert "_fingerprint" not in body and body["id"] == names[0].split(".", 1)[1]
 
 
+def test_multipart_sends_only_a_recorded_start_time(sample_config, migration_state):
+    """Ingest trusts start_time as given, so a derived one is not sent."""
+    import json
+
+    migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=1)
+    sample_config.migration.dry_run = False
+    sample_config.migration.feedback_multipart = True
+    dest.post_multipart = Mock()
+    recorded = _mp_feedback(0, _start_time="2026-11-11T20:00:00+00:00", _start_time_recorded=True)
+    derived = _mp_feedback(1, _start_time="2026-11-11T21:00:00+00:00", _start_time_recorded=False)
+
+    migrator.create_feedback_batch([recorded, derived])
+
+    bodies = [json.loads(b) for _, b in dest.post_multipart.call_args.args[1]]
+    assert bodies[0]["start_time"] == "2026-11-11T20:00:00+00:00"
+    assert "start_time" not in bodies[1]
+
+
 def test_multipart_failure_falls_back_to_individual_posts(sample_config, migration_state):
     migrator, _, dest = _feedback_migrator(sample_config, migration_state, workers=1)
     sample_config.migration.dry_run = False
