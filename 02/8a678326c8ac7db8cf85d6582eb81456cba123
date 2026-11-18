@@ -1,0 +1,28 @@
+langsmith_migrator/core/migrators/feedback.py
+  s_62fcd8c5ff5731::t_2daac6f69a3c1c 174,180-182,190
+  s_62fcd8c5ff5731::t_fb0d0f7b937577 228,234-238
+  s_62fcd8c5ff5731::t_79501a7f722159 8
+  s_62fcd8c5ff5731::t_ffbd6c3a32a474 523
+  s_62fcd8c5ff5731::t_2bbc25dd92f5f4 225-226,230-233
+langsmith_migrator/core/migrators/experiment.py
+  s_62fcd8c5ff5731::t_9998f5bf0dd7c6 458-459
+tests/test_feedback_accounting.py
+  s_62fcd8c5ff5731::t_406acd6e2a136c 5,11
+  s_62fcd8c5ff5731::t_8748fed65bd16a 242-243
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "028a678326c8ac7db8cf85d6582eb81456cba123",
+  "prompts": {},
+  "sessions": {
+    "s_62fcd8c5ff5731": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f8ee6673-a818-4472-9631-0ccbcfe6fb01",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
