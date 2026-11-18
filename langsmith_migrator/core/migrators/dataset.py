@@ -537,8 +537,10 @@ class DatasetMigrator(BaseMigrator):
             raise
 
         # Initialize LangSmith client with destination credentials
-        # SDK expects base URL without /api/v1 suffix
-        sdk_url = self.dest.base_url.replace("/api/v1", "")
+        # Self-hosted only has the prefixed (/api/v1) path
+        sdk_url = self.dest.base_url.rstrip("/")
+        if not sdk_url.endswith("/api/v1"):
+            sdk_url = f"{sdk_url}/api/v1"
         api_key = self.dest.headers.get("X-API-Key") or self.dest.headers.get("x-api-key", "")
 
         # Hand the SDK the destination's /info payload rather than an empty dict:
