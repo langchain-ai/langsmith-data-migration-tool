@@ -1,0 +1,25 @@
+tests/test_annotation_queue_runs.py
+  s_62fcd8c5ff5731::t_72ae949668695c 227-228,231-235,242-243,250
+  s_62fcd8c5ff5731::t_45a2b27c9aa63e 263
+README.md
+  s_62fcd8c5ff5731::t_90ca0db985b798 857
+langsmith_migrator/core/migrators/annotation_queue.py
+  s_62fcd8c5ff5731::t_bf832bdd8ea3ef 187-188,190
+  s_62fcd8c5ff5731::t_153395dd7c28f0 114-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "65c39bc23626cbeae8f004dc5d01baea4004f9d6",
+  "prompts": {},
+  "sessions": {
+    "s_62fcd8c5ff5731": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f8ee6673-a818-4472-9631-0ccbcfe6fb01",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
