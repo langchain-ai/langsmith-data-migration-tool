@@ -78,6 +78,13 @@ The `traces` command migrates **long-lived traces only** (`trace_tier == "longli
 — the ones deliberately retained for up to 180 days. Short-lived traces are out of
 scope.
 
+On a SmithDB-only source (ClickHouse queries turned off), the run query does not
+report each run's tier, so the project's tier decides: every run of a long-lived
+project is migrated, and a short-lived project is skipped and recorded as an issue,
+including any traces upgraded to long-lived inside it. Setting
+`MIGRATION_NO_DEPRECATED_FALLBACK=true` applies the same rule to any source that
+serves the v2 run query, LangSmith Cloud included.
+
 What `traces` guarantees:
 
 - **Run IDs are preserved.** `id`, `trace_id`, `parent_run_id` and `dotted_order` are

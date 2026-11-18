@@ -100,6 +100,8 @@ def test_runs_shifted_consistently_preserves_offsets(tmp_path: Path):
             return DATASET_PAYLOAD
         if endpoint == f"/sessions/{EXP_ID}":
             return EXPERIMENT_PAYLOAD
+        if endpoint == "/info":
+            return {}  # no instance flags: an older server that serves the v1 run query
         # Feedback pagination (list_feedback_for_session)
         if endpoint == "/feedback":
             return []
