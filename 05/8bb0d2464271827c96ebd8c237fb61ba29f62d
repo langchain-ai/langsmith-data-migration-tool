@@ -1,0 +1,21 @@
+langsmith_migrator/core/run_query.py
+  s_62fcd8c5ff5731::t_0e25d10718a302 65-66
+tests/test_run_query.py
+  s_62fcd8c5ff5731::t_b8f704ae6d667e 39-40,82-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "058bb0d2464271827c96ebd8c237fb61ba29f62d",
+  "prompts": {},
+  "sessions": {
+    "s_62fcd8c5ff5731": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f8ee6673-a818-4472-9631-0ccbcfe6fb01",
+        "model": "unknown"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
