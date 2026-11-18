@@ -7,7 +7,6 @@ from unittest.mock import Mock, patch
 
 from langsmith_migrator.core.api_client import EnhancedAPIClient
 from langsmith_migrator.core.migrators.trace import TraceMigrator
-from langsmith_migrator.core.run_query import to_v1_run
 from langsmith_migrator.core.trace_domain import Window
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
@@ -115,13 +114,6 @@ def test_skipped_short_lived_project_is_reported_once(sample_config):
     assert [issue[1] for issue in first.issues] == ["shortlived_project_not_migrated"]
     assert first.issues[0][0] == "degraded"
     assert second.issues == []
-
-
-def test_v2_attachments_become_v1_s3_urls():
-    run = to_v1_run({**_item("a"), "attachments": {"report.pdf": "https://blob.test/x"}})
-
-    assert run["s3_urls"] == {"attachment.report.pdf": {"presigned_url": "https://blob.test/x"}}
-    assert "attachments" not in run  # on a run payload that key means downloaded bytes
 
 
 def test_canary_reads_the_run_back_through_the_v2_query(sample_config):

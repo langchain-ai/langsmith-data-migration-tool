@@ -32,17 +32,22 @@ def _client(flags=None) -> Mock:
     return client
 
 
-def _v2_item(run_id: str = ROOT, dotted: str | None = None) -> dict:
-    return {
+def _v2_item(run_id: str = ROOT, parent: str | None = None) -> dict:
+    item = {
         "id": run_id,
         "name": "run",
         "run_type": "chain",
+        "status": "success",
         "project_id": "exp-src",
         "trace_id": ROOT,
         "start_time": "2026-03-01T00:00:01Z",
-        "dotted_order": dotted or f"20260301T000001000000Z{run_id}",
+        "dotted_order": f"20260301T000001000000Z{run_id}",
         "manifest": {"k": "v"},
     }
+    if parent:
+        item["parent_run_ids"] = [parent]
+        item["dotted_order"] = f"20260301T000001000000Z{parent}.20260301T000002000000Z{run_id}"
+    return item
 
 
 def _v2_server(*pages):
@@ -73,17 +78,29 @@ def migrator(sample_config, migration_state):
     return ExperimentMigrator(_client(SMITHDB_ONLY), _client(), migration_state, sample_config)
 
 
-def test_to_v1_run_restores_the_field_names_migrators_read():
+def test_to_v1_run_restores_the_field_names_and_values_migrators_read():
     child = to_v1_run(
         {
-            **_v2_item(CHILD, f"20260301T000001000000Z{ROOT}.20260301T000002000000Z{CHILD}"),
-            "parent_run_ids": [ROOT],
+            **_v2_item(CHILD, parent=ROOT),
+            "parent_run_ids": ["0" * 36, ROOT],
+            # as the v2 docs give them; servers send lower case
+            "run_type": "CHAIN",
+            "status": "SUCCESS",
         }
     )
+
     assert child["session_id"] == "exp-src"
-    assert child["parent_run_id"] == ROOT
+    assert child["parent_run_id"] == ROOT  # the direct parent is the last ancestor
     assert child["serialized"] == {"k": "v"}
+    assert (child["run_type"], child["status"]) == ("chain", "success")
     assert "parent_run_id" not in to_v1_run(_v2_item())
+
+
+def test_v2_attachments_become_v1_s3_urls():
+    run = to_v1_run({**_v2_item(), "attachments": {"report.pdf": "https://blob.test/x"}})
+
+    assert run["s3_urls"] == {"attachment.report.pdf": {"presigned_url": "https://blob.test/x"}}
+    assert "attachments" not in run  # on a run payload that key means downloaded bytes
 
 
 def test_v1_body_is_translated_for_the_v2_endpoint(migrator):
@@ -151,6 +168,25 @@ def test_unreadable_info_falls_back_to_v1(migrator):
     assert migrator.source.post.call_args.args[0] == V1
 
 
+def test_v1_answering_501_switches_the_instance_to_v2(migrator):
+    """/info can be unreadable or stale; a 501 from v1 is the definitive signal."""
+    migrator.source = _client()
+
+    def post(endpoint, data=None):
+        if endpoint == V1:
+            raise APIError("Not Implemented", status_code=501)
+        return {"items": [_v2_item()], "next_cursor": None}
+
+    migrator.source.post.side_effect = post
+    query = RunQuery(migrator)
+
+    runs, _ = query.page("source", {"session": ["exp-src"]})
+    query.page("source", {"session": ["exp-src"]})
+
+    assert [r["id"] for r in runs] == [ROOT]
+    assert [c.args[0] for c in migrator.source.post.call_args_list] == [V1, V2, V2]
+
+
 def test_no_deprecated_fallback_uses_v2_where_v1_still_works(migrator):
     migrator.config.migration.no_deprecated_fallback = True
     migrator.source = _client(DUAL)
@@ -189,9 +225,8 @@ def test_missing_project_is_not_mistaken_for_a_server_without_v2(migrator):
 
 
 def test_experiment_runs_replay_from_the_v2_endpoint(migrator, migration_state):
-    child = _v2_item(CHILD, f"20260301T000001000000Z{ROOT}.20260301T000002000000Z{CHILD}")
     migrator.source.post.side_effect = _v2_server(
-        {"items": [child, _v2_item()], "next_cursor": None}
+        {"items": [_v2_item(CHILD, parent=ROOT), _v2_item()], "next_cursor": None}
     )
     migrator.dest.post.return_value = {}
     migration_state.ensure_item(
@@ -235,8 +270,9 @@ def test_empty_fields_come_back_the_way_v1_returns_them(migrator):
     migrator.source.post.side_effect = _v2_server({"items": [item], "next_cursor": None})
 
     runs, _ = RunQuery(migrator).page(
-        "source", {"session": ["exp-src"], "select": ["id", "events", "serialized"]}
+        "source", {"session": ["exp-src"], "select": ["id", "events", "inputs", "serialized"]}
     )
 
     assert runs[0]["events"] == []
+    assert runs[0]["inputs"] == {}
     assert runs[0]["serialized"] is None

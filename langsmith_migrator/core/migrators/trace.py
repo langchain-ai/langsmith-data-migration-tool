@@ -387,7 +387,12 @@ class TraceMigrator(BaseMigrator):
         """One run by ID. The v2 query needs its project and a lower time bound."""
         client = self.source if side == "source" else self.dest
         if not self._run_query.uses_v2(side, session_id):
-            return client.get(f"/runs/{run_id}")
+            try:
+                return client.get(f"/runs/{run_id}")
+            except APIError as exc:
+                if exc.status_code != 501:
+                    raise
+                self._run_query.v1_not_served(side)
         runs, _ = self._run_query.page(
             side,
             {

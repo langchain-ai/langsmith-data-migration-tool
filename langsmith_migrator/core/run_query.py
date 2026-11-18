@@ -9,7 +9,7 @@ does not care which one answered.
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from .api_client import EnhancedAPIClient, NotFoundError
+from .api_client import APIError, EnhancedAPIClient, NotFoundError
 
 V2_RUNS_QUERY = "/api/v2/runs/query"
 V1_RUNS_QUERY = "/runs/query"
@@ -62,12 +62,13 @@ def to_v1_run(item: Dict[str, Any]) -> Dict[str, Any]:
     run = dict(item)
     if "project_id" in item:
         run["session_id"] = item["project_id"]
-    # dotted_order lists the run's ancestors root-first, itself last, so the
-    # direct parent is the second-to-last part.
-    parts = str(item.get("dotted_order") or "").split(".")
-    if len(parts) > 1:
-        run["parent_run_id"] = parts[-2][-36:]
-    elif item.get("parent_run_ids"):
+    # Servers send these in lower case, but the v2 docs give them in upper case (LLM,
+    # SUCCESS), and the write endpoints only accept lower case, so normalise them.
+    for key in ("run_type", "status"):
+        if isinstance(run.get(key), str):
+            run[key] = run[key].lower()
+    # parent_run_ids lists the ancestors from the trace root down to the direct parent.
+    if item.get("parent_run_ids"):
         run["parent_run_id"] = item["parent_run_ids"][-1]
     if "manifest" in item:
         # v2 returns {} where v1 returns null for a run with no manifest.
@@ -94,7 +95,8 @@ class RunQuery:
         return self.migrator.source if side == "source" else self.migrator.dest
 
     def uses_v2(self, side: str, session_id: str) -> bool:
-        """Whether to query one instance through v2, decided once per side.
+        """Whether to query one instance through v2, decided once per side (see also
+        ``v1_not_served``).
 
         As in the LangSmith SDK, v1 stays in use wherever it still answers: it reports
         each run's tier and the URLs of offloaded payloads, and v2 does not. v2 is used
@@ -164,15 +166,31 @@ class RunQuery:
         client = self._client(side)
         session_id = str(body["session"][0])
         if not self.uses_v2(side, session_id):
-            response = client.post(V1_RUNS_QUERY, body) or {}
-            return response.get("runs") or [], (response.get("cursors") or {}).get("next")
+            try:
+                response = client.post(V1_RUNS_QUERY, body) or {}
+                return response.get("runs") or [], (response.get("cursors") or {}).get("next")
+            except APIError as exc:
+                if exc.status_code != 501:
+                    raise
+                self.v1_not_served(side)
         response = client.post(V2_RUNS_QUERY, self._v2_body(side, session_id, body)) or {}
         runs = [to_v1_run(item) for item in response.get("items") or []]
-        if "events" in (body.get("select") or REPLAY_SELECT):
-            # v2 omits a field that is empty; v1 returns [] for a run with no events.
-            for run in runs:
+        # v2 omits a field that is empty; v1 returns [] for no events and {} for no inputs.
+        selected = body.get("select") or REPLAY_SELECT
+        for run in runs:
+            if "events" in selected:
                 run.setdefault("events", [])
+            if "inputs" in selected and run.get("inputs") is None:
+                run["inputs"] = {}
         return runs, response.get("next_cursor")
+
+    def v1_not_served(self, side: str) -> None:
+        """Switch a side to v2 after v1 answered 501, whatever /info said."""
+        self.migrator.log(
+            f"The {side} instance does not serve the v1 run query (501); using v2",
+            "warning",
+        )
+        self._uses_v2[side] = True
 
     def _v2_body(self, side: str, session_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         selects = [_SELECTS[name] for name in body.get("select") or REPLAY_SELECT if name in _SELECTS]

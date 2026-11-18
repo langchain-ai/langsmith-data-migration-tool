@@ -129,6 +129,7 @@ resolve to the destination's latest commit of each linked repo (recorded as a
 ### Key Components
 
 - **EnhancedAPIClient** (`core/api_client.py`): HTTP wrapper with retry logic, rate limiting, and pagination support (offset-based and cursor-based)
+- **RunQuery** (`core/run_query.py`): Run queries for experiments and `traces`. Like the SDK, stays on `POST /api/v1/runs/query` wherever it answers (it reports per-run tiers) and uses `POST /api/v2/runs/query` on SmithDB-only instances (per `/info` `instance_flags`, or after v1 answers 501), translating v2 runs to v1 field names and values
 - **State Management** (`utils/state.py`): Session tracking, ID mappings, and resume capability
 - **TUI Selector** (`cli/tui_selector.py`): Textual-based interactive selection with search/filter
 - **TUI Project Mapper** (`cli/tui_project_mapper.py`): Text-input-first project mapping with suggestion filtering
@@ -152,7 +153,7 @@ Environment variables (can also use CLI flags or a `.env` file — auto-loaded o
 - `MIGRATION_FEEDBACK_WORKERS` (default: 0 = use `MIGRATION_WORKERS`) - threads per experiment for feedback paging and creation; raise it (e.g. 16-32) for feedback-heavy workspaces
 - `MIGRATION_FEEDBACK_MULTIPART` (default: false) - send experiment feedback in batches via `POST /runs/multipart` (`feedback.<id>` parts) instead of one `POST /feedback` per record; a batch rejected for a bad part (400/413/422) is replayed per record with the same ids
 - `MIGRATION_FEEDBACK_BATCH_SIZE` (default: 100, max 100, the ingest `size_limit`) - feedback records per multipart request
-- `MIGRATION_NO_DEPRECATED_FALLBACK` (default: false) - fail instead of falling back to a deprecated endpoint when an instance lacks its replacement; use it to confirm a run exercised the current endpoints. Run queries otherwise stay on v1 wherever it still answers (it reports per-run tiers) and use v2 only on SmithDB-only instances; with this set they use v2 wherever it exists
+- `MIGRATION_NO_DEPRECATED_FALLBACK` (default: false) - fail instead of falling back to a deprecated endpoint when an instance lacks its replacement; use it to confirm a run exercised the current endpoints. Run queries then use v2 wherever it exists, so `traces` falls back to project tiers (see `RunQuery`)
 - `MIGRATION_CHUNK_SIZE` (default: 1000)
 - `MIGRATION_RATE_LIMIT_DELAY` (default: 0.1)
 - `MIGRATION_STREAM_EXAMPLES` (default: true)
