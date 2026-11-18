@@ -1,0 +1,42 @@
+tests/test_run_query.py
+  s_62fcd8c5ff5731::t_5ccb6c7d55da86 81,91,93,95,99-103
+  s_62fcd8c5ff5731::t_306a4839fb86d7 229
+  s_62fcd8c5ff5731::t_b81af71cd4e1d1 273,277
+  s_62fcd8c5ff5731::t_c5a91f1959c3bb 171-189
+  s_62fcd8c5ff5731::t_0fb195e58de351 35-36,44,47-50
+  s_62fcd8c5ff5731::t_299b0c6ac45fb6 104-105
+  s_62fcd8c5ff5731::t_b8f704ae6d667e 39-40,82-90
+CLAUDE.md
+  s_62fcd8c5ff5731::t_3092ac1e1e9797 156
+  s_62fcd8c5ff5731::t_58e6c69fa800e3 132
+README.md
+  s_62fcd8c5ff5731::t_ffb7ffa659952b 84-86
+langsmith_migrator/core/migrators/trace.py
+  s_62fcd8c5ff5731::t_a9264bd584c32c 390-395
+langsmith_migrator/core/run_query.py
+  s_62fcd8c5ff5731::t_16d7da1c2fd017 12
+  s_62fcd8c5ff5731::t_24eeb7c3d0171e 67-71
+  s_62fcd8c5ff5731::t_51b20a493f7214 169-175,178-181,183-184,187-193
+  s_62fcd8c5ff5731::t_ecded24d6cc043 98-99
+  s_62fcd8c5ff5731::t_2fb21a2aca13bb 194
+  s_62fcd8c5ff5731::t_0e25d10718a302 65-66
+tests/test_annotation_queue_runs.py
+  s_62fcd8c5ff5731::t_72ae949668695c 222-223
+  s_62fcd8c5ff5731::t_45a2b27c9aa63e 238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c0e7b5815a134c91e36e3d2c07e77a028ccce84b",
+  "prompts": {},
+  "sessions": {
+    "s_62fcd8c5ff5731": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f8ee6673-a818-4472-9631-0ccbcfe6fb01",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
