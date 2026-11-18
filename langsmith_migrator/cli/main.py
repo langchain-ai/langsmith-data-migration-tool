@@ -4985,6 +4985,7 @@ def _migrate_all_for_workspace(
                     _mark_state_item_started(orchestrator, item_id)
 
                 all_mappings = chart_migrator.migrate_all_charts(same_instance=same_instance)
+                chart_migrator.migrate_dashboard_agent_links(same_instance=same_instance)
                 flat_chart_map = {}
                 for session_chart_map in all_mappings.values():
                     flat_chart_map.update(session_chart_map)
@@ -5462,6 +5463,7 @@ def charts(
                 dest_session_id,
                 same_instance=effective_same_instance,
             )
+            chart_migrator.migrate_dashboard_agent_links(same_instance=effective_same_instance)
 
             for chart_id, item_id in tracked_chart_items.items():
                 if chart_id in chart_mappings:
@@ -5582,6 +5584,7 @@ def charts(
                 tracked_chart_items[chart_id] = item_id
                 _mark_state_item_started(orchestrator, item_id)
             all_mappings = chart_migrator.migrate_all_charts(same_instance=effective_same_instance)
+            chart_migrator.migrate_dashboard_agent_links(same_instance=effective_same_instance)
             flat_chart_map = {}
             for session_chart_map in all_mappings.values():
                 flat_chart_map.update(session_chart_map)

@@ -1753,6 +1753,80 @@ class ChartMigrator(BaseMigrator):
 
         return all_mappings
 
+    def migrate_dashboard_agent_links(self, same_instance: bool = False) -> None:
+        """Copy dashboards' Agent tags and agent environments' default dashboards.
+
+        Agents are matched by ID. Dashboards are matched by title, as charts are.
+        """
+        try:
+            source_agents = list(self.source.get_cursor_paginated("/agents"))
+            dest_agents = {a["id"]: a for a in self.dest.get_cursor_paginated("/agents")}
+        except NotFoundError:
+            return  # Instance without agents.
+
+        agent_tags = {
+            a["tag_value_id"]: dest_agents[a["id"]]["tag_value_id"]
+            for a in source_agents
+            if a.get("tag_value_id") and dest_agents.get(a["id"], {}).get("tag_value_id")
+        }
+        dashboards = {}
+        for section in self.source.get_paginated("/charts/section"):
+            dest_id = self._get_dest_section_id(section.get("title"))
+            if dest_id:
+                dashboards[section["id"]] = dest_id
+
+        for source_id, dest_id in dashboards.items():
+            params = {"resource_type": "dashboard", "resource_id": source_id}
+            source_values = [
+                value["id"]
+                for tag in self.source.get("/workspaces/current/tags/resource", params=params)
+                if tag["key"] == "Agent"
+                for value in tag["values"]
+            ]
+            params["resource_id"] = dest_id
+            dest_values = {
+                value["id"]
+                for tag in self.dest.get("/workspaces/current/tags/resource", params=params)
+                for value in tag["values"]
+            }
+            for value_id in source_values:
+                dest_value_id = agent_tags.get(value_id)
+                if not dest_value_id or dest_value_id in dest_values:
+                    continue
+                self.log(f"Tagging dashboard {dest_id} with its agent", "info")
+                if not self.config.migration.dry_run:
+                    self.dest.post("/workspaces/current/taggings", {
+                        "tag_value_id": dest_value_id,
+                        "resource_type": "dashboard",
+                        "resource_id": dest_id,
+                    })
+
+        project_map = {} if same_instance else self._build_project_mapping()
+        for agent in source_agents:
+            if agent["id"] not in dest_agents:
+                continue
+            for env in agent.get("environments", []):
+                source_project = self.source.get(f"/sessions/{env['tracer_session_id']}")
+                source_metadata = (source_project.get("extra") or {}).get("metadata") or {}
+                dest_dashboard = dashboards.get(source_metadata.get("default_dashboard_id"))
+                dest_project_id = (
+                    env["tracer_session_id"] if same_instance
+                    else project_map.get(env["tracer_session_id"])
+                )
+                if not dest_dashboard or not dest_project_id:
+                    continue
+                dest_project = self.dest.get(f"/sessions/{dest_project_id}")
+                metadata = (dest_project.get("extra") or {}).get("metadata") or {}
+                if metadata.get("default_dashboard_id") == dest_dashboard:
+                    continue
+                self.log(f"Setting default dashboard of project {dest_project_id}", "info")
+                if not self.config.migration.dry_run:
+                    # PATCH replaces extra.metadata as a whole, so send the existing keys too.
+                    self.dest.patch(
+                        f"/sessions/{dest_project_id}",
+                        {"extra": {"metadata": {**metadata, "default_dashboard_id": dest_dashboard}}},
+                    )
+
     def _extract_session_id(self, chart: Dict[str, Any]) -> Optional[str]:
         """Extract session/project ID from chart config."""
         found = self._find_session_dependency(chart)

@@ -1498,3 +1498,73 @@ def test_create_chart_exports_skipped_v2_conversion_on_update(sample_config, mig
     ]
     item = migration_state.items["chart_source-chart"]
     assert item.outcome_code == "chart_v2_conversion_skipped"
+
+
+def _agent_link_clients(dest_metadata=None):
+    """A source dashboard tagged with agent "a1" and set as its production default."""
+    source = _mock_client()
+    dest = _mock_client()
+    agent = {"id": "a1", "tag_value_id": "src-tag", "environments": [{"tracer_session_id": "src-proj"}]}
+    source.get_cursor_paginated.return_value = iter([agent])
+    dest.get_cursor_paginated.return_value = iter([{**agent, "tag_value_id": "dst-tag"}])
+    source.get_paginated.return_value = iter([{"id": "src-dash", "title": "Health"}])
+    source.get.side_effect = lambda path, params=None: (
+        [{"key": "Agent", "values": [{"id": "src-tag"}]}] if path.endswith("tags/resource")
+        else {"extra": {"metadata": {"default_dashboard_id": "src-dash"}}}
+    )
+    dest.get.side_effect = lambda path, params=None: (
+        [] if path.endswith("tags/resource")
+        else {"extra": {"metadata": dest_metadata or {"keep": 1}}}
+    )
+    return source, dest
+
+
+def _agent_link_migrator(source, dest, config, state):
+    migrator = ChartMigrator(source, dest, state, config)
+    migrator._dest_section_map = {"Health": "dst-dash"}
+    migrator._project_id_map = {"src-proj": "dst-proj"}
+    migrator._project_mapping_complete = True
+    return migrator
+
+
+def test_dashboard_agent_links_copies_tag_and_default(sample_config, migration_state):
+    source, dest = _agent_link_clients()
+
+    _agent_link_migrator(source, dest, sample_config, migration_state).migrate_dashboard_agent_links()
+
+    dest.post.assert_called_once_with("/workspaces/current/taggings", {
+        "tag_value_id": "dst-tag", "resource_type": "dashboard", "resource_id": "dst-dash",
+    })
+    dest.patch.assert_called_once_with(
+        "/sessions/dst-proj",
+        {"extra": {"metadata": {"keep": 1, "default_dashboard_id": "dst-dash"}}},
+    )
+
+
+def test_dashboard_agent_links_writes_nothing_in_dry_run(sample_config, migration_state):
+    sample_config.migration.dry_run = True
+    source, dest = _agent_link_clients()
+
+    _agent_link_migrator(source, dest, sample_config, migration_state).migrate_dashboard_agent_links()
+
+    dest.post.assert_not_called()
+    dest.patch.assert_not_called()
+
+
+def test_dashboard_agent_links_skips_default_already_set(sample_config, migration_state):
+    source, dest = _agent_link_clients(dest_metadata={"default_dashboard_id": "dst-dash"})
+
+    _agent_link_migrator(source, dest, sample_config, migration_state).migrate_dashboard_agent_links()
+
+    dest.patch.assert_not_called()
+
+
+def test_dashboard_agent_links_skips_instances_without_agents(sample_config, migration_state):
+    from langsmith_migrator.core.api_client import NotFoundError
+
+    source, dest = _mock_client(), _mock_client()
+    source.get_cursor_paginated.side_effect = NotFoundError("no agents")
+
+    ChartMigrator(source, dest, migration_state, sample_config).migrate_dashboard_agent_links()
+
+    dest.post.assert_not_called()

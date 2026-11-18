@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Dashboards keep their agent links**: `charts` and `migrate-all` re-apply each
+  dashboard's Agent tag and each agent environment's default dashboard on the
+  destination. Agents are matched by ID.
+
 ## [0.0.92] - 2026-11-18
 
 ### Fixed
