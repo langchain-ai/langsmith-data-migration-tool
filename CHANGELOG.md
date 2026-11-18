@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.92] - 2026-11-18
+
+### Fixed
+- **Single-domain self-hosted destinations**: `traces` ingest and dataset
+  attachment uploads keep `/api/v1` on the SDK client URL, so they reach the
+  API instead of the web UI (which answered `405`). (#185)
+- **Feedback on SmithDB-only destinations**: per-record `POST /feedback` now
+  sends the destination experiment as `session_id`, plus the run's
+  `start_time`, and its `trace_id` when the tool recorded that `start_time`
+  while replaying the run. Multipart feedback (`MIGRATION_FEEDBACK_MULTIPART`)
+  sends the recorded `start_time` too. (#180)
+- **Experiments and `traces` from SmithDB-only sources**: run queries use
+  `POST /api/v2/runs/query` where `/info` reports SmithDB-only query serving,
+  or after `/api/v1/runs/query` answers `501`. Everywhere else, LangSmith Cloud
+  included, v1 stays in use because it reports each run's tier. On a
+  SmithDB-only source, `traces` goes by the project's tier, so short-lived
+  projects are skipped and recorded as an issue. (#182)
+- **`queues --byoc-migration` on newer instances**: queue runs are listed and
+  linked through the queue items API where an instance has it, checked
+  separately for source and destination. Every run still in the queue is
+  copied, whoever's key runs the migration; archived runs are still left out.
+  (#181)
+
+### Added
+- **`MIGRATION_NO_DEPRECATED_FALLBACK`**: fail instead of falling back to a
+  deprecated endpoint. With it set, run queries use v2 wherever it exists.
+  (#181, #182)
+
+### Security
+- Bumped `certifi` 2025.11.12 → 2026.10.23 (SEC-3846), along with the routine
+  dependency updates in #173–#179.
+
 ## [0.0.91] - 2026-10-22
 
 ### Added
