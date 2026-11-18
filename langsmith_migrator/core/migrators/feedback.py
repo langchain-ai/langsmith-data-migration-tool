@@ -4,9 +4,8 @@ import hashlib
 import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Any, Optional, Tuple
-
 from datetime import timedelta
+from typing import Dict, List, Any, Optional, Tuple
 
 from .base import BaseMigrator
 from ...utils.retry import APIError, AuthenticationError
@@ -172,15 +171,15 @@ class FeedbackMigrator(BaseMigrator):
         return all_feedback
 
     def _dest_run_start_time(
-        self, source_exp_id: str, dest_run_id: str, feedback: Dict[str, Any]
+        self, experiment_item_id: str, dest_run_id: str, feedback: Dict[str, Any]
     ) -> Tuple[Optional[str], bool]:
         """
         Return the destination run's start_time and whether it was recorded at replay.
 
         The recorded value is what this tool sent when it created the run. Without one
-        (state written by an older version, or runs not replayed with --skip-runs), fall
-        back to the start_time the source reports on the feedback record, moved by the
-        same shift the experiment's runs received.
+        (state from an older version, or runs skipped with --skip-runs), fall back to
+        the start_time the source reports on the feedback record, moved by the same
+        shift the experiment's runs received.
         """
         if self.state:
             recorded = self.state.get_mapped_id("run_start_time", dest_run_id)
@@ -188,7 +187,7 @@ class FeedbackMigrator(BaseMigrator):
                 return recorded, True
         delta = timedelta(0)
         if self.state and not self._preserve_ids:
-            item = self.state.get_item(f"experiment_{source_exp_id}")
+            item = self.state.get_item(experiment_item_id)
             shift = item.metadata.get("time_shift_seconds") if item else None
             if shift is not None:
                 delta = timedelta(seconds=float(shift))
@@ -223,19 +222,20 @@ class FeedbackMigrator(BaseMigrator):
 
         try:
             payload = {k: v for k, v in feedback.items() if not k.startswith("_")}
-            # POST /feedback requires the owning project (session) id on SmithDB-backed
-            # servers; older servers accept it as an optional field.
+            # POST /feedback requires the run's project (session) on SmithDB-backed
+            # servers; older servers accept it as optional.
             session_id = feedback.get("_session_id")
-            if session_id and not payload.get("session_id"):
+            if session_id:
                 payload["session_id"] = session_id
-            # With session_id and start_time the server can look the run up in SmithDB.
-            # trace_id as well makes it skip that lookup and trust start_time, so it is
-            # only sent when start_time is the value this tool wrote to the destination.
-            start_time = feedback.get("_start_time")
-            if session_id and start_time:
-                payload["start_time"] = start_time
-                if feedback.get("_start_time_recorded") and feedback.get("_trace_id"):
-                    payload["trace_id"] = feedback["_trace_id"]
+                # start_time and trace_id together let the server write the feedback
+                # without looking the run up, so trace_id only goes with a start_time
+                # this tool wrote itself. A derived start_time goes alone, and the
+                # server still looks the run up.
+                start_time = feedback.get("_start_time")
+                if start_time:
+                    payload["start_time"] = start_time
+                    if feedback.get("_start_time_recorded") and feedback.get("_trace_id"):
+                        payload["trace_id"] = feedback["_trace_id"]
             self.dest.post("/feedback", payload)
             return True
         except Exception as e:
@@ -520,7 +520,7 @@ class FeedbackMigrator(BaseMigrator):
                 migrated_fb["_session_id"] = dest_exp_id
                 if dest_run_id:
                     start_time, recorded = self._dest_run_start_time(
-                        source_exp_id, dest_run_id, fb
+                        experiment_item_id, dest_run_id, fb
                     )
                     if start_time:
                         migrated_fb["_start_time"] = start_time

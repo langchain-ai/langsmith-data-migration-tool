@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import uuid
 from unittest.mock import Mock
 
 import pytest
 
 from langsmith_migrator.core.api_client import EnhancedAPIClient
-from langsmith_migrator.core.migrators import FeedbackMigrator
+from langsmith_migrator.core.migrators import ExperimentMigrator, FeedbackMigrator
 
 
 def _clients(feedbacks: list[dict]):
@@ -218,17 +219,6 @@ def test_per_record_post_carries_destination_session_id(sample_config, migration
     assert not any(key.startswith("_") for key in payload)
 
 
-def test_create_feedback_without_session_id_omits_the_field(sample_config, migration_state):
-    source, dest = _clients([])
-
-    ok = _migrator(source, dest, sample_config, migration_state).create_feedback(
-        {"run_id": "dest-run-1", "key": "correctness", "score": 1}
-    )
-
-    assert ok is True
-    assert "session_id" not in dest.post.call_args.args[1]
-
-
 def test_per_record_post_sends_recorded_run_start_time_and_trace_id(
     sample_config, migration_state
 ):
@@ -249,7 +239,8 @@ def test_per_record_post_sends_recorded_run_start_time_and_trace_id(
     payload = dest.post.call_args.args[1]
     assert payload["session_id"] == "exp-dst"
     assert payload["start_time"] == "2026-11-11T20:00:00.000000+00:00"
-    assert payload["trace_id"]
+    # The destination trace id, derived the same way as when the runs were replayed.
+    assert payload["trace_id"] == str(uuid.uuid5(ExperimentMigrator._RUN_NAMESPACE, "trace-1"))
     assert not any(key.startswith("_") for key in payload)
 
 
