@@ -822,6 +822,32 @@ def _mark_state_item_failed(orchestrator, item_id, error):
     orchestrator.state_manager.save()
 
 
+def _migrate_dashboard_agent_links(
+    chart_migrator, config, *, same_instance, source_session_id=None
+):
+    """Copy dashboards' agent links after the charts, and say what happened."""
+    try:
+        result = chart_migrator.migrate_dashboard_agent_links(
+            same_instance=same_instance, source_session_id=source_session_id
+        )
+    except Exception as e:  # The links are best effort and never stop the run.
+        console.print(f"[yellow]Dashboard agent links skipped: {e}[/yellow]")
+        return
+    if not any(result.values()):
+        return
+    tags, defaults = result["tagged"], result["defaults"]
+    if config.migration.dry_run:
+        line = (
+            f"Dashboard agent links (dry run): would add {tags} tag(s) "
+            f"and set {defaults} default dashboard(s) on existing dashboards"
+        )
+    else:
+        line = f"Dashboard agent links: {tags} tag(s) added, {defaults} default dashboard(s) set"
+    if result["failed"]:
+        line += f", [yellow]{result['failed']} failed (run with -v for details)[/yellow]"
+    console.print(line)
+
+
 def _migrate_issue_agents(orchestrator, config, issue_migrator, agents):
     """Migrate selected issues-agent configs. Returns (success, failed, skipped)."""
     success_count = 0
@@ -4985,7 +5011,6 @@ def _migrate_all_for_workspace(
                     _mark_state_item_started(orchestrator, item_id)
 
                 all_mappings = chart_migrator.migrate_all_charts(same_instance=same_instance)
-                chart_migrator.migrate_dashboard_agent_links(same_instance=same_instance)
                 flat_chart_map = {}
                 for session_chart_map in all_mappings.values():
                     flat_chart_map.update(session_chart_map)
@@ -5007,6 +5032,7 @@ def _migrate_all_for_workspace(
                 console.print(
                     f"Charts: {len(flat_chart_map)} migrated, {len(tracked_chart_items) - len(flat_chart_map)} failed"
                 )
+                _migrate_dashboard_agent_links(chart_migrator, config, same_instance=same_instance)
                 console.print()
             else:
                 console.print("[yellow]Skipped charts[/yellow]\n")
@@ -5463,7 +5489,6 @@ def charts(
                 dest_session_id,
                 same_instance=effective_same_instance,
             )
-            chart_migrator.migrate_dashboard_agent_links(same_instance=effective_same_instance)
 
             for chart_id, item_id in tracked_chart_items.items():
                 if chart_id in chart_mappings:
@@ -5480,6 +5505,12 @@ def charts(
                     )
 
             console.print(f"\n[green]✓[/green] Migrated {len(chart_mappings)} chart(s)")
+            _migrate_dashboard_agent_links(
+                chart_migrator,
+                config,
+                same_instance=effective_same_instance,
+                source_session_id=source_session_id,
+            )
 
         else:
             # Migrate all charts from all sessions
@@ -5584,7 +5615,6 @@ def charts(
                 tracked_chart_items[chart_id] = item_id
                 _mark_state_item_started(orchestrator, item_id)
             all_mappings = chart_migrator.migrate_all_charts(same_instance=effective_same_instance)
-            chart_migrator.migrate_dashboard_agent_links(same_instance=effective_same_instance)
             flat_chart_map = {}
             for session_chart_map in all_mappings.values():
                 flat_chart_map.update(session_chart_map)
@@ -5606,6 +5636,9 @@ def charts(
                 console.print("\n[green]✓ Chart migration completed successfully[/green]")
             else:
                 console.print("\n[yellow]No charts were migrated[/yellow]")
+            _migrate_dashboard_agent_links(
+                chart_migrator, config, same_instance=effective_same_instance
+            )
 
             if config.migration.verbose and all_mappings:
                 console.print("\n[dim]Detailed chart mappings:[/dim]")
