@@ -1,0 +1,35 @@
+tests/test_chart_migrator.py
+  s_62fcd8c5ff5731::t_956f6aca5c0dc1 1503-1515,1521,1523,1538-1540,1542,1546,1563-1581,1588-1629,1636-1638,1640
+tests/functional/test_cli_functional.py
+  s_62fcd8c5ff5731::t_9a8610a9890f5e 3544-3564
+langsmith_migrator/core/migrators/chart.py
+  s_62fcd8c5ff5731::t_77422f494a01da 1829-1830
+  s_62fcd8c5ff5731::t_b6ac2f1eb79a4a 1775,1777,1790-1803,1811-1812,1814
+  s_62fcd8c5ff5731::t_878c1f88192433 1875,1881,1886
+  s_62fcd8c5ff5731::t_67b03043c0b41f 1756-1758,1761-1768,1770,1774,1778-1783,1787-1788,1804-1810,1813,1815-1828,1836-1861,1863-1874,1876-1880,1882-1885,1887-1901
+langsmith_migrator/cli/main.py
+  s_62fcd8c5ff5731::t_dbd68aff2b28e1 825-838
+  s_62fcd8c5ff5731::t_a8bbdbccd0c096 5023
+  s_62fcd8c5ff5731::t_91f9aea8e0bd62 5622
+  s_62fcd8c5ff5731::t_1c8a0657d8d431 5496
+CHANGELOG.md
+  s_62fcd8c5ff5731::t_49100cbf004f6f 12-17
+tests/functional/conftest.py
+  s_62fcd8c5ff5731::t_f513709fc5f8b8 326-328
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1b917e0c1984030efe34e4fa516169d0237a6d75",
+  "prompts": {},
+  "sessions": {
+    "s_62fcd8c5ff5731": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f8ee6673-a818-4472-9631-0ccbcfe6fb01",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
