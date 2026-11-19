@@ -1,0 +1,42 @@
+tests/functional/conftest.py
+  s_62fcd8c5ff5731::t_f513709fc5f8b8 326-328
+tests/functional/test_cli_functional.py
+  s_62fcd8c5ff5731::t_40718c2a4de70c 2755
+  s_62fcd8c5ff5731::t_fa3980568c45f9 3781
+  s_62fcd8c5ff5731::t_9a8610a9890f5e 3545-3565
+langsmith_migrator/cli/main.py
+  s_62fcd8c5ff5731::t_dbd68aff2b28e1 826-829,838-842
+  s_62fcd8c5ff5731::t_d788e153efcb1f 825,830-837
+  s_62fcd8c5ff5731::t_23ee270e3382ea 5027,5500,5626
+tests/test_chart_migrator.py
+  s_62fcd8c5ff5731::t_5421e268ba7457 1503-1524,1526-1536,1540,1542,1599,1614-1616,1618-1631,1633-1648,1650-1664,1671
+  s_62fcd8c5ff5731::t_956f6aca5c0dc1 1525,1549-1551,1553,1557,1574-1592,1600-1613,1617,1632,1649,1665-1666,1673-1675,1677
+CHANGELOG.md
+  s_62fcd8c5ff5731::t_49100cbf004f6f 12-13,16-18
+  s_62fcd8c5ff5731::t_ab1d93773c78c3 14-15
+langsmith_migrator/core/migrators/chart.py
+  s_62fcd8c5ff5731::t_67b03043c0b41f 1756-1758,1761-1768,1770,1774,1778-1783,1787-1788,1804-1808,1810,1813,1816-1824,1826-1828,1866-1891,1897-1906,1908-1912,1914-1917,1919-1920,1925-1935
+  s_62fcd8c5ff5731::t_878c1f88192433 1907,1913,1918
+  s_62fcd8c5ff5731::t_9196f476dd6268 1829-1865
+  s_62fcd8c5ff5731::t_09ce0dfdb10486 1772-1773,1775
+  s_62fcd8c5ff5731::t_183a7b0ceb89b8 1893-1896
+  s_62fcd8c5ff5731::t_c12489986c8bef 1921-1924
+  s_62fcd8c5ff5731::t_b6ac2f1eb79a4a 1777,1790-1803,1811,1814
+  s_62fcd8c5ff5731::t_87ef2721bf360f 1892
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a1a39fb208277e5509bec8bb22bf05fe899e28fe",
+  "prompts": {},
+  "sessions": {
+    "s_62fcd8c5ff5731": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f8ee6673-a818-4472-9631-0ccbcfe6fb01",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": null
+    }
+  }
+}
