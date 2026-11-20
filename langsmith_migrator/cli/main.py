@@ -999,6 +999,13 @@ def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> Non
             "(e.g. after a trace storage migration). Run `langsmith-migrator resume` "
             "to retry linking them.[/dim]"
         )
+    reordered = sum(r.get("reordered", 0) for _, r in queue_run_results)
+    order_failed = sum(r.get("order_failed", 0) for _, r in queue_run_results)
+    if reordered or order_failed:
+        console.print(
+            f"Queue item order: {reordered} item(s) moved to their source position"
+            + (f", {order_failed} could not be moved" if order_failed else "")
+        )
     missing = sum(r.get("missing", 0) for _, r in queue_run_results)
     if missing:
         console.print(
