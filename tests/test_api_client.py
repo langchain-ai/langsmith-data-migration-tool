@@ -451,3 +451,19 @@ def test_scoped_connection_does_not_bypass_workspace_rejection(monkeypatch):
     monkeypatch.setattr(client.session, "get", get)
     assert client.test_connection()[0] is False
     get.assert_called_once()
+
+
+def test_org_key_connection_skips_workspace_route_that_answers_405(monkeypatch):
+    """BYOC data planes answer 405 on GET /workspaces; try the next endpoint."""
+    client = _client()
+    url = client.base_url
+    get = Mock(side_effect=[
+        _response("GET", url + "/datasets", 403, json_body={"detail": "Forbidden"}),
+        _response("GET", url + "/workspaces", 405, json_body={"detail": "Method Not Allowed"}),
+        _response("GET", url + "/orgs/current/workspaces", 200, json_body=[{"id": "ws-1"}]),
+    ])
+    monkeypatch.setattr(client.session, "get", get)
+
+    assert client.test_connection() == (True, None)
+    assert get.call_args_list[-1].args[0] == url + "/orgs/current/workspaces"
+

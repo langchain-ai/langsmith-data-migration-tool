@@ -731,6 +731,17 @@ class EnhancedAPIClient:
                             return True, None
                         except NotFoundError:
                             continue
+                        except APIError as workspace_error:
+                            # 405: the route exists for other methods only (seen on
+                            # BYOC data planes); fall through to the next endpoint.
+                            if getattr(workspace_error, "status_code", None) == 405:
+                                continue
+                            return False, (
+                                f"Authentication failed: {e}. Workspace authentication "
+                                f"check also failed: {workspace_error}. Please verify "
+                                "your API key is correct, not expired, and has access "
+                                "to the destination workspace."
+                            )
                         except Exception as workspace_error:
                             return False, (
                                 f"Authentication failed: {e}. Workspace authentication "
