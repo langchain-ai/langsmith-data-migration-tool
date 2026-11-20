@@ -414,3 +414,91 @@ def test_state_save_interval_env(monkeypatch):
 def test_migration_state_lock_is_not_serialized(migration_state):
     assert "_lock" not in migration_state.to_dict()
     assert isinstance(MigrationState.from_dict(migration_state.to_dict()).lock, type(threading.RLock()))
+
+
+# --- Resume safety under throttled saves ------------------------------------------------
+
+
+def _resumable_on_disk(orchestrator):
+    manager = StateManager(orchestrator.state_manager.state_dir)
+    state = manager.load_session(orchestrator.state.session_id)
+    return {item.id for item in state.get_resume_items()}
+
+
+def test_dataset_inventory_is_on_disk_before_workers_run(sample_config, tmp_path, monkeypatch):
+    sample_config.migration.state_save_interval = 3600
+    orchestrator = _orchestrator(sample_config, tmp_path, monkeypatch)
+    monkeypatch.setattr(DatasetMigrator, "get_dataset", lambda self, ds: {"id": ds, "name": ds})
+    seen_on_disk = []
+
+    def migrate_dataset(self, ds, include_examples):
+        seen_on_disk.append(_resumable_on_disk(orchestrator))
+        return f"dst-{ds}", {}
+
+    monkeypatch.setattr(DatasetMigrator, "migrate_dataset", migrate_dataset)
+
+    orchestrator.migrate_datasets_parallel(["a", "b"], include_experiments=False)
+
+    assert seen_on_disk[0] == {"dataset_a", "dataset_b"}
+
+
+def test_experiment_inventory_is_on_disk_before_workers_run(sample_config, tmp_path, monkeypatch):
+    sample_config.migration.state_save_interval = 3600
+    orchestrator = _orchestrator(sample_config, tmp_path, monkeypatch)
+    experiments = [{"id": "e1", "name": "one"}, {"id": "e2", "name": "two"}]
+    monkeypatch.setattr(ExperimentMigrator, "list_experiment_summaries", lambda self, ds: experiments)
+    monkeypatch.setattr(ExperimentMigrator, "fetch_experiment_details", lambda self, e: e)
+    seen_on_disk = []
+
+    def resolve(*args):
+        seen_on_disk.append(_resumable_on_disk(orchestrator))
+        return True, "migrated"
+
+    monkeypatch.setattr(orchestrator, "_resolve_experiment_item", resolve)
+
+    with orchestrator.state_manager.throttled_saves(3600):
+        orchestrator._migrate_experiments_for_datasets(["ds-1"], {"ds-1": "dst-1"})
+
+    assert seen_on_disk[0] >= {"experiment_e1", "experiment_e2"}
+
+
+def _feedback_migrator(config):
+    from langsmith_migrator.core.migrators.feedback import FeedbackMigrator
+
+    dest = _client()
+    dest.post = Mock(return_value={})
+    return FeedbackMigrator(_client(), dest, None, config)
+
+
+def _feedback_record():
+    return {"run_id": "r1", "key": "correct", "score": 1, "_fingerprint": "fp-1", "_session_id": "s1"}
+
+
+def test_individual_feedback_uploads_send_a_stable_id(sample_config):
+    migrator = _feedback_migrator(sample_config)
+
+    migrator.create_feedback_batch([_feedback_record()])
+    migrator.create_feedback_batch([_feedback_record()])
+
+    first, second = (c.args[1] for c in migrator.dest.post.call_args_list)
+    assert first["id"] and first["id"] == second["id"]
+
+
+def test_feedback_conflict_on_a_stable_id_counts_as_created(sample_config):
+    from langsmith_migrator.utils.retry import ConflictError
+
+    migrator = _feedback_migrator(sample_config)
+    migrator.dest.post.side_effect = ConflictError("exists")
+
+    created, records = migrator.create_feedback_batch([_feedback_record()])
+
+    assert created == 1 and records[0]["_fingerprint"] == "fp-1"
+
+
+def test_feedback_conflict_without_an_id_is_a_failure(sample_config):
+    from langsmith_migrator.utils.retry import ConflictError
+
+    migrator = _feedback_migrator(sample_config)
+    migrator.dest.post.side_effect = ConflictError("exists")
+
+    assert migrator.create_feedback({"key": "k", "run_id": "r1"}) is False

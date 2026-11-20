@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.94] - 2026-11-19
+
+### Fixed
+- **Resume after a crash in a throttled run**: the dataset and experiment
+  items are written to the state file before any worker starts, so `resume`
+  finds them even if the run stops before the next save.
+- **No duplicate feedback on resume**: per-record `POST /feedback` now sends a
+  stable id derived from the source record, as multipart feedback already did.
+  A `409` for that id counts as already migrated.
+
 ## [0.0.93] - 2026-11-19
 
 ### Changed

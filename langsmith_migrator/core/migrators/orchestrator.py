@@ -183,7 +183,12 @@ class MigrationOrchestrator:
                 item.id,
                 metadata={"include_examples": include_examples},
             )
-        self.state_manager.save()
+            self.state.update_item_status(
+                item.id,
+                MigrationStatus.IN_PROGRESS,
+                stage="create_dataset",
+            )
+        self.state_manager.save(force=True)
 
         # Migrate with concurrency
         id_mapping = {}
@@ -192,18 +197,12 @@ class MigrationOrchestrator:
             futures = {}
 
             for dataset_id in dataset_ids:
-                self.state.update_item_status(
-                    f"dataset_{dataset_id}",
-                    MigrationStatus.IN_PROGRESS,
-                    stage="create_dataset",
-                )
                 future = executor.submit(
                     dataset_migrator.migrate_dataset,
                     dataset_id,
                     include_examples
                 )
                 futures[future] = dataset_id
-            self.state_manager.save()
 
             # Process completed migrations
             with Progress(console=self.console) as progress:
@@ -339,6 +338,14 @@ class MigrationOrchestrator:
         failed_items = []
         skipped_items = []
 
+        for experiment in all_experiments:
+            self._register_experiment_item(
+                experiment,
+                experiment_to_dataset[experiment["id"]],
+                dataset_id_mapping,
+            )
+        self.state_manager.save(force=True)
+
         def migrate_one(experiment: Dict[str, Any]) -> Tuple[str, str]:
             source_experiment_id = experiment["id"]
             return self._migrate_one_experiment(
@@ -380,6 +387,25 @@ class MigrationOrchestrator:
             for name, err in failed_items:
                 self.console.print(f"  [red]✗[/red] {name}: {err}")
 
+    def _register_experiment_item(
+        self,
+        experiment: Dict[str, Any],
+        source_dataset_id: str,
+        dataset_id_mapping: Dict[str, str],
+    ):
+        return self.state.ensure_item(
+            f"experiment_{experiment['id']}",
+            "experiment",
+            experiment["name"],
+            experiment["id"],
+            stage="create_experiment",
+            workspace_pair=self.workspace_pair(),
+            metadata={
+                "source_dataset_id": source_dataset_id,
+                "dest_dataset_id": dataset_id_mapping.get(source_dataset_id),
+            },
+        )
+
     def _migrate_one_experiment(
         self,
         experiment: Dict[str, Any],
@@ -395,17 +421,8 @@ class MigrationOrchestrator:
         source_experiment_id = experiment["id"]
         dest_dataset_id = dataset_id_mapping.get(source_dataset_id)
         item_id = f"experiment_{source_experiment_id}"
-        item = self.state.ensure_item(
-            item_id,
-            "experiment",
-            experiment["name"],
-            source_experiment_id,
-            stage="create_experiment",
-            workspace_pair=self.workspace_pair(),
-            metadata={
-                "source_dataset_id": source_dataset_id,
-                "dest_dataset_id": dest_dataset_id,
-            },
+        item = self._register_experiment_item(
+            experiment, source_dataset_id, dataset_id_mapping
         )
 
         if item.terminal_state == ResolutionOutcome.MIGRATED.value:
