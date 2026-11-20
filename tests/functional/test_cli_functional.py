@@ -2320,27 +2320,52 @@ def test_byoc_migration_keeps_explicit_feedback_workers(cli_harness, monkeypatch
     assert cli_harness.orchestrator_factory.instances[-1].config.migration.feedback_workers == 3
 
 
-def test_queues_command_interrupt_stops_remaining_queues(cli_harness):
-    """Ctrl-C must cancel queued queues instead of migrating them all."""
+def test_queues_command_interrupt_stops_remaining_queues(cli_harness, monkeypatch):
+    """Ctrl-C on the main thread cancels queued queues and stops the clients.
+
+    The worker is held inside the first queue until the clients are cancelled,
+    and the interrupt is raised on the main thread, so the outcome does not
+    depend on thread scheduling.
+    """
+    import threading
+
+    from langsmith_migrator.cli import main as cli_main
 
     queues = [{"id": f"queue-{i}", "name": f"Queue {i}"} for i in range(6)]
     cli_harness.migrators.queue.list_queues.return_value = queues
+    started = threading.Event()
+    release = threading.Event()
     created = []
+    cancelled = []
 
     def create(queue):
         created.append(queue["id"])
-        if len(created) == 1:
-            raise KeyboardInterrupt
+        started.set()
+        assert release.wait(5), "worker was never released"
         return f"new-{queue['id']}"
 
     cli_harness.migrators.queue.create_queue.side_effect = create
 
+    def make_cancel(label):
+        def cancel():
+            cancelled.append(label)
+            release.set()  # cancel runs after pending futures are dropped
+        return cancel
+
+    factory = cli_harness.orchestrator_factory
+    factory.source_client.cancel = make_cancel("source")
+    factory.dest_client.cancel = make_cancel("dest")
+
+    def interrupting_as_completed(futures):
+        assert started.wait(5), "first queue never started"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_main, "as_completed", interrupting_as_completed)
+
     cli_harness.invoke(["--workers", "1", "--non-interactive", "queues"])
 
-    # The one worker may pick up the next queue before the main thread cancels;
-    # everything after that is dropped (without the fix all six were created).
-    assert created[0] == "queue-0"
-    assert len(created) <= 2
+    assert created == ["queue-0"]
+    assert sorted(cancelled) == ["dest", "source"]
 
 
 def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):
