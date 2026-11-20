@@ -1,6 +1,7 @@
 """Migration orchestrator for coordinating migration operations."""
 
 import threading
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -45,7 +46,8 @@ class MigrationOrchestrator:
             timeout=config.source.timeout,
             max_retries=config.source.max_retries,
             rate_limit_delay=config.migration.rate_limit_delay,
-            verbose=config.migration.verbose
+            verbose=config.migration.verbose,
+            pool_maxsize=self._pool_maxsize(config),
         )
 
         self.dest_client = EnhancedAPIClient(
@@ -55,12 +57,29 @@ class MigrationOrchestrator:
             timeout=config.destination.timeout,
             max_retries=config.destination.max_retries,
             rate_limit_delay=config.migration.rate_limit_delay,
-            verbose=config.migration.verbose
+            verbose=config.migration.verbose,
+            pool_maxsize=self._pool_maxsize(config),
         )
 
         # Initialize state
         self.state = None
         self.config.state_manager = state_manager
+
+    @staticmethod
+    def _pool_maxsize(config) -> int:
+        workers = max(1, config.migration.concurrent_workers)
+        feedback_workers = max(1, config.migration.feedback_workers or workers)
+        return max(10, workers * feedback_workers + workers)
+
+    @contextmanager
+    def _stop_pool_on_error(self, executor: ThreadPoolExecutor):
+        try:
+            yield
+        except BaseException:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self.source_client.cancel()
+            self.dest_client.cancel()
+            raise
 
     def _prepare_base_url(self, base_url: str) -> str:
         """Prepare base URL for API client."""
@@ -167,7 +186,7 @@ class MigrationOrchestrator:
         include_experiments: bool,
     ) -> Dict[str, str]:
         # One GET per dataset; fetch them together, keeping the input order.
-        with ThreadPoolExecutor(max_workers=self._workers(len(dataset_ids))) as executor:
+        with ThreadPoolExecutor(max_workers=self._workers(len(dataset_ids))) as executor, self._stop_pool_on_error(executor):
             datasets = list(executor.map(dataset_migrator.get_dataset, dataset_ids))
 
         for dataset_id, dataset in zip(dataset_ids, datasets):
@@ -183,27 +202,28 @@ class MigrationOrchestrator:
                 item.id,
                 metadata={"include_examples": include_examples},
             )
-        self.state_manager.save()
+            self.state.update_item_status(
+                item.id,
+                MigrationStatus.IN_PROGRESS,
+                stage="create_dataset",
+            )
+        self.state_manager.save(force=True)
 
         # Migrate with concurrency
         id_mapping = {}
 
-        with ThreadPoolExecutor(max_workers=self.config.migration.concurrent_workers) as executor:
+        with ThreadPoolExecutor(
+            max_workers=self.config.migration.concurrent_workers
+        ) as executor, self._stop_pool_on_error(executor):
             futures = {}
 
             for dataset_id in dataset_ids:
-                self.state.update_item_status(
-                    f"dataset_{dataset_id}",
-                    MigrationStatus.IN_PROGRESS,
-                    stage="create_dataset",
-                )
                 future = executor.submit(
                     dataset_migrator.migrate_dataset,
                     dataset_id,
                     include_examples
                 )
                 futures[future] = dataset_id
-            self.state_manager.save()
 
             # Process completed migrations
             with Progress(console=self.console) as progress:
@@ -308,7 +328,7 @@ class MigrationOrchestrator:
 
         # List every dataset's experiments, then fetch each experiment's details,
         # both across the worker pool. Results keep the dataset and listing order.
-        with ThreadPoolExecutor(max_workers=self._workers(len(dataset_ids))) as executor:
+        with ThreadPoolExecutor(max_workers=self._workers(len(dataset_ids))) as executor, self._stop_pool_on_error(executor):
             summaries_per_dataset = list(
                 executor.map(experiment_migrator.list_experiment_summaries, dataset_ids)
             )
@@ -319,7 +339,7 @@ class MigrationOrchestrator:
         ]
         summaries = [summary for batch in summaries_per_dataset for summary in batch]
         if summaries:
-            with ThreadPoolExecutor(max_workers=self._workers(len(summaries))) as executor:
+            with ThreadPoolExecutor(max_workers=self._workers(len(summaries))) as executor, self._stop_pool_on_error(executor):
                 all_experiments = list(
                     executor.map(experiment_migrator.fetch_experiment_details, summaries)
                 )
@@ -339,6 +359,14 @@ class MigrationOrchestrator:
         failed_items = []
         skipped_items = []
 
+        for experiment in all_experiments:
+            self._register_experiment_item(
+                experiment,
+                experiment_to_dataset[experiment["id"]],
+                dataset_id_mapping,
+            )
+        self.state_manager.save(force=True)
+
         def migrate_one(experiment: Dict[str, Any]) -> Tuple[str, str]:
             source_experiment_id = experiment["id"]
             return self._migrate_one_experiment(
@@ -353,7 +381,7 @@ class MigrationOrchestrator:
             task = progress.add_task("Migrating experiments...", total=len(all_experiments))
             with ThreadPoolExecutor(
                 max_workers=self._workers(len(all_experiments))
-            ) as executor:
+            ) as executor, self._stop_pool_on_error(executor):
                 futures = {
                     executor.submit(migrate_one, experiment): experiment
                     for experiment in all_experiments
@@ -380,6 +408,25 @@ class MigrationOrchestrator:
             for name, err in failed_items:
                 self.console.print(f"  [red]✗[/red] {name}: {err}")
 
+    def _register_experiment_item(
+        self,
+        experiment: Dict[str, Any],
+        source_dataset_id: str,
+        dataset_id_mapping: Dict[str, str],
+    ):
+        return self.state.ensure_item(
+            f"experiment_{experiment['id']}",
+            "experiment",
+            experiment["name"],
+            experiment["id"],
+            stage="create_experiment",
+            workspace_pair=self.workspace_pair(),
+            metadata={
+                "source_dataset_id": source_dataset_id,
+                "dest_dataset_id": dataset_id_mapping.get(source_dataset_id),
+            },
+        )
+
     def _migrate_one_experiment(
         self,
         experiment: Dict[str, Any],
@@ -395,17 +442,8 @@ class MigrationOrchestrator:
         source_experiment_id = experiment["id"]
         dest_dataset_id = dataset_id_mapping.get(source_dataset_id)
         item_id = f"experiment_{source_experiment_id}"
-        item = self.state.ensure_item(
-            item_id,
-            "experiment",
-            experiment["name"],
-            source_experiment_id,
-            stage="create_experiment",
-            workspace_pair=self.workspace_pair(),
-            metadata={
-                "source_dataset_id": source_dataset_id,
-                "dest_dataset_id": dest_dataset_id,
-            },
+        item = self._register_experiment_item(
+            experiment, source_dataset_id, dataset_id_mapping
         )
 
         if item.terminal_state == ResolutionOutcome.MIGRATED.value:
@@ -491,7 +529,7 @@ class MigrationOrchestrator:
                 item.id,
                 metadata={_TIME_SHIFT_SECONDS_KEY: delta.total_seconds()},
             )
-            self.state_manager.save()
+            self.state_manager.save(force=True)
         return delta
 
     def _resolve_experiment_item(

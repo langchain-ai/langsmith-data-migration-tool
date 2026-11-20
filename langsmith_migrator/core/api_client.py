@@ -1,8 +1,10 @@
 """Simplified API client with improved separation of concerns."""
 
 import re
+import threading
 import time
 import requests
+from requests.adapters import HTTPAdapter
 from typing import Dict, Any, Optional, List, Generator, Tuple
 from dataclasses import dataclass
 from rich.console import Console
@@ -18,6 +20,10 @@ from ..utils.retry import (
 )
 from ..utils.pagination import CursorPaginationHelper, PaginationHelper
 
+
+
+class MigrationCancelled(BaseException):
+    pass
 
 class NotFoundError(APIError):
     """Resource not found error."""
@@ -116,7 +122,8 @@ class EnhancedAPIClient:
         max_retries: int = 3,
         rate_limit_delay: float = 0.1,
         verbose: bool = False,
-        workspace_id: Optional[str] = None
+        workspace_id: Optional[str] = None,
+        pool_maxsize: Optional[int] = None,
     ):
         """
         Initialize the API client.
@@ -130,6 +137,7 @@ class EnhancedAPIClient:
             rate_limit_delay: Delay between requests to avoid rate limits
             verbose: Whether to log verbose output
             workspace_id: Optional workspace ID to scope requests via X-Tenant-Id header
+            pool_maxsize: Connections kept per host (requests' default is 10)
         """
         self.base_url = base_url.rstrip('/')
         self.headers = headers
@@ -148,10 +156,18 @@ class EnhancedAPIClient:
         self.session = requests.Session()
         self.session.headers.update(headers)
         self.session.verify = verify_ssl
+        if pool_maxsize:
+            adapter = HTTPAdapter(pool_maxsize=pool_maxsize)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+        self._cancelled = threading.Event()
 
         # Set workspace scoping if provided
         if workspace_id:
             self.session.headers["X-Tenant-Id"] = workspace_id
+
+    def cancel(self) -> None:
+        self._cancelled.set()
 
     def set_workspace(self, workspace_id: Optional[str]) -> None:
         """Set or remove the workspace scoping header.
@@ -343,6 +359,8 @@ class EnhancedAPIClient:
             self.console.print(f"[dim]GET {url}[/dim]")
 
         # Add rate limiting delay
+        if self._cancelled.is_set():
+            raise MigrationCancelled("Migration interrupted")
         if self.rate_limit_delay > 0:
             time.sleep(self.rate_limit_delay)
 
@@ -367,6 +385,8 @@ class EnhancedAPIClient:
             self.console.print(f"[dim]POST {url}[/dim]")
 
         # Add rate limiting delay
+        if self._cancelled.is_set():
+            raise MigrationCancelled("Migration interrupted")
         if self.rate_limit_delay > 0:
             time.sleep(self.rate_limit_delay)
 
@@ -388,6 +408,8 @@ class EnhancedAPIClient:
         if self.verbose:
             self.console.print(f"[dim]POST {url} (multipart, {len(parts)} parts)[/dim]")
 
+        if self._cancelled.is_set():
+            raise MigrationCancelled("Migration interrupted")
         if self.rate_limit_delay > 0:
             time.sleep(self.rate_limit_delay)
 
@@ -417,6 +439,8 @@ class EnhancedAPIClient:
             self.console.print(f"[dim]PATCH {url}[/dim]")
 
         # Add rate limiting delay
+        if self._cancelled.is_set():
+            raise MigrationCancelled("Migration interrupted")
         if self.rate_limit_delay > 0:
             time.sleep(self.rate_limit_delay)
 
@@ -441,6 +465,8 @@ class EnhancedAPIClient:
         if self.verbose:
             self.console.print(f"[dim]DELETE {url}[/dim]")
 
+        if self._cancelled.is_set():
+            raise MigrationCancelled("Migration interrupted")
         if self.rate_limit_delay > 0:
             time.sleep(self.rate_limit_delay)
 
@@ -465,6 +491,8 @@ class EnhancedAPIClient:
         if self.verbose:
             self.console.print(f"[dim]PUT {url}[/dim]")
 
+        if self._cancelled.is_set():
+            raise MigrationCancelled("Migration interrupted")
         if self.rate_limit_delay > 0:
             time.sleep(self.rate_limit_delay)
 
@@ -475,7 +503,8 @@ class EnhancedAPIClient:
         self,
         endpoint: str,
         params: Optional[Dict] = None,
-        page_size: int = 100
+        page_size: int = 100,
+        raise_errors: bool = False,
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Get paginated results, yielding one item at a time.
@@ -484,6 +513,7 @@ class EnhancedAPIClient:
             endpoint: API endpoint
             params: Query parameters
             page_size: Number of items per page
+            raise_errors: Raise a failed page fetch instead of ending the listing
 
         Yields:
             Individual items from paginated results
@@ -492,7 +522,8 @@ class EnhancedAPIClient:
             self.get,
             endpoint,
             params,
-            page_size
+            page_size,
+            raise_errors=raise_errors,
         )
 
     def get_cursor_paginated(
