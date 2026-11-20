@@ -2,7 +2,7 @@
 
 import threading
 from datetime import timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.progress import Progress
@@ -128,17 +128,49 @@ class MigrationOrchestrator:
     ) -> Dict[str, str]:
         """Migrate multiple datasets in parallel."""
         self.ensure_state()
+        with self.state_manager.throttled_saves(self._save_interval()):
+            return self._migrate_datasets_parallel(
+                dataset_ids, include_examples, include_experiments
+            )
 
-        # Add items to state
+    def _save_interval(self) -> float:
+        return float(getattr(self.config.migration, "state_save_interval", 0.0) or 0.0)
+
+    def _workers(self, task_count: int) -> int:
+        """Thread count for a pool of ``task_count`` independent tasks."""
+        return max(1, min(self.config.migration.concurrent_workers, task_count))
+
+    def _migrate_datasets_parallel(
+        self,
+        dataset_ids: List[str],
+        include_examples: bool,
+        include_experiments: bool,
+    ) -> Dict[str, str]:
         dataset_migrator = DatasetMigrator(
             self.source_client,
             self.dest_client,
             self.state,
             self.config
         )
+        try:
+            return self._run_dataset_pool(
+                dataset_migrator, dataset_ids, include_examples, include_experiments
+            )
+        finally:
+            dataset_migrator.close()
 
-        for dataset_id in dataset_ids:
-            dataset = dataset_migrator.get_dataset(dataset_id)
+    def _run_dataset_pool(
+        self,
+        dataset_migrator: DatasetMigrator,
+        dataset_ids: List[str],
+        include_examples: bool,
+        include_experiments: bool,
+    ) -> Dict[str, str]:
+        # One GET per dataset; fetch them together, keeping the input order.
+        with ThreadPoolExecutor(max_workers=self._workers(len(dataset_ids))) as executor:
+            datasets = list(executor.map(dataset_migrator.get_dataset, dataset_ids))
+
+        for dataset_id, dataset in zip(dataset_ids, datasets):
             item = self.state.ensure_item(
                 f"dataset_{dataset_id}",
                 "dataset",
@@ -204,10 +236,7 @@ class MigrationOrchestrator:
                             )
 
                             # Store example mappings
-                            if example_mapping:
-                                if "examples" not in self.state.id_mappings:
-                                    self.state.id_mappings["examples"] = {}
-                                self.state.id_mappings["examples"].update(example_mapping)
+                            self.state.merge_mappings("examples", example_mapping)
 
                     except Exception as e:
                         error_msg = str(e)
@@ -277,12 +306,25 @@ class MigrationOrchestrator:
         all_experiments = []
         experiment_to_dataset = {}
 
-        # Collect all experiments for these datasets
-        for dataset_id in dataset_ids:
-            experiments = experiment_migrator.list_experiments(dataset_id)
-            for exp in experiments:
-                all_experiments.append(exp)
-                experiment_to_dataset[exp['id']] = dataset_id
+        # List every dataset's experiments, then fetch each experiment's details,
+        # both across the worker pool. Results keep the dataset and listing order.
+        with ThreadPoolExecutor(max_workers=self._workers(len(dataset_ids))) as executor:
+            summaries_per_dataset = list(
+                executor.map(experiment_migrator.list_experiment_summaries, dataset_ids)
+            )
+        owners = [
+            dataset_id
+            for dataset_id, dataset_summaries in zip(dataset_ids, summaries_per_dataset)
+            for _ in dataset_summaries
+        ]
+        summaries = [summary for batch in summaries_per_dataset for summary in batch]
+        if summaries:
+            with ThreadPoolExecutor(max_workers=self._workers(len(summaries))) as executor:
+                all_experiments = list(
+                    executor.map(experiment_migrator.fetch_experiment_details, summaries)
+                )
+        for dataset_id, exp in zip(owners, all_experiments):
+            experiment_to_dataset[exp["id"]] = dataset_id
 
         if not all_experiments:
             self.console.print("[dim]No experiments found for selected datasets[/dim]")
@@ -290,81 +332,45 @@ class MigrationOrchestrator:
 
         self.console.print(f"Found {len(all_experiments)} experiment(s)")
 
-        # Create experiments in destination
+        # Create experiments in destination. Each experiment is independent:
+        # its run and feedback replay only read the dataset and example mappings,
+        # which are complete before this point.
         success_count = 0
         failed_items = []
         skipped_items = []
 
+        def migrate_one(experiment: Dict[str, Any]) -> Tuple[str, str]:
+            source_experiment_id = experiment["id"]
+            return self._migrate_one_experiment(
+                experiment,
+                experiment_to_dataset[source_experiment_id],
+                dataset_id_mapping,
+                experiment_migrator,
+                feedback_migrator,
+            )
+
         with Progress(console=self.console) as progress:
             task = progress.add_task("Migrating experiments...", total=len(all_experiments))
-
-            for experiment in all_experiments:
-                source_experiment_id = experiment["id"]
-                source_dataset_id = experiment_to_dataset[source_experiment_id]
-                dest_dataset_id = dataset_id_mapping.get(source_dataset_id)
-                item_id = f"experiment_{source_experiment_id}"
-                item = self.state.ensure_item(
-                    item_id,
-                    "experiment",
-                    experiment["name"],
-                    source_experiment_id,
-                    stage="create_experiment",
-                    workspace_pair=self.workspace_pair(),
-                    metadata={
-                        "source_dataset_id": source_dataset_id,
-                        "dest_dataset_id": dest_dataset_id,
-                    },
-                )
-
-                if item.terminal_state == ResolutionOutcome.MIGRATED.value:
-                    success_count += 1
+            with ThreadPoolExecutor(
+                max_workers=self._workers(len(all_experiments))
+            ) as executor:
+                futures = {
+                    executor.submit(migrate_one, experiment): experiment
+                    for experiment in all_experiments
+                }
+                for future in as_completed(futures):
+                    experiment = futures[future]
+                    try:
+                        outcome, detail = future.result()
+                    except Exception as e:  # defensive: _migrate_one_experiment records its own errors
+                        outcome, detail = "failed", str(e)
+                    if outcome == "migrated":
+                        success_count += 1
+                    elif outcome == "skipped":
+                        skipped_items.append((experiment["name"], detail))
+                    else:
+                        failed_items.append((experiment["name"], detail))
                     progress.advance(task)
-                    continue
-
-                if not dest_dataset_id:
-                    skipped_items.append((experiment["name"], "dataset not migrated"))
-                    self.state.mark_terminal(
-                        item_id,
-                        ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
-                        "missing_dataset_dependency",
-                        verification_state=VerificationState.BLOCKED,
-                        next_action="Migrate the referenced dataset, then run `langsmith-migrator resume`.",
-                        evidence={"source_dataset_id": source_dataset_id},
-                        error="dataset not migrated",
-                    )
-                    issue = self.state.add_issue(
-                        "dependency",
-                        "missing_dataset_dependency",
-                        f"Experiment {experiment['name']} depends on dataset {source_dataset_id}",
-                        item_id=item_id,
-                        next_action="Migrate the dataset and re-run resume.",
-                        evidence={"source_dataset_id": source_dataset_id},
-                        workspace_pair=self.workspace_pair(),
-                    )
-                    self.state.queue_remediation(
-                        issue_id=issue.id,
-                        item_id=item_id,
-                        next_action=issue.next_action or "Migrate dataset dependency.",
-                        command="langsmith-migrator resume",
-                    )
-                    self.state_manager.save()
-                    progress.advance(task)
-                    continue
-
-                success, detail = self._resolve_experiment_item(
-                    experiment,
-                    source_dataset_id,
-                    dest_dataset_id,
-                    experiment_migrator,
-                    feedback_migrator,
-                )
-                if success:
-                    success_count += 1
-                else:
-                    failed_items.append((experiment["name"], detail))
-
-                progress.advance(task)
-                self.state_manager.save()
 
         # Summary
         self.console.print(f"Experiments: {success_count} migrated, {len(skipped_items)} skipped, {len(failed_items)} failed")
@@ -373,6 +379,76 @@ class MigrationOrchestrator:
                 self.console.print(f"  [yellow]⊘[/yellow] {name}: {err}")
             for name, err in failed_items:
                 self.console.print(f"  [red]✗[/red] {name}: {err}")
+
+    def _migrate_one_experiment(
+        self,
+        experiment: Dict[str, Any],
+        source_dataset_id: str,
+        dataset_id_mapping: Dict[str, str],
+        experiment_migrator: ExperimentMigrator,
+        feedback_migrator: FeedbackMigrator,
+    ) -> Tuple[str, str]:
+        """Migrate one experiment; runs on a worker thread.
+
+        Returns (outcome, detail) where outcome is "migrated", "skipped" or "failed".
+        """
+        source_experiment_id = experiment["id"]
+        dest_dataset_id = dataset_id_mapping.get(source_dataset_id)
+        item_id = f"experiment_{source_experiment_id}"
+        item = self.state.ensure_item(
+            item_id,
+            "experiment",
+            experiment["name"],
+            source_experiment_id,
+            stage="create_experiment",
+            workspace_pair=self.workspace_pair(),
+            metadata={
+                "source_dataset_id": source_dataset_id,
+                "dest_dataset_id": dest_dataset_id,
+            },
+        )
+
+        if item.terminal_state == ResolutionOutcome.MIGRATED.value:
+            return "migrated", "already migrated"
+
+        if not dest_dataset_id:
+            with self.state.lock:
+                self.state.mark_terminal(
+                    item_id,
+                    ResolutionOutcome.BLOCKED_WITH_CHECKPOINT,
+                    "missing_dataset_dependency",
+                    verification_state=VerificationState.BLOCKED,
+                    next_action="Migrate the referenced dataset, then run `langsmith-migrator resume`.",
+                    evidence={"source_dataset_id": source_dataset_id},
+                    error="dataset not migrated",
+                )
+                issue = self.state.add_issue(
+                    "dependency",
+                    "missing_dataset_dependency",
+                    f"Experiment {experiment['name']} depends on dataset {source_dataset_id}",
+                    item_id=item_id,
+                    next_action="Migrate the dataset and re-run resume.",
+                    evidence={"source_dataset_id": source_dataset_id},
+                    workspace_pair=self.workspace_pair(),
+                )
+                self.state.queue_remediation(
+                    issue_id=issue.id,
+                    item_id=item_id,
+                    next_action=issue.next_action or "Migrate dataset dependency.",
+                    command="langsmith-migrator resume",
+                )
+            self.state_manager.save()
+            return "skipped", "dataset not migrated"
+
+        success, detail = self._resolve_experiment_item(
+            experiment,
+            source_dataset_id,
+            dest_dataset_id,
+            experiment_migrator,
+            feedback_migrator,
+        )
+        self.state_manager.save()
+        return ("migrated" if success else "failed"), detail
 
     def _resolve_experiment_delta(
         self,
@@ -411,12 +487,11 @@ class MigrationOrchestrator:
             return None
 
         if item is not None:
-            with self._state_lock:
-                self.state.update_item_checkpoint(
-                    item.id,
-                    metadata={_TIME_SHIFT_SECONDS_KEY: delta.total_seconds()},
-                )
-                self.state_manager.save()
+            self.state.update_item_checkpoint(
+                item.id,
+                metadata={_TIME_SHIFT_SECONDS_KEY: delta.total_seconds()},
+            )
+            self.state_manager.save()
         return delta
 
     def _resolve_experiment_item(
@@ -871,6 +946,10 @@ class MigrationOrchestrator:
     def resume_items(self, items_to_process: List[MigrationItem]) -> Dict[str, List[str]]:
         """Resume pending and failed items using typed dispatch."""
         self.ensure_state()
+        with self.state_manager.throttled_saves(self._save_interval()):
+            return self._resume_items(items_to_process)
+
+    def _resume_items(self, items_to_process: List[MigrationItem]) -> Dict[str, List[str]]:
         # Older sessions have no saved settings and keep the caller's configuration.
         # New sessions must retain their ID and run replay policy across retries.
         for key in ("preserve_ids", "skip_runs", "skip_feedback"):

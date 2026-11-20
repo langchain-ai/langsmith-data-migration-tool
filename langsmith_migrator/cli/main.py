@@ -3,6 +3,7 @@
 import csv
 import functools
 import logging
+import os
 import shlex
 import time
 from dataclasses import dataclass
@@ -620,6 +621,10 @@ def _apply_byoc_migration_profile(config) -> None:
     config.migration.skip_feedback = True
     config.migration.non_interactive = True
     config.migration.interactive = False
+    # The per-request sleep is the main cost of a bulk copy; retries with backoff
+    # already handle 429s. An explicit MIGRATION_RATE_LIMIT_DELAY still wins.
+    if "MIGRATION_RATE_LIMIT_DELAY" not in os.environ:
+        config.migration.rate_limit_delay = 0.0
 
 
 def _resolve_workspaces(

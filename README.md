@@ -6,7 +6,7 @@ A Python CLI for migrating users and roles, datasets, experiments, annotation qu
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.92-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.93-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -243,20 +243,20 @@ The destination's `POST /runs/batch` endpoint rejects runs with timestamps outsi
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.92-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.93-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.92-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.93-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.92-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.93-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.92-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.93-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -573,6 +573,29 @@ does not revisit them. Older sessions retain their original behavior; rerun
 
 ```bash
 langsmith-migrator datasets --byoc-migration
+```
+
+#### Throughput
+
+`--workers` (`MIGRATION_WORKERS`) sets the thread count for each stage of a
+dataset run: dataset and experiment lookups, datasets, experiments, and
+uploads of examples with attachments. Examples without attachments go through
+the bulk endpoint; each example with attachments needs its own request, so
+those run on the worker threads. Experiments migrate in parallel too, so with
+run or feedback replay the destination sees up to `--workers` experiments at
+once, each with its own feedback threads (`MIGRATION_FEEDBACK_WORKERS`).
+
+`--byoc-migration` removes the per-request delay (`MIGRATION_RATE_LIMIT_DELAY`,
+default 0.1 s); rate-limited requests are still retried with backoff. Set
+`MIGRATION_RATE_LIMIT_DELAY` explicitly to keep a delay.
+
+During dataset and resume runs the state file is written at most every
+`MIGRATION_STATE_SAVE_INTERVAL` seconds (default 5, `0` writes on every
+checkpoint) and always at the end. A crash loses at most that many seconds of
+checkpoints; `resume` re-checks the destination and redoes that work.
+
+```bash
+langsmith-migrator --workers 16 datasets --byoc-migration
 ```
 
 `queues --byoc-migration` is the matching step for annotation queues: it pairs

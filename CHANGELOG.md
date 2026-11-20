@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.93] - 2026-11-19
+
+### Changed
+- **Faster dataset migration** (`datasets`, `migrate-all`, `resume`):
+  experiments migrate in parallel on `--workers` threads, as datasets already
+  did. Dataset lookups and experiment listings run in parallel too. Existing
+  destination experiments are listed once per dataset, not once per
+  experiment. Examples with attachments download and upload in parallel, and
+  examples without attachments in the same batch go through the bulk endpoint
+  instead of one SDK request each. (#188)
+- **State file writes are throttled** during dataset and resume runs: at most
+  every `MIGRATION_STATE_SAVE_INTERVAL` seconds (default 5), always at the end,
+  and atomically (a crash never leaves a truncated state file). The file is no
+  longer indented. (#188)
+- **`--byoc-migration` removes the per-request delay** unless
+  `MIGRATION_RATE_LIMIT_DELAY` is set. (#188)
+
 ## [0.0.92] - 2026-11-18
 
 ### Fixed
