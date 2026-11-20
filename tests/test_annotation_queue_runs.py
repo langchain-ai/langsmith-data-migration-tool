@@ -420,6 +420,43 @@ def test_failed_destination_page_is_not_cached(migrator):
 
     migrator.dest.get.side_effect = get
 
-    assert migrator.find_existing_queue("One") is None
+    with pytest.raises(APIError):
+        migrator.find_existing_queue("One")
     assert migrator.find_existing_queue("One") == "dst-1"
     assert migrator.dest.get_paginated.call_args.kwargs.get("raise_errors") is True
+
+
+def test_failed_listing_fails_the_queue_instead_of_creating_a_duplicate(migrator):
+    migrator.dest.get_paginated.side_effect = APIError("503 upstream", status_code=503)
+
+    with pytest.raises(APIError):
+        migrator.create_queue({"id": "src-1", "name": "Existing"})
+    migrator.dest.post.assert_not_called()
+
+
+def test_same_named_queues_create_one_destination_queue(migrator):
+    """Concurrent workers must not both create a queue for the same name."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    migrator.dest.get_paginated.side_effect = lambda *a, **k: iter([])
+    created = []
+    guard = threading.Lock()
+
+    def post(endpoint, body):
+        time.sleep(0.02)  # widen the window between lookup and create
+        with guard:
+            created.append(body["name"])
+            return {"id": f"dst-{len(created)}"}
+
+    migrator.dest.post.side_effect = post
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        ids = list(pool.map(
+            migrator.create_queue,
+            [{"id": f"src-{i}", "name": "Same"} for i in range(4)],
+        ))
+
+    assert created == ["Same"]
+    assert set(ids) == {"dst-1"}

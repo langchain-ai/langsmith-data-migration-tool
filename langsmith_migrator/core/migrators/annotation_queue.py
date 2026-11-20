@@ -36,25 +36,26 @@ class AnnotationQueueMigrator(BaseMigrator):
 
         The API has no name filter, so the destination queues are listed once
         per workspace and cached; listing them for every queue made a
-        migration quadratic in the queue count. A failed listing is not cached.
+        migration quadratic in the queue count. A failed listing raises and is
+        not cached: treating it as "not found" would create a duplicate queue.
         """
         scope = self._dest_scope()
         with self._dest_index_lock:
             index = self._dest_queue_index.get(scope)
             if index is None:
-                try:
-                    index = {}
-                    # raise_errors: a failed page must not leave a partial index cached.
-                    for queue in self.dest.get_paginated(
-                        "/annotation-queues", raise_errors=True
-                    ):
-                        if isinstance(queue, dict) and queue.get("name"):
-                            index.setdefault(queue["name"], queue.get("id"))
-                except Exception as e:
-                    self.log(f"Failed to check for existing queue: {e}", "warning")
-                    return None
+                index = {}
+                # raise_errors: a failed page must raise, not end the listing early.
+                for queue in self.dest.get_paginated("/annotation-queues", raise_errors=True):
+                    if isinstance(queue, dict) and queue.get("name"):
+                        index.setdefault(queue["name"], queue.get("id"))
                 self._dest_queue_index[scope] = index
             return index.get(name)
+
+    def _name_lock(self, name: str) -> threading.Lock:
+        """One lock per destination workspace and queue name."""
+        key = (self._dest_scope(), name)
+        with self._dest_index_lock:
+            return self._name_locks.setdefault(key, threading.Lock())
 
     def _remember_dest_queue(self, name: str, queue_id: str) -> None:
         with self._dest_index_lock:
@@ -89,8 +90,19 @@ class AnnotationQueueMigrator(BaseMigrator):
         queue: Dict[str, Any],
         default_dataset_id: Optional[str] = None
     ) -> str:
-        """Create or update annotation queue in destination."""
+        """Create or update annotation queue in destination.
 
+        Serialized per queue name, so two source queues with one name are
+        handled as in a sequential run: the second finds the first.
+        """
+        with self._name_lock(queue["name"]):
+            return self._create_queue_unlocked(queue, default_dataset_id)
+
+    def _create_queue_unlocked(
+        self,
+        queue: Dict[str, Any],
+        default_dataset_id: Optional[str] = None,
+    ) -> str:
         # Check if exists
         existing_id = self.find_existing_queue(queue["name"])
 
@@ -152,6 +164,7 @@ class AnnotationQueueMigrator(BaseMigrator):
         # Destination queue name -> id, per destination workspace (X-Tenant-Id).
         self._dest_queue_index: Dict[Optional[str], Dict[str, str]] = {}
         self._dest_index_lock = threading.Lock()
+        self._name_locks: Dict[tuple, threading.Lock] = {}
 
     def _post_workers(self) -> int:
         """Threads posting run batches for one queue, like feedback per experiment."""
