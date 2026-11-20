@@ -2302,6 +2302,24 @@ def test_queues_command_migrates_queues_in_parallel(cli_harness):
         assert state.items[f"queue_default_queue-{i}"].destination_id == f"new-queue-{i}"
 
 
+def test_byoc_migration_matches_feedback_workers_to_workers(cli_harness, monkeypatch):
+    monkeypatch.delenv("MIGRATION_FEEDBACK_WORKERS", raising=False)
+
+    result = cli_harness.invoke(["--workers", "7", "queues", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert cli_harness.orchestrator_factory.instances[-1].config.migration.feedback_workers == 7
+
+
+def test_byoc_migration_keeps_explicit_feedback_workers(cli_harness, monkeypatch):
+    monkeypatch.setenv("MIGRATION_FEEDBACK_WORKERS", "3")
+
+    result = cli_harness.invoke(["--workers", "7", "queues", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert cli_harness.orchestrator_factory.instances[-1].config.migration.feedback_workers == 3
+
+
 def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):
     """Queue runs are opt-in; the default command only migrates the queue config."""
 

@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Faster `queues`**: queues migrate in parallel (`--workers`), each queue's
   run batches post in parallel (`MIGRATION_FEEDBACK_WORKERS`), and destination
   queues are listed once per workspace instead of once per queue.
+  `--byoc-migration` sets `MIGRATION_FEEDBACK_WORKERS` to `--workers` unless it
+  is set.
 
 ### Fixed
 - **Workspace discovery paths**: base URLs ending in `/api/v1` no longer probe

@@ -627,6 +627,10 @@ def _apply_byoc_migration_profile(config) -> None:
     # already handle 429s. An explicit MIGRATION_RATE_LIMIT_DELAY still wins.
     if "MIGRATION_RATE_LIMIT_DELAY" not in os.environ:
         config.migration.rate_limit_delay = 0.0
+    # Nested I/O (queue run batches) uses as many threads as --workers.
+    # An explicit MIGRATION_FEEDBACK_WORKERS still wins.
+    if "MIGRATION_FEEDBACK_WORKERS" not in os.environ:
+        config.migration.feedback_workers = max(1, config.migration.concurrent_workers)
 
 
 def _resolve_workspaces(

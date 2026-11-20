@@ -607,11 +607,12 @@ the runs exist on the destination:
 langsmith-migrator queues --byoc-migration
 ```
 
-Queues migrate in parallel with `--workers` threads, and each queue posts its run
-batches with `MIGRATION_FEEDBACK_WORKERS` threads (default: `--workers`):
+Queues migrate in parallel with `--workers` threads, and `--byoc-migration`
+posts each queue's run batches with the same number of threads
+(`MIGRATION_FEEDBACK_WORKERS` overrides it):
 
 ```bash
-MIGRATION_FEEDBACK_WORKERS=8 langsmith-migrator --workers 8 queues --byoc-migration
+langsmith-migrator --workers 8 queues --byoc-migration
 ```
 
 Org-scoped API keys are supported: the connection check authenticates through
