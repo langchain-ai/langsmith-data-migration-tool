@@ -1,7 +1,7 @@
 """Unit tests for PromptMigrator."""
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 from langsmith_migrator.core.migrators import PromptMigrator
 
 
@@ -19,6 +19,7 @@ class TestPromptMigrator:
                 sample_config
             )
             migrator.source_ls_client = Mock()
+            migrator.source_ls_client.get_prompt.return_value = Mock(description="", readme="", tags=[])
             migrator.dest_ls_client = Mock()
             return migrator
 
@@ -54,7 +55,7 @@ class TestPromptMigrator:
         mock_prompt_obj.num_downloads = 10
         mock_prompt_obj.num_commits = 3
         mock_prompt_obj.updated_at = '2024-01-01T00:00:00Z'
-        
+
         mock_response.repos = [mock_prompt_obj]
         prompt_migrator.source_ls_client.list_prompts.return_value = mock_response
 
@@ -172,6 +173,21 @@ class TestPromptMigrator:
             'user/test-prompt', description="Scores transcripts", readme="# Usage", tags=["prod", "v2"]
         )
 
+    def test_failed_metadata_copy_fails_the_prompt(self, prompt_migrator, sample_config):
+        """A prompt without its description and tags is not recorded as migrated."""
+        sample_config.migration.dry_run = False
+        prompt_migrator._pull_prompt_manifest = Mock(return_value={"commit_hash": "abc", "manifest": {"kwargs": {}}})
+        prompt_migrator._push_prompt_manifest = Mock(return_value="new-commit")
+        prompt_migrator._verify_prompt_commit = Mock(return_value=(True, "new-commit"))
+        prompt_migrator.source_ls_client.get_prompt.return_value = Mock(description="d", readme="", tags=[])
+        prompt_migrator.dest_ls_client.update_prompt.side_effect = RuntimeError("upstream timeout")
+        prompt_migrator.mark_migrated = Mock()
+
+        result = prompt_migrator.migrate_prompt('user/test-prompt')
+
+        assert result is None
+        prompt_migrator.mark_migrated.assert_not_called()
+
     def test_migrate_prompt_with_all_commits(self, prompt_migrator, sample_config):
         """Test migrating prompt with all commit history using manifest-based approach."""
         sample_config.migration.dry_run = False
@@ -235,7 +251,7 @@ class TestPromptMigrator:
         mock_commit.commit_hash = 'hash1'
         mock_commit.manifest = {'key': 'value'}
         mock_commit.parent_commit_hash = None
-        
+
         prompt_migrator.source_ls_client.list_prompt_commits.return_value = [mock_commit]
 
         result = prompt_migrator.get_prompt_commits('user/test-prompt')

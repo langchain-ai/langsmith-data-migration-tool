@@ -48,6 +48,23 @@ class FeedbackConfigMigrator(BaseMigrator):
             return None
         return key, json.dumps(definition, sort_keys=True)
 
+    @staticmethod
+    def _creation_order(configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Plain configs before the enforced one, the key's first config first.
+
+        The destination makes a key's first created config its first config,
+        which is the key's default when none is enforced, and it refuses other
+        scales for a key once one is enforced.
+        """
+        return sorted(
+            configs,
+            key=lambda c: (
+                bool(c.get("is_enforced")),
+                not c.get("is_first"),
+                str(c.get("modified_at") or ""),
+            ),
+        )
+
     def migrate_all(self) -> Dict[str, Any]:
         """Create every live source config with no equal destination config.
 
@@ -60,7 +77,7 @@ class FeedbackConfigMigrator(BaseMigrator):
         destination = self._list(self.dest)
         present = {self._identity(c) for c in destination}
         enforced_keys = {c.get("feedback_key") for c in destination if c.get("is_enforced")}
-        for config in source:
+        for config in self._creation_order(source):
             identity = self._identity(config)
             if identity is None:
                 result["failed"] += 1

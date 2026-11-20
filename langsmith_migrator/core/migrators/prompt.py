@@ -649,15 +649,13 @@ class PromptMigrator(BaseMigrator):
 
         Commits carry only the prompt content, and the destination repo is created
         empty, so these are set separately, also on a prompt that already exists.
+        A failure fails the prompt, so ``resume`` retries it; replaying its
+        commits is a no-op.
         """
         try:
             source = self.source_ls_client.get_prompt(prompt_identifier)
-        except Exception as e:
-            self.log(f"Could not read prompt details for {prompt_identifier}: {e}", "warning")
-            return
-        if source is None:
-            return
-        try:
+            if source is None:
+                raise ValueError("the source prompt was not found")
             self.dest_ls_client.update_prompt(
                 prompt_identifier,
                 description=source.description or "",
@@ -665,7 +663,7 @@ class PromptMigrator(BaseMigrator):
                 tags=list(source.tags or []),
             )
         except Exception as e:
-            self.log(f"Could not copy description and tags of {prompt_identifier}: {e}", "warning")
+            raise ValueError(f"Could not copy the description, readme and tags: {e}") from e
 
     def find_existing_prompt(self, prompt_identifier: str) -> bool:
         """

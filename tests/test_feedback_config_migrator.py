@@ -79,3 +79,25 @@ def test_failed_create_is_reported(make):
 
 def test_legacy_string_definition_is_read():
     assert config_definition('{"type": "continuous", "min": 0, "max": 5}') == SCALE_0_5
+
+
+def test_first_config_is_created_first_and_the_enforced_one_last(make):
+    """The first created config becomes the key's default, and enforcing a key
+    makes the destination refuse its other scales, so order matters."""
+    scale_0_10 = {"type": "continuous", "min": 0, "max": 10}
+    migrator = make(
+        [  # newest first, as the source lists them
+            _config("quality", scale_0_10, is_enforced=True, modified_at="2026-03-01"),
+            _config("quality", SCALE_0_5, modified_at="2026-02-01"),
+            _config("quality", SCALE_0_1, is_first=True, modified_at="2026-01-01"),
+        ],
+        [],
+    )
+
+    migrator.migrate_all()
+
+    assert [(b["feedback_config"]["max"], b.get("is_enforced")) for b in _created(migrator)] == [
+        (1, None),
+        (5, None),
+        (10, True),
+    ]
