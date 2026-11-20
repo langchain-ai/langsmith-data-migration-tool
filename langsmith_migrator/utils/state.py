@@ -18,6 +18,23 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar
 from uuid import uuid4
 
 
+# Migration settings saved with a session and restored by `resume`, so a retry
+# keeps the policy of the run that created the session (e.g. --byoc-migration).
+SAVED_MIGRATION_SETTINGS = (
+    "preserve_ids",
+    "skip_runs",
+    "skip_feedback",
+    "check_queue_runs_exist",
+)
+
+
+def saved_migration_settings(migration_config: Any) -> Dict[str, bool]:
+    """The session-scoped settings of a ``MigrationConfig``, as saved in state."""
+    return {
+        key: bool(getattr(migration_config, key, False)) for key in SAVED_MIGRATION_SETTINGS
+    }
+
+
 class MigrationStatus(Enum):
     """Status of a migration item."""
 
@@ -1034,7 +1051,7 @@ class MigrationState:
         """Create from dictionary."""
         migration_settings = data.get("migration_settings", {})
         if not isinstance(migration_settings, dict) or any(
-            key not in {"preserve_ids", "skip_runs", "skip_feedback"} or not isinstance(value, bool)
+            key not in SAVED_MIGRATION_SETTINGS or not isinstance(value, bool)
             for key, value in migration_settings.items()
         ):
             raise ValueError("Invalid migration settings in saved session")

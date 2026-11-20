@@ -69,7 +69,13 @@ from ..utils.chart_mode import (
 )
 from ..utils.config import Config, S3Config
 from ..utils.retry import RateLimitError
-from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
+from ..utils.state import (
+    MigrationStatus,
+    ResolutionOutcome,
+    StateManager,
+    VerificationState,
+    saved_migration_settings,
+)
 from ..utils.workspace import (
     discover_workspaces,
     get_workspace_name,
@@ -749,6 +755,8 @@ def _ensure_migration_session(orchestrator, config):
             config.source.base_url,
             config.destination.base_url,
         )
+        # Saved so `resume` restores them, as the dataset flow does.
+        orchestrator.state.migration_settings = saved_migration_settings(config.migration)
     elif not orchestrator.state.remediation_bundle_path:
         orchestrator.state.remediation_bundle_path = str(
             orchestrator.state_manager._default_bundle_path(orchestrator.state.session_id).resolve()

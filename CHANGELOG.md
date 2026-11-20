@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Smaller state files**: each queue keeps at most 100 per-run errors in the
   state file; the counts stay exact.
 
+### Fixed
+- **`resume` keeps the BYOC run lookup**: queue sessions now save their
+  migration settings, so a resumed queue still looks runs up before linking.
+
 ## [0.0.95] - 2026-11-20
 
 ### Changed
