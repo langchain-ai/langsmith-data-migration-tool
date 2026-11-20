@@ -5,7 +5,9 @@ import functools
 import logging
 import os
 import shlex
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -2539,33 +2541,49 @@ def queues(
         failed_items = []
         queue_run_results = []
 
-        with Progress(console=console) as progress:
-            task = progress.add_task("Migrating queues...", total=len(selected_queues))
-            for queue in selected_queues:
-                item_id = _ensure_state_item(
-                    orchestrator,
-                    config,
-                    "queue",
-                    queue["id"],
-                    queue["name"],
-                    metadata={"queue": queue, "include_runs": include_runs},
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    new_id = queue_migrator.create_queue(queue)
+        results_lock = threading.Lock()
+
+        def migrate_one(queue: dict) -> None:
+            nonlocal success_count
+            item_id = _ensure_state_item(
+                orchestrator,
+                config,
+                "queue",
+                queue["id"],
+                queue["name"],
+                metadata={"queue": queue, "include_runs": include_runs},
+            )
+            try:
+                _mark_state_item_started(orchestrator, item_id)
+                new_id = queue_migrator.create_queue(queue)
+                with results_lock:
                     success_count += 1
-                    run_result = None
-                    if include_runs:
-                        run_result = _migrate_queue_runs_for_item(
-                            orchestrator, queue_migrator, queue, new_id
-                        )
-                        if run_result is not None:
+                run_result = None
+                if include_runs:
+                    run_result = _migrate_queue_runs_for_item(
+                        orchestrator, queue_migrator, queue, new_id
+                    )
+                    if run_result is not None:
+                        with results_lock:
                             queue_run_results.append((queue["name"], run_result))
-                    _finish_queue_state_item(orchestrator, item_id, new_id, run_result)
-                except Exception as e:
+                _finish_queue_state_item(orchestrator, item_id, new_id, run_result)
+            except Exception as e:
+                with results_lock:
                     failed_items.append((queue["name"], str(e)))
-                    _mark_state_item_failed(orchestrator, item_id, e)
-                progress.advance(task)
+                _mark_state_item_failed(orchestrator, item_id, e)
+
+        # Queues are independent, so they run in a pool like datasets do; each
+        # queue's run batches post in its own nested pool (MIGRATION_FEEDBACK_WORKERS).
+        workers = max(1, min(config.migration.concurrent_workers, len(selected_queues)))
+        save_interval = float(getattr(config.migration, "state_save_interval", 0.0) or 0.0)
+        with Progress(console=console) as progress, \
+                orchestrator.state_manager.throttled_saves(save_interval):
+            task = progress.add_task("Migrating queues...", total=len(selected_queues))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(migrate_one, q) for q in selected_queues]
+                for future in as_completed(futures):
+                    future.result()
+                    progress.advance(task)
 
         console.print(f"Queues: {success_count} migrated, {len(failed_items)} failed")
         if failed_items and config.migration.verbose:

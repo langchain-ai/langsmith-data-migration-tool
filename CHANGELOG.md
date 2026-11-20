@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Faster `queues`**: queues migrate in parallel (`--workers`), each queue's
+  run batches post in parallel (`MIGRATION_FEEDBACK_WORKERS`), and destination
+  queues are listed once per workspace instead of once per queue.
+
+### Fixed
+- **Workspace discovery paths**: base URLs ending in `/api/v1` no longer probe
+  `/api/v1/api/v1/workspaces`, and a `405` on `/workspaces` falls through to
+  `/orgs/current/workspaces`, also in the org-key connection check.
+
 ## [0.0.94] - 2026-11-19
 
 ### Fixed

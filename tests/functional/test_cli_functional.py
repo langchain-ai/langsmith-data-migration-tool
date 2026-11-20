@@ -2271,6 +2271,37 @@ def test_queues_command_byoc_migration_implies_all_workspaces_runs_and_no_prompt
     assert "Queue runs: 2 added, 0 failed, 0 skipped" in cli_harness.console.text
 
 
+def test_queues_command_migrates_queues_in_parallel(cli_harness):
+    """Independent queues should run in the worker pool, not one after another."""
+    import threading
+    import time
+
+    queues = [{"id": f"queue-{i}", "name": f"Queue {i}"} for i in range(6)]
+    cli_harness.migrators.queue.list_queues.return_value = queues
+    active = {"now": 0, "peak": 0}
+    guard = threading.Lock()
+
+    def create(queue):
+        with guard:
+            active["now"] += 1
+            active["peak"] = max(active["peak"], active["now"])
+        time.sleep(0.03)
+        with guard:
+            active["now"] -= 1
+        return f"new-{queue['id']}"
+
+    cli_harness.migrators.queue.create_queue.side_effect = create
+
+    result = cli_harness.invoke(["--workers", "3", "--non-interactive", "queues"])
+
+    assert result.exit_code == 0
+    assert "Queues: 6 migrated, 0 failed" in cli_harness.console.text
+    assert 1 < active["peak"] <= 3
+    state = cli_harness.orchestrator_factory.state
+    for i in range(6):
+        assert state.items[f"queue_default_queue-{i}"].destination_id == f"new-queue-{i}"
+
+
 def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):
     """Queue runs are opt-in; the default command only migrates the queue config."""
 
