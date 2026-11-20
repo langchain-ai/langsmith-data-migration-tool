@@ -988,6 +988,12 @@ def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> Non
             "(e.g. after a trace storage migration). Run `langsmith-migrator resume` "
             "to retry linking them.[/dim]"
         )
+    assumed = sum(r.get("assumed_missing", 0) for _, r in queue_run_results)
+    if assumed:
+        console.print(
+            f"[dim]{assumed} of the failed runs were in batches recorded as missing "
+            "after a long run of missing runs (MIGRATION_QUEUE_MISSING_STREAK).[/dim]"
+        )
     if skipped:
         console.print(
             "[dim]Skipped runs had no session_id/start_time on the source; their queues "
@@ -997,6 +1003,8 @@ def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> Non
         for name, r in queue_run_results:
             for run_id, err in r.get("errors", []):
                 console.print(f"  [red]✗[/red] {name} run {run_id}: {err}")
+            if r.get("errors_truncated"):
+                console.print(f"  [dim]{name}: {r['errors_truncated']} more not shown[/dim]")
 
 
 def _filter_datasets(datasets: list, selectors) -> tuple[list, list]:

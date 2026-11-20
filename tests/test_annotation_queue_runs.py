@@ -187,7 +187,9 @@ def test_migrate_queue_runs_replays_rejected_batch_per_run(migrator):
         "added": 1,
         "skipped": 0,
         "failed": 1,
+        "assumed_missing": 0,
         "errors": [("run-2", "run not found on destination")],
+        "errors_truncated": 0,
     }
     per_run = [c.args[1] for c in migrator.dest.post.call_args_list[1:]]
     assert [body[0]["run_id"] for body in per_run] == ["run-1", "run-2"]
@@ -460,3 +462,108 @@ def test_same_named_queues_create_one_destination_queue(migrator):
 
     assert created == ["Same"]
     assert set(ids) == {"dst-1"}
+
+
+# ---------------------------------------------------------------------------
+# Rejected batches: halving, the missing-run streak limit, the error cap
+# ---------------------------------------------------------------------------
+
+
+def _many(n):
+    return [{"id": f"run-{i}", "session_id": "sess-1", "start_time": "2026-01-01T00:00:00"}
+            for i in range(n)]
+
+
+def _reject(missing_ids, error_cls=NotFoundError, status=404):
+    """dest.post that rejects any batch containing a missing run."""
+    def post(endpoint, body):
+        if any(k["run_id"] in missing_ids for k in body):
+            raise error_cls("run not found", status_code=status)
+        return {}
+    return post
+
+
+def test_one_missing_run_is_found_by_halving(migrator):
+    _serve(migrator, _many(100))
+    migrator.dest.post.side_effect = _reject({"run-37"})
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["added"] == 99
+    assert result["failed"] == 1
+    assert result["errors"] == [("run-37", "run not found")]
+    # One batch, then two halves per level down to the missing run: far below
+    # the 101 requests of a one-by-one retry.
+    assert migrator.dest.post.call_count <= 15
+
+
+def test_missing_streak_records_rejected_batches_whole(migrator):
+    migrator.config.migration.queue_missing_streak = 4
+    _serve(migrator, _many(40))
+    migrator.dest.post.side_effect = _reject({f"run-{i}" for i in range(40)})
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst", batch_size=8)
+
+    assert result["added"] == 0
+    assert result["failed"] == 40
+    assert result["assumed_missing"] > 0
+    # Splitting every batch of 8 would cost 15 requests each (75 in total).
+    assert migrator.dest.post.call_count < 40
+
+
+def test_accepted_batch_ends_the_missing_streak(migrator):
+    migrator.config.migration.queue_missing_streak = 2
+    runs = _many(12)
+    _serve(migrator, runs)
+    # runs 0-3 missing (trips the streak), 4-7 fine (resets it), 8 missing alone.
+    migrator.dest.post.side_effect = _reject({"run-0", "run-1", "run-2", "run-3", "run-8"})
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst", batch_size=4)
+
+    assert result["added"] == 7
+    assert result["failed"] == 5
+    # run-0 and run-1 are confirmed one by one, then run-2/run-3 are assumed as a
+    # pair. The accepted batch resets the streak, so run-8 is found by splitting
+    # and run-9 is still linked.
+    assert result["assumed_missing"] == 2
+    assert ("run-8", "run not found") in result["errors"]
+
+
+def test_streak_only_counts_not_found(migrator):
+    migrator.config.migration.queue_missing_streak = 1
+    _serve(migrator, _many(8))
+    migrator.dest.post.side_effect = _reject(
+        {f"run-{i}" for i in range(8)}, error_cls=APIError, status=422
+    )
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst", batch_size=4)
+
+    assert result["failed"] == 8
+    assert result["assumed_missing"] == 0
+
+
+def test_streak_limit_zero_always_splits(migrator):
+    migrator.config.migration.queue_missing_streak = 0
+    _serve(migrator, _many(16))
+    migrator.dest.post.side_effect = _reject({f"run-{i}" for i in range(16)})
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst", batch_size=8)
+
+    assert result["failed"] == 16
+    assert result["assumed_missing"] == 0
+    assert len(result["errors"]) == 16
+
+
+def test_stored_errors_are_capped(migrator):
+    from langsmith_migrator.core.migrators.annotation_queue import MAX_STORED_RUN_ERRORS
+
+    migrator.config.migration.queue_missing_streak = 0
+    _serve(migrator, _many(250))
+    migrator.dest.post.side_effect = _reject({f"run-{i}" for i in range(250)})
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["failed"] == 250
+    assert len(result["errors"]) == MAX_STORED_RUN_ERRORS
+    assert result["errors_truncated"] == 250 - MAX_STORED_RUN_ERRORS
+

@@ -9,6 +9,8 @@ from ...utils.pagination import PaginationHelper
 from .base import BaseMigrator
 
 QUEUE_RUNS_BATCH_SIZE = 100
+# Per-run errors kept in a result (and so in the state file); counts stay exact.
+MAX_STORED_RUN_ERRORS = 100
 
 
 class AnnotationQueueMigrator(BaseMigrator):
@@ -334,13 +336,25 @@ class AnnotationQueueMigrator(BaseMigrator):
         storage migration). Review progress (reviewed / done / reviewer cursors)
         is not exposed by the API and is not copied.
 
+        A rejected batch is split in halves until the rejected runs are found,
+        so a few missing runs cost a few requests rather than one per run.
+        After ``MIGRATION_QUEUE_MISSING_STREAK`` runs in a row are confirmed
+        missing, a rejected batch is recorded as failed whole instead of split:
+        queues whose runs expired before the trace migration would otherwise
+        cost one request per run. The first accepted batch ends that mode.
+
         Returns counts: ``total`` runs listed, ``added``, ``skipped`` (missing key
-        fields), ``failed``, and ``errors`` as ``(run_id, message)`` pairs.
+        fields), ``failed`` (of which ``assumed_missing`` were in batches recorded
+        whole), and ``errors`` as up to ``MAX_STORED_RUN_ERRORS``
+        ``(run_id, message)`` pairs, with ``errors_truncated`` counting the rest.
         """
         batch_size = max(1, min(batch_size, QUEUE_RUNS_BATCH_SIZE))
         result: Dict[str, Any] = {
-            "total": 0, "added": 0, "skipped": 0, "failed": 0, "errors": [],
+            "total": 0, "added": 0, "skipped": 0, "failed": 0,
+            "assumed_missing": 0, "errors": [], "errors_truncated": 0,
         }
+        streak_limit = max(0, int(getattr(self.config.migration, "queue_missing_streak", 0) or 0))
+        missing = {"streak": 0}
         dry_run = self.config.migration.dry_run
         if not dry_run:
             # Settle which endpoints the destination has before any run is sent, so
@@ -356,27 +370,55 @@ class AnnotationQueueMigrator(BaseMigrator):
         in_flight: Set[Future] = set()
         executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
 
+        def record_error(run_id: str, message: str) -> None:
+            # Caller holds ``lock``.
+            if len(result["errors"]) < MAX_STORED_RUN_ERRORS:
+                result["errors"].append((run_id, message))
+            else:
+                result["errors_truncated"] += 1
+
         def post(keys: List[Dict[str, str]]) -> None:
             try:
                 self._add_runs_to_queue(dest_queue_id, keys)
-                with lock:
-                    result["added"] += len(keys)
+            except APIError as error:
+                rejected(keys, error)
                 return
-            except APIError as batch_error:
-                self.log(
-                    f"Batch of {len(keys)} queue run(s) rejected ({batch_error}); "
-                    "retrying one by one",
-                    "warning",
+            with lock:
+                result["added"] += len(keys)
+                missing["streak"] = 0
+
+        def rejected(keys: List[Dict[str, str]], error: APIError) -> None:
+            if len(keys) == 1:
+                with lock:
+                    result["failed"] += 1
+                    record_error(keys[0]["run_id"], str(error))
+                    if isinstance(error, NotFoundError):
+                        missing["streak"] += 1
+                    else:
+                        missing["streak"] = 0
+                return
+            with lock:
+                assume = (
+                    streak_limit > 0
+                    and isinstance(error, NotFoundError)
+                    and missing["streak"] >= streak_limit
                 )
-            for key in keys:
-                try:
-                    self._add_runs_to_queue(dest_queue_id, [key])
-                    with lock:
-                        result["added"] += 1
-                except APIError as run_error:
-                    with lock:
-                        result["failed"] += 1
-                        result["errors"].append((key["run_id"], str(run_error)))
+                if assume:
+                    result["failed"] += len(keys)
+                    result["assumed_missing"] += len(keys)
+                    record_error(
+                        keys[0]["run_id"],
+                        f"batch of {len(keys)} rejected after {missing['streak']} "
+                        f"missing runs in a row; recorded as missing: {error}",
+                    )
+                    return
+            self.log(
+                f"Batch of {len(keys)} queue run(s) rejected ({error}); splitting",
+                "warning",
+            )
+            middle = len(keys) // 2
+            post(keys[:middle])
+            post(keys[middle:])
 
         def drain(limit: int) -> None:
             while len(in_flight) > limit:
@@ -406,9 +448,9 @@ class AnnotationQueueMigrator(BaseMigrator):
                 if key is None:
                     with lock:
                         result["skipped"] += 1
-                        result["errors"].append(
-                            (str(run.get("id") or run.get("run_id") or "?"),
-                             "missing run key fields")
+                        record_error(
+                            str(run.get("id") or run.get("run_id") or "?"),
+                            "missing run key fields",
                         )
                     continue
                 batch.append(key)
