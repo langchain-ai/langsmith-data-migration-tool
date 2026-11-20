@@ -230,23 +230,23 @@ def test_migrate_queue_runs_empty_queue(migrator):
 # --- queue items API (replaces the deprecated /runs endpoints) ---------------
 
 
-def test_items_api_lists_every_active_item_and_adds_by_key(migrator):
-    """Both active statuses are listed, so the caller's own reviews hide nothing."""
+def test_items_api_lists_every_item_and_adds_by_key(migrator):
+    """Every status is listed, so neither the caller's reviews nor completion hide an item."""
     migrator.source.get.side_effect = _items_server(
         {
             # the empty page still has a next cursor, so listing goes on past it
             "needs_my_review": [[_run(1)], [], [_run(2)]],
             # run-1 was reviewed mid-listing, so it is listed twice but copied once
             "needs_others_review": [[_run(3), _run(1)]],
-            "archived": [[_run(4)]],  # review complete: not copied
+            "archived": [[_run(4)]],  # review complete: copied, as an open item
         }
     )
     migrator.dest.get.side_effect = _items_server({})
 
     result = migrator.migrate_queue_runs("q-src", "q-dst")
 
-    assert result["total"] == 3
-    assert result["added"] == 3
+    assert result["total"] == 4
+    assert result["added"] == 4
     listing = migrator.source.get.call_args_list[1:]  # after the support probe
     assert {c.args[0] for c in listing} == {"/platform/annotation-queues/q-src/items"}
     assert listing[0].args[1] == {"status": "needs_my_review", "item_type": "RUN", "page_size": 100}
@@ -255,6 +255,7 @@ def test_items_api_lists_every_active_item_and_adds_by_key(migrator):
         ("needs_my_review", "1"),
         ("needs_my_review", "2"),
         ("needs_others_review", None),
+        ("archived", None),
     ]
     endpoint, body = migrator.dest.post.call_args.args
     assert endpoint == "/platform/annotation-queues/q-dst/items"
@@ -266,7 +267,7 @@ def test_items_api_lists_every_active_item_and_adds_by_key(migrator):
                 "session_id": "sess-1",
                 "start_time": f"2026-01-0{i}T00:00:00",
             }
-            for i in (1, 2, 3)
+            for i in (1, 2, 3, 4)
         ]
     }
 

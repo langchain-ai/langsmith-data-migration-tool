@@ -155,6 +155,23 @@ class TestPromptMigrator:
             mock_manifest
         )
 
+    def test_migrate_prompt_copies_description_and_tags(self, prompt_migrator, sample_config):
+        """Commits carry no repo metadata, so it is copied also onto an existing prompt."""
+        sample_config.migration.dry_run = False
+        prompt_migrator.find_existing_prompt = Mock(return_value=True)
+        prompt_migrator._pull_prompt_manifest = Mock(return_value={"commit_hash": "abc", "manifest": {"kwargs": {}}})
+        prompt_migrator._push_prompt_manifest = Mock(return_value="already_up_to_date")
+        prompt_migrator._verify_prompt_commit = Mock(return_value=(True, "abc"))
+        prompt_migrator.source_ls_client.get_prompt.return_value = Mock(
+            description="Scores transcripts", readme="# Usage", tags=["prod", "v2"]
+        )
+
+        prompt_migrator.migrate_prompt('user/test-prompt')
+
+        prompt_migrator.dest_ls_client.update_prompt.assert_called_once_with(
+            'user/test-prompt', description="Scores transcripts", readme="# Usage", tags=["prod", "v2"]
+        )
+
     def test_migrate_prompt_with_all_commits(self, prompt_migrator, sample_config):
         """Test migrating prompt with all commit history using manifest-based approach."""
         sample_config.migration.dry_run = False

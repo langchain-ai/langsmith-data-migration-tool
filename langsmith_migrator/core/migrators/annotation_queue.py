@@ -274,11 +274,11 @@ class AnnotationQueueMigrator(BaseMigrator):
     # Queue items (runs)
     # ------------------------------------------------------------------
 
-    # The items API requires a status. These two cover every item still in the queue:
-    # which one an item is in depends on whether the caller has reviewed it, so both
-    # are listed to copy the same runs whoever's key runs the migration. Archived
-    # items are done and are left out, as the deprecated endpoint does by default.
-    _ITEM_STATUSES = ("needs_my_review", "needs_others_review")
+    # The items API requires a status, so every status is listed. Open items are
+    # in needs_my_review or needs_others_review depending on whether the caller
+    # has reviewed them; completed items are archived. On the destination every
+    # copied item is open: review progress cannot be set through the API.
+    _ITEM_STATUSES = ("needs_my_review", "needs_others_review", "archived")
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)

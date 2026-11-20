@@ -24,6 +24,7 @@ from ..core.migrators import (
     ChartMigrator,
     ContextHubMigrator,
     DatasetMigrator,
+    FeedbackConfigMigrator,
     MigrationOrchestrator,
     IssueMigrator,
     ModelPriceMapMigrator,
@@ -2500,6 +2501,69 @@ def _select_resume_session(config: Config, state_manager: StateManager):
     except ValueError:
         console.print("[red]Invalid input[/red]")
         return None
+
+
+@cli.command("feedback-configs")
+@ssl_option
+@click.option(
+    "--all-workspaces",
+    is_flag=True,
+    help="Copy every source workspace into the destination workspace with the same ID, "
+    "without prompting",
+)
+@click.option(
+    "--byoc-migration",
+    is_flag=True,
+    help="Self-hosted to BYOC profile: pair every workspace by ID, without prompting.",
+)
+@workspace_options
+@click.pass_context
+def feedback_configs(ctx, all_workspaces, byoc_migration, source_workspace, dest_workspace, map_workspaces):
+    """Copy feedback configs (label types and scales) the destination lacks."""
+    config = ctx.obj["config"]
+    display_banner()
+    if byoc_migration:
+        _apply_byoc_migration_profile(config)
+        all_workspaces = True
+    if not ensure_config(config):
+        return
+    orchestrator = MigrationOrchestrator(config, ctx.obj["state_manager"])
+    try:
+        if not orchestrator.test_connections():
+            console.print("\n[red]Cannot proceed without valid connections[/red]")
+            ctx.exit(1)
+            return
+        ws_result = _resolve_workspaces(
+            orchestrator, source_workspace, dest_workspace, map_workspaces,
+            non_interactive=config.migration.non_interactive, all_workspaces=all_workspaces,
+        )
+        if ws_result is _WS_ABORTED:
+            ctx.exit(1)
+            return
+        if ws_result is _WS_CANCELLED:
+            console.print("[yellow]Cancelled[/yellow]")
+            return
+        ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+        migrator = FeedbackConfigMigrator(orchestrator.source_client, orchestrator.dest_client, None, config)
+        failed = 0
+        for src_ws, dst_ws in ws_pairs:
+            if src_ws and dst_ws:
+                orchestrator.set_workspace_context(src_ws, dst_ws)
+                console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+            result = migrator.migrate_all()
+            failed += result["failed"]
+            console.print(
+                f"Feedback configs: {result['created']} created, {result['existing']} already present"
+                + (f", [red]{result['failed']} failed[/red]" if result["failed"] else "")
+            )
+            for key, err in result["errors"]:
+                console.print(f"  [red]✗[/red] {key}: {err}")
+        if ws_result:
+            orchestrator.clear_workspace_context()
+        if failed:
+            ctx.exit(1)
+    finally:
+        orchestrator.cleanup()
 
 
 @cli.command()

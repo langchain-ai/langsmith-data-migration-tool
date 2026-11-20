@@ -644,6 +644,29 @@ class PromptMigrator(BaseMigrator):
             self.log(f"Failed to get commits for prompt {prompt_identifier}: {e}", "error")
             return []
 
+    def _sync_prompt_metadata(self, prompt_identifier: str) -> None:
+        """Copy the source prompt's description, readme and tags to the destination.
+
+        Commits carry only the prompt content, and the destination repo is created
+        empty, so these are set separately, also on a prompt that already exists.
+        """
+        try:
+            source = self.source_ls_client.get_prompt(prompt_identifier)
+        except Exception as e:
+            self.log(f"Could not read prompt details for {prompt_identifier}: {e}", "warning")
+            return
+        if source is None:
+            return
+        try:
+            self.dest_ls_client.update_prompt(
+                prompt_identifier,
+                description=source.description or "",
+                readme=source.readme or "",
+                tags=list(source.tags or []),
+            )
+        except Exception as e:
+            self.log(f"Could not copy description and tags of {prompt_identifier}: {e}", "warning")
+
     def find_existing_prompt(self, prompt_identifier: str) -> bool:
         """
         Check if a prompt already exists in the destination.
@@ -880,6 +903,7 @@ class PromptMigrator(BaseMigrator):
                 else:
                     raise ValueError("Failed to push prompt manifest")
 
+            self._sync_prompt_metadata(prompt_identifier)
             self.checkpoint_item(item_id, stage="completed")
             if degraded_history:
                 self.mark_degraded(
