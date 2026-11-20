@@ -502,3 +502,131 @@ def test_feedback_conflict_without_an_id_is_a_failure(sample_config):
     migrator.dest.post.side_effect = ConflictError("exists")
 
     assert migrator.create_feedback({"key": "k", "run_id": "r1"}) is False
+
+
+def test_pagination_raises_failed_pages_only_when_asked():
+    from langsmith_migrator.utils.pagination import PaginationHelper
+
+    def fetch(endpoint, params):
+        if params["offset"]:
+            raise APIError("page 2 failed")
+        return [{"id": str(i)} for i in range(2)]
+
+    assert len(list(PaginationHelper.paginate(fetch, "/x", page_size=2))) == 2
+    with pytest.raises(APIError):
+        list(PaginationHelper.paginate(fetch, "/x", page_size=2, raise_errors=True))
+
+
+def test_partial_experiment_listing_is_not_cached(sample_config):
+    from langsmith_migrator.utils.pagination import PaginationHelper
+
+    sample_config.migration.preserve_ids = True
+    migrator = _experiment_migrator(sample_config, [])
+    pages = {"fail": True}
+
+    def fetch(endpoint, params=None):
+        if endpoint.startswith("/sessions/"):
+            return {"id": "e2", "reference_dataset_id": "ds-1"}
+        if params["offset"] and pages["fail"]:
+            raise APIError("page 2 failed")
+        return [{"id": "e1", "name": "one"}] if not params["offset"] else [{"id": "e2", "name": "two"}]
+
+    migrator.dest.get = Mock(side_effect=fetch)
+    migrator.dest.get_paginated = lambda endpoint, params=None, raise_errors=False: (
+        PaginationHelper.paginate(fetch, endpoint, params, 1, raise_errors=raise_errors)
+    )
+
+    assert migrator.find_existing_experiment("two", "ds-1", "e2") == "e2"
+    assert migrator._dest_experiment_index == {}
+
+    pages["fail"] = False
+    assert migrator.find_existing_experiment("two", "ds-1", "e2") == "e2"
+    assert migrator._dest_experiment_index["ds-1"]["ids"] == {"e1", "e2"}
+
+
+def test_time_shift_is_on_disk_before_runs_are_sent(sample_config, tmp_path, monkeypatch):
+    orchestrator = _orchestrator(sample_config, tmp_path, monkeypatch)
+    item = orchestrator.state.ensure_item("experiment_e1", "experiment", "one", "e1")
+    experiment = {"id": "e1", "name": "one", "start_time": "2025-01-01T00:00:00+00:00"}
+
+    with orchestrator.state_manager.throttled_saves(3600):
+        delta = orchestrator._resolve_experiment_delta(experiment, item)
+        on_disk = json.loads(orchestrator.state_manager.state_file.read_text())
+
+    assert on_disk["items"]["experiment_e1"]["metadata"]["time_shift_seconds"] == delta.total_seconds()
+
+
+def test_interrupt_drops_queued_experiments_and_cancels_clients(sample_config, tmp_path, monkeypatch):
+    sample_config.migration.concurrent_workers = 1
+    orchestrator = _orchestrator(sample_config, tmp_path, monkeypatch)
+    experiments = [{"id": f"e{i}", "name": f"n{i}"} for i in range(6)]
+    monkeypatch.setattr(ExperimentMigrator, "list_experiment_summaries", lambda self, ds: experiments)
+    monkeypatch.setattr(ExperimentMigrator, "fetch_experiment_details", lambda self, e: e)
+    ran = []
+
+    def resolve(experiment, *args):
+        ran.append(experiment["id"])
+        time.sleep(0.05)
+        return True, "migrated"
+
+    monkeypatch.setattr(orchestrator, "_resolve_experiment_item", resolve)
+
+    def interrupted(futures):
+        raise KeyboardInterrupt
+        yield
+
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.orchestrator.as_completed", interrupted
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator._migrate_experiments_for_datasets(["ds-1"], {"ds-1": "dst-1"})
+
+    assert len(ran) < len(experiments)
+    orchestrator.source_client.cancel.assert_called_once()
+    orchestrator.dest_client.cancel.assert_called_once()
+
+
+def test_cancelled_client_stops_requests_and_listings():
+    from langsmith_migrator.core.api_client import EnhancedAPIClient, MigrationCancelled
+
+    client = EnhancedAPIClient("https://d/api/v1", {"X-API-Key": "k"}, rate_limit_delay=0)
+    client.session.get = Mock()
+    client.cancel()
+
+    with pytest.raises(MigrationCancelled):
+        client.get("/sessions")
+    with pytest.raises(MigrationCancelled):
+        list(client.get_paginated("/sessions"))
+    client.session.get.assert_not_called()
+
+
+def test_client_connection_pool_matches_worker_concurrency(sample_config):
+    from langsmith_migrator.core.api_client import EnhancedAPIClient
+
+    client = EnhancedAPIClient("https://d/api/v1", {}, pool_maxsize=48)
+    assert client.session.get_adapter("https://d/api/v1")._pool_maxsize == 48
+
+    sample_config.migration.concurrent_workers = 4
+    sample_config.migration.feedback_workers = 0
+    assert MigrationOrchestrator._pool_maxsize(sample_config) == 20
+    sample_config.migration.concurrent_workers = 2
+    assert MigrationOrchestrator._pool_maxsize(sample_config) == 10
+
+
+def test_skipped_save_is_written_by_timer_without_another_save(tmp_path):
+    manager = _manager_with_session(tmp_path)
+
+    with manager.throttled_saves(0.2):
+        manager.current_state.set_mapped_id("dataset", "a", "b")
+        manager.save()
+        assert "dataset" not in json.loads(manager.state_file.read_text())["id_mappings"]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            on_disk = json.loads(manager.state_file.read_text())["id_mappings"]
+            if on_disk.get("dataset") == {"a": "b"}:
+                break
+            time.sleep(0.02)
+
+    assert on_disk.get("dataset") == {"a": "b"}
+    assert manager._flush_timer is None

@@ -313,7 +313,8 @@ class ExperimentMigrator(BaseMigrator):
             try:
                 for experiment in self.dest.get_paginated(
                     "/sessions",
-                    params={"reference_dataset": dataset_id}
+                    params={"reference_dataset": dataset_id},
+                    raise_errors=True,
                 ):
                     if not isinstance(experiment, dict) or not experiment.get("id"):
                         continue

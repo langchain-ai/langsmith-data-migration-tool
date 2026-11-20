@@ -16,6 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **No duplicate feedback on resume**: per-record `POST /feedback` now sends a
   stable id derived from the source record, as multipart feedback already did.
   A `409` for that id counts as already migrated.
+- **Run timestamps stay consistent on resume**: an experiment's time shift is
+  written to the state file before its runs are sent, so a resume after a
+  crash replays runs with the same timestamps.
+- **A failed destination experiment listing is not cached**: an error on any
+  page now falls back to per-experiment lookups and is retried on the next
+  lookup, instead of hiding existing experiments for the rest of the run.
+- **Ctrl-C stops a parallel run**: queued datasets and experiments are dropped
+  and running ones stop at their next request, instead of the run continuing
+  until all queued work is done.
+- **Throttled state writes are timed**: a skipped write now happens when the
+  interval is up, even if no later checkpoint comes. Writes are fsynced.
+- **Connection pool sized to the workers**: the source and destination clients
+  keep `workers x feedback workers` connections per host instead of 10.
 
 ## [0.0.93] - 2026-11-19
 

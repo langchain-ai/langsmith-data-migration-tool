@@ -1106,6 +1106,7 @@ class StateManager:
         self._last_save = 0.0
         self._dirty = False
         self._save_lock = threading.Lock()
+        self._flush_timer: Optional[threading.Timer] = None
 
     def _default_bundle_path(self, session_id: str) -> Path:
         return self.remediation_dir / session_id
@@ -1192,6 +1193,12 @@ class StateManager:
                 and now - self._last_save < self.min_save_interval
             ):
                 self._dirty = True
+                if self._flush_timer is None:
+                    self._flush_timer = threading.Timer(
+                        self.min_save_interval - (now - self._last_save), self.flush
+                    )
+                    self._flush_timer.daemon = True
+                    self._flush_timer.start()
                 return
 
             state = self.current_state
@@ -1203,6 +1210,9 @@ class StateManager:
             self._write_atomic(self.state_file, payload)
             self._last_save = time.monotonic()
             self._dirty = False
+            timer, self._flush_timer = self._flush_timer, None
+            if timer is not None:
+                timer.cancel()
 
     def flush(self) -> None:
         """Write state if a throttled save skipped a write."""
@@ -1215,8 +1225,9 @@ class StateManager:
 
         Bulk runs call save() several times per item; rewriting the whole state
         file each time costs more than the API calls once the ID mappings grow.
-        The state is flushed on exit, also on error or interrupt. A crash loses
-        at most ``interval`` seconds of checkpoints; resume re-checks the
+        Skipped changes are written by a timer once the interval is up, and the
+        state is flushed on exit, also on error or interrupt. A crash loses at
+        most ``interval`` seconds of checkpoints; resume re-checks the
         destination, so the lost work is redone, not duplicated.
         """
         previous = self.min_save_interval
@@ -1226,6 +1237,9 @@ class StateManager:
         finally:
             self.min_save_interval = previous
             self.flush()
+            timer, self._flush_timer = self._flush_timer, None
+            if timer is not None:
+                timer.cancel()
 
     @staticmethod
     def _write_atomic(path: Path, payload: str) -> None:
@@ -1234,6 +1248,8 @@ class StateManager:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, path)
         except BaseException:
             try:

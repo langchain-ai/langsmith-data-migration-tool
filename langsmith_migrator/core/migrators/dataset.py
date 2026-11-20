@@ -64,7 +64,7 @@ class DatasetMigrator(BaseMigrator):
         with self._lazy_lock:
             pool, self._attachment_pool = self._attachment_pool, None
         if pool is not None:
-            pool.shutdown(wait=True)
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def _attachment_executor(self) -> ThreadPoolExecutor:
         with self._lazy_lock:
