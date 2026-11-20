@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.96] - 2026-11-20
+
 ### Changed
 - **Faster queue run linking with missing runs**: with `--byoc-migration`, each
   batch of queue runs is looked up on the destination first and only the runs
