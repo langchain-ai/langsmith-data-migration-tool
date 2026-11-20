@@ -2271,6 +2271,103 @@ def test_queues_command_byoc_migration_implies_all_workspaces_runs_and_no_prompt
     assert "Queue runs: 2 added, 0 failed, 0 skipped" in cli_harness.console.text
 
 
+def test_queues_command_migrates_queues_in_parallel(cli_harness):
+    """Independent queues should run in the worker pool, not one after another."""
+    import threading
+    import time
+
+    queues = [{"id": f"queue-{i}", "name": f"Queue {i}"} for i in range(6)]
+    cli_harness.migrators.queue.list_queues.return_value = queues
+    active = {"now": 0, "peak": 0}
+    guard = threading.Lock()
+
+    def create(queue):
+        with guard:
+            active["now"] += 1
+            active["peak"] = max(active["peak"], active["now"])
+        time.sleep(0.03)
+        with guard:
+            active["now"] -= 1
+        return f"new-{queue['id']}"
+
+    cli_harness.migrators.queue.create_queue.side_effect = create
+
+    result = cli_harness.invoke(["--workers", "3", "--non-interactive", "queues"])
+
+    assert result.exit_code == 0
+    assert "Queues: 6 migrated, 0 failed" in cli_harness.console.text
+    assert 1 < active["peak"] <= 3
+    state = cli_harness.orchestrator_factory.state
+    for i in range(6):
+        assert state.items[f"queue_default_queue-{i}"].destination_id == f"new-queue-{i}"
+
+
+def test_byoc_migration_matches_feedback_workers_to_workers(cli_harness, monkeypatch):
+    monkeypatch.delenv("MIGRATION_FEEDBACK_WORKERS", raising=False)
+
+    result = cli_harness.invoke(["--workers", "7", "queues", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert cli_harness.orchestrator_factory.instances[-1].config.migration.feedback_workers == 7
+
+
+def test_byoc_migration_keeps_explicit_feedback_workers(cli_harness, monkeypatch):
+    monkeypatch.setenv("MIGRATION_FEEDBACK_WORKERS", "3")
+
+    result = cli_harness.invoke(["--workers", "7", "queues", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert cli_harness.orchestrator_factory.instances[-1].config.migration.feedback_workers == 3
+
+
+def test_queues_command_interrupt_stops_remaining_queues(cli_harness, monkeypatch):
+    """Ctrl-C on the main thread cancels queued queues and stops the clients.
+
+    The worker is held inside the first queue until the clients are cancelled,
+    and the interrupt is raised on the main thread, so the outcome does not
+    depend on thread scheduling.
+    """
+    import threading
+
+    from langsmith_migrator.cli import main as cli_main
+
+    queues = [{"id": f"queue-{i}", "name": f"Queue {i}"} for i in range(6)]
+    cli_harness.migrators.queue.list_queues.return_value = queues
+    started = threading.Event()
+    release = threading.Event()
+    created = []
+    cancelled = []
+
+    def create(queue):
+        created.append(queue["id"])
+        started.set()
+        assert release.wait(5), "worker was never released"
+        return f"new-{queue['id']}"
+
+    cli_harness.migrators.queue.create_queue.side_effect = create
+
+    def make_cancel(label):
+        def cancel():
+            cancelled.append(label)
+            release.set()  # cancel runs after pending futures are dropped
+        return cancel
+
+    factory = cli_harness.orchestrator_factory
+    factory.source_client.cancel = make_cancel("source")
+    factory.dest_client.cancel = make_cancel("dest")
+
+    def interrupting_as_completed(futures):
+        assert started.wait(5), "first queue never started"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_main, "as_completed", interrupting_as_completed)
+
+    cli_harness.invoke(["--workers", "1", "--non-interactive", "queues"])
+
+    assert created == ["queue-0"]
+    assert sorted(cancelled) == ["dest", "source"]
+
+
 def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):
     """Queue runs are opt-in; the default command only migrates the queue config."""
 

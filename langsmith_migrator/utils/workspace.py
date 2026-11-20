@@ -2,7 +2,24 @@
 
 from typing import Dict, List, Optional
 
-from ..core.api_client import EnhancedAPIClient, NotFoundError
+from ..core.api_client import APIError, EnhancedAPIClient, NotFoundError
+
+
+def _api_prefix(client: EnhancedAPIClient) -> str:
+    """'' when the base URL already carries the API version, else '/api/v1'.
+
+    Base URLs are accepted with or without the '/api/v1' suffix; adding it
+    unconditionally produced '/api/v1/api/v1/workspaces' probes.
+    """
+    base_url = str(getattr(client, "base_url", "") or "")
+    return "" if ("/api/v1" in base_url or "/api/v2" in base_url) else "/api/v1"
+
+
+def _endpoint_unsupported(error: Exception) -> bool:
+    """404 or 405: the server has no such route; try the next endpoint."""
+    if isinstance(error, NotFoundError):
+        return True
+    return isinstance(error, APIError) and getattr(error, "status_code", None) == 405
 
 
 def discover_workspaces(client: EnhancedAPIClient) -> Dict[str, object]:
@@ -16,7 +33,8 @@ def discover_workspaces(client: EnhancedAPIClient) -> Dict[str, object]:
     Returns:
         Dict with ``workspaces`` and ``probes`` keys.
     """
-    endpoints = ["/api/v1/workspaces", "/workspaces", "/orgs/current/workspaces"]
+    prefix = _api_prefix(client)
+    endpoints = [f"{prefix}/workspaces", f"{prefix}/orgs/current/workspaces"]
     probes: List[Dict[str, object]] = []
 
     for endpoint in endpoints:
@@ -77,14 +95,14 @@ def create_workspace(
     if tenant_handle:
         payload["tenant_handle"] = tenant_handle
 
-    endpoints = ["/api/v1/workspaces", "/workspaces"]
+    endpoints = [f"{_api_prefix(client)}/workspaces"]
     last_error: Optional[Exception] = None
     for endpoint in endpoints:
         try:
             return client.post(endpoint, payload)
-        except NotFoundError:
-            continue
         except Exception as e:
+            if _endpoint_unsupported(e):
+                continue
             last_error = e
             continue
 

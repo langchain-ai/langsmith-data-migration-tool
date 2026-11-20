@@ -1,6 +1,8 @@
 """Annotation queue migration logic."""
 
-from typing import Any, Dict, Iterator, List, Optional
+import threading
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from typing import Any, Dict, Iterator, List, Optional, Set
 
 from ..api_client import APIError, NotFoundError
 from ...utils.pagination import PaginationHelper
@@ -24,17 +26,42 @@ class AnnotationQueueMigrator(BaseMigrator):
         """Get a specific annotation queue."""
         return self.source.get(f"/annotation-queues/{queue_id}")
 
+    def _dest_scope(self) -> Optional[str]:
+        """The destination workspace the client currently targets."""
+        headers = getattr(getattr(self.dest, "session", None), "headers", None) or {}
+        return headers.get("X-Tenant-Id")
+
     def find_existing_queue(self, name: str) -> Optional[str]:
-        """Check if queue already exists in destination."""
-        try:
-            # We have to list all queues because there's no name search param
-            queues = self.dest.get_paginated("/annotation-queues")
-            for queue in queues:
-                if isinstance(queue, dict) and queue.get("name") == name:
-                    return queue.get("id")
-        except Exception as e:
-            self.log(f"Failed to check for existing queue: {e}", "warning")
-        return None
+        """Check if queue already exists in destination.
+
+        The API has no name filter, so the destination queues are listed once
+        per workspace and cached; listing them for every queue made a
+        migration quadratic in the queue count. A failed listing raises and is
+        not cached: treating it as "not found" would create a duplicate queue.
+        """
+        scope = self._dest_scope()
+        with self._dest_index_lock:
+            index = self._dest_queue_index.get(scope)
+            if index is None:
+                index = {}
+                # raise_errors: a failed page must raise, not end the listing early.
+                for queue in self.dest.get_paginated("/annotation-queues", raise_errors=True):
+                    if isinstance(queue, dict) and queue.get("name"):
+                        index.setdefault(queue["name"], queue.get("id"))
+                self._dest_queue_index[scope] = index
+            return index.get(name)
+
+    def _name_lock(self, name: str) -> threading.Lock:
+        """One lock per destination workspace and queue name."""
+        key = (self._dest_scope(), name)
+        with self._dest_index_lock:
+            return self._name_locks.setdefault(key, threading.Lock())
+
+    def _remember_dest_queue(self, name: str, queue_id: str) -> None:
+        with self._dest_index_lock:
+            index = self._dest_queue_index.get(self._dest_scope())
+            if index is not None:
+                index.setdefault(name, queue_id)
 
     def update_queue(self, queue_id: str, queue: Dict[str, Any]) -> None:
         """Update existing queue in destination."""
@@ -63,8 +90,19 @@ class AnnotationQueueMigrator(BaseMigrator):
         queue: Dict[str, Any],
         default_dataset_id: Optional[str] = None
     ) -> str:
-        """Create or update annotation queue in destination."""
+        """Create or update annotation queue in destination.
 
+        Serialized per queue name, so two source queues with one name are
+        handled as in a sequential run: the second finds the first.
+        """
+        with self._name_lock(queue["name"]):
+            return self._create_queue_unlocked(queue, default_dataset_id)
+
+    def _create_queue_unlocked(
+        self,
+        queue: Dict[str, Any],
+        default_dataset_id: Optional[str] = None,
+    ) -> str:
         # Check if exists
         existing_id = self.find_existing_queue(queue["name"])
 
@@ -105,6 +143,7 @@ class AnnotationQueueMigrator(BaseMigrator):
             from ..api_client import APIError
             raise APIError(f"Invalid response creating queue: missing 'id' field. Response: {response}")
 
+        self._remember_dest_queue(queue["name"], response["id"])
         return response["id"]
 
     # ------------------------------------------------------------------
@@ -121,6 +160,16 @@ class AnnotationQueueMigrator(BaseMigrator):
         super().__init__(*args, **kwargs)
         # Whether each side ("source"/"dest") serves the queue items API.
         self._items_support: Dict[str, bool] = {}
+        self._items_support_lock = threading.Lock()
+        # Destination queue name -> id, per destination workspace (X-Tenant-Id).
+        self._dest_queue_index: Dict[Optional[str], Dict[str, str]] = {}
+        self._dest_index_lock = threading.Lock()
+        self._name_locks: Dict[tuple, threading.Lock] = {}
+
+    def _post_workers(self) -> int:
+        """Threads posting run batches for one queue, like feedback per experiment."""
+        migration = self.config.migration
+        return max(1, int(migration.feedback_workers or migration.concurrent_workers or 1))
 
     @staticmethod
     def _items_endpoint(queue_id: str) -> str:
@@ -133,6 +182,10 @@ class AnnotationQueueMigrator(BaseMigrator):
         endpoints. Servers that predate it answer 404; so does a missing queue,
         so a 404 is only read as "unsupported" once the queue is confirmed to exist.
         """
+        with self._items_support_lock:
+            return self._probe_items_support(side, queue_id)
+
+    def _probe_items_support(self, side: str, queue_id: str) -> bool:
         if side not in self._items_support:
             client = self.source if side == "source" else self.dest
             try:
@@ -295,18 +348,19 @@ class AnnotationQueueMigrator(BaseMigrator):
             self._items_supported("dest", dest_queue_id)
 
         batch: List[Dict[str, str]] = []
+        lock = threading.Lock()
+        workers = self._post_workers()
+        # Listing stays sequential (cursor pages); posting overlaps with it. At
+        # most 2x workers batches are in flight, which bounds memory.
+        max_in_flight = workers * 2
+        in_flight: Set[Future] = set()
+        executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
 
-        def flush() -> None:
-            if not batch:
-                return
-            keys = list(batch)
-            batch.clear()
-            if dry_run:
-                result["added"] += len(keys)
-                return
+        def post(keys: List[Dict[str, str]]) -> None:
             try:
                 self._add_runs_to_queue(dest_queue_id, keys)
-                result["added"] += len(keys)
+                with lock:
+                    result["added"] += len(keys)
                 return
             except APIError as batch_error:
                 self.log(
@@ -317,24 +371,55 @@ class AnnotationQueueMigrator(BaseMigrator):
             for key in keys:
                 try:
                     self._add_runs_to_queue(dest_queue_id, [key])
-                    result["added"] += 1
+                    with lock:
+                        result["added"] += 1
                 except APIError as run_error:
-                    result["failed"] += 1
-                    result["errors"].append((key["run_id"], str(run_error)))
+                    with lock:
+                        result["failed"] += 1
+                        result["errors"].append((key["run_id"], str(run_error)))
 
-        for run in self.iter_queue_runs(source_queue_id):
-            result["total"] += 1
-            key = self._run_key(run, session_id_map)
-            if key is None:
-                result["skipped"] += 1
-                result["errors"].append(
-                    (str(run.get("id") or run.get("run_id") or "?"), "missing run key fields")
-                )
-                continue
-            batch.append(key)
-            if len(batch) >= batch_size:
-                flush()
-        flush()
+        def drain(limit: int) -> None:
+            while len(in_flight) > limit:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    in_flight.discard(future)
+                    future.result()  # a non-API error stops the copy
+
+        def flush() -> None:
+            if not batch:
+                return
+            keys = list(batch)
+            batch.clear()
+            if dry_run:
+                result["added"] += len(keys)
+                return
+            if executor is None:
+                post(keys)
+                return
+            drain(max_in_flight - 1)
+            in_flight.add(executor.submit(post, keys))
+
+        try:
+            for run in self.iter_queue_runs(source_queue_id):
+                result["total"] += 1
+                key = self._run_key(run, session_id_map)
+                if key is None:
+                    with lock:
+                        result["skipped"] += 1
+                        result["errors"].append(
+                            (str(run.get("id") or run.get("run_id") or "?"),
+                             "missing run key fields")
+                        )
+                    continue
+                batch.append(key)
+                if len(batch) >= batch_size:
+                    flush()
+            flush()
+            drain(0)
+        finally:
+            if executor is not None:
+                # On error, drop queued batches; running ones finish.
+                executor.shutdown(wait=True, cancel_futures=True)
 
         if dry_run:
             self.log(
