@@ -631,6 +631,9 @@ def _apply_byoc_migration_profile(config) -> None:
     # An explicit MIGRATION_FEEDBACK_WORKERS still wins.
     if "MIGRATION_FEEDBACK_WORKERS" not in os.environ:
         config.migration.feedback_workers = max(1, config.migration.concurrent_workers)
+    # Queues can reference runs the trace migration never copied (expired on the
+    # source); looking runs up first links the rest in one request per batch.
+    config.migration.check_queue_runs_exist = True
 
 
 def _resolve_workspaces(
@@ -988,11 +991,11 @@ def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> Non
             "(e.g. after a trace storage migration). Run `langsmith-migrator resume` "
             "to retry linking them.[/dim]"
         )
-    assumed = sum(r.get("assumed_missing", 0) for _, r in queue_run_results)
-    if assumed:
+    missing = sum(r.get("missing", 0) for _, r in queue_run_results)
+    if missing:
         console.print(
-            f"[dim]{assumed} of the failed runs were in batches recorded as missing "
-            "after a long run of missing runs (MIGRATION_QUEUE_MISSING_STREAK).[/dim]"
+            f"[dim]{missing} of the failed runs do not exist on the destination, for "
+            "example because they expired before the trace migration.[/dim]"
         )
     if skipped:
         console.print(

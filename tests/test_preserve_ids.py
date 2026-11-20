@@ -200,6 +200,7 @@ def test_byoc_migration_profile_preserves_ids_and_disables_prompts(sample_config
     assert sample_config.migration.skip_feedback is True
     assert sample_config.migration.non_interactive is True
     assert sample_config.migration.interactive is False
+    assert sample_config.migration.check_queue_runs_exist is True
 
 
 def test_preserved_example_updates_when_only_inputs_changed(preserving_config, migration_state):

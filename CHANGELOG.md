@@ -8,10 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **Faster queue run linking with missing runs**: a rejected batch is split in
-  halves instead of retried one run at a time. After
-  `MIGRATION_QUEUE_MISSING_STREAK` missing runs in a row (default 1000), a
-  rejected batch is recorded as missing with one request.
+- **Faster queue run linking with missing runs**: with `--byoc-migration`, each
+  batch of queue runs is looked up on the destination first and only the runs
+  found are linked, so runs that expired before the trace migration cost no
+  extra requests. A rejected batch is split in halves instead of retried one
+  run at a time.
 - **Smaller state files**: each queue keeps at most 100 per-run errors in the
   state file; the counts stay exact.
 

@@ -615,13 +615,11 @@ posts each queue's run batches with the same number of threads
 langsmith-migrator --workers 8 queues --byoc-migration
 ```
 
-The destination rejects a batch of run links if one run in it is missing. The
-tool then splits the batch in halves until it finds the missing runs. Queues
-whose runs expired before the trace migration can hold mostly missing runs.
-After `MIGRATION_QUEUE_MISSING_STREAK` missing runs in a row (default 1000, `0`
-turns it off), a rejected batch is recorded as missing as a whole, with one
-request. The first accepted batch ends that mode. Those runs are reported as
-failed, so `resume` can retry them.
+Queues can reference runs that expired before the trace migration, so they do
+not exist on the destination. With `--byoc-migration`, the tool looks up each
+batch of runs on the destination first and links only the runs it finds. The
+missing runs are reported as failed. If the destination still rejects a batch,
+the tool splits it in halves until it finds the rejected runs.
 
 Org-scoped API keys are supported: the connection check authenticates through
 workspace discovery, and dataset requests use the selected workspace's
