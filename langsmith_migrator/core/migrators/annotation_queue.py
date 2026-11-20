@@ -1,14 +1,19 @@
 """Annotation queue migration logic."""
 
 import threading
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from typing import Any, Dict, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 from ..api_client import APIError, NotFoundError
+from ..run_query import RunQuery
 from ...utils.pagination import PaginationHelper
 from .base import BaseMigrator
 
 QUEUE_RUNS_BATCH_SIZE = 100
+# Per-run errors kept in a result (and so in the state file); counts stay exact.
+MAX_STORED_RUN_ERRORS = 100
+MISSING_RUN_ERROR = "run not found on destination"
 
 
 class AnnotationQueueMigrator(BaseMigrator):
@@ -165,6 +170,7 @@ class AnnotationQueueMigrator(BaseMigrator):
         self._dest_queue_index: Dict[Optional[str], Dict[str, str]] = {}
         self._dest_index_lock = threading.Lock()
         self._name_locks: Dict[tuple, threading.Lock] = {}
+        self._dest_run_query = RunQuery(self)
 
     def _post_workers(self) -> int:
         """Threads posting run batches for one queue, like feedback per experiment."""
@@ -320,6 +326,43 @@ class AnnotationQueueMigrator(BaseMigrator):
                 f"/annotation-queues/{dest_queue_id}/runs", [k["run_id"] for k in keys]
             )
 
+    def _existing_dest_runs(self, keys: List[Dict[str, str]]) -> Optional[Set[str]]:
+        """The run IDs among ``keys`` that exist on the destination, or None if unknown.
+
+        One run query per project, filtered by ID and bounded below by the
+        earliest start time in the batch. A failed lookup returns None so the
+        caller links the batch as it would without the check.
+        """
+        by_session: Dict[str, List[Dict[str, str]]] = {}
+        for key in keys:
+            by_session.setdefault(key["session_id"], []).append(key)
+        found: Set[str] = set()
+        try:
+            for session_id, group in by_session.items():
+                body: Dict[str, Any] = {
+                    "session": [session_id],
+                    "id": [k["run_id"] for k in group],
+                    "select": ["id"],
+                    "limit": len(group),
+                }
+                start = _lower_bound(k["start_time"] for k in group)
+                if start:
+                    body["start_time"] = start
+                while True:
+                    runs, cursor = self._dest_run_query.page("dest", body)
+                    found.update(str(r.get("id")) for r in runs if r.get("id"))
+                    if not cursor or cursor == body.get("cursor"):
+                        break
+                    body["cursor"] = cursor
+        except APIError as error:
+            self.log(
+                f"Could not look up {len(keys)} queue run(s) on the destination "
+                f"({error}); linking them without the check",
+                "warning",
+            )
+            return None
+        return found
+
     def migrate_queue_runs(
         self,
         source_queue_id: str,
@@ -334,13 +377,24 @@ class AnnotationQueueMigrator(BaseMigrator):
         storage migration). Review progress (reviewed / done / reviewer cursors)
         is not exposed by the API and is not copied.
 
+        With ``check_queue_runs_exist`` (set for BYOC migrations), each batch is
+        first looked up on the destination by run ID, and only the runs found
+        are linked: queues whose runs expired before the trace migration cost
+        two requests per batch, and every missing run is confirmed, not guessed.
+        A rejected batch is split in halves until the rejected runs are found,
+        so a few missing runs cost a few requests rather than one per run.
+
         Returns counts: ``total`` runs listed, ``added``, ``skipped`` (missing key
-        fields), ``failed``, and ``errors`` as ``(run_id, message)`` pairs.
+        fields), ``failed`` (of which ``missing`` were not found on the
+        destination), and ``errors`` as up to ``MAX_STORED_RUN_ERRORS``
+        ``(run_id, message)`` pairs, with ``errors_truncated`` counting the rest.
         """
         batch_size = max(1, min(batch_size, QUEUE_RUNS_BATCH_SIZE))
         result: Dict[str, Any] = {
-            "total": 0, "added": 0, "skipped": 0, "failed": 0, "errors": [],
+            "total": 0, "added": 0, "skipped": 0, "failed": 0,
+            "missing": 0, "errors": [], "errors_truncated": 0,
         }
+        check_exists = bool(getattr(self.config.migration, "check_queue_runs_exist", False))
         dry_run = self.config.migration.dry_run
         if not dry_run:
             # Settle which endpoints the destination has before any run is sent, so
@@ -356,27 +410,48 @@ class AnnotationQueueMigrator(BaseMigrator):
         in_flight: Set[Future] = set()
         executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
 
+        def record_error(run_id: str, message: str) -> None:
+            # Caller holds ``lock``.
+            if len(result["errors"]) < MAX_STORED_RUN_ERRORS:
+                result["errors"].append((run_id, message))
+            else:
+                result["errors_truncated"] += 1
+
         def post(keys: List[Dict[str, str]]) -> None:
+            if check_exists:
+                found = self._existing_dest_runs(keys)
+                if found is not None:
+                    absent = [k for k in keys if k["run_id"] not in found]
+                    if absent:
+                        with lock:
+                            result["failed"] += len(absent)
+                            result["missing"] += len(absent)
+                            for key in absent:
+                                record_error(key["run_id"], MISSING_RUN_ERROR)
+                    keys = [k for k in keys if k["run_id"] in found]
+            link(keys)
+
+        def link(keys: List[Dict[str, str]]) -> None:
+            if not keys:
+                return
             try:
                 self._add_runs_to_queue(dest_queue_id, keys)
-                with lock:
-                    result["added"] += len(keys)
-                return
-            except APIError as batch_error:
-                self.log(
-                    f"Batch of {len(keys)} queue run(s) rejected ({batch_error}); "
-                    "retrying one by one",
-                    "warning",
-                )
-            for key in keys:
-                try:
-                    self._add_runs_to_queue(dest_queue_id, [key])
-                    with lock:
-                        result["added"] += 1
-                except APIError as run_error:
+            except APIError as error:
+                if len(keys) == 1:
                     with lock:
                         result["failed"] += 1
-                        result["errors"].append((key["run_id"], str(run_error)))
+                        record_error(keys[0]["run_id"], str(error))
+                    return
+                self.log(
+                    f"Batch of {len(keys)} queue run(s) rejected ({error}); splitting",
+                    "warning",
+                )
+                middle = len(keys) // 2
+                link(keys[:middle])
+                link(keys[middle:])
+                return
+            with lock:
+                result["added"] += len(keys)
 
         def drain(limit: int) -> None:
             while len(in_flight) > limit:
@@ -406,9 +481,9 @@ class AnnotationQueueMigrator(BaseMigrator):
                 if key is None:
                     with lock:
                         result["skipped"] += 1
-                        result["errors"].append(
-                            (str(run.get("id") or run.get("run_id") or "?"),
-                             "missing run key fields")
+                        record_error(
+                            str(run.get("id") or run.get("run_id") or "?"),
+                            "missing run key fields",
                         )
                     continue
                 batch.append(key)
@@ -432,3 +507,20 @@ class AnnotationQueueMigrator(BaseMigrator):
                 "success" if not result["failed"] else "warning",
             )
         return result
+
+
+def _lower_bound(start_times: Iterable[str]) -> Optional[str]:
+    """The earliest start time as RFC 3339 in UTC, one second early, or None."""
+    earliest = None
+    for raw in start_times:
+        try:
+            value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        if earliest is None or value < earliest:
+            earliest = value
+    if earliest is None:
+        return None
+    return (earliest - timedelta(seconds=1)).astimezone(timezone.utc).isoformat()

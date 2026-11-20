@@ -10,11 +10,13 @@ from rich.progress import Progress
 
 from ..api_client import EnhancedAPIClient
 from ...utils.state import (
+    SAVED_MIGRATION_SETTINGS,
     MigrationItem,
     MigrationStatus,
     ResolutionOutcome,
     StateManager,
     VerificationState,
+    saved_migration_settings,
 )
 from ...utils.chart_mode import should_reuse_chart_ids
 from ...utils.time_shift import compute_delta
@@ -119,11 +121,7 @@ class MigrationOrchestrator:
                 self.config.source.base_url,
                 self.config.destination.base_url,
             )
-            self.state.migration_settings = {
-                "preserve_ids": self.config.migration.preserve_ids,
-                "skip_runs": self.config.migration.skip_runs,
-                "skip_feedback": self.config.migration.skip_feedback,
-            }
+            self.state.migration_settings = saved_migration_settings(self.config.migration)
             self.state_manager.save()
         elif not self.state.remediation_bundle_path:
             self.state.remediation_bundle_path = str(
@@ -990,7 +988,7 @@ class MigrationOrchestrator:
     def _resume_items(self, items_to_process: List[MigrationItem]) -> Dict[str, List[str]]:
         # Older sessions have no saved settings and keep the caller's configuration.
         # New sessions must retain their ID and run replay policy across retries.
-        for key in ("preserve_ids", "skip_runs", "skip_feedback"):
+        for key in SAVED_MIGRATION_SETTINGS:
             if key in self.state.migration_settings:
                 setattr(self.config.migration, key, self.state.migration_settings[key])
         results = {"resumed": [], "blocked": []}

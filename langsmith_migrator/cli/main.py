@@ -69,7 +69,13 @@ from ..utils.chart_mode import (
 )
 from ..utils.config import Config, S3Config
 from ..utils.retry import RateLimitError
-from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
+from ..utils.state import (
+    MigrationStatus,
+    ResolutionOutcome,
+    StateManager,
+    VerificationState,
+    saved_migration_settings,
+)
 from ..utils.workspace import (
     discover_workspaces,
     get_workspace_name,
@@ -631,6 +637,9 @@ def _apply_byoc_migration_profile(config) -> None:
     # An explicit MIGRATION_FEEDBACK_WORKERS still wins.
     if "MIGRATION_FEEDBACK_WORKERS" not in os.environ:
         config.migration.feedback_workers = max(1, config.migration.concurrent_workers)
+    # Queues can reference runs the trace migration never copied (expired on the
+    # source); looking runs up first links the rest in one request per batch.
+    config.migration.check_queue_runs_exist = True
 
 
 def _resolve_workspaces(
@@ -746,6 +755,8 @@ def _ensure_migration_session(orchestrator, config):
             config.source.base_url,
             config.destination.base_url,
         )
+        # Saved so `resume` restores them, as the dataset flow does.
+        orchestrator.state.migration_settings = saved_migration_settings(config.migration)
     elif not orchestrator.state.remediation_bundle_path:
         orchestrator.state.remediation_bundle_path = str(
             orchestrator.state_manager._default_bundle_path(orchestrator.state.session_id).resolve()
@@ -988,6 +999,12 @@ def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> Non
             "(e.g. after a trace storage migration). Run `langsmith-migrator resume` "
             "to retry linking them.[/dim]"
         )
+    missing = sum(r.get("missing", 0) for _, r in queue_run_results)
+    if missing:
+        console.print(
+            f"[dim]{missing} of the failed runs do not exist on the destination, for "
+            "example because they expired before the trace migration.[/dim]"
+        )
     if skipped:
         console.print(
             "[dim]Skipped runs had no session_id/start_time on the source; their queues "
@@ -997,6 +1014,8 @@ def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> Non
         for name, r in queue_run_results:
             for run_id, err in r.get("errors", []):
                 console.print(f"  [red]✗[/red] {name} run {run_id}: {err}")
+            if r.get("errors_truncated"):
+                console.print(f"  [dim]{name}: {r['errors_truncated']} more not shown[/dim]")
 
 
 def _filter_datasets(datasets: list, selectors) -> tuple[list, list]:

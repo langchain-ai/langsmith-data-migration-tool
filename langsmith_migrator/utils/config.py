@@ -28,6 +28,8 @@ class MigrationConfig:
     feedback_multipart: bool = False  # Send feedback via /runs/multipart in batches
     feedback_batch_size: int = 100  # Feedback records per multipart request
     feedback_workers: int = 0  # Threads per experiment for feedback I/O; 0 = use concurrent_workers
+    # Look queue runs up on the destination before linking them; set for BYOC migrations.
+    check_queue_runs_exist: bool = False
     no_deprecated_fallback: bool = False  # Fail instead of falling back to a deprecated endpoint
     dry_run: bool = False
     skip_existing: bool = False
