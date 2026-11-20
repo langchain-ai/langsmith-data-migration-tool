@@ -344,7 +344,18 @@ class AnnotationQueueMigrator(BaseMigrator):
             yield from self._iter_queue_runs_legacy(queue_id)
 
     def _iter_queue_items(self, queue_id: str) -> Iterator[Dict[str, Any]]:
-        """List run items through the queue items API, one status at a time."""
+        """List source run items through the queue items API."""
+        for item in self._iter_items("source", queue_id):
+            yield {
+                "id": item.get("run_id"),
+                "session_id": item.get("project_id") or item.get("session_id"),
+                "start_time": item.get("start_time"),
+                "added_at": item.get("added_at"),
+            }
+
+    def _iter_items(self, side: str, queue_id: str) -> Iterator[Dict[str, Any]]:
+        """List one instance's run items through the queue items API, one status at a time."""
+        client = self.source if side == "source" else self.dest
         endpoint = self._items_endpoint(queue_id)
         seen: set = set()
         for status in self._ITEM_STATUSES:
@@ -352,7 +363,7 @@ class AnnotationQueueMigrator(BaseMigrator):
                 "status": status, "item_type": "RUN", "page_size": QUEUE_RUNS_BATCH_SIZE,
             }
             while True:
-                response = self.source.get(endpoint, dict(params))
+                response = client.get(endpoint, dict(params))
                 page = response if isinstance(response, dict) else {}
                 items = page.get("items") or []
                 for item in items:
@@ -363,17 +374,58 @@ class AnnotationQueueMigrator(BaseMigrator):
                         continue
                     if run_id:
                         seen.add(run_id)
-                    yield {
-                        "id": run_id,
-                        "session_id": item.get("project_id") or item.get("session_id"),
-                        "start_time": item.get("start_time"),
-                    }
+                    yield item
                 # A page can be empty and still have a next cursor (the server skips
                 # unusable rows), so follow the cursor rather than stopping early.
                 cursor = page.get("next_cursor")
                 if not cursor or cursor == params.get("cursor"):
                     break
                 params["cursor"] = cursor
+
+    def restore_item_order(
+        self, dest_queue_id: str, added_at: Dict[str, str], workers: int = 1
+    ) -> Dict[str, int]:
+        """Give each destination item its source ``added_at``, which sets the review order.
+
+        Linking stamps every item with the time it was linked, and parallel
+        batches shuffle that. Only items whose time differs are patched.
+        """
+        counts = {"reordered": 0, "order_failed": 0}
+        if not added_at or not self._items_supported("dest", dest_queue_id):
+            return counts
+        patches = []
+        try:
+            for item in self._iter_items("dest", dest_queue_id):
+                wanted = added_at.get(str(item.get("run_id")))
+                if wanted and item.get("id") and _parse_time(item.get("added_at")) != _parse_time(wanted):
+                    patches.append((str(item["id"]), wanted))
+        except APIError as e:
+            self.log(f"Could not list destination queue items to restore their order ({e})", "warning")
+            counts["order_failed"] = len(added_at)
+            return counts
+        lock = threading.Lock()
+
+        def patch(entry: tuple) -> None:
+            item_id, wanted = entry
+            try:
+                self.dest.patch(
+                    f"{self._items_endpoint(dest_queue_id)}/{item_id}", {"added_at": wanted}
+                )
+            except APIError as e:
+                with lock:
+                    counts["order_failed"] += 1
+                self.log(f"Could not set the position of queue item {item_id} ({e})", "warning")
+                return
+            with lock:
+                counts["reordered"] += 1
+
+        if workers > 1 and len(patches) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(patch, patches))
+        else:
+            for entry in patches:
+                patch(entry)
+        return counts
 
     def _iter_queue_runs_legacy(self, queue_id: str) -> Iterator[Dict[str, Any]]:
         """List runs through the deprecated ``/runs`` endpoint (offset pagination).
@@ -518,6 +570,7 @@ class AnnotationQueueMigrator(BaseMigrator):
         result: Dict[str, Any] = {
             "total": 0, "added": 0, "skipped": 0, "failed": 0,
             "missing": 0, "errors": [], "errors_truncated": 0,
+            "reordered": 0, "order_failed": 0,
         }
         check_exists = bool(getattr(self.config.migration, "check_queue_runs_exist", False))
         dry_run = self.config.migration.dry_run
@@ -599,9 +652,13 @@ class AnnotationQueueMigrator(BaseMigrator):
             drain(max_in_flight - 1)
             in_flight.add(executor.submit(post, keys))
 
+        # Source added_at per run ID, restored on the destination after linking.
+        added_at: Dict[str, str] = {}
         try:
             for run in self.iter_queue_runs(source_queue_id):
                 result["total"] += 1
+                if run.get("added_at") and (run.get("id") or run.get("run_id")):
+                    added_at[str(run.get("id") or run.get("run_id"))] = str(run["added_at"])
                 key = self._run_key(run, session_id_map)
                 if key is None:
                     with lock:
@@ -616,6 +673,8 @@ class AnnotationQueueMigrator(BaseMigrator):
                     flush()
             flush()
             drain(0)
+            if not dry_run:
+                result.update(self.restore_item_order(dest_queue_id, added_at, workers))
         finally:
             if executor is not None:
                 # On error, drop queued batches; running ones finish.
@@ -649,3 +708,12 @@ def _lower_bound(start_times: Iterable[str]) -> Optional[str]:
     if earliest is None:
         return None
     return (earliest - timedelta(seconds=1)).astimezone(timezone.utc).isoformat()
+
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    """A timestamp as an aware UTC datetime, or None when it cannot be read."""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)

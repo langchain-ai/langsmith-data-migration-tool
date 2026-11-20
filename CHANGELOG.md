@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instructions, creates a missing destination feedback config for each rubric
   key, copies the reviewer access mode, and assigns the reviewers who are
   members of the destination workspace, matched by email.
+- **Queue item order**: after linking a queue's runs, each destination item gets
+  its source `added_at`, which sets the review order. Needs the queue items API
+  on both instances.
 
 ## [0.0.96] - 2026-11-20
 

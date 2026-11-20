@@ -190,6 +190,8 @@ def test_migrate_queue_runs_replays_rejected_batch_per_run(migrator):
         "missing": 0,
         "errors": [("run-2", "run not found on destination")],
         "errors_truncated": 0,
+        "reordered": 0,
+        "order_failed": 0,
     }
     per_run = [c.args[1] for c in migrator.dest.post.call_args_list[1:]]
     assert [body[0]["run_id"] for body in per_run] == ["run-1", "run-2"]
@@ -606,3 +608,62 @@ def test_stored_errors_are_capped(migrator):
     assert len(result["errors"]) == MAX_STORED_RUN_ERRORS
     assert result["errors_truncated"] == 250 - MAX_STORED_RUN_ERRORS
 
+
+
+# ---------------------------------------------------------------------------
+# Item order: each destination item gets its source added_at
+# ---------------------------------------------------------------------------
+
+
+def test_linked_items_get_their_source_added_at(migrator):
+    source_items = [
+        {"id": "s1", "item_type": "RUN", "run_id": "run-1", "project_id": "sess-1",
+         "start_time": "2026-01-01T00:00:00", "added_at": "2026-01-03T00:00:00Z"},
+        {"id": "s2", "item_type": "RUN", "run_id": "run-2", "project_id": "sess-1",
+         "start_time": "2026-01-01T00:00:00", "added_at": "2026-01-01T00:00:00Z"},
+    ]
+    dest_items = [
+        {"id": "d1", "run_id": "run-1", "added_at": "2026-11-20T10:00:00Z"},
+        {"id": "d2", "run_id": "run-2", "added_at": "2026-01-01T00:00:00+00:00"},
+    ]
+
+    def page(items):
+        return lambda endpoint, params=None: {
+            "items": items if (params or {}).get("status") == "needs_my_review" else [],
+            "next_cursor": None,
+        }
+
+    migrator.source.get.side_effect = page(source_items)
+    migrator.dest.get.side_effect = page(dest_items)
+    migrator.dest.post.return_value = {}
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["added"] == 2
+    assert result["reordered"] == 1
+    # Only the item whose time differs is moved, to its source time.
+    migrator.dest.patch.assert_called_once_with(
+        "/platform/annotation-queues/q-dst/items/d1", {"added_at": "2026-01-03T00:00:00Z"}
+    )
+
+
+def test_item_order_failures_are_counted_not_raised(migrator):
+    migrator.source.get.side_effect = lambda endpoint, params=None: {
+        "items": [{"id": "s1", "run_id": "run-1", "project_id": "sess-1",
+                   "start_time": "2026-01-01T00:00:00", "added_at": "2026-01-03T00:00:00Z"}]
+        if (params or {}).get("status") == "needs_my_review" else [],
+        "next_cursor": None,
+    }
+    migrator.dest.get.side_effect = lambda endpoint, params=None: {
+        "items": [{"id": "d1", "run_id": "run-1", "added_at": "2026-11-20T10:00:00Z"}]
+        if (params or {}).get("status") == "needs_my_review" else [],
+        "next_cursor": None,
+    }
+    migrator.dest.post.return_value = {}
+    migrator.dest.patch.side_effect = APIError("conflict", status_code=409)
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["added"] == 1
+    assert result["order_failed"] == 1
+    assert result["reordered"] == 0
