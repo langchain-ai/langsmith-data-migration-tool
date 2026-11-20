@@ -2320,6 +2320,29 @@ def test_byoc_migration_keeps_explicit_feedback_workers(cli_harness, monkeypatch
     assert cli_harness.orchestrator_factory.instances[-1].config.migration.feedback_workers == 3
 
 
+def test_queues_command_interrupt_stops_remaining_queues(cli_harness):
+    """Ctrl-C must cancel queued queues instead of migrating them all."""
+
+    queues = [{"id": f"queue-{i}", "name": f"Queue {i}"} for i in range(6)]
+    cli_harness.migrators.queue.list_queues.return_value = queues
+    created = []
+
+    def create(queue):
+        created.append(queue["id"])
+        if len(created) == 1:
+            raise KeyboardInterrupt
+        return f"new-{queue['id']}"
+
+    cli_harness.migrators.queue.create_queue.side_effect = create
+
+    cli_harness.invoke(["--workers", "1", "--non-interactive", "queues"])
+
+    # The one worker may pick up the next queue before the main thread cancels;
+    # everything after that is dropped (without the fix all six were created).
+    assert created[0] == "queue-0"
+    assert len(created) <= 2
+
+
 def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):
     """Queue runs are opt-in; the default command only migrates the queue config."""
 

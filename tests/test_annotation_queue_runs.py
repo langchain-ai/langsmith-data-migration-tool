@@ -403,16 +403,23 @@ def test_created_queue_is_found_without_relisting(migrator):
     assert migrator.dest.get_paginated.call_count == 1
 
 
-def test_failed_destination_listing_is_not_cached(migrator):
-    calls = {"n": 0}
+def test_failed_destination_page_is_not_cached(migrator):
+    """A failed page through the real paginator must raise, not cache a partial index."""
+    from langsmith_migrator.core.api_client import EnhancedAPIClient
 
-    def listing(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise APIError("boom", status_code=500)
-        return iter([{"id": "dst-1", "name": "One"}])
+    migrator.dest.get_paginated.side_effect = (
+        lambda endpoint, **kw: EnhancedAPIClient.get_paginated(migrator.dest, endpoint, **kw)
+    )
+    pages = {"n": 0}
 
-    migrator.dest.get_paginated.side_effect = listing
+    def get(endpoint, params=None):
+        pages["n"] += 1
+        if pages["n"] == 1:
+            raise APIError("503 upstream", status_code=503)
+        return [{"id": "dst-1", "name": "One"}]
+
+    migrator.dest.get.side_effect = get
 
     assert migrator.find_existing_queue("One") is None
     assert migrator.find_existing_queue("One") == "dst-1"
+    assert migrator.dest.get_paginated.call_args.kwargs.get("raise_errors") is True

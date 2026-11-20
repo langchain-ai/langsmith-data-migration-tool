@@ -2585,9 +2585,19 @@ def queues(
             task = progress.add_task("Migrating queues...", total=len(selected_queues))
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [executor.submit(migrate_one, q) for q in selected_queues]
-                for future in as_completed(futures):
-                    future.result()
-                    progress.advance(task)
+                try:
+                    for future in as_completed(futures):
+                        future.result()
+                        progress.advance(task)
+                except BaseException:
+                    # Ctrl-C or a crash: drop queued queues and stop running ones at
+                    # their next request, instead of finishing the whole migration.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    for client in (orchestrator.source_client, orchestrator.dest_client):
+                        cancel = getattr(client, "cancel", None)
+                        if callable(cancel):
+                            cancel()
+                    raise
 
         console.print(f"Queues: {success_count} migrated, {len(failed_items)} failed")
         if failed_items and config.migration.verbose:

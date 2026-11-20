@@ -44,7 +44,10 @@ class AnnotationQueueMigrator(BaseMigrator):
             if index is None:
                 try:
                     index = {}
-                    for queue in self.dest.get_paginated("/annotation-queues"):
+                    # raise_errors: a failed page must not leave a partial index cached.
+                    for queue in self.dest.get_paginated(
+                        "/annotation-queues", raise_errors=True
+                    ):
                         if isinstance(queue, dict) and queue.get("name"):
                             index.setdefault(queue["name"], queue.get("id"))
                 except Exception as e:
