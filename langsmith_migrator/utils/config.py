@@ -43,6 +43,15 @@ class MigrationConfig:
     stream_examples: bool = True  # Stream instead of loading all into memory
     chunk_size: int = 1000  # Process in chunks
     rate_limit_delay: float = 0.1  # Delay between API calls
+    state_save_interval: float = 5.0  # Min seconds between state file writes in bulk runs
+
+
+def _env_float(name: str, default: float) -> float:
+    """Non-negative float env var or default, never an exception."""
+    try:
+        return max(0.0, float(os.getenv(name, default)))
+    except ValueError:
+        return default
 
 
 def _env_int(name: str, default: int) -> int:
@@ -254,6 +263,7 @@ class Config:
             # Capped at the ingest size_limit (/info batch_ingest_config) so a typo cannot build an oversized request.
             feedback_batch_size=min(100, max(1, _env_int('MIGRATION_FEEDBACK_BATCH_SIZE', 100))),
             no_deprecated_fallback=os.getenv('MIGRATION_NO_DEPRECATED_FALLBACK', 'false').lower() == 'true',
+            state_save_interval=_env_float('MIGRATION_STATE_SAVE_INTERVAL', 5.0),
         )
         self.state_manager = None
 

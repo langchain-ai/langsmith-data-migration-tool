@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import shutil
 import re
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar
 from uuid import uuid4
 
 
@@ -123,6 +128,25 @@ _ACTIONABLE_NEXT_ACTION_OVERRIDES = {
         "then re-run `langsmith-migrator users --sync`."
     ),
 }
+
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _synchronized(method: _F) -> _F:
+    """Run a MigrationState method under the state's lock.
+
+    Experiments and datasets migrate on worker threads that all write to one
+    state object, while a save serializes it. Without the lock a save can
+    iterate a dict that a worker is resizing.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
 
 
 def _now() -> float:
@@ -343,16 +367,26 @@ class MigrationState:
     resolution_decisions: Dict[str, Any] = field(default_factory=dict)
     resolution_provenance: Dict[str, Any] = field(default_factory=dict)
     migration_settings: Dict[str, bool] = field(default_factory=dict)
+    _lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False, compare=False
+    )
+
+    @property
+    def lock(self) -> threading.RLock:
+        """Reentrant lock that guards every read-modify-write of this state."""
+        return self._lock
 
     def touch(self) -> None:
         self.updated_at = _now()
 
+    @_synchronized
     def add_item(self, item: MigrationItem) -> MigrationItem:
         """Add or replace an item to track."""
         self.items[item.id] = item
         self.touch()
         return item
 
+    @_synchronized
     def ensure_item(
         self,
         item_id: str,
@@ -394,10 +428,24 @@ class MigrationState:
     def get_item(self, item_id: str) -> Optional[MigrationItem]:
         return self.items.get(item_id)
 
+    @_synchronized
+    def merge_mappings(self, item_type: str, mapping: Dict[str, str]) -> None:
+        """Add many source to destination ID mappings at once."""
+        if not mapping:
+            return
+        self.id_mappings.setdefault(item_type, {}).update(mapping)
+        self.touch()
+
+    @_synchronized
+    def mapping_snapshot(self, item_type: str) -> Dict[str, str]:
+        """Copy of one ID mapping, safe to iterate while workers add to it."""
+        return dict(self.id_mappings.get(item_type, {}))
+
     def get_mapped_id(self, item_type: str, source_id: str) -> Optional[str]:
         """Return the destination ID for a previously migrated item."""
         return self.id_mappings.get(item_type, {}).get(source_id)
 
+    @_synchronized
     def set_mapped_id(self, item_type: str, source_id: str, destination_id: str) -> None:
         """Store a source to destination ID mapping."""
         if item_type not in self.id_mappings:
@@ -405,6 +453,7 @@ class MigrationState:
         self.id_mappings[item_type][source_id] = destination_id
         self.touch()
 
+    @_synchronized
     def update_item_status(
         self,
         item_id: str,
@@ -439,6 +488,7 @@ class MigrationState:
 
         self.touch()
 
+    @_synchronized
     def update_item_checkpoint(self, item_id: str, **kwargs: Any) -> None:
         """Persist non-status checkpoint details for an item."""
         item = self.items.get(item_id)
@@ -472,6 +522,7 @@ class MigrationState:
             self.set_mapped_id(item.type, item.source_id, item.destination_id)
         self.touch()
 
+    @_synchronized
     def mark_terminal(
         self,
         item_id: str,
@@ -511,6 +562,7 @@ class MigrationState:
         self.refresh_verification_summary()
         self.touch()
 
+    @_synchronized
     def get_pending_items(
         self,
         item_type: Optional[str] = None,
@@ -528,6 +580,7 @@ class MigrationState:
                     items.append(item)
         return items
 
+    @_synchronized
     def get_failed_items(self, max_attempts: Optional[int] = 3) -> List[MigrationItem]:
         """Get failed items that haven't exceeded max attempts.
 
@@ -541,6 +594,7 @@ class MigrationState:
                 items.append(item)
         return items
 
+    @_synchronized
     def get_resume_items(self, max_attempts: Optional[int] = 3) -> List[MigrationItem]:
         """Return items that should be reconsidered by resume.
 
@@ -550,6 +604,7 @@ class MigrationState:
         items.extend(self.get_failed_items(max_attempts=max_attempts))
         return items
 
+    @_synchronized
     def get_checkpoint_items(self) -> List[MigrationItem]:
         """Return items that landed in a checkpoint/export terminal state."""
         items = []
@@ -613,6 +668,7 @@ class MigrationState:
             return f"{preview}, +{len(unique_subjects) - max_items} more"
         return ", ".join(unique_subjects)
 
+    @_synchronized
     def get_actionable_groups(self) -> List[Dict[str, Any]]:
         """Group blocked/exported items into higher-signal remediation steps."""
         grouped: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
@@ -652,6 +708,7 @@ class MigrationState:
 
         return list(grouped.values())
 
+    @_synchronized
     def record_capability(
         self,
         scope: str,
@@ -673,11 +730,13 @@ class MigrationState:
         }
         self.touch()
 
+    @_synchronized
     def record_inventory(self, key: str, value: Any) -> None:
         """Store an inventory snapshot entry."""
         self.inventory_snapshot[key] = value
         self.touch()
 
+    @_synchronized
     def add_dependency(self, node: str, depends_on: str) -> None:
         """Add a directed dependency edge."""
         deps = self.dependency_graph.setdefault(node, [])
@@ -685,18 +744,22 @@ class MigrationState:
             deps.append(depends_on)
             self.touch()
 
+    @_synchronized
     def set_dependency_graph(self, graph: Dict[str, List[str]]) -> None:
         self.dependency_graph = graph
         self.touch()
 
+    @_synchronized
     def record_resolution_decision(self, key: str, value: Any) -> None:
         self.resolution_decisions[key] = value
         self.touch()
 
+    @_synchronized
     def record_resolution_provenance(self, key: str, value: Any) -> None:
         self.resolution_provenance[key] = value
         self.touch()
 
+    @_synchronized
     def add_issue(
         self,
         issue_class: str,
@@ -729,6 +792,7 @@ class MigrationState:
         self.touch()
         return issue
 
+    @_synchronized
     def queue_remediation(
         self,
         *,
@@ -754,6 +818,7 @@ class MigrationState:
         self.touch()
         return task
 
+    @_synchronized
     def get_terminal_counts(self) -> Dict[str, int]:
         counts = {outcome.value: 0 for outcome in ResolutionOutcome}
         for item in self.items.values():
@@ -761,6 +826,7 @@ class MigrationState:
                 counts[item.terminal_state] += 1
         return counts
 
+    @_synchronized
     def refresh_verification_summary(self) -> None:
         """Recompute verification counts."""
         summary = {state.value: 0 for state in VerificationState}
@@ -770,6 +836,7 @@ class MigrationState:
         summary["total"] = len(self.items)
         self.verification_summary = summary
 
+    @_synchronized
     def get_statistics(self) -> Dict[str, Any]:
         """Get migration statistics."""
         stats = {
@@ -850,6 +917,7 @@ class MigrationState:
             path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         return str(path.resolve())
 
+    @_synchronized
     def write_remediation_bundle(self) -> Optional[Path]:
         """Refresh the remediation bundle files on disk."""
         bundle_dir = self.ensure_bundle_dir()
@@ -928,6 +996,7 @@ class MigrationState:
         (bundle_dir / "summary.md").write_text("\n".join(lines), encoding="utf-8")
         return bundle_dir
 
+    @_synchronized
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         d = {
@@ -1032,6 +1101,11 @@ class StateManager:
         self.remediation_dir.mkdir(parents=True, exist_ok=True)
         self.current_state: Optional[MigrationState] = None
         self.state_file: Optional[Path] = None
+        # 0 writes on every save(); throttled_saves() raises it for bulk runs.
+        self.min_save_interval = 0.0
+        self._last_save = 0.0
+        self._dirty = False
+        self._save_lock = threading.Lock()
 
     def _default_bundle_path(self, session_id: str) -> Path:
         return self.remediation_dir / session_id
@@ -1100,16 +1174,73 @@ class StateManager:
         sessions.sort(key=lambda x: x["updated_at"], reverse=True)
         return sessions
 
-    def save(self) -> None:
-        """Save current state to disk."""
+    def save(self, force: bool = False) -> None:
+        """Save current state to disk.
+
+        Inside throttled_saves() a call within ``min_save_interval`` seconds of
+        the last write only marks the state dirty; the next due call, or the
+        flush when the block exits, writes it. ``force`` always writes.
+        """
         if not self.current_state or not self.state_file:
             return
 
-        self.current_state.touch()
-        with open(self.state_file, "w", encoding="utf-8") as f:
-            json.dump(self.current_state.to_dict(), f, indent=2)
+        with self._save_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self.min_save_interval > 0
+                and now - self._last_save < self.min_save_interval
+            ):
+                self._dirty = True
+                return
 
-        self.current_state.write_remediation_bundle()
+            state = self.current_state
+            with state.lock:
+                state.touch()
+                # Serialize under the lock: to_dict() hands out live dicts.
+                payload = json.dumps(state.to_dict())
+                state.write_remediation_bundle()
+            self._write_atomic(self.state_file, payload)
+            self._last_save = time.monotonic()
+            self._dirty = False
+
+    def flush(self) -> None:
+        """Write state if a throttled save skipped a write."""
+        if self._dirty:
+            self.save(force=True)
+
+    @contextmanager
+    def throttled_saves(self, interval: float) -> Iterator[None]:
+        """Write state at most once per ``interval`` seconds inside the block.
+
+        Bulk runs call save() several times per item; rewriting the whole state
+        file each time costs more than the API calls once the ID mappings grow.
+        The state is flushed on exit, also on error or interrupt. A crash loses
+        at most ``interval`` seconds of checkpoints; resume re-checks the
+        destination, so the lost work is redone, not duplicated.
+        """
+        previous = self.min_save_interval
+        self.min_save_interval = max(previous, interval)
+        try:
+            yield
+        finally:
+            self.min_save_interval = previous
+            self.flush()
+
+    @staticmethod
+    def _write_atomic(path: Path, payload: str) -> None:
+        """Replace ``path`` so a crash mid-write never leaves a truncated state file."""
+        fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a migration session."""

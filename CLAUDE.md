@@ -130,7 +130,7 @@ resolve to the destination's latest commit of each linked repo (recorded as a
 
 - **EnhancedAPIClient** (`core/api_client.py`): HTTP wrapper with retry logic, rate limiting, and pagination support (offset-based and cursor-based)
 - **RunQuery** (`core/run_query.py`): Run queries for experiments and `traces`. Like the SDK, stays on `POST /api/v1/runs/query` wherever it answers (it reports per-run tiers) and uses `POST /api/v2/runs/query` on SmithDB-only instances (per `/info` `instance_flags`, or after v1 answers 501), translating v2 runs to v1 field names and values
-- **State Management** (`utils/state.py`): Session tracking, ID mappings, and resume capability
+- **State Management** (`utils/state.py`): Session tracking, ID mappings, and resume capability. `MigrationState` methods run under its `RLock` (`state.lock`) because dataset/experiment workers share one state; read mappings for iteration with `mapping_snapshot()`, write many with `merge_mappings()`, never mutate `id_mappings` directly from worker threads
 - **TUI Selector** (`cli/tui_selector.py`): Textual-based interactive selection with search/filter
 - **TUI Project Mapper** (`cli/tui_project_mapper.py`): Text-input-first project mapping with suggestion filtering
 - **TUI Workspace Mapper** (`cli/tui_workspace_mapper.py`): Interactive N-to-N workspace mapping with create-new support
@@ -155,7 +155,8 @@ Environment variables (can also use CLI flags or a `.env` file — auto-loaded o
 - `MIGRATION_FEEDBACK_BATCH_SIZE` (default: 100, max 100, the ingest `size_limit`) - feedback records per multipart request
 - `MIGRATION_NO_DEPRECATED_FALLBACK` (default: false) - fail instead of falling back to a deprecated endpoint when an instance lacks its replacement; use it to confirm a run exercised the current endpoints. Run queries then use v2 wherever it exists, so `traces` falls back to project tiers (see `RunQuery`)
 - `MIGRATION_CHUNK_SIZE` (default: 1000)
-- `MIGRATION_RATE_LIMIT_DELAY` (default: 0.1)
+- `MIGRATION_RATE_LIMIT_DELAY` (default: 0.1; `--byoc-migration` sets 0 unless this is set)
+- `MIGRATION_STATE_SAVE_INTERVAL` (default: 5) - min seconds between state file writes inside `migrate_datasets_parallel` and `resume_items` (`StateManager.throttled_saves`, flushed on exit); 0 writes on every checkpoint
 - `MIGRATION_STREAM_EXAMPLES` (default: true)
 - `MIGRATION_DRY_RUN`, `MIGRATION_VERBOSE`, `MIGRATION_SKIP_EXISTING`
 - `LANGSMITH_VERIFY_SSL` (default: true)

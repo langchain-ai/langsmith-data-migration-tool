@@ -575,6 +575,29 @@ does not revisit them. Older sessions retain their original behavior; rerun
 langsmith-migrator datasets --byoc-migration
 ```
 
+#### Throughput
+
+`--workers` (`MIGRATION_WORKERS`) sets the thread count for each stage of a
+dataset run: dataset and experiment lookups, datasets, experiments, and
+uploads of examples with attachments. Examples without attachments go through
+the bulk endpoint; each example with attachments needs its own request, so
+those run on the worker threads. Experiments migrate in parallel too, so with
+run or feedback replay the destination sees up to `--workers` experiments at
+once, each with its own feedback threads (`MIGRATION_FEEDBACK_WORKERS`).
+
+`--byoc-migration` removes the per-request delay (`MIGRATION_RATE_LIMIT_DELAY`,
+default 0.1 s); rate-limited requests are still retried with backoff. Set
+`MIGRATION_RATE_LIMIT_DELAY` explicitly to keep a delay.
+
+During dataset and resume runs the state file is written at most every
+`MIGRATION_STATE_SAVE_INTERVAL` seconds (default 5, `0` writes on every
+checkpoint) and always at the end. A crash loses at most that many seconds of
+checkpoints; `resume` re-checks the destination and redoes that work.
+
+```bash
+langsmith-migrator --workers 16 datasets --byoc-migration
+```
+
 `queues --byoc-migration` is the matching step for annotation queues: it pairs
 every workspace by ID, migrates each queue, and links the queued runs to the
 destination queue without prompting. Run it after the trace storage migration so
