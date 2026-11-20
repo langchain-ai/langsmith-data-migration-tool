@@ -49,6 +49,7 @@ from ..core.trace_archive import (
     ArchiveSource,
     projected_file_count,
 )
+from ..core.dataset_check import compare_datasets
 from ..core.trace_blobstore import ArchiveError, is_s3
 from ..core.trace_frames import DEFAULT_COMPRESS_LEVEL
 from ..core.migrators.user_role import (
@@ -2219,6 +2220,12 @@ def test(ctx):
     help="Dataset name or ID to migrate; repeatable. Only the matched datasets (and, with "
     "--include-experiments, their experiments) are migrated, without prompting.",
 )
+@click.option(
+    "--validate",
+    is_flag=True,
+    help="Only compare the selected datasets' example (and experiment) counts with the "
+    "destination; copy nothing. A migration runs the same check when it ends.",
+)
 @workspace_options
 @click.pass_context
 def datasets(
@@ -2229,6 +2236,7 @@ def datasets(
     all_workspaces,
     byoc_migration,
     dataset_filters,
+    validate,
     source_workspace,
     dest_workspace,
     map_workspaces,
@@ -2291,6 +2299,7 @@ def datasets(
     )
 
     unmatched_filters = set(dataset_filters)
+    mismatched = 0
 
     try:
         for src_ws, dst_ws in ws_pairs:
@@ -2341,6 +2350,12 @@ def datasets(
                 console.print("[yellow]No datasets selected[/yellow]")
                 continue
 
+            if validate:
+                mismatched += _report_dataset_comparison(
+                    dataset_migrator, selected, include_experiments
+                )
+                continue
+
             inc_exp = include_experiments
             if not inc_exp:
                 inc_exp = _confirm_action(
@@ -2388,10 +2403,14 @@ def datasets(
             except Exception as e:
                 console.print(f"\n[red]Migration failed: {e}[/red]")
 
+            if not config.migration.dry_run:
+                mismatched += _report_dataset_comparison(dataset_migrator, selected, inc_exp)
+
         if ws_result:
             orchestrator.clear_workspace_context()
-        _display_resolution_summary(orchestrator)
-        _exit_for_remediation_if_needed(ctx, config, orchestrator)
+        if not validate:
+            _display_resolution_summary(orchestrator)
+            _exit_for_remediation_if_needed(ctx, config, orchestrator)
     except Exception as e:
         console.print(f"\n[red]Migration failed: {e}[/red]")
         ctx.exit(1)
@@ -2404,6 +2423,34 @@ def datasets(
             f"{', '.join(sorted(unmatched_filters))}[/red]"
         )
         ctx.exit(1)
+    if mismatched:
+        ctx.exit(1)
+
+
+def _report_dataset_comparison(dataset_migrator, datasets_to_check, include_experiments) -> int:
+    """Print how the destination copies compare with the source; returns how many differ."""
+    console.print("\nValidating datasets against the destination... ", end="")
+    results = compare_datasets(dataset_migrator, datasets_to_check, include_experiments)
+    differing = [r for r in results if not r.matches]
+    if not differing:
+        console.print(f"[green]✓ {len(results)} dataset(s) match[/green]")
+        return 0
+    console.print(f"[red]{len(differing)} of {len(results)} dataset(s) differ[/red]")
+    table = Table(show_header=True)
+    table.add_column("Dataset")
+    table.add_column("Source ID", style="dim")
+    table.add_column("Examples (src → dest)")
+    if include_experiments:
+        table.add_column("Experiments (src → dest)")
+    table.add_column("Problem")
+    for r in differing:
+        problem = r.error or ("missing on destination" if r.dest_id is None else "counts differ")
+        row = [r.name, r.source_id, f"{r.source_examples} → {r.dest_examples}"]
+        if include_experiments:
+            row.append(f"{r.source_experiments} → {r.dest_experiments}")
+        table.add_row(*row, problem)
+    console.print(table)
+    return len(differing)
 
 
 def _select_resume_session(config: Config, state_manager: StateManager):

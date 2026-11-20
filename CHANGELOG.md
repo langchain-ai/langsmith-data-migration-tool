@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.98] - 2026-11-20
+
+### Added
+- **Dataset validation**: `datasets` compares each migrated dataset's example
+  count, and experiment count with `--include-experiments`, against the
+  destination when it ends, lists the datasets that differ, and exits 1 if any
+  do. `datasets --validate` runs only that comparison and copies nothing, for
+  example `datasets --byoc-migration --validate` after a BYOC dataset migration.
+
 ## [0.0.97] - 2026-11-20
 
 ### Fixed
