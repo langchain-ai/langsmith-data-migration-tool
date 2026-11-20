@@ -1964,10 +1964,12 @@ def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_ha
         "dataset-2": "dest-2",
     }
     cli_harness.controls.confirm_answers = [True]
+    _serve_dataset_counts(cli_harness, {"dataset-1": 3, "dataset-2": 5}, {"dataset-1": 3, "dataset-2": 5})
 
     result = cli_harness.invoke(["datasets", "--all", "--include-experiments"])
 
     assert result.exit_code == 0
+    assert "2 dataset(s) match" in cli_harness.console.text
     orchestrator = cli_harness.orchestrator_factory.instances[0]
     assert orchestrator.workspace_calls == [("src-ws", "dst-ws")]
     assert orchestrator.migrate_dataset_calls == [
@@ -1979,6 +1981,38 @@ def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_ha
     ]
     assert orchestrator.clear_workspace_called is True
     assert "Migration completed" in cli_harness.console.text
+
+
+def _serve_dataset_counts(cli_harness, source_counts, dest_counts):
+    """Serve example counts per dataset ID on each side, and no experiments."""
+    migrator = cli_harness.migrators.dataset
+    migrator.source.get.side_effect = lambda endpoint, params=None: {
+        "example_count": source_counts[endpoint.rsplit("/", 1)[-1]]
+    }
+    migrator.dest.get.side_effect = lambda endpoint, params=None: {
+        "example_count": dest_counts[endpoint.rsplit("/", 1)[-1]]
+    }
+    migrator.find_existing_dataset.side_effect = (
+        lambda name, dataset_id: dataset_id if dataset_id in dest_counts else None
+    )
+    migrator.source.get_paginated.side_effect = lambda *a, **k: iter([])
+    migrator.dest.get_paginated.side_effect = lambda *a, **k: iter([])
+
+
+def test_datasets_validate_compares_without_migrating(cli_harness):
+    """--validate reports datasets whose copy differs and exits 1, without copying anything."""
+
+    cli_harness.migrators.dataset.list_datasets.return_value = [
+        {"id": "dataset-1", "name": "Dataset One"},
+        {"id": "dataset-2", "name": "Dataset Two"},
+    ]
+    _serve_dataset_counts(cli_harness, {"dataset-1": 3, "dataset-2": 2104}, {"dataset-1": 3, "dataset-2": 0})
+
+    result = cli_harness.invoke(["datasets", "--all", "--validate"])
+
+    assert result.exit_code == 1
+    assert cli_harness.orchestrator_factory.instances[0].migrate_dataset_calls == []
+    assert "1 of 2 dataset(s) differ" in cli_harness.console.text
 
 
 def test_datasets_command_exits_nonzero_when_workspace_resolution_aborts(cli_harness):
