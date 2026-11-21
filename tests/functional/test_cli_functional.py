@@ -521,6 +521,42 @@ def test_users_command_without_csv_keeps_api_member_paths(cli_harness, monkeypat
     user_role_migrator.list_source_workspace_members.assert_called_once()
 
 
+def test_users_byoc_migration_pairs_every_workspace_by_id(cli_harness, monkeypatch):
+    """--byoc-migration copies members into every workspace with the same ID, without prompting."""
+    calls = []
+
+    def resolve(*args, **kwargs):
+        calls.append(kwargs)
+        return WorkspaceProjectResult(
+            workspace_mapping={"ws-1": "ws-1"}, project_mappings={}, workspaces_to_create=[]
+        )
+
+    monkeypatch.setattr(cli_main, "_resolve_workspaces", resolve)
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {}
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.list_source_org_members.return_value = []
+    user_role_migrator.list_source_pending_org_members.return_value = []
+    user_role_migrator.list_source_workspace_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (0, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (0, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(["users", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert calls and calls[0]["all_workspaces"] is True
+    assert calls[0]["non_interactive"] is True
+
+
+def test_users_byoc_migration_rejects_single_instance_sync(cli_harness):
+    result = cli_harness.invoke(["users", "--byoc-migration", "--single-instance"])
+
+    assert result.exit_code != 0
+    assert "single-instance" in result.output
+
+
 def test_users_command_preflight_stays_user_scoped(cli_harness, monkeypatch):
     """users preflight should avoid project/dataset lookup probes."""
     cli_harness.controls.workspace_result = WorkspaceProjectResult(

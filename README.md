@@ -6,7 +6,7 @@ A Python CLI for migrating users and roles, datasets, experiments, annotation qu
 
 ```bash
 # Install (requires uv: https://docs.astral.sh/uv/)
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.99-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.100-py3-none-any.whl"
 
 # Set up environment variables
 export LANGSMITH_OLD_API_KEY="your_source_api_key"
@@ -243,20 +243,20 @@ The destination's `POST /runs/batch` endpoint rejects runs with timestamps outsi
 
 ### Option 1: uv tool install (Recommended)
 ```bash
-uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.99-py3-none-any.whl"
+uv tool install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.100-py3-none-any.whl"
 
 # To update an existing installation, use --force:
-uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.99-py3-none-any.whl"
+uv tool install --force "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.100-py3-none-any.whl"
 ```
 
 ### Option 2: uvx (One-off execution, no install)
 ```bash
-uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.99-py3-none-any.whl" langsmith-migrator test
+uvx --from "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.100-py3-none-any.whl" langsmith-migrator test
 ```
 
 ### Option 3: pip
 ```bash
-pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.99-py3-none-any.whl"
+pip install "langsmith-data-migration-tool @ https://github.com/langchain-ai/langsmith-data-migration-tool/releases/latest/download/langsmith_data_migration_tool-0.0.100-py3-none-any.whl"
 ```
 
 ### Option 4: From source (Development/Contributing)
@@ -311,6 +311,7 @@ langsmith-migrator datasets --include-experiments  # With experiments, runs, and
 langsmith-migrator queues
 langsmith-migrator queues --byoc-migration     # Self-hosted to BYOC: every workspace by ID, with queued runs, no prompts
 langsmith-migrator feedback-configs --byoc-migration  # Copy feedback configs (label types and scales) the destination lacks
+langsmith-migrator users --byoc-migration       # Self-hosted to BYOC: members into every workspace with the same ID
 
 # Prompts
 langsmith-migrator prompts

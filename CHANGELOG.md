@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.100] - 2026-11-21
+
+### Added
+- **`users --byoc-migration`**: copies members into every destination
+  workspace with the same ID, without prompting. Run it after the workspaces
+  are imported.
+
 ## [0.0.99] - 2026-11-20
 
 ### Added
