@@ -2929,6 +2929,12 @@ def model_pricing(ctx, source_workspace, dest_workspace, map_workspaces):
     is_flag=True,
     help="Disable prompts for this users run. Same behavior as the global --non-interactive.",
 )
+@click.option(
+    "--byoc-migration",
+    is_flag=True,
+    help="Self-hosted to BYOC profile: copy members into every workspace with the same ID, "
+    "without prompting. Run it after the workspaces are imported.",
+)
 @workspace_options
 @click.pass_context
 def users(
@@ -2942,6 +2948,7 @@ def users(
     instance_key,
     instance_url,
     users_non_interactive,
+    byoc_migration,
     source_workspace,
     dest_workspace,
     map_workspaces,
@@ -2954,7 +2961,7 @@ def users(
 
     if users_dry_run:
         config.migration.dry_run = True
-    if users_non_interactive:
+    if users_non_interactive or byoc_migration:
         config.migration.non_interactive = True
         config.migration.interactive = False
 
@@ -2971,6 +2978,11 @@ def users(
 
     if instance_key or instance_url or csv_source_of_truth:
         single_instance = True
+    if byoc_migration and single_instance:
+        raise click.ClickException(
+            "--byoc-migration copies members between two instances; it cannot be used with "
+            "single-instance CSV sync"
+        )
 
     if single_instance and roles_only:
         raise click.ClickException(
@@ -3036,6 +3048,7 @@ def users(
             dest_workspace,
             map_workspaces,
             non_interactive=config.migration.non_interactive,
+            all_workspaces=byoc_migration,
         )
         if ws_result is _WS_ABORTED:
             ctx.exit(1)
