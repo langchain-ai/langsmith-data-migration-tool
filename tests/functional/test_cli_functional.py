@@ -51,6 +51,7 @@ def test_registered_command_names_match_public_cli_surface():
         "contexts",
         "datasets",
         "export-users",
+        "feedback-configs",
         "fleet",
         "issues",
         "list-projects",

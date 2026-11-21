@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.99] - 2026-11-20
+
+### Added
+- **`feedback-configs` command**: copies every live feedback config (label type
+  and scale) the destination workspace lacks, matched by key and settings.
+  `--byoc-migration` pairs every workspace by ID.
+
+### Fixed
+- **Completed queue items**: `queues` copies archived (completed) items too.
+  They arrive open, since review progress cannot be set through the API.
+- **Prompt descriptions and tags**: `prompts` copies each prompt's
+  description, readme and tags, also onto prompts that already exist.
+
 ## [0.0.98] - 2026-11-20
 
 ### Added
