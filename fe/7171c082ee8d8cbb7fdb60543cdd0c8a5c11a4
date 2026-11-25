@@ -1,0 +1,26 @@
+tests/test_trace_migrator.py
+  s_c082f715b47906::t_51811b67083070 540-558
+README.md
+  s_c082f715b47906::t_77ff0a7bffe36d 159-164
+langsmith_migrator/core/migrators/trace.py
+  s_c082f715b47906::t_1db48db47e1cf3 21
+  s_c082f715b47906::t_9cf925ab374894 839-845
+CHANGELOG.md
+  s_c082f715b47906::t_4dd98208cac22c 10-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fe7171c082ee8d8cbb7fdb60543cdd0c8a5c11a4",
+  "prompts": {},
+  "sessions": {
+    "s_c082f715b47906": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "321b637c-88d0-41b0-b776-e1f249e763e1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
