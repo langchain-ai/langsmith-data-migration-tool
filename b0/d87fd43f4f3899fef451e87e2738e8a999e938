@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_c082f715b47906::t_15614d9ab64a99 10-11
+README.md
+  s_c082f715b47906::t_15614d9ab64a99 9,248,251,256,261
+pyproject.toml
+  s_c082f715b47906::t_15614d9ab64a99 3
+uv.lock
+  s_c082f715b47906::t_347485e276f0fc 1225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b0d87fd43f4f3899fef451e87e2738e8a999e938",
+  "prompts": {},
+  "sessions": {
+    "s_c082f715b47906": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "321b637c-88d0-41b0-b776-e1f249e763e1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
