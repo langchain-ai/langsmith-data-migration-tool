@@ -537,6 +537,25 @@ def test_a_hidden_leftover_canary_project_does_not_block_the_next_run(sample_con
     assert projects == {"leftover": _CANARY_SESSION}
 
 
+def test_a_canary_project_that_cannot_be_deleted_is_named_without_verbose(
+    sample_config, migration_state
+):
+    """Each such run leaves one more project, so the user is told which to remove."""
+    sample_config.migration.verbose = False
+    m = _migrator(sample_config, migration_state)
+    m.console = Mock()
+    m.dest.post.return_value = {"id": "scratch", "name": f"{_CANARY_SESSION}-abc"}
+    m.dest.delete.side_effect = APIError("HTTP 403: Forbidden [no delete]")
+    m.ingest = Mock(return_value=[("id", "HTTP 403: Forbidden")])
+
+    with pytest.raises(TracePreflightError, match="historical_ingest_rejected"):
+        m.canary()
+
+    (message,) = [call.args[0] for call in m.console.print.call_args_list]
+    assert f"{_CANARY_SESSION}-abc (scratch)" in message
+    assert "HTTP 403: Forbidden \\[no delete]" in message
+
+
 def test_dry_run_skips_the_canary_entirely(sample_config):
     sample_config.migration.dry_run = True
     m = _migrator(sample_config)

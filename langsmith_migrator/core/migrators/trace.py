@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 import requests
 from langsmith import Client
+from rich.markup import escape
 
 from ..api_client import APIError, NotFoundError
 from ..run_query import RunQuery
@@ -835,7 +836,13 @@ class TraceMigrator(BaseMigrator):
         try:
             self.dest.delete(f"/sessions/{session_id}")
         except Exception as exc:
-            self.log(f"Could not delete canary project {session_id}: {exc}", "warning")
+            # Printed without --verbose: each run that can't delete leaves one more.
+            name = session.get("name") or f"{_CANARY_SESSION}-..."
+            self.console.print(
+                f"[yellow]Could not delete the pre-flight canary project "
+                f"{escape(str(name))} ({escape(str(session_id))}) on the destination: "
+                f"{escape(str(exc))}. Delete it by hand.[/yellow]"
+            )
 
     def prepare_slice(
         self, source_session: Dict[str, Any], dest_session: Dict[str, Any], window: Window
