@@ -156,10 +156,12 @@ The tool reports rather than requires: the pre-flight prints the destination's a
 limits, runs a historical-ingest canary, and names the setting behind any value that will
 hurt. Fixing the destination and re-running costs nothing.
 
-The canary writes to the destination before your traces are migrated. It creates
-or reuses a project called `langsmith-migrator-canary` and leaves one run in it,
-stamped at the far end of your range. Nothing deletes it, so it stays until the
-destination's retention removes it. `--dry-run` skips the canary.
+The canary writes to the destination before your traces are migrated. Each run
+creates a project called `langsmith-migrator-canary-<id>`, writes one run to it,
+stamped at the far end of your range, and deletes the project when the check is
+done. If the project can't be deleted (for example, the key may not delete
+projects), the run prints its name so you can remove it by hand. `--dry-run`
+skips the canary.
 
 | Setting | Default | Why it matters |
 | --- | --- | --- |
@@ -691,6 +693,9 @@ The prompt default is `No` (rules are created disabled).
 --project-mapping TEXT  JSON string or file path with project ID mapping (headless, no TUI; mutually exclusive with --map-projects)
 --same-instance         Reuse source project/session IDs on destination only when both sides truly share IDs
 ```
+
+Charts that sit in a dashboard section are matched against that section on the
+destination, so re-running `charts` finds them instead of creating duplicates.
 
 ### Trace Options
 

@@ -19,6 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination already has. A link that can't be read or written is counted as
   failed and the run carries on.
 
+### Fixed
+- **Sectioned charts on re-run and verification**: the destination chart
+  listing nests charts under their section without a `section_id` on each
+  chart. The chart migrator now takes it from the parent section, so charts
+  created in a section verify as `chart_migrated` instead of
+  `chart_create_verification_mismatch` on `section_id`, and re-runs find
+  existing sectioned charts instead of creating duplicates.
+- **`traces` pre-flight canary**: each run creates its own
+  `langsmith-migrator-canary-<id>` project and deletes it after the check.
+  Before, a leftover `langsmith-migrator-canary` project that the project
+  listing did not return made the create fail with a 409, which blocked every
+  later `traces` run. If the project can't be deleted, the run prints its name
+  so it can be removed by hand.
+
 ## [0.0.100] - 2026-11-21
 
 ### Added
