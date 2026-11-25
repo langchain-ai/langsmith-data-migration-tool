@@ -1,0 +1,145 @@
+"""The trace migrator against SmithDB-only instances, which need the v2 run query."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock, patch
+
+from langsmith_migrator.core.api_client import EnhancedAPIClient
+from langsmith_migrator.core.migrators.trace import TraceMigrator
+from langsmith_migrator.core.trace_domain import Window
+
+NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+WINDOW = Window(NOW - timedelta(days=1), NOW)
+V2 = "/api/v2/runs/query"
+SMITHDB_ONLY = {"ch_query_enabled": False, "sdb_query_enabled": True}
+DUAL = {"ch_query_enabled": True, "sdb_query_enabled": True}  # e.g. LangSmith Cloud
+
+
+def _client(tier: str, flags=None) -> Mock:
+    """A client whose /info reports ``flags``; every other GET returns the project."""
+    client = Mock(spec=EnhancedAPIClient)
+    client.session = Mock()
+    client.session.headers = {}
+    project = {"id": "p", "name": "proj", "trace_tier": tier}
+    client.get.side_effect = lambda endpoint, params=None: (
+        {"instance_flags": flags or SMITHDB_ONLY} if endpoint == "/info" else project
+    )
+    return client
+
+
+def _item(rid: str) -> dict:
+    return {
+        "id": rid,
+        "trace_id": rid,
+        "start_time": "2026-08-25T10:00:00Z",
+        "project_id": "src",
+        "dotted_order": f"20260825T100000000000Z{rid}",
+    }
+
+
+def _migrator(
+    sample_config,
+    state=None,
+    *,
+    source_tier="longlived",
+    dest_tier="longlived",
+    source_flags=None,
+):
+    with patch("langsmith_migrator.core.migrators.trace.Client"):
+        m = TraceMigrator(
+            _client(source_tier, source_flags),
+            _client(dest_tier),
+            state,
+            sample_config,
+            range_start=NOW - timedelta(days=30),
+            range_end=NOW,
+        )
+    m.dest_ls_client = Mock()
+    return m
+
+
+def test_long_lived_project_on_v2_keeps_every_run(sample_config):
+    m = _migrator(sample_config)
+    m.source.post.return_value = {"items": [_item("a"), _item("b")], "next_cursor": None}
+
+    runs = m.slice_runs(m.source, "src", WINDOW)
+
+    assert [r["id"] for r in runs] == ["a", "b"]
+    endpoint, body = m.source.post.call_args.args
+    assert endpoint == V2
+    assert body["project_ids"] == ["src"]
+    assert body["selects"] == ["ID", "TRACE_ID", "START_TIME"]  # no per-run tier on v2
+    assert "trace_filter" in body and "min_start_time" in body
+
+
+def test_short_lived_project_on_v2_is_not_queried(sample_config):
+    m = _migrator(sample_config, source_tier="shortlived")
+
+    assert m.slice_runs(m.source, "src", WINDOW) == []
+    m.source.post.assert_not_called()
+
+
+def test_source_that_still_serves_v1_keeps_upgraded_traces_of_a_short_lived_project(
+    sample_config,
+):
+    """On LangSmith Cloud the per-run tier is still available, so it decides."""
+    m = _migrator(sample_config, source_tier="shortlived", source_flags=DUAL)
+    m.source.post.return_value = {
+        "runs": [
+            {"id": "a", "trace_tier": "longlived"},
+            {"id": "b", "trace_tier": "shortlived"},
+        ],
+        "cursors": {},
+    }
+
+    assert [r["id"] for r in m.slice_runs(m.source, "src", WINDOW)] == ["a"]
+    assert m.source.post.call_args.args[0] == "/runs/query"
+
+
+def test_tier_filter_off_ignores_the_project_tier(sample_config):
+    m = _migrator(sample_config, dest_tier="shortlived")
+    m.dest.post.return_value = {"items": [_item("a")], "next_cursor": None}
+
+    assert m.long_lived_run_ids(m.dest, "dst", WINDOW, tier_filter=False) == {"a"}
+
+
+def test_skipped_short_lived_project_is_reported_once(sample_config):
+    m = _migrator(sample_config, source_tier="shortlived")
+    source, target = {"id": "src", "name": "proj"}, {"id": "dst"}
+
+    first = m.prepare(source, target, WINDOW, set)
+    second = m.prepare(source, target, WINDOW, set)
+
+    assert [issue[1] for issue in first.issues] == ["shortlived_project_not_migrated"]
+    assert first.issues[0][0] == "degraded"
+    assert second.issues == []
+
+
+def test_canary_reads_the_run_back_through_the_v2_query(sample_config):
+    m = _migrator(sample_config)
+    m.ingest = Mock(return_value=[])
+    m._scratch_session = Mock(return_value={"id": "scratch"})
+    stamp = m.resolved_range_start()
+    m.dest.post.side_effect = lambda endpoint, body: {
+        "items": [{"id": body["ids"][0], "start_time": stamp.isoformat(), "project_id": "scratch"}],
+        "next_cursor": None,
+    }
+
+    with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
+        m.canary()
+
+    endpoint, body = m.dest.post.call_args.args
+    assert endpoint == V2
+    assert body["project_ids"] == ["scratch"]
+    assert body["min_start_time"] < stamp.isoformat()
+    assert not any("/runs/" in str(c.args[0]) for c in m.dest.get.call_args_list)
+
+
+def test_missing_run_diagnosis_skips_the_lookup_v2_cannot_do(sample_config):
+    m = _migrator(sample_config)
+
+    code, _ = m._diagnose_missing("dst", {"a", "b"})
+
+    assert code == "run_not_ingested"
+    assert not any(c.args[0].startswith("/runs/") for c in m.dest.get.call_args_list)

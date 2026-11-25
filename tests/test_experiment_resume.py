@@ -65,6 +65,7 @@ def test_migrate_runs_streaming_drops_unmapped_reference_example_id(
                 "run_type": "chain",
                 "session_id": "exp-src",
                 "reference_example_id": "example-src",
+                "start_time": "2026-01-01T00:00:00+00:00",
             }
         ],
         "cursors": {"next": None},
@@ -98,3 +99,6 @@ def test_migrate_runs_streaming_drops_unmapped_reference_example_id(
     assert failed_runs == 0
     assert run_mapping["run-1"] == captured_payloads[0]["post"][0]["id"]
     assert "reference_example_id" not in captured_payloads[0]["post"][0]
+    # The start_time sent for each run is kept so feedback can address the run later.
+    posted = captured_payloads[0]["post"][0]
+    assert migration_state.get_mapped_id("run_start_time", posted["id"]) == posted["start_time"]

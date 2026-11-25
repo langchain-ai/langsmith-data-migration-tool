@@ -100,6 +100,8 @@ def test_runs_shifted_consistently_preserves_offsets(tmp_path: Path):
             return DATASET_PAYLOAD
         if endpoint == f"/sessions/{EXP_ID}":
             return EXPERIMENT_PAYLOAD
+        if endpoint == "/info":
+            return {}  # no instance flags: an older server that serves the v1 run query
         # Feedback pagination (list_feedback_for_session)
         if endpoint == "/feedback":
             return []
@@ -243,9 +245,10 @@ def test_runs_shifted_consistently_preserves_offsets(tmp_path: Path):
     assert captured_session_payload, "No /sessions POST payload was captured"
     sess_start = parse_iso(captured_session_payload["start_time"])
     sess_end = parse_iso(captured_session_payload["end_time"])
-    assert sess_start.date() == now.date(), (
-        f"Experiment start_time date {sess_start.date()} != today {now.date()}"
+    # Within a day of now rather than the same date, so a run across midnight passes.
+    assert abs((now - sess_start).total_seconds()) < 24 * 3600, (
+        f"Experiment start_time {sess_start} is not near now {now}"
     )
-    assert sess_end.date() == now.date(), (
-        f"Experiment end_time date {sess_end.date()} != today {now.date()}"
+    assert abs((now - sess_end).total_seconds()) < 24 * 3600, (
+        f"Experiment end_time {sess_end} is not near now {now}"
     )

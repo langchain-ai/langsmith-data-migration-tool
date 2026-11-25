@@ -11,7 +11,8 @@ class PaginationHelper:
         fetch_fn: Callable,
         endpoint: str,
         params: Optional[Dict] = None,
-        page_size: int = 100
+        page_size: int = 100,
+        raise_errors: bool = False,
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Paginate through API results.
@@ -21,6 +22,7 @@ class PaginationHelper:
             endpoint: API endpoint
             params: Query parameters
             page_size: Number of items per page
+            raise_errors: Raise a failed page fetch instead of ending the listing
 
         Yields:
             Individual items from paginated results
@@ -41,6 +43,8 @@ class PaginationHelper:
             try:
                 response = fetch_fn(endpoint, params)
             except Exception:
+                if raise_errors:
+                    raise
                 # No more results or error
                 break
 

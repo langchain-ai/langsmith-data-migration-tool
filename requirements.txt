@@ -2,15 +2,15 @@
 #    uv pip compile pyproject.toml -o requirements.txt
 annotated-types==0.8.0
     # via pydantic
-anthropic==1.15.0
+anthropic==2.6.0
     # via langchain-anthropic
-anyio==4.15.1
+anyio==4.16.0
     # via
     #   anthropic
     #   httpx
     #   langsmith
     #   openai
-certifi==2026.7.22
+certifi==2026.10.23
     # via
     #   httpcore
     #   httpx
@@ -40,26 +40,26 @@ idna==3.20
     #   anyio
     #   httpx
     #   requests
-jiter==0.17.0
+jiter==0.18.0
     # via
     #   anthropic
     #   openai
-jsonpatch==1.35
+jsonpatch==1.44
     # via langchain-core
-jsonpointer==3.2.1
+jsonpointer==3.10
     # via jsonpatch
-langchain-anthropic==1.7.6
+langchain-anthropic==1.7.10
     # via langsmith-data-migration-tool (pyproject.toml)
-langchain-core==1.6.11
+langchain-core==1.7.6
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-anthropic
     #   langchain-openai
-langchain-openai==1.7.2
+langchain-openai==1.7.4
     # via langsmith-data-migration-tool (pyproject.toml)
-langchain-protocol==0.0.19
+langchain-protocol==0.0.21
     # via langchain-core
-langsmith==0.14.11
+langsmith==0.14.17
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   langchain-core
@@ -74,7 +74,7 @@ mdit-py-plugins==0.6.1
     # via textual
 mdurl==0.1.2
     # via markdown-it-py
-openai==3.31.0
+openai==3.46.0
     # via langchain-openai
 orjson==3.13.0
     # via langsmith
@@ -82,16 +82,16 @@ packaging==26.3
     # via
     #   langchain-core
     #   langsmith
-platformdirs==4.13.3
+platformdirs==4.14.5
     # via textual
-pydantic==2.14.1
+pydantic==2.14.3
     # via
     #   anthropic
     #   langchain-anthropic
     #   langchain-core
     #   langsmith
     #   openai
-pydantic-core==2.50.1
+pydantic-core==2.50.4
     # via pydantic
 pygments==2.21.0
     # via
@@ -139,7 +139,7 @@ typing-extensions==4.16.0
     #   pydantic-core
     #   textual
     #   typing-inspection
-typing-inspection==0.4.4
+typing-inspection==0.4.5
     # via pydantic
 uc-micro-py==2.0.0
     # via linkify-it-py
@@ -147,13 +147,13 @@ urllib3==2.8.0
     # via
     #   langsmith-data-migration-tool (pyproject.toml)
     #   requests
-uuid-utils==1.0.0
+uuid-utils==1.2.0
     # via
     #   langchain-core
     #   langsmith
-websockets==17.2
+websockets==17.4
     # via langsmith
-xxhash==4.0.1
+xxhash==4.0.2
     # via langsmith
 zstandard==0.25.0
     # via langsmith

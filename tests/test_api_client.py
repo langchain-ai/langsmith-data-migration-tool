@@ -367,7 +367,10 @@ def test_prepare_url_absolute_url_passthrough():
         (403, "This API key is org-scoped and requires workspace specification. Please provide 'X-Tenant-ID' header.", 403, False),
         (403, "This API key is org-scoped and requires workspace specification. Please provide 'X-Tenant-ID' header.", 404, False),
         (401, "Invalid API key", 200, False),
-        (403, "Permission denied", 200, False),
+        # BYOC deployments reject org keys on /datasets with a bare "Forbidden".
+        (403, "Forbidden", 200, True),
+        (403, "Forbidden", 403, False),
+        (403, "Permission denied", 404, False),
         (200, "", 200, True),
     ],
 )
@@ -411,10 +414,14 @@ def test_connection_auth_over_http(base_path, dataset_status, detail, workspace_
         assert all("health" not in path for path, _ in seen)
         assert all(tenant is None for _, tenant in seen)
         assert "X-Tenant-Id" not in client.session.headers
-        if dataset_status == 403 and "org-scoped" in detail:
+        if dataset_status == 403:
             assert seen[1][0] == "/api/v1/workspaces"
+            if workspace_status == 404:
+                assert seen[2][0] == "/api/v1/orgs/current/workspaces"
         else:
             assert len(seen) == 1
+        if dataset_status == 403 and not expected:
+            assert "Access denied for" in error and "datasets" in error
     finally:
         server.shutdown()
         server.server_close()
@@ -444,3 +451,19 @@ def test_scoped_connection_does_not_bypass_workspace_rejection(monkeypatch):
     monkeypatch.setattr(client.session, "get", get)
     assert client.test_connection()[0] is False
     get.assert_called_once()
+
+
+def test_org_key_connection_skips_workspace_route_that_answers_405(monkeypatch):
+    """BYOC data planes answer 405 on GET /workspaces; try the next endpoint."""
+    client = _client()
+    url = client.base_url
+    get = Mock(side_effect=[
+        _response("GET", url + "/datasets", 403, json_body={"detail": "Forbidden"}),
+        _response("GET", url + "/workspaces", 405, json_body={"detail": "Method Not Allowed"}),
+        _response("GET", url + "/orgs/current/workspaces", 200, json_body=[{"id": "ws-1"}]),
+    ])
+    monkeypatch.setattr(client.session, "get", get)
+
+    assert client.test_connection() == (True, None)
+    assert get.call_args_list[-1].args[0] == url + "/orgs/current/workspaces"
+

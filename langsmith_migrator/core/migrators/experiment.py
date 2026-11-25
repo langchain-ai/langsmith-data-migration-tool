@@ -1,11 +1,14 @@
 """Experiment migration logic."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from typing import Dict, List, Any, Optional, Tuple
 import copy
+import threading
 import uuid
 
 from .base import BaseMigrator
+from ..run_query import RunQuery
 from ...utils.time_shift import shift_experiment_payload, shift_run_payload
 
 
@@ -13,6 +16,14 @@ class ExperimentMigrator(BaseMigrator):
     """Handles experiment and run migration."""
 
     _RUN_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "langsmith-data-migration-tool/runs")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Destination dataset ID -> {"ids": set, "names": {name: id}}. Filled by
+        # one listing per dataset instead of one listing per experiment.
+        self._dest_experiment_index: Dict[str, Dict[str, Any]] = {}
+        self._index_guard = threading.Lock()
+        self._index_locks: Dict[str, threading.Lock] = {}
 
     @property
     def _preserve_ids(self) -> bool:
@@ -206,40 +217,52 @@ class ExperimentMigrator(BaseMigrator):
 
         return extra_copy
 
+    def list_experiment_summaries(self, dataset_id: str) -> List[Dict[str, Any]]:
+        """List a dataset's experiments as the paginated listing returns them."""
+        return [
+            experiment
+            for experiment in self.source.get_paginated(
+                "/sessions",
+                params={"reference_dataset": dataset_id}
+            )
+            if isinstance(experiment, dict)
+        ]
+
+    def fetch_experiment_details(self, experiment: Dict[str, Any]) -> Dict[str, Any]:
+        """Full experiment details, including evaluators in the 'extra' field.
+
+        Falls back to the summary when the detail fetch fails.
+        """
+        exp_id = experiment.get('id')
+        if not exp_id:
+            return experiment
+        try:
+            full_experiment = self.source.get(f"/sessions/{exp_id}")
+        except Exception as e:
+            self.log(f"Failed to fetch full details for experiment {exp_id}: {e}", "warning")
+            return experiment
+        if full_experiment.get('extra'):
+            has_evaluators = any(
+                key in full_experiment['extra']
+                for key in ['evaluators', 'comparative_experiment_evaluators', 'dataset_evaluators']
+            )
+            if has_evaluators:
+                self.log(f"Found evaluators in experiment '{full_experiment.get('name', exp_id)}'", "info")
+        return full_experiment
+
     def list_experiments(self, dataset_id: str) -> List[Dict[str, Any]]:
         """
         List experiments for a dataset.
 
-        Fetches full experiment details including evaluators in the 'extra' field.
+        Fetches full experiment details including evaluators in the 'extra' field,
+        in parallel, keeping the listing order.
         """
-        experiments = []
-        for experiment in self.source.get_paginated(
-            "/sessions",
-            params={"reference_dataset": dataset_id}
-        ):
-            if isinstance(experiment, dict):
-                # Get the full experiment details to ensure we have all metadata
-                # including evaluators in the 'extra' field
-                exp_id = experiment.get('id')
-                if exp_id:
-                    try:
-                        full_experiment = self.source.get(f"/sessions/{exp_id}")
-                        # Log if we find evaluators
-                        if full_experiment.get('extra'):
-                            has_evaluators = any(
-                                key in full_experiment['extra']
-                                for key in ['evaluators', 'comparative_experiment_evaluators', 'dataset_evaluators']
-                            )
-                            if has_evaluators:
-                                self.log(f"Found evaluators in experiment '{full_experiment.get('name', exp_id)}'", "info")
-                        experiments.append(full_experiment)
-                    except Exception as e:
-                        self.log(f"Failed to fetch full details for experiment {exp_id}: {e}", "warning")
-                        # Fall back to the summary data if full fetch fails
-                        experiments.append(experiment)
-                else:
-                    experiments.append(experiment)
-        return experiments
+        summaries = self.list_experiment_summaries(dataset_id)
+        if len(summaries) <= 1:
+            return [self.fetch_experiment_details(e) for e in summaries]
+        workers = max(1, min(self.config.migration.concurrent_workers, len(summaries)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(self.fetch_experiment_details, summaries))
 
     def _find_experiment_by_id(self, experiment_id: str, dataset_id: str) -> bool:
         """True when the destination has this experiment on the given dataset."""
@@ -253,6 +276,67 @@ class ExperimentMigrator(BaseMigrator):
             and str(response.get("reference_dataset_id")) == str(dataset_id)
         )
 
+    def _find_experiment_by_name(self, name: str, dataset_id: str) -> Optional[str]:
+        """Destination experiment ID matching the name on the dataset, if any."""
+        try:
+            for exp in self.dest.get_paginated(
+                "/sessions",
+                params={"reference_dataset": dataset_id}
+            ):
+                if isinstance(exp, dict) and exp.get("name") == name:
+                    return exp.get("id")
+            return None
+        except Exception as e:
+            self.log(f"Failed to check for existing experiment: {e}", "warning")
+            return None
+
+    def _dest_experiments(self, dataset_id: str) -> Optional[Dict[str, Any]]:
+        """Cached index of the destination experiments on a dataset.
+
+        Listed once per dataset under a per-dataset lock, so parallel workers on
+        the same dataset wait for one listing instead of each running their
+        own. Returns None, and caches nothing, when the listing fails; callers
+        then fall back to per-experiment lookups.
+        """
+        with self._index_guard:
+            cached = self._dest_experiment_index.get(dataset_id)
+            if cached is not None:
+                return cached
+            lock = self._index_locks.setdefault(dataset_id, threading.Lock())
+        with lock:
+            with self._index_guard:
+                cached = self._dest_experiment_index.get(dataset_id)
+            if cached is not None:
+                return cached
+            ids: set = set()
+            names: Dict[str, str] = {}
+            try:
+                for experiment in self.dest.get_paginated(
+                    "/sessions",
+                    params={"reference_dataset": dataset_id},
+                    raise_errors=True,
+                ):
+                    if not isinstance(experiment, dict) or not experiment.get("id"):
+                        continue
+                    ids.add(experiment["id"])
+                    if experiment.get("name") is not None:
+                        names.setdefault(experiment["name"], experiment["id"])
+            except Exception as e:
+                self.log(f"Failed to list destination experiments for dataset {dataset_id}: {e}", "warning")
+                return None
+            index = {"ids": ids, "names": names}
+            with self._index_guard:
+                self._dest_experiment_index[dataset_id] = index
+            return index
+
+    def _register_dest_experiment(self, dataset_id: str, experiment_id: str, name: str) -> None:
+        """Add a just-created experiment to the cached index, if the dataset has one."""
+        with self._index_guard:
+            index = self._dest_experiment_index.get(dataset_id)
+            if index is not None:
+                index["ids"].add(experiment_id)
+                index["names"].setdefault(name, experiment_id)
+
     def find_existing_experiment(
         self, name: str, dataset_id: str, experiment_id: Optional[str] = None
     ) -> Optional[str]:
@@ -264,6 +348,9 @@ class ExperimentMigrator(BaseMigrator):
         because creating the experiment under its source ID would collide on the
         name.
 
+        Lookups use one cached listing of the dataset's destination experiments;
+        if that listing fails they fall back to per-experiment requests.
+
         Args:
             name: Experiment name
             dataset_id: Reference dataset ID
@@ -272,10 +359,16 @@ class ExperimentMigrator(BaseMigrator):
         Returns:
             The experiment ID if found, None otherwise
         """
+        index = self._dest_experiments(dataset_id)
         if self._preserve_ids and experiment_id:
-            if self._find_experiment_by_id(experiment_id, dataset_id):
+            if index is not None:
+                found_by_id = experiment_id in index["ids"]
+                by_name = index["names"].get(name)
+            else:
+                found_by_id = self._find_experiment_by_id(experiment_id, dataset_id)
+                by_name = None if found_by_id else self._find_experiment_by_name(name, dataset_id)
+            if found_by_id:
                 return experiment_id
-            by_name = self._find_experiment_by_name(name, dataset_id)
             if by_name and by_name != experiment_id:
                 from ..api_client import APIError
                 raise APIError(
@@ -283,29 +376,9 @@ class ExperimentMigrator(BaseMigrator):
                     f"{experiment_id}; rename or delete it, or migrate without --preserve-ids"
                 )
             return None
+        if index is not None:
+            return index["names"].get(name)
         return self._find_experiment_by_name(name, dataset_id)
-
-    def _find_experiment_by_name(self, name: str, dataset_id: str) -> Optional[str]:
-        """Destination experiment ID matching the name on the dataset, if any."""
-        try:
-            # List experiments for the dataset
-            experiments = []
-            for experiment in self.dest.get_paginated(
-                "/sessions",
-                params={"reference_dataset": dataset_id}
-            ):
-                if isinstance(experiment, dict):
-                    experiments.append(experiment)
-
-            # Find by name
-            for exp in experiments:
-                if exp.get("name") == name:
-                    return exp.get("id")
-
-            return None
-        except Exception as e:
-            self.log(f"Failed to check for existing experiment: {e}", "warning")
-            return None
 
     def update_experiment(self, experiment_id: str, experiment: Dict[str, Any]) -> None:
         """Update existing experiment in destination."""
@@ -384,6 +457,7 @@ class ExperimentMigrator(BaseMigrator):
             from ..api_client import APIError
             raise APIError(f"Invalid response creating experiment: missing 'id' field. Response: {response}")
 
+        self._register_dest_experiment(new_dataset_id, response["id"], payload["name"])
         return response["id"]
 
     def migrate_runs_streaming(
@@ -411,7 +485,7 @@ class ExperimentMigrator(BaseMigrator):
         """
         run_id_mapping: Dict[str, str] = {}
         if self.state:
-            run_id_mapping.update(self.state.id_mappings.get("run", {}))
+            run_id_mapping.update(self.state.mapping_snapshot("run"))
 
         if self.config.migration.dry_run:
             self.log("[DRY RUN] Would migrate runs")
@@ -427,6 +501,8 @@ class ExperimentMigrator(BaseMigrator):
         total_skipped = 0
         total_failed = 0
 
+        run_query = RunQuery(self)
+
         # Query runs for EACH experiment separately
         # The LangSmith /runs/query API only processes the first session ID when given a list
         for exp_idx, experiment_id in enumerate(experiment_ids, 1):
@@ -434,6 +510,10 @@ class ExperimentMigrator(BaseMigrator):
             experiment_item_id = self._experiment_item_id(experiment_id)
             experiment_item = self.state.get_item(experiment_item_id) if self.state else None
             start_cursor = experiment_item.metadata.get("run_cursor") if experiment_item else None
+            saved_cursor_api = (
+                experiment_item.metadata.get("run_cursor_api", "v1") if experiment_item else "v1"
+            )
+            cursor_api: Optional[str] = None
             pending_run_mapping: Dict[str, str] = {}
             batch: List[Dict[str, Any]] = []
             experiment_runs_created = 0
@@ -455,8 +535,15 @@ class ExperimentMigrator(BaseMigrator):
                 if created_mapping:
                     run_id_mapping.update(created_mapping)
                     if self.state:
+                        # Kept so feedback can send each run's start_time with its
+                        # trace_id, which spares the server a run lookup.
+                        start_times = {run.get("id"): run.get("start_time") for run in batch}
                         for old_id, new_id in created_mapping.items():
                             self.state.set_mapped_id("run", old_id, new_id)
+                            if start_times.get(new_id):
+                                self.state.set_mapped_id(
+                                    "run_start_time", new_id, start_times[new_id]
+                                )
                         self.persist_state()
                     self.log(
                         f"Created batch of {len(created_mapping)} runs (total: {total_runs})",
@@ -510,7 +597,18 @@ class ExperimentMigrator(BaseMigrator):
             while True:
                 page_num += 1
                 try:
-                    response = self.source.post("/runs/query", payload)
+                    if cursor_api is None:
+                        cursor_api = "v2" if run_query.uses_v2("source", experiment_id) else "v1"
+                        if payload.get("cursor") and saved_cursor_api != cursor_api:
+                            # A cursor only means something to the endpoint that issued
+                            # it. Start over; runs already replayed are skipped below.
+                            self.log(
+                                f"Ignoring the saved run cursor for experiment {experiment_id}: "
+                                f"it came from the {saved_cursor_api} run query, not {cursor_api}",
+                                "warning",
+                            )
+                            del payload["cursor"]
+                    runs, next_cursor = run_query.page("source", payload)
                 except Exception as e:
                     # Do not swallow this. Breaking out leaves the failure counter at
                     # zero, so the caller concludes the run stage succeeded and moves
@@ -542,8 +640,6 @@ class ExperimentMigrator(BaseMigrator):
                                 command="langsmith-migrator resume",
                             )
                     raise
-
-                runs = response.get("runs", [])
 
                 # Sort runs by dotted_order to ensure parents are processed before children
                 # dotted_order format: {timestamp}Z{uuid}.{timestamp}Z{uuid}...
@@ -654,8 +750,6 @@ class ExperimentMigrator(BaseMigrator):
                 flush_batch()
                 page_had_failures = experiment_failed_runs > failures_before_page
 
-                cursors = response.get("cursors")
-                next_cursor = cursors.get("next") if cursors else None
                 checkpoint_cursor = current_cursor if page_had_failures else next_cursor
 
                 if experiment_item:
@@ -664,6 +758,7 @@ class ExperimentMigrator(BaseMigrator):
                         stage="migrate_runs",
                         metadata={
                             "run_cursor": checkpoint_cursor,
+                            "run_cursor_api": cursor_api,
                             "run_failures": experiment_failed_runs,
                             "runs_migrated": experiment_runs_created,
                         },
