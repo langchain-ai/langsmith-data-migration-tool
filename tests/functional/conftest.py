@@ -323,6 +323,9 @@ class MigratorRegistry:
         self.chart.list_sessions.return_value = []
         self.chart.migrate_all_charts.return_value = {}
         self.chart.migrate_session_charts.return_value = {}
+        self.chart.migrate_dashboard_agent_links.return_value = {
+            "tagged": 0, "defaults": 0, "failed": 0,
+        }
 
 
 @dataclass

@@ -2920,6 +2920,9 @@ def test_charts_command_same_deployment_different_keys_uses_remap_mode(cli_harne
 
     assert result.exit_code == 0
     cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
+    cli_harness.migrators.chart.migrate_dashboard_agent_links.assert_called_once_with(
+        same_instance=False, source_session_id=None
+    )
     assert "auto-remap projects and sessions" in cli_harness.console.text
 
 
@@ -3709,6 +3712,64 @@ def test_charts_command_uses_saved_project_mapping_for_session_migration(cli_har
     assert "Mapped to destination session" in cli_harness.console.text
 
 
+def test_charts_command_copies_agent_links_for_the_selected_project(cli_harness):
+    cli_harness.orchestrator_factory.state = build_state(
+        "chart-session",
+        id_mappings={"project": {"source-session": "dest-session"}},
+    )
+    cli_harness.migrators.chart.list_sessions.return_value = [
+        {"id": "source-session", "name": "Session A"},
+    ]
+    cli_harness.migrators.chart.migrate_dashboard_agent_links.return_value = {
+        "tagged": 1, "defaults": 0, "failed": 0,
+    }
+
+    result = cli_harness.invoke(["charts", "--session", "Session A"])
+
+    assert result.exit_code == 0
+    cli_harness.migrators.chart.migrate_dashboard_agent_links.assert_called_once_with(
+        same_instance=False, source_session_id="source-session"
+    )
+    assert "Dashboard agent links: 1 tag(s) added" in cli_harness.console.text
+
+
+def test_charts_command_finishes_when_agent_links_fail(cli_harness):
+    cli_harness.orchestrator_factory.state = build_state(
+        "chart-session",
+        id_mappings={"project": {"source-session": "dest-session"}},
+    )
+    cli_harness.migrators.chart.list_sessions.return_value = [
+        {"id": "source-session", "name": "Session A"},
+    ]
+    cli_harness.migrators.chart.migrate_dashboard_agent_links.side_effect = RuntimeError("boom")
+
+    result = cli_harness.invoke(["charts", "--session", "Session A"])
+
+    assert result.exit_code == 0
+    assert "Dashboard agent links skipped: boom" in cli_harness.console.text
+
+
+def test_charts_command_dry_run_says_what_agent_links_would_do(cli_harness):
+    cli_harness.orchestrator_factory.state = build_state(
+        "chart-session",
+        id_mappings={"project": {"source-session": "dest-session"}},
+    )
+    cli_harness.migrators.chart.list_sessions.return_value = [
+        {"id": "source-session", "name": "Session A"},
+    ]
+    cli_harness.migrators.chart.migrate_dashboard_agent_links.return_value = {
+        "tagged": 1, "defaults": 1, "failed": 0,
+    }
+
+    result = cli_harness.invoke(["--dry-run", "charts", "--session", "Session A"])
+
+    assert result.exit_code == 0
+    assert (
+        "Dashboard agent links (dry run): would add 1 tag(s) and set 1 default dashboard(s)"
+        in cli_harness.console.text
+    )
+
+
 def test_charts_command_session_uses_workspace_project_mappings(cli_harness):
     """Session-scoped chart migration should honor workspace/TUI project mappings."""
 
@@ -3924,6 +3985,9 @@ def test_migrate_all_chart_step_same_key_cross_workspace_uses_remap_mode(cli_har
 
     assert result.exit_code == 0
     cli_harness.migrators.chart.migrate_all_charts.assert_called_once_with(same_instance=False)
+    cli_harness.migrators.chart.migrate_dashboard_agent_links.assert_called_once_with(
+        same_instance=False, source_session_id=None
+    )
     assert "different workspaces" in cli_harness.console.text
     assert "auto-remap projects and sessions" in cli_harness.console.text
 

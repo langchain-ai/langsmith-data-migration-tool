@@ -1759,6 +1759,211 @@ class ChartMigrator(BaseMigrator):
 
         return all_mappings
 
+    def migrate_dashboard_agent_links(
+        self, same_instance: bool = False, source_session_id: Optional[str] = None
+    ) -> Dict[str, int]:
+        """Copy dashboards' Agent tags and agent environments' default dashboards.
+
+        Agents are matched by ID and dashboards by title, as charts are, and only
+        dashboards that source charts go to are linked. A default dashboard is set on
+        the project of the destination agent's environment with the same name, and
+        only when the project mapping points at that project too.
+        With ``source_session_id``, only that project's environment and the
+        dashboards holding its charts are touched.
+
+        Best effort: a link that cannot be read or written is logged and counted as
+        failed, and the others still go ahead. Returns counts of tags added, default
+        dashboards set, and failures.
+        """
+        result = {"tagged": 0, "defaults": 0, "failed": 0}
+        try:
+            source_agents = self._list_agents(self.source)
+            dest_agents = {a["id"]: a for a in self._list_agents(self.dest)}
+            agents = [a for a in source_agents if a.get("id") in dest_agents]
+            dashboards = self._dashboard_id_map() if agents else {}
+            if dashboards:
+                # Only dashboards that source charts go to; a same-titled destination
+                # dashboard holding none of them is someone else's.
+                held = self._dest_dashboards_holding()
+                dashboards = {s: d for s, d in dashboards.items() if d in held}
+        except NotFoundError:
+            return result  # An instance without agents.
+        except Exception as e:
+            self.log(f"Could not list agents or dashboards: {e}", "warning")
+            result["failed"] += 1
+            return result
+        if not dashboards:
+            return result
+
+        agent_tags = {
+            a["tag_value_id"]: dest_agents[a["id"]]["tag_value_id"]
+            for a in agents
+            if a.get("tag_value_id") and dest_agents[a["id"]].get("tag_value_id")
+        }
+        if agent_tags:
+            tag_scope = dashboards
+            if source_session_id:
+                in_project = self._dest_dashboards_holding(source_session_id)
+                tag_scope = {s: d for s, d in dashboards.items() if d in in_project}
+            for source_id, dest_id in tag_scope.items():
+                try:
+                    result["tagged"] += self._copy_agent_tags(source_id, dest_id, agent_tags)
+                except Exception as e:
+                    self.log(f"Could not tag dashboard {dest_id} with its agent: {e}", "warning")
+                    result["failed"] += 1
+
+        for agent in agents:
+            dest_envs = {
+                env.get("environment"): env
+                for env in dest_agents[agent["id"]].get("environments") or []
+            }
+            for env in agent.get("environments") or []:
+                if source_session_id and env.get("tracer_session_id") != source_session_id:
+                    continue
+                dest_env = dest_envs.get(env.get("environment"))
+                if not dest_env:
+                    continue
+                dest_project_id = dest_env.get("tracer_session_id")
+                try:
+                    mapped = self.resolve_destination_session_id(
+                        env["tracer_session_id"], same_instance=same_instance
+                    )
+                    if mapped != dest_project_id:
+                        self.log(
+                            f"Leaving the default dashboard of project {dest_project_id} "
+                            f"alone: its source project maps to {mapped or 'no project'}",
+                            "info",
+                        )
+                        continue
+                    result["defaults"] += self._copy_default_dashboard(
+                        env["tracer_session_id"], dest_project_id, dashboards
+                    )
+                except Exception as e:
+                    self.log(
+                        f"Could not set the default dashboard of project {dest_project_id}: {e}",
+                        "warning",
+                    )
+                    result["failed"] += 1
+        return result
+
+    def _dest_dashboards_holding(self, session_id: Optional[str] = None) -> set:
+        """Destination dashboards that source charts (of one project, if given) go to."""
+        return {
+            self._get_dest_section_id(chart.get("_source_section_title"))
+            for chart in self.list_charts(session_id)
+        }
+
+    @staticmethod
+    def _list_agents(client) -> List[Dict[str, Any]]:
+        """Every agent in the workspace. Unlike get_cursor_paginated, a failed page raises."""
+        agents: List[Dict[str, Any]] = []
+        # The default order is by latest run, which can change while the list is read.
+        params: Dict[str, Any] = {"page_size": 100, "sort_by": "created_at"}
+        while True:
+            page = client.get("/agents", params=params)
+            page = page if isinstance(page, dict) else {}
+            agents.extend(page.get("items") or [])
+            cursor = page.get("next_cursor")
+            if not cursor or cursor == params.get("cursor"):
+                return agents
+            params = {**params, "cursor": cursor}
+
+    def _dashboard_id_map(self) -> Dict[str, str]:
+        """Source dashboard ID -> destination dashboard ID, matched by title.
+
+        A title shared by several source dashboards is skipped, since the
+        destination can't tell them apart. Unlike get_paginated, a failed page raises.
+        """
+        sections: Dict[str, Dict[str, Any]] = {}
+        offset = 0
+        while True:
+            # Oldest first, so a dashboard created meanwhile doesn't shift the pages.
+            params = {"limit": 100, "offset": offset, "sort_by": "created_at", "sort_by_desc": "false"}
+            page = self.source.get("/charts/section", params=params)
+            page = page if isinstance(page, list) else []
+            for section in page:
+                sections.setdefault(section.get("id"), section)
+            offset += len(page)
+            if len(page) < 100:
+                break
+        by_title, duplicates = unique_name_map(sections.values(), name_key="title")
+        for title in duplicates:
+            self.log(f"Skipping agent links of dashboards titled {title!r}: not unique", "warning")
+        dashboards = {}
+        for title, source_id in by_title.items():
+            dest_id = self._get_dest_section_id(title)
+            if dest_id:
+                dashboards[source_id] = dest_id
+        return dashboards
+
+    def _copy_agent_tags(
+        self, source_id: str, dest_id: str, agent_tags: Dict[str, str]
+    ) -> int:
+        """Tag a destination dashboard with the agents its source is tagged with."""
+
+        def tags(client, dashboard_id):
+            params = {"resource_type": "dashboard", "resource_id": dashboard_id}
+            return client.get("/workspaces/current/tags/resource", params=params) or []
+
+        wanted = [
+            agent_tags[value["id"]]
+            for tag in tags(self.source, source_id)
+            for value in tag.get("values") or []
+            if value.get("id") in agent_tags
+        ]
+        if not wanted:
+            return 0
+        present = {
+            value.get("id") for tag in tags(self.dest, dest_id) for value in tag.get("values") or []
+        }
+        added = 0
+        for value_id in wanted:
+            if value_id in present:
+                continue
+            if self.config.migration.dry_run:
+                self.log(f"[DRY RUN] Would tag dashboard {dest_id} with its agent", "info")
+            else:
+                self.log(f"Tagging dashboard {dest_id} with its agent", "info")
+                self.dest.post("/workspaces/current/taggings", {
+                    "tag_value_id": value_id,
+                    "resource_type": "dashboard",
+                    "resource_id": dest_id,
+                })
+            present.add(value_id)
+            added += 1
+        return added
+
+    def _copy_default_dashboard(
+        self, source_project_id: str, dest_project_id: str, dashboards: Dict[str, str]
+    ) -> int:
+        """Point a destination project at its source project's default dashboard."""
+        source_default = self._project_metadata(self.source, source_project_id).get(
+            "default_dashboard_id"
+        )
+        dest_dashboard = dashboards.get(source_default)
+        if not dest_dashboard:
+            return 0
+        metadata = self._project_metadata(self.dest, dest_project_id)
+        current = metadata.get("default_dashboard_id")
+        # With --skip-existing, a default the destination already has is kept.
+        if current == dest_dashboard or (current and self.config.migration.skip_existing):
+            return 0
+        if self.config.migration.dry_run:
+            self.log(f"[DRY RUN] Would set the default dashboard of project {dest_project_id}")
+        else:
+            self.log(f"Setting default dashboard of project {dest_project_id}", "info")
+            # PATCH replaces extra.metadata as a whole, so send the existing keys too.
+            self.dest.patch(
+                f"/sessions/{dest_project_id}",
+                {"extra": {"metadata": {**metadata, "default_dashboard_id": dest_dashboard}}},
+            )
+        return 1
+
+    @staticmethod
+    def _project_metadata(client, project_id: str) -> Dict[str, Any]:
+        project = client.get(f"/sessions/{project_id}") or {}
+        return (project.get("extra") or {}).get("metadata") or {}
+
     def _extract_session_id(self, chart: Dict[str, Any]) -> Optional[str]:
         """Extract session/project ID from chart config."""
         found = self._find_session_dependency(chart)

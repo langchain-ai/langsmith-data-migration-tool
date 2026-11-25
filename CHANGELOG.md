@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Dashboards keep their agent links**: `charts` and `migrate-all` re-apply each
+  dashboard's Agent tag, and set each agent environment's default dashboard on
+  the destination agent's environment of the same name, when the project
+  mapping points at that project too. Agents are matched by ID, and dashboards
+  by title; only dashboards that source charts go to are linked, and a title
+  shared by several source dashboards is skipped.
+  `charts --session` only touches that project's environment and the dashboards
+  holding its charts, and `--skip-existing` keeps a default dashboard the
+  destination already has. A link that can't be read or written is counted as
+  failed and the run carries on.
+
 ### Fixed
 - **Sectioned charts on re-run and verification**: the destination chart
   listing nests charts under their section without a `section_id` on each

@@ -1500,6 +1500,301 @@ def test_create_chart_exports_skipped_v2_conversion_on_update(sample_config, mig
     assert item.outcome_code == "chart_v2_conversion_skipped"
 
 
+def _agent_link_clients(*, dest_tagged=False, dest_metadata=None, envs=None, dashboards=None):
+    """Agent "a1" tags every source dashboard; its projects default to the first one.
+
+    The source also has agent "a2", which the destination doesn't, so it is ignored.
+    """
+    envs = envs or {"PRODUCTION": ("src-proj", "dst-proj")}
+    dashboards = dashboards or [{"id": "src-dash", "title": "Health"}]
+
+    def agents(tag, side):
+        environments = [
+            {"environment": name, "tracer_session_id": projects[side]}
+            for name, projects in envs.items()
+        ]
+        items = [{"id": "a1", "tag_value_id": tag, "environments": environments}]
+        if side == 0:
+            items.append({"id": "a2", "tag_value_id": "src-tag-2", "environments": environments})
+        return {"items": items, "next_cursor": None}
+
+    def source_get(path, params=None):
+        if path == "/agents":
+            return agents("src-tag", 0)
+        if path == "/charts/section":
+            return dashboards
+        if path.endswith("tags/resource"):
+            return [{"key": "Agent", "values": [{"id": "src-tag"}]}]
+        return {"extra": {"metadata": {"default_dashboard_id": dashboards[0]["id"]}}}
+
+    dest_tags = [{"key": "Agent", "values": [{"id": "dst-tag"}]}] if dest_tagged else []
+
+    def dest_get(path, params=None):
+        if path == "/agents":
+            return agents("dst-tag", 1)
+        if path.endswith("tags/resource"):
+            return dest_tags
+        return {"extra": {"metadata": dest_metadata or {"keep": 1}}}
+
+    source, dest = _mock_client(), _mock_client()
+    source.get.side_effect = source_get
+    dest.get.side_effect = dest_get
+    return source, dest
+
+
+def _agent_link_migrator(source, dest, config, state, *, dest_dashboards=None, project_map=None):
+    migrator = ChartMigrator(source, dest, state, config)
+    migrator._dest_section_map = dest_dashboards or {"Health": "dst-dash"}
+    migrator._project_id_map = project_map or {"src-proj": "dst-proj", "src-other": "dst-other"}
+    migrator._project_mapping_complete = True
+    # Every destination dashboard holds source charts unless a test says otherwise.
+    migrator.list_charts = Mock(
+        return_value=[{"_source_section_title": t} for t in migrator._dest_section_map]
+    )
+    return migrator
+
+
+def test_dashboard_agent_links_copies_tag_and_default(sample_config, migration_state):
+    source, dest = _agent_link_clients()
+
+    result = _agent_link_migrator(
+        source, dest, sample_config, migration_state
+    ).migrate_dashboard_agent_links()
+
+    assert result == {"tagged": 1, "defaults": 1, "failed": 0}
+    dest.post.assert_called_once_with("/workspaces/current/taggings", {
+        "tag_value_id": "dst-tag", "resource_type": "dashboard", "resource_id": "dst-dash",
+    })
+    # The default goes on the destination agent's own production project.
+    dest.patch.assert_called_once_with(
+        "/sessions/dst-proj",
+        {"extra": {"metadata": {"keep": 1, "default_dashboard_id": "dst-dash"}}},
+    )
+
+
+def test_dashboard_agent_links_writes_nothing_in_dry_run(sample_config, migration_state):
+    sample_config.migration.dry_run = True
+    source, dest = _agent_link_clients()
+
+    result = _agent_link_migrator(
+        source, dest, sample_config, migration_state
+    ).migrate_dashboard_agent_links()
+
+    assert result == {"tagged": 1, "defaults": 1, "failed": 0}  # the dashboard already exists
+    dest.post.assert_not_called()
+    dest.patch.assert_not_called()
+
+
+def test_dashboard_agent_links_rerun_writes_nothing(sample_config, migration_state):
+    source, dest = _agent_link_clients(
+        dest_tagged=True, dest_metadata={"default_dashboard_id": "dst-dash"}
+    )
+
+    result = _agent_link_migrator(
+        source, dest, sample_config, migration_state
+    ).migrate_dashboard_agent_links()
+
+    assert result == {"tagged": 0, "defaults": 0, "failed": 0}
+    dest.post.assert_not_called()
+    dest.patch.assert_not_called()
+
+
+def test_dashboard_agent_links_keeps_existing_default_with_skip_existing(
+    sample_config, migration_state
+):
+    sample_config.migration.skip_existing = True
+    source, dest = _agent_link_clients(dest_metadata={"default_dashboard_id": "other-dash"})
+
+    migrator = _agent_link_migrator(source, dest, sample_config, migration_state)
+    migrator.migrate_dashboard_agent_links()
+
+    dest.patch.assert_not_called()
+
+
+def test_dashboard_agent_links_leave_a_project_the_mapping_sends_elsewhere(
+    sample_config, migration_state
+):
+    """The agent's environment and the project mapping must agree on the project."""
+    source, dest = _agent_link_clients()
+
+    result = _agent_link_migrator(
+        source, dest, sample_config, migration_state, project_map={"src-proj": "dst-elsewhere"}
+    ).migrate_dashboard_agent_links()
+
+    assert result["defaults"] == 0
+    dest.patch.assert_not_called()
+
+
+def test_dashboard_agent_links_failures_do_not_stop_the_rest(sample_config, migration_state):
+    """A tag the key may not write and a project it can't read are counted; the run goes on."""
+    from langsmith_migrator.core.api_client import AuthenticationError
+
+    source, dest = _agent_link_clients(
+        envs={"PRODUCTION": ("src-proj", "dst-proj"), "STAGING": ("src-other", "dst-other")},
+    )
+    dest.post.side_effect = AuthenticationError("Forbidden", status_code=403)
+    listing = dest.get.side_effect
+
+    def dest_get(path, params=None):
+        if path == "/sessions/dst-proj":
+            raise APIError("Server error", status_code=500)
+        return listing(path, params)
+
+    dest.get.side_effect = dest_get
+
+    result = _agent_link_migrator(
+        source, dest, sample_config, migration_state
+    ).migrate_dashboard_agent_links()
+
+    assert result == {"tagged": 0, "defaults": 1, "failed": 2}
+    assert [c.args[0] for c in dest.patch.call_args_list] == ["/sessions/dst-other"]
+
+
+def test_dashboard_agent_links_counts_a_failed_listing(sample_config, migration_state):
+    from langsmith_migrator.core.api_client import AuthenticationError
+
+    source, dest = _agent_link_clients()
+    listing = dest.get.side_effect
+
+    def dest_get(path, params=None):
+        if path == "/agents":
+            raise AuthenticationError("Forbidden", status_code=403)
+        return listing(path, params)
+
+    dest.get.side_effect = dest_get
+
+    result = _agent_link_migrator(
+        source, dest, sample_config, migration_state
+    ).migrate_dashboard_agent_links()
+
+    assert result == {"tagged": 0, "defaults": 0, "failed": 1}
+    dest.post.assert_not_called()
+
+
+def test_dashboard_agent_links_for_one_project_leaves_the_others(sample_config, migration_state):
+    source, dest = _agent_link_clients(
+        envs={"PRODUCTION": ("src-proj", "dst-proj"), "STAGING": ("src-other", "dst-other")},
+        dashboards=[{"id": "src-dash", "title": "Health"}, {"id": "src-ops", "title": "Ops"}],
+    )
+    migrator = _agent_link_migrator(
+        source, dest, sample_config, migration_state,
+        dest_dashboards={"Health": "dst-dash", "Ops": "dst-ops"},
+    )
+    migrator.list_charts = Mock(side_effect=lambda session_id=None: (
+        [{"_source_section_title": "Ops"}] if session_id == "src-other"
+        else [{"_source_section_title": "Health"}, {"_source_section_title": "Ops"}]
+    ))
+
+    migrator.migrate_dashboard_agent_links(source_session_id="src-other")
+
+    assert "src-other" in [c.args[0] for c in migrator.list_charts.call_args_list if c.args]
+    assert [c.args[1]["resource_id"] for c in dest.post.call_args_list] == ["dst-ops"]
+    assert [c.args[0] for c in dest.patch.call_args_list] == ["/sessions/dst-other"]
+
+
+def test_dashboard_agent_links_skip_dashboards_with_a_shared_title(sample_config, migration_state):
+    """Two "Overview" dashboards can't be told apart, so neither gets linked."""
+    source, dest = _agent_link_clients(
+        dashboards=[{"id": "src-a", "title": "Overview"}, {"id": "src-b", "title": "Overview"}],
+    )
+
+    result = _agent_link_migrator(
+        source, dest, sample_config, migration_state, dest_dashboards={"Overview": "dst-b"}
+    ).migrate_dashboard_agent_links()
+
+    assert result == {"tagged": 0, "defaults": 0, "failed": 0}
+    dest.post.assert_not_called()
+    dest.patch.assert_not_called()
+
+
+def test_dashboard_agent_links_read_every_page(sample_config, migration_state):
+    agents = _mock_client()
+    agents.get.side_effect = lambda path, params=None: (
+        {"items": [{"id": "a2"}], "next_cursor": None} if params.get("cursor")
+        else {"items": [{"id": "a1"}], "next_cursor": "c2"}
+    )
+    assert [a["id"] for a in ChartMigrator._list_agents(agents)] == ["a1", "a2"]
+    assert all(c.kwargs["params"]["sort_by"] == "created_at" for c in agents.get.call_args_list)
+
+    # Offset pages overlap here, so T99 comes back twice; it is still one dashboard,
+    # not a shared title.
+    sections = [{"id": f"s{i}", "title": f"T{i}"} for i in range(101)]
+    source = _mock_client()
+    source.get.side_effect = lambda path, params=None: (
+        sections[max(params["offset"] - 1, 0):params["offset"] + params["limit"] - 1]
+        if params["offset"] else sections[:100]
+    )
+    migrator = ChartMigrator(source, _mock_client(), migration_state, sample_config)
+    migrator._dest_section_map = {"T99": "d99", "T100": "d100"}
+
+    assert migrator._dashboard_id_map() == {"s99": "d99", "s100": "d100"}
+    sorts = {(c.kwargs["params"]["sort_by"], c.kwargs["params"]["sort_by_desc"])
+             for c in source.get.call_args_list}
+    assert sorts == {("created_at", "false")}
+
+
+def test_dashboard_agent_links_stop_on_a_repeated_cursor():
+    agents = _mock_client()
+    calls = []
+
+    def get(path, params=None):
+        calls.append(params)
+        assert len(calls) < 5, "kept asking for the same page"
+        return {"items": [{"id": "a1"}], "next_cursor": "same"}
+
+    agents.get.side_effect = get
+
+    assert [a["id"] for a in ChartMigrator._list_agents(agents)] == ["a1", "a1"]
+
+
+def test_dashboard_agent_links_skip_a_destination_agent_without_a_tag(
+    sample_config, migration_state
+):
+    source, dest = _agent_link_clients()
+    listing = dest.get.side_effect
+    dest.get.side_effect = lambda path, params=None: (
+        {"items": [{**listing(path, params)["items"][0], "tag_value_id": None}],
+         "next_cursor": None}
+        if path == "/agents" else listing(path, params)
+    )
+
+    result = _agent_link_migrator(
+        source, dest, sample_config, migration_state
+    ).migrate_dashboard_agent_links()
+
+    assert result["tagged"] == 0
+    dest.post.assert_not_called()
+
+
+def test_dashboard_agent_links_leave_a_dashboard_no_source_chart_goes_to(
+    sample_config, migration_state
+):
+    """A same-titled destination dashboard holding none of the source's charts isn't theirs."""
+    source, dest = _agent_link_clients()
+    migrator = _agent_link_migrator(source, dest, sample_config, migration_state)
+    migrator.list_charts = Mock(return_value=[])
+
+    result = migrator.migrate_dashboard_agent_links()
+
+    assert result == {"tagged": 0, "defaults": 0, "failed": 0}
+    dest.post.assert_not_called()
+    dest.patch.assert_not_called()
+
+
+def test_dashboard_agent_links_skips_instances_without_agents(sample_config, migration_state):
+    from langsmith_migrator.core.api_client import NotFoundError
+
+    source, dest = _mock_client(), _mock_client()
+    source.get.side_effect = NotFoundError("no agents", status_code=404)
+
+    result = ChartMigrator(
+        source, dest, migration_state, sample_config
+    ).migrate_dashboard_agent_links()
+
+    assert result == {"tagged": 0, "defaults": 0, "failed": 0}
+    dest.post.assert_not_called()
+
+
 def _sectioned_listing(chart: dict) -> dict:
     """Shape of POST /charts: charts nested in sections, without their own section_id."""
     listed = {k: v for k, v in chart.items() if k != "section_id"}
