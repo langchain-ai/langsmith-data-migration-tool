@@ -21,6 +21,7 @@ from langsmith_migrator.core.migrators.trace import (
     TracePreflightError,
 )
 from langsmith_migrator.core.trace_domain import Reconciliation, Window
+from langsmith_migrator.utils.retry import ConflictError
 from langsmith_migrator.core.trace_frames import DEFAULT_COMPRESS_LEVEL, CompiledFrame
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
@@ -494,11 +495,9 @@ def test_the_tier_is_not_restored_while_a_session_is_incomplete(sample_config):
 # Pre-flight canary
 # --------------------------------------------------------------------------
 def _dest_get(run_payload):
-    """Route dest.get: /sessions is the scratch lookup, /runs/<id> the read-back."""
+    """Route dest.get: /runs/<id> is the read-back."""
 
     def get(path, params=None):
-        if path == "/sessions":
-            return [{"id": "scratch", "name": _CANARY_SESSION}]
         return run_payload() if callable(run_payload) else run_payload
 
     return get
@@ -507,11 +506,54 @@ def _dest_get(run_payload):
 def test_the_canary_blocks_when_the_timestamp_is_rewritten(sample_config, migration_state):
     m = _migrator(sample_config, migration_state)
     m.ingest = Mock(return_value=[])
+    m.dest.post.return_value = {"id": "scratch"}
     m.dest.get.side_effect = _dest_get({"start_time": datetime.now(timezone.utc).isoformat()})
     with patch("langsmith_migrator.core.migrators.trace.time.sleep"):
         with pytest.raises(TracePreflightError, match="historical_ingest_rejected"):
             m.canary()
     assert any(i.code == "historical_ingest_rejected" for i in migration_state.issue_log)
+
+
+def test_a_hidden_leftover_canary_project_does_not_block_the_next_run(sample_config, migration_state):
+    """The list endpoint can hide a project whose name still 409s on create."""
+    projects = {"leftover": _CANARY_SESSION}
+
+    def post(path, body):
+        if body["name"] in projects.values():
+            raise ConflictError("Session already exists.")
+        projects[body["name"]] = body["name"]
+        return {"id": body["name"]}
+
+    m = _migrator(sample_config, migration_state)
+    m.dest.get.return_value = []
+    m.dest.post.side_effect = post
+    m.dest.delete.side_effect = lambda path: projects.pop(path.rsplit("/", 1)[1])
+    m.ingest = Mock(return_value=[("id", "HTTP 403: Forbidden")])
+
+    for _ in range(2):
+        with pytest.raises(TracePreflightError):
+            m.canary()
+
+    assert projects == {"leftover": _CANARY_SESSION}
+
+
+def test_a_canary_project_that_cannot_be_deleted_is_named_without_verbose(
+    sample_config, migration_state
+):
+    """Each such run leaves one more project, so the user is told which to remove."""
+    sample_config.migration.verbose = False
+    m = _migrator(sample_config, migration_state)
+    m.console = Mock()
+    m.dest.post.return_value = {"id": "scratch", "name": f"{_CANARY_SESSION}-abc"}
+    m.dest.delete.side_effect = APIError("HTTP 403: Forbidden [no delete]")
+    m.ingest = Mock(return_value=[("id", "HTTP 403: Forbidden")])
+
+    with pytest.raises(TracePreflightError, match="historical_ingest_rejected"):
+        m.canary()
+
+    (message,) = [call.args[0] for call in m.console.print.call_args_list]
+    assert f"{_CANARY_SESSION}-abc (scratch)" in message
+    assert "HTTP 403: Forbidden \\[no delete]" in message
 
 
 def test_dry_run_skips_the_canary_entirely(sample_config):
