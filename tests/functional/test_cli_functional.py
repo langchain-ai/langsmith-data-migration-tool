@@ -51,6 +51,7 @@ def test_registered_command_names_match_public_cli_surface():
         "contexts",
         "datasets",
         "export-users",
+        "feedback-configs",
         "fleet",
         "issues",
         "list-projects",
@@ -518,6 +519,42 @@ def test_users_command_without_csv_keeps_api_member_paths(cli_harness, monkeypat
     user_role_migrator.list_source_org_members.assert_called_once()
     user_role_migrator.list_source_pending_org_members.assert_called_once()
     user_role_migrator.list_source_workspace_members.assert_called_once()
+
+
+def test_users_byoc_migration_pairs_every_workspace_by_id(cli_harness, monkeypatch):
+    """--byoc-migration copies members into every workspace with the same ID, without prompting."""
+    calls = []
+
+    def resolve(*args, **kwargs):
+        calls.append(kwargs)
+        return WorkspaceProjectResult(
+            workspace_mapping={"ws-1": "ws-1"}, project_mappings={}, workspaces_to_create=[]
+        )
+
+    monkeypatch.setattr(cli_main, "_resolve_workspaces", resolve)
+    user_role_migrator = Mock()
+    user_role_migrator.build_role_mapping.return_value = {}
+    user_role_migrator._dest_email_to_identity = {}
+    user_role_migrator.list_dest_org_members.return_value = []
+    user_role_migrator.list_source_org_members.return_value = []
+    user_role_migrator.list_source_pending_org_members.return_value = []
+    user_role_migrator.list_source_workspace_members.return_value = []
+    user_role_migrator.migrate_org_members.return_value = (0, 0, 0)
+    user_role_migrator.migrate_workspace_members.return_value = (0, 0, 0)
+    monkeypatch.setattr(cli_main, "UserRoleMigrator", lambda *args, **kwargs: user_role_migrator)
+
+    result = cli_harness.invoke(["users", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert calls and calls[0]["all_workspaces"] is True
+    assert calls[0]["non_interactive"] is True
+
+
+def test_users_byoc_migration_rejects_single_instance_sync(cli_harness):
+    result = cli_harness.invoke(["users", "--byoc-migration", "--single-instance"])
+
+    assert result.exit_code != 0
+    assert "single-instance" in result.output
 
 
 def test_users_command_preflight_stays_user_scoped(cli_harness, monkeypatch):
@@ -1964,10 +2001,12 @@ def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_ha
         "dataset-2": "dest-2",
     }
     cli_harness.controls.confirm_answers = [True]
+    _serve_dataset_counts(cli_harness, {"dataset-1": 3, "dataset-2": 5}, {"dataset-1": 3, "dataset-2": 5})
 
     result = cli_harness.invoke(["datasets", "--all", "--include-experiments"])
 
     assert result.exit_code == 0
+    assert "2 dataset(s) match" in cli_harness.console.text
     orchestrator = cli_harness.orchestrator_factory.instances[0]
     assert orchestrator.workspace_calls == [("src-ws", "dst-ws")]
     assert orchestrator.migrate_dataset_calls == [
@@ -1979,6 +2018,38 @@ def test_datasets_command_migrates_selected_datasets_with_workspace_scope(cli_ha
     ]
     assert orchestrator.clear_workspace_called is True
     assert "Migration completed" in cli_harness.console.text
+
+
+def _serve_dataset_counts(cli_harness, source_counts, dest_counts):
+    """Serve example counts per dataset ID on each side, and no experiments."""
+    migrator = cli_harness.migrators.dataset
+    migrator.source.get.side_effect = lambda endpoint, params=None: {
+        "example_count": source_counts[endpoint.rsplit("/", 1)[-1]]
+    }
+    migrator.dest.get.side_effect = lambda endpoint, params=None: {
+        "example_count": dest_counts[endpoint.rsplit("/", 1)[-1]]
+    }
+    migrator.find_existing_dataset.side_effect = (
+        lambda name, dataset_id: dataset_id if dataset_id in dest_counts else None
+    )
+    migrator.source.get_paginated.side_effect = lambda *a, **k: iter([])
+    migrator.dest.get_paginated.side_effect = lambda *a, **k: iter([])
+
+
+def test_datasets_validate_compares_without_migrating(cli_harness):
+    """--validate reports datasets whose copy differs and exits 1, without copying anything."""
+
+    cli_harness.migrators.dataset.list_datasets.return_value = [
+        {"id": "dataset-1", "name": "Dataset One"},
+        {"id": "dataset-2", "name": "Dataset Two"},
+    ]
+    _serve_dataset_counts(cli_harness, {"dataset-1": 3, "dataset-2": 2104}, {"dataset-1": 3, "dataset-2": 0})
+
+    result = cli_harness.invoke(["datasets", "--all", "--validate"])
+
+    assert result.exit_code == 1
+    assert cli_harness.orchestrator_factory.instances[0].migrate_dataset_calls == []
+    assert "1 of 2 dataset(s) differ" in cli_harness.console.text
 
 
 def test_datasets_command_exits_nonzero_when_workspace_resolution_aborts(cli_harness):
@@ -2269,6 +2340,103 @@ def test_queues_command_byoc_migration_implies_all_workspaces_runs_and_no_prompt
     assert cli_harness.migrators.queue.create_queue.call_count == 2
     assert cli_harness.migrators.queue.migrate_queue_runs.call_count == 2
     assert "Queue runs: 2 added, 0 failed, 0 skipped" in cli_harness.console.text
+
+
+def test_queues_command_migrates_queues_in_parallel(cli_harness):
+    """Independent queues should run in the worker pool, not one after another."""
+    import threading
+    import time
+
+    queues = [{"id": f"queue-{i}", "name": f"Queue {i}"} for i in range(6)]
+    cli_harness.migrators.queue.list_queues.return_value = queues
+    active = {"now": 0, "peak": 0}
+    guard = threading.Lock()
+
+    def create(queue):
+        with guard:
+            active["now"] += 1
+            active["peak"] = max(active["peak"], active["now"])
+        time.sleep(0.03)
+        with guard:
+            active["now"] -= 1
+        return f"new-{queue['id']}"
+
+    cli_harness.migrators.queue.create_queue.side_effect = create
+
+    result = cli_harness.invoke(["--workers", "3", "--non-interactive", "queues"])
+
+    assert result.exit_code == 0
+    assert "Queues: 6 migrated, 0 failed" in cli_harness.console.text
+    assert 1 < active["peak"] <= 3
+    state = cli_harness.orchestrator_factory.state
+    for i in range(6):
+        assert state.items[f"queue_default_queue-{i}"].destination_id == f"new-queue-{i}"
+
+
+def test_byoc_migration_matches_feedback_workers_to_workers(cli_harness, monkeypatch):
+    monkeypatch.delenv("MIGRATION_FEEDBACK_WORKERS", raising=False)
+
+    result = cli_harness.invoke(["--workers", "7", "queues", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert cli_harness.orchestrator_factory.instances[-1].config.migration.feedback_workers == 7
+
+
+def test_byoc_migration_keeps_explicit_feedback_workers(cli_harness, monkeypatch):
+    monkeypatch.setenv("MIGRATION_FEEDBACK_WORKERS", "3")
+
+    result = cli_harness.invoke(["--workers", "7", "queues", "--byoc-migration"])
+
+    assert result.exit_code == 0
+    assert cli_harness.orchestrator_factory.instances[-1].config.migration.feedback_workers == 3
+
+
+def test_queues_command_interrupt_stops_remaining_queues(cli_harness, monkeypatch):
+    """Ctrl-C on the main thread cancels queued queues and stops the clients.
+
+    The worker is held inside the first queue until the clients are cancelled,
+    and the interrupt is raised on the main thread, so the outcome does not
+    depend on thread scheduling.
+    """
+    import threading
+
+    from langsmith_migrator.cli import main as cli_main
+
+    queues = [{"id": f"queue-{i}", "name": f"Queue {i}"} for i in range(6)]
+    cli_harness.migrators.queue.list_queues.return_value = queues
+    started = threading.Event()
+    release = threading.Event()
+    created = []
+    cancelled = []
+
+    def create(queue):
+        created.append(queue["id"])
+        started.set()
+        assert release.wait(5), "worker was never released"
+        return f"new-{queue['id']}"
+
+    cli_harness.migrators.queue.create_queue.side_effect = create
+
+    def make_cancel(label):
+        def cancel():
+            cancelled.append(label)
+            release.set()  # cancel runs after pending futures are dropped
+        return cancel
+
+    factory = cli_harness.orchestrator_factory
+    factory.source_client.cancel = make_cancel("source")
+    factory.dest_client.cancel = make_cancel("dest")
+
+    def interrupting_as_completed(futures):
+        assert started.wait(5), "first queue never started"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_main, "as_completed", interrupting_as_completed)
+
+    cli_harness.invoke(["--workers", "1", "--non-interactive", "queues"])
+
+    assert created == ["queue-0"]
+    assert sorted(cancelled) == ["dest", "source"]
 
 
 def test_queues_command_without_include_runs_does_not_copy_runs(cli_harness):

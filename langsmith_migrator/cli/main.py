@@ -3,8 +3,11 @@
 import csv
 import functools
 import logging
+import os
 import shlex
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -21,6 +24,7 @@ from ..core.migrators import (
     ChartMigrator,
     ContextHubMigrator,
     DatasetMigrator,
+    FeedbackConfigMigrator,
     MigrationOrchestrator,
     IssueMigrator,
     ModelPriceMapMigrator,
@@ -46,6 +50,7 @@ from ..core.trace_archive import (
     ArchiveSource,
     projected_file_count,
 )
+from ..core.dataset_check import compare_datasets
 from ..core.trace_blobstore import ArchiveError, is_s3
 from ..core.trace_frames import DEFAULT_COMPRESS_LEVEL
 from ..core.migrators.user_role import (
@@ -66,7 +71,13 @@ from ..utils.chart_mode import (
 )
 from ..utils.config import Config, S3Config
 from ..utils.retry import RateLimitError
-from ..utils.state import MigrationStatus, ResolutionOutcome, StateManager, VerificationState
+from ..utils.state import (
+    MigrationStatus,
+    ResolutionOutcome,
+    StateManager,
+    VerificationState,
+    saved_migration_settings,
+)
 from ..utils.workspace import (
     discover_workspaces,
     get_workspace_name,
@@ -620,6 +631,17 @@ def _apply_byoc_migration_profile(config) -> None:
     config.migration.skip_feedback = True
     config.migration.non_interactive = True
     config.migration.interactive = False
+    # The per-request sleep is the main cost of a bulk copy; retries with backoff
+    # already handle 429s. An explicit MIGRATION_RATE_LIMIT_DELAY still wins.
+    if "MIGRATION_RATE_LIMIT_DELAY" not in os.environ:
+        config.migration.rate_limit_delay = 0.0
+    # Nested I/O (queue run batches) uses as many threads as --workers.
+    # An explicit MIGRATION_FEEDBACK_WORKERS still wins.
+    if "MIGRATION_FEEDBACK_WORKERS" not in os.environ:
+        config.migration.feedback_workers = max(1, config.migration.concurrent_workers)
+    # Queues can reference runs the trace migration never copied (expired on the
+    # source); looking runs up first links the rest in one request per batch.
+    config.migration.check_queue_runs_exist = True
 
 
 def _resolve_workspaces(
@@ -735,6 +757,8 @@ def _ensure_migration_session(orchestrator, config):
             config.source.base_url,
             config.destination.base_url,
         )
+        # Saved so `resume` restores them, as the dataset flow does.
+        orchestrator.state.migration_settings = saved_migration_settings(config.migration)
     elif not orchestrator.state.remediation_bundle_path:
         orchestrator.state.remediation_bundle_path = str(
             orchestrator.state_manager._default_bundle_path(orchestrator.state.session_id).resolve()
@@ -1003,6 +1027,19 @@ def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> Non
             "(e.g. after a trace storage migration). Run `langsmith-migrator resume` "
             "to retry linking them.[/dim]"
         )
+    reordered = sum(r.get("reordered", 0) for _, r in queue_run_results)
+    order_failed = sum(r.get("order_failed", 0) for _, r in queue_run_results)
+    if reordered or order_failed:
+        console.print(
+            f"Queue item order: {reordered} item(s) moved to their source position"
+            + (f", {order_failed} could not be moved" if order_failed else "")
+        )
+    missing = sum(r.get("missing", 0) for _, r in queue_run_results)
+    if missing:
+        console.print(
+            f"[dim]{missing} of the failed runs do not exist on the destination, for "
+            "example because they expired before the trace migration.[/dim]"
+        )
     if skipped:
         console.print(
             "[dim]Skipped runs had no session_id/start_time on the source; their queues "
@@ -1012,6 +1049,8 @@ def _report_queue_runs(config, queue_run_results: list[tuple[str, dict]]) -> Non
         for name, r in queue_run_results:
             for run_id, err in r.get("errors", []):
                 console.print(f"  [red]✗[/red] {name} run {run_id}: {err}")
+            if r.get("errors_truncated"):
+                console.print(f"  [dim]{name}: {r['errors_truncated']} more not shown[/dim]")
 
 
 def _filter_datasets(datasets: list, selectors) -> tuple[list, list]:
@@ -2208,6 +2247,12 @@ def test(ctx):
     help="Dataset name or ID to migrate; repeatable. Only the matched datasets (and, with "
     "--include-experiments, their experiments) are migrated, without prompting.",
 )
+@click.option(
+    "--validate",
+    is_flag=True,
+    help="Only compare the selected datasets' example (and experiment) counts with the "
+    "destination; copy nothing. A migration runs the same check when it ends.",
+)
 @workspace_options
 @click.pass_context
 def datasets(
@@ -2218,6 +2263,7 @@ def datasets(
     all_workspaces,
     byoc_migration,
     dataset_filters,
+    validate,
     source_workspace,
     dest_workspace,
     map_workspaces,
@@ -2280,6 +2326,7 @@ def datasets(
     )
 
     unmatched_filters = set(dataset_filters)
+    mismatched = 0
 
     try:
         for src_ws, dst_ws in ws_pairs:
@@ -2330,6 +2377,12 @@ def datasets(
                 console.print("[yellow]No datasets selected[/yellow]")
                 continue
 
+            if validate:
+                mismatched += _report_dataset_comparison(
+                    dataset_migrator, selected, include_experiments
+                )
+                continue
+
             inc_exp = include_experiments
             if not inc_exp:
                 inc_exp = _confirm_action(
@@ -2377,10 +2430,14 @@ def datasets(
             except Exception as e:
                 console.print(f"\n[red]Migration failed: {e}[/red]")
 
+            if not config.migration.dry_run:
+                mismatched += _report_dataset_comparison(dataset_migrator, selected, inc_exp)
+
         if ws_result:
             orchestrator.clear_workspace_context()
-        _display_resolution_summary(orchestrator)
-        _exit_for_remediation_if_needed(ctx, config, orchestrator)
+        if not validate:
+            _display_resolution_summary(orchestrator)
+            _exit_for_remediation_if_needed(ctx, config, orchestrator)
     except Exception as e:
         console.print(f"\n[red]Migration failed: {e}[/red]")
         ctx.exit(1)
@@ -2393,6 +2450,34 @@ def datasets(
             f"{', '.join(sorted(unmatched_filters))}[/red]"
         )
         ctx.exit(1)
+    if mismatched:
+        ctx.exit(1)
+
+
+def _report_dataset_comparison(dataset_migrator, datasets_to_check, include_experiments) -> int:
+    """Print how the destination copies compare with the source; returns how many differ."""
+    console.print("\nValidating datasets against the destination... ", end="")
+    results = compare_datasets(dataset_migrator, datasets_to_check, include_experiments)
+    differing = [r for r in results if not r.matches]
+    if not differing:
+        console.print(f"[green]✓ {len(results)} dataset(s) match[/green]")
+        return 0
+    console.print(f"[red]{len(differing)} of {len(results)} dataset(s) differ[/red]")
+    table = Table(show_header=True)
+    table.add_column("Dataset")
+    table.add_column("Source ID", style="dim")
+    table.add_column("Examples (src → dest)")
+    if include_experiments:
+        table.add_column("Experiments (src → dest)")
+    table.add_column("Problem")
+    for r in differing:
+        problem = r.error or ("missing on destination" if r.dest_id is None else "counts differ")
+        row = [r.name, r.source_id, f"{r.source_examples} → {r.dest_examples}"]
+        if include_experiments:
+            row.append(f"{r.source_experiments} → {r.dest_experiments}")
+        table.add_row(*row, problem)
+    console.print(table)
+    return len(differing)
 
 
 def _select_resume_session(config: Config, state_manager: StateManager):
@@ -2442,6 +2527,69 @@ def _select_resume_session(config: Config, state_manager: StateManager):
     except ValueError:
         console.print("[red]Invalid input[/red]")
         return None
+
+
+@cli.command("feedback-configs")
+@ssl_option
+@click.option(
+    "--all-workspaces",
+    is_flag=True,
+    help="Copy every source workspace into the destination workspace with the same ID, "
+    "without prompting",
+)
+@click.option(
+    "--byoc-migration",
+    is_flag=True,
+    help="Self-hosted to BYOC profile: pair every workspace by ID, without prompting.",
+)
+@workspace_options
+@click.pass_context
+def feedback_configs(ctx, all_workspaces, byoc_migration, source_workspace, dest_workspace, map_workspaces):
+    """Copy feedback configs (label types and scales) the destination lacks."""
+    config = ctx.obj["config"]
+    display_banner()
+    if byoc_migration:
+        _apply_byoc_migration_profile(config)
+        all_workspaces = True
+    if not ensure_config(config):
+        return
+    orchestrator = MigrationOrchestrator(config, ctx.obj["state_manager"])
+    try:
+        if not orchestrator.test_connections():
+            console.print("\n[red]Cannot proceed without valid connections[/red]")
+            ctx.exit(1)
+            return
+        ws_result = _resolve_workspaces(
+            orchestrator, source_workspace, dest_workspace, map_workspaces,
+            non_interactive=config.migration.non_interactive, all_workspaces=all_workspaces,
+        )
+        if ws_result is _WS_ABORTED:
+            ctx.exit(1)
+            return
+        if ws_result is _WS_CANCELLED:
+            console.print("[yellow]Cancelled[/yellow]")
+            return
+        ws_pairs = list(ws_result.workspace_mapping.items()) if ws_result else [(None, None)]
+        migrator = FeedbackConfigMigrator(orchestrator.source_client, orchestrator.dest_client, None, config)
+        failed = 0
+        for src_ws, dst_ws in ws_pairs:
+            if src_ws and dst_ws:
+                orchestrator.set_workspace_context(src_ws, dst_ws)
+                console.print(f"\n[bold cyan]Workspace: {src_ws} -> {dst_ws}[/bold cyan]")
+            result = migrator.migrate_all()
+            failed += result["failed"]
+            console.print(
+                f"Feedback configs: {result['created']} created, {result['existing']} already present"
+                + (f", [red]{result['failed']} failed[/red]" if result["failed"] else "")
+            )
+            for key, err in result["errors"]:
+                console.print(f"  [red]✗[/red] {key}: {err}")
+        if ws_result:
+            orchestrator.clear_workspace_context()
+        if failed:
+            ctx.exit(1)
+    finally:
+        orchestrator.cleanup()
 
 
 @cli.command()
@@ -2560,33 +2708,59 @@ def queues(
         failed_items = []
         queue_run_results = []
 
-        with Progress(console=console) as progress:
-            task = progress.add_task("Migrating queues...", total=len(selected_queues))
-            for queue in selected_queues:
-                item_id = _ensure_state_item(
-                    orchestrator,
-                    config,
-                    "queue",
-                    queue["id"],
-                    queue["name"],
-                    metadata={"queue": queue, "include_runs": include_runs},
-                )
-                try:
-                    _mark_state_item_started(orchestrator, item_id)
-                    new_id = queue_migrator.create_queue(queue)
+        results_lock = threading.Lock()
+
+        def migrate_one(queue: dict) -> None:
+            nonlocal success_count
+            item_id = _ensure_state_item(
+                orchestrator,
+                config,
+                "queue",
+                queue["id"],
+                queue["name"],
+                metadata={"queue": queue, "include_runs": include_runs},
+            )
+            try:
+                _mark_state_item_started(orchestrator, item_id)
+                new_id = queue_migrator.create_queue(queue)
+                with results_lock:
                     success_count += 1
-                    run_result = None
-                    if include_runs:
-                        run_result = _migrate_queue_runs_for_item(
-                            orchestrator, queue_migrator, queue, new_id
-                        )
-                        if run_result is not None:
+                run_result = None
+                if include_runs:
+                    run_result = _migrate_queue_runs_for_item(
+                        orchestrator, queue_migrator, queue, new_id
+                    )
+                    if run_result is not None:
+                        with results_lock:
                             queue_run_results.append((queue["name"], run_result))
-                    _finish_queue_state_item(orchestrator, item_id, new_id, run_result)
-                except Exception as e:
+                _finish_queue_state_item(orchestrator, item_id, new_id, run_result)
+            except Exception as e:
+                with results_lock:
                     failed_items.append((queue["name"], str(e)))
-                    _mark_state_item_failed(orchestrator, item_id, e)
-                progress.advance(task)
+                _mark_state_item_failed(orchestrator, item_id, e)
+
+        # Queues are independent, so they run in a pool like datasets do; each
+        # queue's run batches post in its own nested pool (MIGRATION_FEEDBACK_WORKERS).
+        workers = max(1, min(config.migration.concurrent_workers, len(selected_queues)))
+        save_interval = float(getattr(config.migration, "state_save_interval", 0.0) or 0.0)
+        with Progress(console=console) as progress, \
+                orchestrator.state_manager.throttled_saves(save_interval):
+            task = progress.add_task("Migrating queues...", total=len(selected_queues))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(migrate_one, q) for q in selected_queues]
+                try:
+                    for future in as_completed(futures):
+                        future.result()
+                        progress.advance(task)
+                except BaseException:
+                    # Ctrl-C or a crash: drop queued queues and stop running ones at
+                    # their next request, instead of finishing the whole migration.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    for client in (orchestrator.source_client, orchestrator.dest_client):
+                        cancel = getattr(client, "cancel", None)
+                        if callable(cancel):
+                            cancel()
+                    raise
 
         console.print(f"Queues: {success_count} migrated, {len(failed_items)} failed")
         if failed_items and config.migration.verbose:
@@ -2781,6 +2955,12 @@ def model_pricing(ctx, source_workspace, dest_workspace, map_workspaces):
     is_flag=True,
     help="Disable prompts for this users run. Same behavior as the global --non-interactive.",
 )
+@click.option(
+    "--byoc-migration",
+    is_flag=True,
+    help="Self-hosted to BYOC profile: copy members into every workspace with the same ID, "
+    "without prompting. Run it after the workspaces are imported.",
+)
 @workspace_options
 @click.pass_context
 def users(
@@ -2794,6 +2974,7 @@ def users(
     instance_key,
     instance_url,
     users_non_interactive,
+    byoc_migration,
     source_workspace,
     dest_workspace,
     map_workspaces,
@@ -2806,7 +2987,7 @@ def users(
 
     if users_dry_run:
         config.migration.dry_run = True
-    if users_non_interactive:
+    if users_non_interactive or byoc_migration:
         config.migration.non_interactive = True
         config.migration.interactive = False
 
@@ -2823,6 +3004,11 @@ def users(
 
     if instance_key or instance_url or csv_source_of_truth:
         single_instance = True
+    if byoc_migration and single_instance:
+        raise click.ClickException(
+            "--byoc-migration copies members between two instances; it cannot be used with "
+            "single-instance CSV sync"
+        )
 
     if single_instance and roles_only:
         raise click.ClickException(
@@ -2888,6 +3074,7 @@ def users(
             dest_workspace,
             map_workspaces,
             non_interactive=config.migration.non_interactive,
+            all_workspaces=byoc_migration,
         )
         if ws_result is _WS_ABORTED:
             ctx.exit(1)

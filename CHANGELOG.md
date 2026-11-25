@@ -19,6 +19,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination already has. A link that can't be read or written is counted as
   failed and the run carries on.
 
+## [0.0.100] - 2026-11-21
+
+### Added
+- **`users --byoc-migration`**: copies members into every destination
+  workspace with the same ID, without prompting. Run it after the workspaces
+  are imported.
+
+## [0.0.99] - 2026-11-20
+
+### Added
+- **`feedback-configs` command**: copies every live feedback config (label type
+  and scale) the destination workspace lacks, matched by key and settings.
+  `--byoc-migration` pairs every workspace by ID.
+
+### Fixed
+- **Completed queue items**: `queues` copies archived (completed) items too.
+  They arrive open, since review progress cannot be set through the API.
+- **Prompt descriptions and tags**: `prompts` copies each prompt's
+  description, readme and tags, also onto prompts that already exist.
+
+## [0.0.98] - 2026-11-20
+
+### Added
+- **Dataset validation**: `datasets` compares each migrated dataset's example
+  count, and experiment count with `--include-experiments`, against the
+  destination when it ends, lists the datasets that differ, and exits 1 if any
+  do. `datasets --validate` runs only that comparison and copies nothing, for
+  example `datasets --byoc-migration --validate` after a BYOC dataset migration.
+
+## [0.0.97] - 2026-11-20
+
+### Fixed
+- **Queue rubrics and reviewers**: `queues` reads each source queue on its own,
+  because the queue list leaves out the rubric. It copies the rubric items and
+  instructions, creates a missing destination feedback config for each rubric
+  key, copies the reviewer access mode, and assigns the reviewers who are
+  members of the destination workspace, matched by email.
+- **Queue item order**: after linking a queue's runs, each destination item gets
+  its source `added_at`, which sets the review order. Needs the queue items API
+  on both instances.
+
+## [0.0.96] - 2026-11-20
+
+### Changed
+- **Faster queue run linking with missing runs**: with `--byoc-migration`, each
+  batch of queue runs is looked up on the destination first and only the runs
+  found are linked, so runs that expired before the trace migration cost no
+  extra requests. A rejected batch is split in halves instead of retried one
+  run at a time.
+- **Smaller state files**: each queue keeps at most 100 per-run errors in the
+  state file; the counts stay exact.
+
+### Fixed
+- **`resume` keeps the BYOC run lookup**: queue sessions now save their
+  migration settings, so a resumed queue still looks runs up before linking.
+
+## [0.0.95] - 2026-11-20
+
+### Changed
+- **Faster `queues`**: queues migrate in parallel (`--workers`), each queue's
+  run batches post in parallel (`MIGRATION_FEEDBACK_WORKERS`), and destination
+  queues are listed once per workspace instead of once per queue.
+  `--byoc-migration` sets `MIGRATION_FEEDBACK_WORKERS` to `--workers` unless it
+  is set.
+
+### Fixed
+- **No duplicate destination queues**: queues with the same name are created
+  one at a time, and a failed destination listing fails the queue instead of
+  creating a second copy.
+- **Workspace discovery paths**: base URLs ending in `/api/v1` no longer probe
+  `/api/v1/api/v1/workspaces`, and a `405` on `/workspaces` falls through to
+  `/orgs/current/workspaces`, also in the org-key connection check.
+
+## [0.0.94] - 2026-11-19
+
+### Fixed
+- **Resume after a crash in a throttled run**: the dataset and experiment
+  items are written to the state file before any worker starts, so `resume`
+  finds them even if the run stops before the next save.
+- **No duplicate feedback on resume**: per-record `POST /feedback` now sends a
+  stable id derived from the source record, as multipart feedback already did.
+  A `409` for that id counts as already migrated.
+- **Run timestamps stay consistent on resume**: an experiment's time shift is
+  written to the state file before its runs are sent, so a resume after a
+  crash replays runs with the same timestamps.
+- **A failed destination experiment listing is not cached**: an error on any
+  page now falls back to per-experiment lookups and is retried on the next
+  lookup, instead of hiding existing experiments for the rest of the run.
+- **Ctrl-C stops a parallel run**: queued datasets and experiments are dropped
+  and running ones stop at their next request, instead of the run continuing
+  until all queued work is done.
+- **Throttled state writes are timed**: a skipped write now happens when the
+  interval is up, even if no later checkpoint comes. Writes are fsynced.
+- **Connection pool sized to the workers**: the source and destination clients
+  keep `workers x feedback workers` connections per host instead of 10.
+
+## [0.0.93] - 2026-11-19
+
+### Changed
+- **Faster dataset migration** (`datasets`, `migrate-all`, `resume`):
+  experiments migrate in parallel on `--workers` threads, as datasets already
+  did. Dataset lookups and experiment listings run in parallel too. Existing
+  destination experiments are listed once per dataset, not once per
+  experiment. Examples with attachments download and upload in parallel, and
+  examples without attachments in the same batch go through the bulk endpoint
+  instead of one SDK request each. (#188)
+- **State file writes are throttled** during dataset and resume runs: at most
+  every `MIGRATION_STATE_SAVE_INTERVAL` seconds (default 5), always at the end,
+  and atomically (a crash never leaves a truncated state file). The file is no
+  longer indented. (#188)
+- **`--byoc-migration` removes the per-request delay** unless
+  `MIGRATION_RATE_LIMIT_DELAY` is set. (#188)
+
 ## [0.0.92] - 2026-11-18
 
 ### Fixed

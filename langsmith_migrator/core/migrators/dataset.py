@@ -1,8 +1,10 @@
 """Dataset migration logic."""
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Any, Optional, Generator, Tuple
 import requests
 import tempfile
+import threading
 from urllib.parse import urljoin, urlparse
 import os
 import json
@@ -47,6 +49,31 @@ def _example_unchanged(
 
 class DatasetMigrator(BaseMigrator):
     """Handles dataset migration with streaming and batching."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._lazy_lock = threading.Lock()
+        # Destination workspace ID -> SDK client; built once, not once per batch.
+        self._sdk_clients: Dict[Optional[str], Any] = {}
+        # Shared by every dataset this migrator handles, so the number of
+        # concurrent attachment uploads stays at concurrent_workers in total.
+        self._attachment_pool: Optional[ThreadPoolExecutor] = None
+
+    def close(self) -> None:
+        """Stop the attachment upload threads."""
+        with self._lazy_lock:
+            pool, self._attachment_pool = self._attachment_pool, None
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def _attachment_executor(self) -> ThreadPoolExecutor:
+        with self._lazy_lock:
+            if self._attachment_pool is None:
+                self._attachment_pool = ThreadPoolExecutor(
+                    max_workers=max(1, self.config.migration.concurrent_workers),
+                    thread_name_prefix="attachments",
+                )
+            return self._attachment_pool
 
     @property
     def _preserve_ids(self) -> bool:
@@ -513,6 +540,58 @@ class DatasetMigrator(BaseMigrator):
                 self._dest_info = {}
         return self._dest_info
 
+    def _sdk_client(self):
+        """LangSmith SDK client for the current destination workspace, built once."""
+        try:
+            from langsmith import Client
+        except ImportError:
+            self.log("LangSmith SDK not installed. Install with: pip install langsmith", "error")
+            raise
+
+        dest_workspace_id = self.dest.session.headers.get("X-Tenant-Id")
+        with self._lazy_lock:
+            cached = self._sdk_clients.get(dest_workspace_id)
+            if cached is not None:
+                return cached
+
+            # Self-hosted only has the prefixed (/api/v1) path
+            sdk_url = self.dest.base_url.rstrip("/")
+            if not sdk_url.endswith("/api/v1"):
+                sdk_url = f"{sdk_url}/api/v1"
+            api_key = self.dest.headers.get("X-API-Key") or self.dest.headers.get("x-api-key", "")
+
+            # Hand the SDK the destination's /info payload rather than an empty dict:
+            # create_examples() only sends attachments when it can see
+            # instance_flags.dataset_examples_multipart_enabled, and silently strips
+            # them otherwise. Fetching through our own client keeps SSL/CA/proxy
+            # settings consistent.
+            client_kwargs = {
+                "api_url": sdk_url,
+                "api_key": api_key,
+                "info": self._get_dest_info(),
+            }
+            # Scope the SDK client to the destination workspace. Without X-Tenant-Id an
+            # org-wide PAT posts into its default workspace, where the target dataset does
+            # not exist, and every example in an attachment batch fails with
+            # "404 dataset not found".
+            if dest_workspace_id:
+                client_kwargs["workspace_id"] = dest_workspace_id
+
+            # Add custom session with SSL verification disabled if needed
+            if not self.config.destination.verify_ssl:
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+                # Create session with SSL verification disabled
+                session = requests.Session()
+                session.verify = False
+                client_kwargs["session"] = session
+
+                self.log("SSL verification disabled for LangSmith SDK client", "info")
+
+            client = Client(**client_kwargs)
+            self._sdk_clients[dest_workspace_id] = client
+            return client
+
     def create_examples_with_attachments(
         self,
         dataset_id: str,
@@ -530,49 +609,12 @@ class DatasetMigrator(BaseMigrator):
             Dictionary mapping original_id to new example ID
         """
         try:
-            from langsmith import Client
             from langsmith.schemas import Attachment
         except ImportError:
             self.log("LangSmith SDK not installed. Install with: pip install langsmith", "error")
             raise
 
-        # Initialize LangSmith client with destination credentials
-        # Self-hosted only has the prefixed (/api/v1) path
-        sdk_url = self.dest.base_url.rstrip("/")
-        if not sdk_url.endswith("/api/v1"):
-            sdk_url = f"{sdk_url}/api/v1"
-        api_key = self.dest.headers.get("X-API-Key") or self.dest.headers.get("x-api-key", "")
-
-        # Hand the SDK the destination's /info payload rather than an empty dict:
-        # create_examples() only sends attachments when it can see
-        # instance_flags.dataset_examples_multipart_enabled, and silently strips
-        # them otherwise. Fetching through our own client keeps SSL/CA/proxy
-        # settings consistent.
-        client_kwargs = {
-            "api_url": sdk_url,
-            "api_key": api_key,
-            "info": self._get_dest_info(),
-        }
-        # Scope the SDK client to the destination workspace. Without X-Tenant-Id an
-        # org-wide PAT posts into its default workspace, where the target dataset does
-        # not exist, and every example in an attachment batch fails with
-        # "404 dataset not found".
-        dest_workspace_id = self.dest.session.headers.get("X-Tenant-Id")
-        if dest_workspace_id:
-            client_kwargs["workspace_id"] = dest_workspace_id
-
-        # Add custom session with SSL verification disabled if needed
-        if not self.config.destination.verify_ssl:
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-            # Create session with SSL verification disabled
-            session = requests.Session()
-            session.verify = False
-            client_kwargs["session"] = session
-
-            self.log("SSL verification disabled for LangSmith SDK client", "info")
-
-        client = Client(**client_kwargs)
+        client = self._sdk_client()
 
         id_mapping = {}
 
@@ -764,16 +806,10 @@ class DatasetMigrator(BaseMigrator):
                     progress_callback(total_migrated)
                 continue
 
-            # Download attachments if present (only for new examples)
-            downloaded_attachments = {}
-            attachment_urls = example.get("attachment_urls")
+            # Attachments are downloaded later, on the upload threads (only for new examples)
+            attachment_urls = example.get("attachment_urls") or {}
             if attachment_urls:
                 self.log(f"Found attachments in example {example['id']}: {list(attachment_urls.keys())}")
-                downloaded_attachments = self.download_attachments(attachment_urls)
-                if downloaded_attachments:
-                    self.log(f"Successfully downloaded {len(downloaded_attachments)} attachment(s)", "success")
-                else:
-                    self.log("No attachments were downloaded", "warning")
 
             # Prepare example for destination
             migrated_example = {
@@ -787,7 +823,7 @@ class DatasetMigrator(BaseMigrator):
             if self._preserve_ids:
                 migrated_example["id"] = example["id"]
 
-            batch.append((example["id"], migrated_example, downloaded_attachments))
+            batch.append((example["id"], migrated_example, attachment_urls))
 
             # Process batch when it reaches configured size
             if len(batch) >= self.config.migration.batch_size:
@@ -822,32 +858,28 @@ class DatasetMigrator(BaseMigrator):
     def _process_example_batch(
         self,
         dest_dataset_id: str,
-        batch: List[Tuple[str, Dict[str, Any], Dict]],
+        batch: List[Tuple[str, Dict[str, Any], Dict[str, Any]]],
         id_mapping: Dict[str, str]
     ) -> int:
         """
         Process a batch of examples for creation.
 
+        Examples without attachments go through the bulk endpoint. Examples with
+        attachments need one SDK request each, so they are downloaded and
+        uploaded on the shared attachment threads.
+
+        Args:
+            batch: (source_id, example_payload, source attachment_urls) tuples
+
         Returns:
             Number of examples successfully created
         """
+        plain = [entry for entry in batch if not entry[2]]
+        with_attachments = [entry for entry in batch if entry[2]]
         created_count = 0
 
-        # Check if any example has attachments
-        has_attachments = any(len(ex[2]) > 0 for ex in batch)
-
-        if has_attachments:
-            # Use SDK for examples with attachments
-            self.log("Using LangSmith SDK for examples with attachments")
-            try:
-                batch_id_mapping = self.create_examples_with_attachments(dest_dataset_id, batch)
-                id_mapping.update(batch_id_mapping)
-                created_count = len(batch_id_mapping)
-            except Exception as e:
-                self.log(f"SDK upload failed: {e}", "error")
-        else:
-            # Use regular bulk endpoint
-            payloads = [ex[1] for ex in batch]
+        if plain:
+            payloads = [ex[1] for ex in plain]
             responses = self.dest.post_batch(
                 "/examples/bulk",
                 payloads,
@@ -855,14 +887,60 @@ class DatasetMigrator(BaseMigrator):
             )
 
             # Update ID mappings
-            for i, (original_id, _, _) in enumerate(batch):
+            for i, (original_id, _, _) in enumerate(plain):
                 if i < len(responses) and responses[i] and isinstance(responses[i], dict):
                     new_id = responses[i].get("id")
                     if new_id:
                         id_mapping[original_id] = new_id
                         created_count += 1
 
+        if with_attachments:
+            self.log(
+                f"Using LangSmith SDK for {len(with_attachments)} example(s) with attachments"
+            )
+            executor = self._attachment_executor()
+            futures = [
+                executor.submit(self._migrate_attachment_example, dest_dataset_id, entry)
+                for entry in with_attachments
+            ]
+            for future in futures:
+                try:
+                    example_mapping = future.result()
+                except Exception as e:
+                    self.log(f"SDK upload failed: {e}", "error")
+                    continue
+                id_mapping.update(example_mapping)
+                created_count += len(example_mapping)
+
         return created_count
+
+    def _migrate_attachment_example(
+        self,
+        dest_dataset_id: str,
+        entry: Tuple[str, Dict[str, Any], Dict[str, Any]],
+    ) -> Dict[str, str]:
+        """Download one example's attachments and create it on the destination.
+
+        Runs on an attachment thread. Temp files are removed even when the
+        upload fails before create_examples_with_attachments cleans them up.
+        """
+        original_id, example_data, attachment_urls = entry
+        downloaded = self.download_attachments(attachment_urls)
+        if downloaded:
+            self.log(f"Successfully downloaded {len(downloaded)} attachment(s)", "success")
+        else:
+            self.log("No attachments were downloaded", "warning")
+        try:
+            return self.create_examples_with_attachments(
+                dest_dataset_id, [(original_id, example_data, downloaded)]
+            )
+        finally:
+            for _mime_type, temp_path, _filename in downloaded.values():
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except OSError as e:
+                    self.log(f"Failed to remove temp file {temp_path}: {e}", "warning")
 
     def migrate_dataset(
         self,

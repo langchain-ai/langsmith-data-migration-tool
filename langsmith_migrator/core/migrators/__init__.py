@@ -4,6 +4,7 @@ from .base import BaseMigrator
 from .dataset import DatasetMigrator
 from .experiment import ExperimentMigrator
 from .feedback import FeedbackMigrator
+from .feedback_config import FeedbackConfigMigrator
 from .annotation_queue import AnnotationQueueMigrator
 from .context_hub import ContextHubMigrator
 from .prompt import PromptMigrator
@@ -30,6 +31,7 @@ __all__ = [
     "DatasetMigrator",
     "ExperimentMigrator",
     "FeedbackMigrator",
+    "FeedbackConfigMigrator",
     "AnnotationQueueMigrator",
     "ContextHubMigrator",
     "PromptMigrator",

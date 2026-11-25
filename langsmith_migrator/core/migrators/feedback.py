@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
 from .base import BaseMigrator
-from ...utils.retry import APIError, AuthenticationError
+from ...utils.retry import APIError, AuthenticationError, ConflictError
 from ...utils.time_shift import shift_iso
 
 
@@ -238,6 +238,15 @@ class FeedbackMigrator(BaseMigrator):
                         payload["trace_id"] = feedback["_trace_id"]
             self.dest.post("/feedback", payload)
             return True
+        except ConflictError:
+            if payload.get("id"):
+                self.log(
+                    f"Feedback '{feedback.get('key')}' ({payload['id']}) already exists",
+                    "info",
+                )
+                return True
+            self.log(f"Failed to create feedback '{feedback.get('key')}': conflict", "warning")
+            return False
         except Exception as e:
             self.log(f"Failed to create feedback '{feedback.get('key')}': {e}", "warning")
             return False
@@ -284,11 +293,11 @@ class FeedbackMigrator(BaseMigrator):
 
         def run(task: Tuple[List[int], bool]) -> List[Tuple[int, bool]]:
             indexes, multipart = task
-            if not multipart:
-                return [(indexes[0], self.create_feedback(feedbacks[indexes[0]]))]
             # Fix each record's id up front so a per-record replay upserts the same
             # feedback rather than duplicating it if the batch had in fact landed.
             batch = [self._with_feedback_id(feedbacks[i]) for i in indexes]
+            if not multipart:
+                return [(indexes[0], self.create_feedback(batch[0]))]
             outcome = self._create_feedback_multipart(batch)
             if outcome is None:
                 # One bad record rejects a whole multipart request, so replay the batch

@@ -73,6 +73,8 @@ def _items_server(pages_by_status):
 def migrator(sample_config):
     source = _client()
     dest = _client()
+    # One post worker keeps batch order deterministic; concurrency has its own tests.
+    sample_config.migration.feedback_workers = 1
     m = AnnotationQueueMigrator(source, dest, None, sample_config)
     # default: both instances predate the items API, and each test sets the
     # single page of runs the source serves
@@ -185,7 +187,11 @@ def test_migrate_queue_runs_replays_rejected_batch_per_run(migrator):
         "added": 1,
         "skipped": 0,
         "failed": 1,
+        "missing": 0,
         "errors": [("run-2", "run not found on destination")],
+        "errors_truncated": 0,
+        "reordered": 0,
+        "order_failed": 0,
     }
     per_run = [c.args[1] for c in migrator.dest.post.call_args_list[1:]]
     assert [body[0]["run_id"] for body in per_run] == ["run-1", "run-2"]
@@ -224,23 +230,23 @@ def test_migrate_queue_runs_empty_queue(migrator):
 # --- queue items API (replaces the deprecated /runs endpoints) ---------------
 
 
-def test_items_api_lists_every_active_item_and_adds_by_key(migrator):
-    """Both active statuses are listed, so the caller's own reviews hide nothing."""
+def test_items_api_lists_every_item_and_adds_by_key(migrator):
+    """Every status is listed, so neither the caller's reviews nor completion hide an item."""
     migrator.source.get.side_effect = _items_server(
         {
             # the empty page still has a next cursor, so listing goes on past it
             "needs_my_review": [[_run(1)], [], [_run(2)]],
             # run-1 was reviewed mid-listing, so it is listed twice but copied once
             "needs_others_review": [[_run(3), _run(1)]],
-            "archived": [[_run(4)]],  # review complete: not copied
+            "archived": [[_run(4)]],  # review complete: copied, as an open item
         }
     )
     migrator.dest.get.side_effect = _items_server({})
 
     result = migrator.migrate_queue_runs("q-src", "q-dst")
 
-    assert result["total"] == 3
-    assert result["added"] == 3
+    assert result["total"] == 4
+    assert result["added"] == 4
     listing = migrator.source.get.call_args_list[1:]  # after the support probe
     assert {c.args[0] for c in listing} == {"/platform/annotation-queues/q-src/items"}
     assert listing[0].args[1] == {"status": "needs_my_review", "item_type": "RUN", "page_size": 100}
@@ -249,6 +255,7 @@ def test_items_api_lists_every_active_item_and_adds_by_key(migrator):
         ("needs_my_review", "1"),
         ("needs_my_review", "2"),
         ("needs_others_review", None),
+        ("archived", None),
     ]
     endpoint, body = migrator.dest.post.call_args.args
     assert endpoint == "/platform/annotation-queues/q-dst/items"
@@ -260,7 +267,7 @@ def test_items_api_lists_every_active_item_and_adds_by_key(migrator):
                 "session_id": "sess-1",
                 "start_time": f"2026-01-0{i}T00:00:00",
             }
-            for i in (1, 2, 3)
+            for i in (1, 2, 3, 4)
         ]
     }
 
@@ -307,3 +314,357 @@ def test_no_deprecated_fallback_stops_before_listing_when_destination_is_old(mig
         migrator.migrate_queue_runs("q-src", "q-dst")
     migrator.source.get.assert_not_called()
     migrator.dest.post.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Parallel posting and the cached destination index
+# ---------------------------------------------------------------------------
+
+
+def test_batches_post_concurrently_and_all_runs_are_counted(migrator):
+    import threading
+    import time
+
+    migrator.config.migration.feedback_workers = 4
+    _serve(migrator, [_run(i % 9 + 1) | {"id": f"run-{i}"} for i in range(40)])
+    active = {"now": 0, "peak": 0}
+    guard = threading.Lock()
+
+    def slow_post(endpoint, body):
+        with guard:
+            active["now"] += 1
+            active["peak"] = max(active["peak"], active["now"])
+        time.sleep(0.02)
+        with guard:
+            active["now"] -= 1
+        return {}
+
+    migrator.dest.post.side_effect = slow_post
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst", batch_size=4)
+
+    assert result["total"] == 40
+    assert result["added"] == 40
+    assert result["failed"] == 0
+    assert migrator.dest.post.call_count == 10
+    assert 1 < active["peak"] <= 4
+
+
+def test_concurrent_per_run_replay_counts_failures(migrator):
+    migrator.config.migration.feedback_workers = 4
+    _serve(migrator, [_run(i % 9 + 1) | {"id": f"run-{i}"} for i in range(8)])
+
+    def post(endpoint, body):
+        ids = [k["run_id"] for k in body]
+        if len(ids) > 1:
+            raise APIError("batch rejected", status_code=422)
+        if ids[0] in {"run-1", "run-6"}:
+            raise APIError("run not found", status_code=404)
+        return {}
+
+    migrator.dest.post.side_effect = post
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst", batch_size=2)
+
+    assert result["added"] == 6
+    assert result["failed"] == 2
+    assert sorted(run_id for run_id, _ in result["errors"]) == ["run-1", "run-6"]
+
+
+def test_unexpected_post_error_stops_the_copy(migrator):
+    migrator.config.migration.feedback_workers = 4
+    _serve(migrator, [_run(i % 9 + 1) | {"id": f"run-{i}"} for i in range(8)])
+    migrator.dest.post.side_effect = RuntimeError("connection pool broke")
+
+    with pytest.raises(RuntimeError):
+        migrator.migrate_queue_runs("q-src", "q-dst", batch_size=2)
+
+
+def test_destination_queues_are_listed_once_per_workspace(migrator):
+    migrator.dest.get_paginated.return_value = []
+    migrator.dest.get_paginated.side_effect = lambda *a, **k: iter(
+        [{"id": "dst-1", "name": "One"}, {"id": "dst-2", "name": "Two"}]
+    )
+
+    migrator.dest.session.headers = {"X-Tenant-Id": "ws-a"}
+    assert migrator.find_existing_queue("One") == "dst-1"
+    assert migrator.find_existing_queue("Two") == "dst-2"
+    assert migrator.find_existing_queue("Missing") is None
+    assert migrator.dest.get_paginated.call_count == 1
+
+    migrator.dest.session.headers = {"X-Tenant-Id": "ws-b"}
+    migrator.find_existing_queue("One")
+    assert migrator.dest.get_paginated.call_count == 2
+
+
+def test_created_queue_is_found_without_relisting(migrator):
+    migrator.dest.get_paginated.side_effect = lambda *a, **k: iter([])
+    migrator.dest.post.return_value = {"id": "dst-new"}
+
+    new_id = migrator.create_queue({"id": "src-1", "name": "Fresh"})
+
+    assert new_id == "dst-new"
+    assert migrator.find_existing_queue("Fresh") == "dst-new"
+    assert migrator.dest.get_paginated.call_count == 1
+
+
+def test_failed_destination_page_is_not_cached(migrator):
+    """A failed page through the real paginator must raise, not cache a partial index."""
+    from langsmith_migrator.core.api_client import EnhancedAPIClient
+
+    migrator.dest.get_paginated.side_effect = (
+        lambda endpoint, **kw: EnhancedAPIClient.get_paginated(migrator.dest, endpoint, **kw)
+    )
+    pages = {"n": 0}
+
+    def get(endpoint, params=None):
+        pages["n"] += 1
+        if pages["n"] == 1:
+            raise APIError("503 upstream", status_code=503)
+        return [{"id": "dst-1", "name": "One"}]
+
+    migrator.dest.get.side_effect = get
+
+    with pytest.raises(APIError):
+        migrator.find_existing_queue("One")
+    assert migrator.find_existing_queue("One") == "dst-1"
+    assert migrator.dest.get_paginated.call_args.kwargs.get("raise_errors") is True
+
+
+def test_failed_listing_fails_the_queue_instead_of_creating_a_duplicate(migrator):
+    migrator.dest.get_paginated.side_effect = APIError("503 upstream", status_code=503)
+
+    with pytest.raises(APIError):
+        migrator.create_queue({"id": "src-1", "name": "Existing"})
+    migrator.dest.post.assert_not_called()
+
+
+def test_same_named_queues_create_one_destination_queue(migrator):
+    """Concurrent workers must not both create a queue for the same name."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    migrator.dest.get_paginated.side_effect = lambda *a, **k: iter([])
+    created = []
+    guard = threading.Lock()
+
+    def post(endpoint, body):
+        time.sleep(0.02)  # widen the window between lookup and create
+        with guard:
+            created.append(body["name"])
+            return {"id": f"dst-{len(created)}"}
+
+    migrator.dest.post.side_effect = post
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        ids = list(pool.map(
+            migrator.create_queue,
+            [{"id": f"src-{i}", "name": "Same"} for i in range(4)],
+        ))
+
+    assert created == ["Same"]
+    assert set(ids) == {"dst-1"}
+
+
+# ---------------------------------------------------------------------------
+# Rejected batches: halving, the destination existence check, the error cap
+# ---------------------------------------------------------------------------
+
+
+def _many(n):
+    return [{"id": f"run-{i}", "session_id": "sess-1", "start_time": "2026-01-01T00:00:00"}
+            for i in range(n)]
+
+
+def _reject(missing_ids, error_cls=NotFoundError, status=404):
+    """dest.post that rejects any batch containing a missing run."""
+    def post(endpoint, body):
+        if any(k["run_id"] in missing_ids for k in body):
+            raise error_cls("run not found", status_code=status)
+        return {}
+    return post
+
+
+def test_one_missing_run_is_found_by_halving(migrator):
+    _serve(migrator, _many(100))
+    migrator.dest.post.side_effect = _reject({"run-37"})
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["added"] == 99
+    assert result["failed"] == 1
+    assert result["errors"] == [("run-37", "run not found")]
+    # One batch, then two halves per level down to the missing run: far below
+    # the 101 requests of a one-by-one retry.
+    assert migrator.dest.post.call_count <= 15
+
+
+def _dest_with_runs(existing, query_error=None):
+    """dest.post that serves a v1 run query by ID and links only existing runs."""
+    queries = []
+
+    def post(endpoint, body):
+        if endpoint == "/runs/query":
+            queries.append(body)
+            if query_error:
+                raise query_error
+            return {"runs": [{"id": i} for i in body["id"] if i in existing], "cursors": {}}
+        if any(k["run_id"] not in existing for k in body):
+            raise NotFoundError("run not found", status_code=404)
+        return {}
+
+    return post, queries
+
+
+def _linked(migrator):
+    return [
+        k["run_id"]
+        for c in migrator.dest.post.call_args_list
+        if c.args[0] != "/runs/query"
+        for k in c.args[1]
+    ]
+
+
+def test_existence_check_links_only_runs_found_on_destination(migrator):
+    migrator.config.migration.check_queue_runs_exist = True
+    _serve(migrator, _many(250))
+    existing = {f"run-{i}" for i in range(0, 250, 7)}
+    migrator.dest.post.side_effect, queries = _dest_with_runs(existing)
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["added"] == len(existing)
+    assert result["failed"] == result["missing"] == 250 - len(existing)
+    assert sorted(_linked(migrator)) == sorted(existing)
+    # One lookup and one link per batch, whatever the mix of missing runs.
+    assert migrator.dest.post.call_count == 6
+    assert queries[0]["session"] == ["sess-1"]
+    assert queries[0]["start_time"].endswith("+00:00")
+
+
+def test_existence_check_skips_the_link_when_no_run_exists(migrator):
+    migrator.config.migration.check_queue_runs_exist = True
+    _serve(migrator, _many(100))
+    migrator.dest.post.side_effect, _ = _dest_with_runs(set())
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["missing"] == result["failed"] == 100
+    assert result["added"] == 0
+    assert migrator.dest.post.call_count == 1
+
+
+def test_existence_check_groups_lookups_by_project(migrator):
+    migrator.config.migration.check_queue_runs_exist = True
+    runs = [_run(1, "sess-a"), _run(2, "sess-b"), _run(3, "sess-a")]
+    _serve(migrator, runs)
+    migrator.dest.post.side_effect, queries = _dest_with_runs({"run-1", "run-2", "run-3"})
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["added"] == 3
+    assert {q["session"][0]: q["id"] for q in queries} == {
+        "sess-a": ["run-1", "run-3"],
+        "sess-b": ["run-2"],
+    }
+
+
+def test_failed_lookup_falls_back_to_splitting(migrator):
+    migrator.config.migration.check_queue_runs_exist = True
+    _serve(migrator, _many(8))
+    migrator.dest.post.side_effect, _ = _dest_with_runs(
+        {f"run-{i}" for i in range(8) if i != 5},
+        query_error=APIError("bad gateway", status_code=502),
+    )
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["added"] == 7
+    assert result["failed"] == 1
+    assert result["missing"] == 0
+    assert result["errors"] == [("run-5", "run not found")]
+
+
+def test_without_the_check_rejected_batches_are_split(migrator):
+    _serve(migrator, _many(16))
+    migrator.dest.post.side_effect = _reject({f"run-{i}" for i in range(16)})
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst", batch_size=8)
+
+    assert result["failed"] == 16
+    assert result["missing"] == 0
+    assert len(result["errors"]) == 16
+
+
+def test_stored_errors_are_capped(migrator):
+    from langsmith_migrator.core.migrators.annotation_queue import MAX_STORED_RUN_ERRORS
+
+    _serve(migrator, _many(250))
+    migrator.dest.post.side_effect = _reject({f"run-{i}" for i in range(250)})
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["failed"] == 250
+    assert len(result["errors"]) == MAX_STORED_RUN_ERRORS
+    assert result["errors_truncated"] == 250 - MAX_STORED_RUN_ERRORS
+
+
+
+# ---------------------------------------------------------------------------
+# Item order: each destination item gets its source added_at
+# ---------------------------------------------------------------------------
+
+
+def test_linked_items_get_their_source_added_at(migrator):
+    source_items = [
+        {"id": "s1", "item_type": "RUN", "run_id": "run-1", "project_id": "sess-1",
+         "start_time": "2026-01-01T00:00:00", "added_at": "2026-01-03T00:00:00Z"},
+        {"id": "s2", "item_type": "RUN", "run_id": "run-2", "project_id": "sess-1",
+         "start_time": "2026-01-01T00:00:00", "added_at": "2026-01-01T00:00:00Z"},
+    ]
+    dest_items = [
+        {"id": "d1", "run_id": "run-1", "added_at": "2026-11-20T10:00:00Z"},
+        {"id": "d2", "run_id": "run-2", "added_at": "2026-01-01T00:00:00+00:00"},
+    ]
+
+    def page(items):
+        return lambda endpoint, params=None: {
+            "items": items if (params or {}).get("status") == "needs_my_review" else [],
+            "next_cursor": None,
+        }
+
+    migrator.source.get.side_effect = page(source_items)
+    migrator.dest.get.side_effect = page(dest_items)
+    migrator.dest.post.return_value = {}
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["added"] == 2
+    assert result["reordered"] == 1
+    # Only the item whose time differs is moved, to its source time.
+    migrator.dest.patch.assert_called_once_with(
+        "/platform/annotation-queues/q-dst/items/d1", {"added_at": "2026-01-03T00:00:00Z"}
+    )
+
+
+def test_item_order_failures_are_counted_not_raised(migrator):
+    migrator.source.get.side_effect = lambda endpoint, params=None: {
+        "items": [{"id": "s1", "run_id": "run-1", "project_id": "sess-1",
+                   "start_time": "2026-01-01T00:00:00", "added_at": "2026-01-03T00:00:00Z"}]
+        if (params or {}).get("status") == "needs_my_review" else [],
+        "next_cursor": None,
+    }
+    migrator.dest.get.side_effect = lambda endpoint, params=None: {
+        "items": [{"id": "d1", "run_id": "run-1", "added_at": "2026-11-20T10:00:00Z"}]
+        if (params or {}).get("status") == "needs_my_review" else [],
+        "next_cursor": None,
+    }
+    migrator.dest.post.return_value = {}
+    migrator.dest.patch.side_effect = APIError("conflict", status_code=409)
+
+    result = migrator.migrate_queue_runs("q-src", "q-dst")
+
+    assert result["added"] == 1
+    assert result["order_failed"] == 1
+    assert result["reordered"] == 0

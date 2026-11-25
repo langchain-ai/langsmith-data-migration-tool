@@ -200,6 +200,7 @@ def test_byoc_migration_profile_preserves_ids_and_disables_prompts(sample_config
     assert sample_config.migration.skip_feedback is True
     assert sample_config.migration.non_interactive is True
     assert sample_config.migration.interactive is False
+    assert sample_config.migration.check_queue_runs_exist is True
 
 
 def test_preserved_example_updates_when_only_inputs_changed(preserving_config, migration_state):
@@ -218,21 +219,26 @@ def test_preserved_example_updates_when_only_inputs_changed(preserving_config, m
     dest.post_batch.assert_not_called()
 
 
+@pytest.mark.parametrize("check_queue_runs_exist", [False, True])
 @pytest.mark.parametrize("skip_feedback", [False, True])
 @pytest.mark.parametrize("preserve_ids,skip_runs", [(False, False), (True, False), (True, True)])
-def test_resume_restores_migration_settings_from_disk(sample_config, tmp_path, preserve_ids, skip_runs, skip_feedback):
+def test_resume_restores_migration_settings_from_disk(
+    sample_config, tmp_path, preserve_ids, skip_runs, skip_feedback, check_queue_runs_exist
+):
     from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
     from langsmith_migrator.utils.state import StateManager
 
     sample_config.migration.preserve_ids = preserve_ids
     sample_config.migration.skip_runs = skip_runs
     sample_config.migration.skip_feedback = skip_feedback
+    sample_config.migration.check_queue_runs_exist = check_queue_runs_exist
     original = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
     session_id = original.ensure_state().session_id
     # A new invocation can have different defaults or environment settings.
     sample_config.migration.preserve_ids = not preserve_ids
     sample_config.migration.skip_runs = not skip_runs
     sample_config.migration.skip_feedback = not skip_feedback
+    sample_config.migration.check_queue_runs_exist = not check_queue_runs_exist
     manager = StateManager(tmp_path / "state")
     resumed = MigrationOrchestrator(sample_config, manager)
     resumed.state = manager.load_session(session_id)
@@ -242,6 +248,7 @@ def test_resume_restores_migration_settings_from_disk(sample_config, tmp_path, p
     assert sample_config.migration.preserve_ids is preserve_ids
     assert sample_config.migration.skip_runs is skip_runs
     assert sample_config.migration.skip_feedback is skip_feedback
+    assert sample_config.migration.check_queue_runs_exist is check_queue_runs_exist
     original.cleanup()
     resumed.cleanup()
 
@@ -265,7 +272,16 @@ def test_legacy_session_keeps_current_settings(sample_config, migration_state, t
     resumed.cleanup()
 
 
-@pytest.mark.parametrize("settings", [{"preserve_ids": "false"}, {"skip_feedback": "true"}, {"base_url": True}, []])
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"preserve_ids": "false"},
+        {"skip_feedback": "true"},
+        {"check_queue_runs_exist": "true"},
+        {"base_url": True},
+        [],
+    ],
+)
 def test_invalid_saved_migration_settings_are_rejected(migration_state, settings):
     from langsmith_migrator.utils.state import MigrationState
 
@@ -368,3 +384,57 @@ def test_byoc_skips_feedback_and_persists_terminal_experiment(sample_config, tmp
     assert reloaded.get_resume_items() == []
     assert reloaded.migration_settings["skip_feedback"] is True
     orchestrator.cleanup()
+
+
+def test_queue_session_saves_and_resume_restores_the_runs_lookup(sample_config, tmp_path, monkeypatch):
+    """A BYOC queue session keeps the destination run lookup across `resume`.
+
+    Queue sessions are created by the CLI helper, not ensure_state. Without the
+    saved setting, a resumed queue would link runs without the lookup, and an
+    all-missing batch of 100 would cost 199 link requests instead of one query.
+    """
+    from unittest.mock import Mock
+
+    from langsmith_migrator.cli.main import _ensure_migration_session
+    from langsmith_migrator.core.migrators.orchestrator import MigrationOrchestrator
+    from langsmith_migrator.utils.state import MigrationStatus, StateManager
+
+    # First run: `queues --byoc-migration` creates the session.
+    sample_config.migration.check_queue_runs_exist = True
+    original = MigrationOrchestrator(sample_config, StateManager(tmp_path / "state"))
+    state = _ensure_migration_session(original, sample_config)
+    assert state.migration_settings["check_queue_runs_exist"] is True
+    state.ensure_item(
+        "queue_default_q-1", "queue", "Queue One", "q-1",
+        destination_id="dst-q-1",
+        metadata={"queue": {"id": "q-1", "name": "Queue One"}, "include_runs": True},
+    )
+    state.update_item_status("queue_default_q-1", MigrationStatus.FAILED, stage="queue_runs")
+    original.state_manager.save()
+    original.cleanup()
+
+    # Later: plain `resume`, whose config has the default (no lookup).
+    sample_config.migration.check_queue_runs_exist = False
+    seen = {}
+    queue_migrator = Mock()
+    queue_migrator.create_queue.return_value = "dst-q-1"
+
+    def migrate_queue_runs(*args, **kwargs):
+        seen["check"] = sample_config.migration.check_queue_runs_exist
+        return {"total": 1, "added": 1, "skipped": 0, "failed": 0, "errors": []}
+
+    queue_migrator.migrate_queue_runs.side_effect = migrate_queue_runs
+    monkeypatch.setattr(
+        "langsmith_migrator.core.migrators.annotation_queue.AnnotationQueueMigrator",
+        lambda *args, **kwargs: queue_migrator,
+    )
+    manager = StateManager(tmp_path / "state")
+    resumed = MigrationOrchestrator(sample_config, manager)
+    resumed.state = manager.load_session(state.session_id)
+
+    results = resumed.resume_items(resumed.state.get_resume_items())
+
+    assert results["resumed"] == ["queue:q-1"]
+    assert seen == {"check": True}
+    resumed.cleanup()
+
