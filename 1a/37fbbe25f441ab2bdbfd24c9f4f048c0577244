@@ -1,0 +1,120 @@
+tests/unit/test_dataset_attachments.py
+  s_c082f715b47906::t_b7360bdbef61d1 121,165-214
+tests/functional/test_cli_functional.py
+  s_c082f715b47906::t_b7360bdbef61d1 54,524-559,2004,2009,2023-2054,2145-2471
+  s_c082f715b47906::t_82218f87b4bbac 2472-2473
+requirements.txt
+  s_c082f715b47906::t_b7360bdbef61d1 5,7,13,43,47,49,51,53,58,60,62,77,85,87,94,142,150,154,156
+CLAUDE.md
+  s_c082f715b47906::t_b7360bdbef61d1 132-133,156,158-159
+langsmith_migrator/core/migrators/annotation_queue.py
+  s_c082f715b47906::t_b7360bdbef61d1 3-6,8-10,13-20,37-40,42-183,197,199,213,215-226,237,253,255,269-270,272-719
+langsmith_migrator/core/migrators/experiment.py
+  s_c082f715b47906::t_b7360bdbef61d1 3,7,11,20-27,220-252,257-258,260-265,279-339,351-353,362,364-370,379-380,460,488,504-505,513-516,538-540,543-546,600-611,761
+langsmith_migrator/utils/config.py
+  s_c082f715b47906::t_b7360bdbef61d1 31-33,48-56,267-268
+tests/test_dataset_selection_and_upsert.py
+  s_c082f715b47906::t_b7360bdbef61d1 159-176
+tests/test_run_query.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-278
+langsmith_migrator/core/api_client.py
+  s_c082f715b47906::t_b7360bdbef61d1 4,7,24-27,125-126,140,159-163,169-171,187-188,197-198,362-363,388-389,411-412,442-443,468-469,494-495,506-507,516,525-526,721-726,734-744,746-751,753-755
+tests/test_experiment_resume.py
+  s_c082f715b47906::t_b7360bdbef61d1 68,102-104
+tests/test_annotation_queue_config.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-126
+tests/test_orchestrator_resume.py
+  s_c082f715b47906::t_b7360bdbef61d1 853-991
+tests/test_workspace_discovery_paths.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-66
+langsmith_migrator/core/migrators/prompt.py
+  s_c082f715b47906::t_b7360bdbef61d1 647-667,904
+langsmith_migrator/core/migrators/__init__.py
+  s_c082f715b47906::t_b7360bdbef61d1 7,34
+tests/test_dataset_check.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-90
+langsmith_migrator/utils/workspace.py
+  s_c082f715b47906::t_b7360bdbef61d1 5-22,36-37,98,104-105
+langsmith_migrator/utils/pagination.py
+  s_c082f715b47906::t_b7360bdbef61d1 14-15,25,46-47
+tests/functional/conftest.py
+  s_c082f715b47906::t_b7360bdbef61d1 16,155-160,205-211
+CHANGELOG.md
+  s_c082f715b47906::t_b7360bdbef61d1 18-176
+  s_2eaa5be37b93c3::t_61844031f15090 177
+langsmith_migrator/core/migrators/orchestrator.py
+  s_c082f715b47906::t_b7360bdbef61d1 4,6,13,19,51-52,62-63,70-85,124,148-154,156-165,172-188,190,203-208,213-215,257,327-345,353-355,360-377,380-398,409-488,526-530,906-981,985-988,991,1098-1108
+tests/test_annotation_queue_runs.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-670
+tests/test_preserve_ids.py
+  s_c082f715b47906::t_b7360bdbef61d1 203,222,225-227,234,241,251,275-284,387-440
+langsmith_migrator/core/migrators/base.py
+  s_c082f715b47906::t_b7360bdbef61d1 6,45-62
+  s_c082f715b47906::t_7478e30b71ff45 63
+tests/test_trace_migrator.py
+  s_c082f715b47906::t_b7360bdbef61d1 925-949
+tests/functional/test_experiment_time_shift.py
+  s_c082f715b47906::t_b7360bdbef61d1 103-104,248-250,252-253
+tests/test_trace_v2.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-145
+pyproject.toml
+  s_c082f715b47906::t_b7360bdbef61d1 3,29,34,36-37,51-52,56,62,66,68-69,75,77-78,124-125
+langsmith_migrator/core/migrators/dataset.py
+  s_c082f715b47906::t_b7360bdbef61d1 3,7,53-77,456-457,543-594,617,653-656,809-810,826,861,867-873,877-878,881-882,890,897-914,917-943
+  s_c082f715b47906::t_e27e1bdddcf437 944
+README.md
+  s_c082f715b47906::t_b7360bdbef61d1 9,28,81-87,246,249,254,259,312-314,580-634,638-641,915
+  s_c082f715b47906::t_dab5ff70ce0899 695-697
+langsmith_migrator/cli/main.py
+  s_c082f715b47906::t_b7360bdbef61d1 6,8,10,27,53,74-80,634-644,760-761,954-1029,1963-1965,2002,2224-2229,2240,2303,2354-2359,2407-2409,2412-2414,2427-2454,2506-2568,2571-2588,2591-2599,2606-2609,2628,2683,2685-2700,2702-2712,2714-2737,2743,2932-2937,2951,2964,2981-2985,3051
+langsmith_migrator/utils/state.py
+  s_c082f715b47906::t_b7360bdbef61d1 5,7,10-11,13,17,21-37,150-168,387-394,399,406,448-460,465,473,508,542,582,600,614,624,688,728,750,756,764,769,774,779,812,838,846,856,937,1016,1054,1121-1126,1195-1201,1205-1259,1261-1276
+langsmith_migrator/core/migrators/trace.py
+  s_c082f715b47906::t_b7360bdbef61d1 12,23,165-167,215,294-299,333,362-371,375,378-413,789,844-865,1101-1103
+tests/test_api_client.py
+  s_c082f715b47906::t_b7360bdbef61d1 370-373,417,419-420,423-424,454-469
+tests/test_feedback_accounting.py
+  s_c082f715b47906::t_b7360bdbef61d1 5,11,202-268
+langsmith_migrator/core/migrators/feedback.py
+  s_c082f715b47906::t_b7360bdbef61d1 7,11-12,173-198,225-238,241-249,299-300,365-369,525-526,535-541
+langsmith_migrator/core/run_query.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-232
+langsmith_migrator/__init__.py
+  s_c082f715b47906::t_b7360bdbef61d1 8
+langsmith_migrator/core/migrators/feedback_config.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-119
+langsmith_migrator/core/dataset_check.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-81
+tests/test_feedback_config_migrator.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-103
+tests/test_parallel_migration.py
+  s_c082f715b47906::t_b7360bdbef61d1 1-632
+tests/test_prompt_migrator.py
+  s_c082f715b47906::t_b7360bdbef61d1 4,22,58,159-190,254
+uv.lock
+  s_c082f715b47906::t_670ad197aa6ec1 2,226,233,235,240,247,249,254,256,258,592,594,596,1047,1054,1056,1061,1069,1071,1091,1094,1106,1108,1113,1122,1124,1129,1137,1139,1173,1181,1183,1188,1193,1195,1200,1218,1220,1225,1281,1284-1286,1289-1293,1298-1301,1307,1317-1318,1759,1761,1763,1884,1893,1895,1900,1906,1908,2124-2144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1a37fbbe25f441ab2bdbfd24c9f4f048c0577244",
+  "prompts": {},
+  "sessions": {
+    "s_2eaa5be37b93c3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eff8967b-2618-4829-b543-892cd7dbc015",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    },
+    "s_c082f715b47906": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "321b637c-88d0-41b0-b776-e1f249e763e1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
