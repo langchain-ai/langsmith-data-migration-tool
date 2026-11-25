@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 import requests
 from langsmith import Client
+from rich.markup import escape
 
 from ..api_client import APIError, NotFoundError
 from ..run_query import RunQuery
@@ -766,6 +767,12 @@ class TraceMigrator(BaseMigrator):
         if self.config.migration.dry_run:
             return
         session = self._scratch_session()
+        try:
+            self._canary_in(session)
+        finally:
+            self._drop_scratch_session(session)
+
+    def _canary_in(self, session: Dict[str, Any]) -> None:
         stamp = self.resolved_range_start()
         run_id = str(uuid.uuid4())
         payload = {
@@ -813,11 +820,29 @@ class TraceMigrator(BaseMigrator):
         raise TracePreflightError(f"historical_ingest_rejected: {detail}")
 
     def _scratch_session(self) -> Dict[str, Any]:
-        existing = next(iter(self._dest_sessions_named(_CANARY_SESSION)), None)
-        return existing or self.dest.post(
+        # Unique per run: a leftover the list endpoint hides still 409s the create.
+        return self.dest.post(
             "/sessions",
-            {"name": _CANARY_SESSION, "description": "langsmith-migrator pre-flight canary"},
+            {
+                "name": f"{_CANARY_SESSION}-{uuid.uuid4().hex[:12]}",
+                "description": "langsmith-migrator pre-flight canary",
+            },
         )
+
+    def _drop_scratch_session(self, session: Dict[str, Any]) -> None:
+        session_id = session.get("id") if isinstance(session, dict) else None
+        if not session_id:
+            return
+        try:
+            self.dest.delete(f"/sessions/{session_id}")
+        except Exception as exc:
+            # Printed without --verbose: each run that can't delete leaves one more.
+            name = session.get("name") or f"{_CANARY_SESSION}-..."
+            self.console.print(
+                f"[yellow]Could not delete the pre-flight canary project "
+                f"{escape(str(name))} ({escape(str(session_id))}) on the destination: "
+                f"{escape(str(exc))}. Delete it by hand.[/yellow]"
+            )
 
     def prepare_slice(
         self, source_session: Dict[str, Any], dest_session: Dict[str, Any], window: Window

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`traces` pre-flight canary**: each run creates its own
+  `langsmith-migrator-canary-<id>` project and deletes it after the check.
+  Before, a leftover `langsmith-migrator-canary` project that the project
+  listing did not return made the create fail with a 409, which blocked every
+  later `traces` run. If the project can't be deleted, the run prints its name
+  so it can be removed by hand.
+
 ## [0.0.100] - 2026-11-21
 
 ### Added
