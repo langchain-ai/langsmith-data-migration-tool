@@ -1498,3 +1498,62 @@ def test_create_chart_exports_skipped_v2_conversion_on_update(sample_config, mig
     ]
     item = migration_state.items["chart_source-chart"]
     assert item.outcome_code == "chart_v2_conversion_skipped"
+
+
+def _sectioned_listing(chart: dict) -> dict:
+    """Shape of POST /charts: charts nested in sections, without their own section_id."""
+    listed = {k: v for k, v in chart.items() if k != "section_id"}
+    return {"sections": [{"id": "dest-section", "title": "Prod", "charts": [listed]}]}
+
+
+def test_find_existing_chart_matches_sectioned_chart_from_listing(sample_config, migration_state):
+    """Sectioned destination charts must dedupe even though the listing omits section_id."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    dest_client.post.return_value = _sectioned_listing(_created_chart(_V2_ERROR_RATE_SERIES))
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+
+    assert (
+        migrator.find_existing_chart(
+            "Error rate", "dest-section", payload=dict(_V1_ERROR_RATE_CHART)
+        )
+        == "dest-chart"
+    )
+
+
+def test_list_charts_does_not_stamp_source_section_ids(sample_config, migration_state):
+    """Source section IDs must not reach destination payloads via the listing."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    source_client.post.return_value = _sectioned_listing(_created_chart(_V2_ERROR_RATE_SERIES))
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+
+    (chart,) = migrator.list_charts()
+    assert "section_id" not in chart
+    assert chart["_source_section_title"] == "Prod"
+
+
+def test_create_chart_verifies_section_placement_from_listing(sample_config, migration_state):
+    """A sectioned create must verify cleanly when the refetch nests the chart in its section."""
+
+    source_client = _mock_client()
+    dest_client = _mock_client()
+    created = {**_created_chart(_V2_ERROR_RATE_SERIES), "section_id": "dest-section"}
+    dest_client.post.side_effect = [
+        {"sections": []},  # find_existing_chart
+        _V1_REJECTION,  # POST /charts/create
+        _convert_response(_V2_ERROR_RATE_SERIES),  # POST convert-v2
+        created,  # POST /charts/create
+        _sectioned_listing(created),  # _verify_chart list refetch
+    ]
+
+    migrator = ChartMigrator(source_client, dest_client, migration_state, sample_config)
+
+    chart = {**_V1_ERROR_RATE_CHART, "section_id": "dest-section"}
+    assert migrator.create_chart(chart) == "dest-chart"
+    item = migration_state.items["chart_source-chart"]
+    assert item.outcome_code == "chart_migrated"

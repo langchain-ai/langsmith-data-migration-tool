@@ -813,6 +813,12 @@ class ChartMigrator(BaseMigrator):
                                         c["_source_section_title"] = section_title
                                     if section_desc:
                                         c["_source_section_description"] = section_desc
+                                    # Listed charts omit section_id; dedupe and post-write
+                                    # verification need the destination placement. Source
+                                    # section IDs are never stamped, so they can't leak
+                                    # into destination payloads.
+                                    if side == "destination" and section.get("id"):
+                                        c.setdefault("section_id", section["id"])
                                     charts.append(c)
                 # Check for direct charts list
                 elif "charts" in response:

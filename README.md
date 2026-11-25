@@ -694,6 +694,9 @@ The prompt default is `No` (rules are created disabled).
 --same-instance         Reuse source project/session IDs on destination only when both sides truly share IDs
 ```
 
+Charts that sit in a dashboard section are matched against that section on the
+destination, so re-running `charts` finds them instead of creating duplicates.
+
 ### Trace Options
 
 ```bash
