@@ -1,0 +1,40 @@
+pyproject.toml
+  s_c082f715b47906::t_dc4d5e4c8a5660 25,29,34,36-37,52,56,62,66-70,75-79,125
+CHANGELOG.md
+  s_c082f715b47906::t_dc4d5e4c8a5660 22-34
+  s_c082f715b47906::t_c8b95996923005 35
+langsmith_migrator/core/migrators/chart.py
+  s_c082f715b47906::t_dc4d5e4c8a5660 816-821
+requirements.txt
+  s_c082f715b47906::t_dc4d5e4c8a5660 5,20,43,47,49,51,53,58,60,62,68,73,77,85,87,94,104,156
+tests/test_chart_migrator.py
+  s_c082f715b47906::t_dc4d5e4c8a5660 1798-1854
+  s_c082f715b47906::t_667ec3172dc328 1796-1797
+tests/test_trace_migrator.py
+  s_c082f715b47906::t_dc4d5e4c8a5660 24,498,509,517-556
+  s_c082f715b47906::t_ea10ccefd821f8 557-558
+langsmith_migrator/core/migrators/trace.py
+  s_c082f715b47906::t_dc4d5e4c8a5660 21,770-775,823-824,826-829,832-845
+  s_c082f715b47906::t_2262c90d550fe5 846
+README.md
+  s_c082f715b47906::t_dc4d5e4c8a5660 159-164,697-698
+  s_c082f715b47906::t_a396852c8ee724 699
+uv.lock
+  s_c082f715b47906::t_ceba3c6687008c 226,233,235,240,247,249,377,379,381,745,751,759,761,1047,1054,1056,1061,1069,1071,1091,1106,1108,1113,1122,1124,1129,1137,1139,1144,1150,1152,1157,1166,1168,1173,1181,1183,1188,1193,1195,1200,1218,1220,1281-1282,1284-1286,1289-1299,1301,1307,1318,1900,1906,1908,2124-2144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "01890fa4ba467d9bf6b834a044ea6d5fd17b3615",
+  "prompts": {},
+  "sessions": {
+    "s_c082f715b47906": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "321b637c-88d0-41b0-b776-e1f249e763e1",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "simon-langchain <simon@langchain.dev>"
+    }
+  }
+}
